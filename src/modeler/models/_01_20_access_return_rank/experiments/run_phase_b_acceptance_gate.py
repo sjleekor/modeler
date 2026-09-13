@@ -13,6 +13,7 @@ one-shot holdout remains deferred to the 2026-10/11 refresh.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import re
@@ -37,23 +38,36 @@ from modeler.models._01_20_access_return_rank.experiments.run_grade_a_acceptance
 
 SNAPSHOT_DATE = "2026-08-23"
 SOURCE = "sj2_remote"
-_ROOT = DataRoot.resolve(market="kr")
-BASELINE_DATASET_DIR = (
-    _ROOT.datasets
-    / "grade_a_gate/baseline/01_20_access_return_rank"
-    / f"snapshot_date={SNAPSHOT_DATE}/source={SOURCE}"
-)
 BASELINE_RESULTS = Path("docs/target/01_20_access_return_rank/grade_a_acceptance_gate_results.json")
 OUTPUT_JSON = Path("docs/target/01_20_access_return_rank/phase_b_acceptance_gate_results.json")
 OUTPUT_MD = Path("docs/target/01_20_access_return_rank/phase_b_acceptance_gate_results.md")
-DATASET_ROOT = (
-    _ROOT.datasets
-    / "phase_b_acceptance_gate/candidate/01_20_access_return_rank"
-    / f"snapshot_date={SNAPSHOT_DATE}/source={SOURCE}"
-)
-FEATURE_MART_ROOT = (
-    _ROOT.derived / "feature" / f"snapshot_date={SNAPSHOT_DATE}/source={SOURCE}"
-)
+
+
+@functools.lru_cache(maxsize=1)
+def _root() -> DataRoot:
+    # Lazy — module import must not require STOCK_DATA_ROOT (test collection
+    # imports this module without it set).
+    return DataRoot.resolve(market="kr")
+
+
+def _baseline_dataset_dir() -> Path:
+    return (
+        _root().datasets
+        / "grade_a_gate/baseline/01_20_access_return_rank"
+        / f"snapshot_date={SNAPSHOT_DATE}/source={SOURCE}"
+    )
+
+
+def _dataset_root() -> Path:
+    return (
+        _root().datasets
+        / "phase_b_acceptance_gate/candidate/01_20_access_return_rank"
+        / f"snapshot_date={SNAPSHOT_DATE}/source={SOURCE}"
+    )
+
+
+def _feature_mart_root() -> Path:
+    return _root().derived / "feature" / f"snapshot_date={SNAPSHOT_DATE}/source={SOURCE}"
 
 # Only columns that can be selected by the current expansion registry belong
 # here.  An unknown screen-pass feature is a contract change and must fail
@@ -130,7 +144,7 @@ def group_features_by_mart(features: list[str]) -> dict[str, list[str]]:
 
 
 def _validate_baseline() -> dict[str, Any]:
-    manifest = _read_json(BASELINE_DATASET_DIR / "dataset_manifest.json")
+    manifest = _read_json(_baseline_dataset_dir() / "dataset_manifest.json")
     expected = {
         "snapshot_date": SNAPSHOT_DATE,
         "period": {"start": "2015-01-02", "end": "2026-06-10"},
@@ -141,7 +155,7 @@ def _validate_baseline() -> dict[str, Any]:
             raise RuntimeError(
                 f"baseline dataset {key} mismatch: {manifest.get(key)!r} != {value!r}"
             )
-    std_path = BASELINE_DATASET_DIR / "feat_panel_std.parquet"
+    std_path = _baseline_dataset_dir() / "feat_panel_std.parquet"
     schema = pl.read_parquet_schema(std_path)
     missing = sorted(set(BASELINE_COLS) - schema.keys())
     if missing:
@@ -153,7 +167,7 @@ def _validate_marts(grouped: dict[str, list[str]], config_hash: str) -> None:
     con = duckdb.connect()
     try:
         for mart, features in grouped.items():
-            directory = FEATURE_MART_ROOT / mart
+            directory = _feature_mart_root() / mart
             metadata = _read_json(directory / "_cache_metadata.json")
             if metadata.get("analysis_config_hash") != config_hash:
                 raise RuntimeError(
@@ -199,7 +213,7 @@ def _dataset_contract(
         "ab_run_id": ab_success["run_id"],
         "ab_content_hash": ab_success["content_hash"],
         "config_hash": ab_success["config_hash"],
-        "baseline_std_sha256": _sha256(BASELINE_DATASET_DIR / "feat_panel_std.parquet"),
+        "baseline_std_sha256": _sha256(_baseline_dataset_dir() / "feat_panel_std.parquet"),
         "families": families,
         "features": features,
     }
@@ -211,7 +225,7 @@ def _join_new_features(
     grouped: dict[str, list[str]],
     engine: EngineOptions,
 ) -> None:
-    baseline = BASELINE_DATASET_DIR / "feat_panel_std.parquet"
+    baseline = _baseline_dataset_dir() / "feat_panel_std.parquet"
     con = duckdb.connect()
     try:
         con.execute(f"SET threads = {int(engine.threads)}")
@@ -221,7 +235,7 @@ def _join_new_features(
         selected: list[str] = []
         for index, (mart, features) in enumerate(grouped.items()):
             alias = f"m{index}"
-            glob = FEATURE_MART_ROOT / mart / "**" / "*.parquet"
+            glob = _feature_mart_root() / mart / "**" / "*.parquet"
             cols = ", ".join(_ident(feature) for feature in features)
             joins.append(
                 f"LEFT JOIN (SELECT trade_date, ticker, market, {cols} "
@@ -284,12 +298,12 @@ def build_candidate_dataset(
     engine: EngineOptions,
     force: bool,
 ) -> Path:
-    manifest_path = DATASET_ROOT / "dataset_manifest.json"
-    parts_dir = DATASET_ROOT / "feat_panel_std"
+    manifest_path = _dataset_root() / "dataset_manifest.json"
+    parts_dir = _dataset_root() / "feat_panel_std"
     if manifest_path.exists() and any(parts_dir.glob("*.parquet")) and not force:
         if _read_json(manifest_path) != contract:
             raise RuntimeError("candidate dataset contract changed; rerun with --force")
-        print(f"reusing candidate dataset: {DATASET_ROOT}", flush=True)
+        print(f"reusing candidate dataset: {_dataset_root()}", flush=True)
         return parts_dir
     if (manifest_path.exists() or parts_dir.exists()) and not force:
         raise RuntimeError("partial candidate dataset exists; rerun with --force")
@@ -299,9 +313,9 @@ def build_candidate_dataset(
     if force:
         import shutil
 
-        shutil.rmtree(DATASET_ROOT, ignore_errors=True)
-    DATASET_ROOT.mkdir(parents=True, exist_ok=True)
-    raw_path = DATASET_ROOT / "joined_raw.parquet"
+        shutil.rmtree(_dataset_root(), ignore_errors=True)
+    _dataset_root().mkdir(parents=True, exist_ok=True)
+    raw_path = _dataset_root() / "joined_raw.parquet"
     grouped = group_features_by_mart(features)
     _join_new_features(output=raw_path, grouped=grouped, engine=engine)
     _standardize_new_features(raw_path, features, parts_dir)
@@ -463,7 +477,7 @@ def main(argv: list[str] | None = None) -> int:
         engine=EngineOptions(
             threads=args.threads,
             memory_limit=args.memory_limit,
-            temp_directory=str(_ROOT.base / "_tmp"),
+            temp_directory=str(_root().base / "_tmp"),
         ),
         force=args.force,
     )

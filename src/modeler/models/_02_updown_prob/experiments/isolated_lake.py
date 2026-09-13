@@ -47,14 +47,24 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 from pathlib import Path
 
 from modeler.etl.config import DataRoot
 
-SHARED_ROOT = DataRoot.resolve(market="kr")
-ISOLATED_ROOT = DataRoot(base=SHARED_ROOT.derived / "_e5")
+
+@functools.lru_cache(maxsize=1)
+def _shared_root() -> DataRoot:
+    # Lazy — module import must not require STOCK_DATA_ROOT (test collection
+    # imports this module without it set).
+    return DataRoot.resolve(market="kr")
+
+
+@functools.lru_cache(maxsize=1)
+def _isolated_root() -> DataRoot:
+    return DataRoot(base=_shared_root().derived / "_e5")
 
 SNAPSHOT = "2026-08-23"
 SOURCE = "sj2_remote"
@@ -113,13 +123,13 @@ def feature_dir(root: DataRoot) -> Path:
 
 def link() -> int:
     """Build the isolated root: symlinks everywhere except the five."""
-    shared_marts = feature_dir(SHARED_ROOT)
+    shared_marts = feature_dir(_shared_root())
     if not shared_marts.is_dir():
         raise SystemExit(f"shared snapshot missing: {shared_marts}")
 
     for base_name, lake in LINKED_LAKES:
-        shared_base = getattr(SHARED_ROOT, base_name)
-        isolated_base = getattr(ISOLATED_ROOT, base_name)
+        shared_base = getattr(_shared_root(), base_name)
+        isolated_base = getattr(_isolated_root(), base_name)
         target = shared_base / lake / f"snapshot_date={SNAPSHOT}" / f"source={SOURCE}"
         if not target.is_dir():
             print(f"  {lake}: absent on the shared snapshot, skipped")
@@ -131,7 +141,7 @@ def link() -> int:
             _symlink_relative(source_link, target)
         print(f"  {lake}: linked")
 
-    marts = feature_dir(ISOLATED_ROOT)
+    marts = feature_dir(_isolated_root())
     marts.mkdir(parents=True, exist_ok=True)
     linked = 0
     for entry in sorted(shared_marts.iterdir()):
@@ -145,12 +155,12 @@ def link() -> int:
             _symlink_relative(dest, entry)
             linked += 1
     print(f"  feature: {linked} marts linked, {len(REBUILD)} left to build")
-    print(f"\nisolated lake: {ISOLATED_ROOT.base}")
+    print(f"\nisolated lake: {_isolated_root().base}")
     return 0
 
 
 def _built(name: str) -> Path | None:
-    path = feature_dir(ISOLATED_ROOT) / name / "_cache_metadata.json"
+    path = feature_dir(_isolated_root()) / name / "_cache_metadata.json"
     return path if path.is_file() else None
 
 
@@ -185,8 +195,8 @@ def verify() -> int:
         ok = ok and matches
         print(f"  {name}: {stored} (09-08: {expected}) {'ok' if matches else 'MISMATCH'}")
 
-    shared = feature_dir(SHARED_ROOT) / "feat_fin_risk" / "**" / "*.parquet"
-    built = feature_dir(ISOLATED_ROOT) / "feat_fin_risk" / "**" / "*.parquet"
+    shared = feature_dir(_shared_root()) / "feat_fin_risk" / "**" / "*.parquet"
+    built = feature_dir(_isolated_root()) / "feat_fin_risk" / "**" / "*.parquet"
     if not _built("feat_fin_risk"):
         return 1
     v1 = _fin_risk_first_valid(str(shared), FIN_RISK_EARLIER_FAMILIES)
@@ -228,7 +238,7 @@ def build(force: bool) -> int:
     )
 
     config = LakeConfig(
-        root=ISOLATED_ROOT,
+        root=_isolated_root(),
         snapshot_date=SNAPSHOT,
         source=SOURCE,
         # Not an A0 run, so the contract field stays empty — which is what the
