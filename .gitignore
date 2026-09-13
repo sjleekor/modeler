@@ -40,7 +40,8 @@ coverage.xml
 logs/
 *.log
 
-# Local data outputs
-data/
-data_lake/
+# Local data outputs (repo-root only — a bare pattern would also hide any
+# same-named directory under src/, as it did in collector/ — see S8)
+/data/
+/data_lake/
 .tmp/
