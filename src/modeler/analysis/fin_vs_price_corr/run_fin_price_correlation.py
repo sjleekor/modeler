@@ -17,19 +17,19 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import matplotlib
+import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from sklearn.linear_model import LinearRegression  # noqa: E402
 
-from modeler.etl.config import DEFAULT_SOURCE, DataRoot, LakeConfig
-from modeler.etl.labels import LabelSpec, materialize_label
-from modeler.etl.lake import connect, register_views
-from modeler.etl.mart import is_materialized, register_mart_view
+from modeler.etl.config import DEFAULT_SOURCE, DataRoot, LakeConfig  # noqa: E402
+from modeler.etl.labels import LabelSpec, materialize_label  # noqa: E402
+from modeler.etl.lake import connect, register_views  # noqa: E402
+from modeler.etl.mart import is_materialized, register_mart_view  # noqa: E402
 
 FEATURES: dict[str, dict[str, object]] = {
     "fin_roa": {"clip": True, "label": "ROA"},

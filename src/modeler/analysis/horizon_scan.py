@@ -991,7 +991,9 @@ def main(argv: list[str] | None = None) -> int:
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(effective_argv)
     command_line = ["horizon_scan", *effective_argv]
-    output_root = args.output_root or (DataRoot.resolve(market="kr").output / "scan" / "horizon_scan")
+    output_root = args.output_root or (
+        DataRoot.resolve(market="kr").output / "scan" / "horizon_scan"
+    )
 
     if args.phase == "A":
         published = run_phase_a(

@@ -115,7 +115,9 @@ def resolve_snapshot(
         raise ValueError("required_inputs must not be empty")
 
     if snapshot_date is not None:
-        candidate = root.raw / "raw_postgres" / f"snapshot_date={snapshot_date}" / f"source={source}"
+        candidate = (
+            root.raw / "raw_postgres" / f"snapshot_date={snapshot_date}" / f"source={source}"
+        )
         candidates = [(date.fromisoformat(snapshot_date), candidate)]
     else:
         candidates = _raw_candidate_dirs(root, source)

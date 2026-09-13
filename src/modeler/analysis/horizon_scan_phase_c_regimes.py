@@ -9,8 +9,9 @@ Phase C conditions on. Two things about it are easy to get wrong, and both are
 what this module exists to pin down.
 
 **The grid is KRX sessions, not the fact's own dates.** ``common_feature_daily_fact``
-is indexed by every weekday for 2014-2023 — ``src/collector/kr/infra/calendar/data/holidays_krx.csv`` only
-covers 2024-2026, so a KRX holiday sits in the fact carrying the previous
+is indexed by every weekday for 2014-2023 —
+``src/collector/kr/infra/calendar/data/holidays_krx.csv`` only covers 2024-2026,
+so a KRX holiday sits in the fact carrying the previous
 session's value. Counting ``t-20`` or ``t-252`` on that axis makes the window a
 different length before and after 2024. So the fact is joined onto the scan's
 own session list and every LAG/rolling window is taken on that.

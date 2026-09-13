@@ -1,8 +1,9 @@
 """F-9.2 — derive KRX trading holidays 2014-2023 from the raw lake.
 
-``src/collector/kr/infra/calendar/data/holidays_krx.csv`` only covers 2024-2026, so for 2014-2023 the
-``common_feature_daily_fact`` grid is every *weekday* — holidays included,
-carrying the previous session's value. Counting ``t-20`` or ``t-252`` on that
+``src/collector/kr/infra/calendar/data/holidays_krx.csv`` only covers 2024-2026,
+so for 2014-2023 the ``common_feature_daily_fact`` grid is every *weekday* —
+holidays included, carrying the previous session's value. Counting ``t-20``
+or ``t-252`` on that
 grid therefore means a different window length either side of 2024, which is
 why the regime work had to route around it on the KRX session grid
 (``03_stage1b`` §2.1). The workaround works; every other consumer that rolls

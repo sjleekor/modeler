@@ -44,7 +44,9 @@ def test_phase_b_requires_derived_intersection(tmp_path: Path) -> None:
     _derived(tmp_path, "2026-07-30", "sj2_remote", "common_feature_daily_fact")
     root = DataRoot(tmp_path)
 
-    pinned, result = resolve_config(root, "sj2_remote", required_inputs=tables, require_derived=True)
+    pinned, result = resolve_config(
+        root, "sj2_remote", required_inputs=tables, require_derived=True
+    )
 
     assert pinned.snapshot_date == "2026-07-30"
     assert set(result.derived_tables) == {"stock_metric_fact", "common_feature_daily_fact"}
@@ -55,5 +57,8 @@ def test_explicit_incomplete_snapshot_fails(tmp_path: Path) -> None:
     root = DataRoot(tmp_path)
     with pytest.raises(FileNotFoundError, match="no complete"):
         resolve_snapshot(
-            root, "sj2_remote", required_inputs=["krx_security_flow_raw"], snapshot_date="2026-07-30"
+            root,
+            "sj2_remote",
+            required_inputs=["krx_security_flow_raw"],
+            snapshot_date="2026-07-30",
         )

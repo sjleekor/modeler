@@ -41,7 +41,10 @@ import sys
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from modeler.etl.config import DataRoot
 
 import numpy as np
 import polars as pl
