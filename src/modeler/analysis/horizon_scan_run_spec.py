@@ -1,7 +1,7 @@
 """Phase A run contract: preflight gate and the immutable ``run_spec.json`` (A-0).
 
-See ``docs/dev/20260731_raw_features/01_feature_candidate/04_specific_plan_A.md``
-§1, §1.2, §5 (A-0). ``run_spec.json`` is the first artifact written for an
+See ``my/milestones/kr/modeling/dev/20260731_raw_features/01_feature_candidate/
+04_specific_plan_A.md`` §1, §1.2, §5 (A-0). ``run_spec.json`` is the first artifact written for an
 official run and no later stage may change it; a debug/smoke invocation still
 produces one (for reproducibility of the debug run itself) but is marked
 ``official=false`` and never accompanied by a final ``_SUCCESS.json``.

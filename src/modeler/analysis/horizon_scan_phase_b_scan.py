@@ -42,7 +42,7 @@ lets continuous and event rows share one downstream schema, plus one
 event-only diagnostic field, ``n_independent_filing_windows`` (§5.4: "분기
 마감 주변 소수 window에 몰리는 의존성을 숨기지 않는다").
 
-Scope for this PR (docs/dev/20260731_raw_features/01_feature_candidate/
+Scope for this PR (my/milestones/kr/modeling/dev/20260731_raw_features/01_feature_candidate/
 04_specific_plan_B.md §10 splits B-PR8 from B-PR9): only the *primary* SUE
 sample (``is_primary_constant_sample``) is scanned here. The secondary/
 available sample, segment diagnostics, and the bootstrap/permutation

@@ -1,7 +1,7 @@
 # ruff: noqa: E501
 """feat_macro_exposure — per-ticker rolling macro exposure betas (Stage 1a).
 
-Design: ``docs/dev/20260829_macro_features/01_design/02_stage1a_exposure_beta_families.md``.
+Design: ``my/milestones/kr/modeling/dev/20260829_macro_features/01_design/02_stage1a_exposure_beta_families.md``.
 
 Grain ``(trade_date, ticker, market)``, valid sessions only — the same three
 key columns ``feat_price`` emits and nothing else shared, so the Phase B panel

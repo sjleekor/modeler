@@ -1,7 +1,7 @@
 """Phase 1 acceptance-gate experiment for the Grade A raw-feature candidates.
 
 Closes the acceptance-gate criteria that Phase A horizon-scan screening
-explicitly deferred (``docs/dev/20260731_raw_features/01_feature_candidate/
+explicitly deferred (``my/milestones/kr/modeling/dev/20260731_raw_features/01_feature_candidate/
 02_feature_candidate.md`` §6.1, ``04_specific_plan_A.md`` §11): ⑤ economic
 significance (decile spread, turnover, cost-adjusted spread) and ⑥ incremental
 value over the existing baseline model. ⑧ (single holdout look) is closed
@@ -10,7 +10,7 @@ separately, gated behind ``--confirm-holdout``.
 Two of the six Grade A families are already part of the existing baseline
 feature set: ``px_amihud_20d`` verbatim, and ``px_near_52w_high`` is the same
 formula as the existing ``px_dist_52w_high`` (see
-``docs/dev/20260731_raw_features/01_feature_candidate/02_feature_candidate.md``
+``my/milestones/kr/modeling/dev/20260731_raw_features/01_feature_candidate/02_feature_candidate.md``
 §4). Only the four genuinely new columns are tested here: ``px_reversal_5d``,
 ``px_maxret_20d``, ``px_idio_vol_60d``, and
 ``flow_individual_netbuy_to_volume_{5,20}d`` (the officially registered
@@ -134,7 +134,7 @@ SNAPSHOT_DATE = "2026-08-01"  # Phase A's snapshot; feat_price/feat_flow already
 SOURCE = "sj2_remote"  # materialize every Grade A column here.
 
 # Trailing window already spent on 2 prior decisions (fin/ev choice; Ridge->HGB
-# choice) — see docs/dev/20260731_raw_features/01_feature_candidate/
+# choice) — see my/milestones/kr/modeling/dev/20260731_raw_features/01_feature_candidate/
 # 07_phase1_acceptance_gate.md §2. Phase 1 stops before this window; Phase 2
 # opens the untouched window right after it, once.
 SPENT_HOLDOUT_START = "2025-12-01"  # approximate; not used directly, documentation only

@@ -1,7 +1,7 @@
 """dim_regime_daily — market regime binaries on the KRX session grid.
 
 Design: ``docs/dev/20260907_model_experiment/02_features_and_preprocessing.md``
-§1.4, §3.1. The definitions are Phase C's (``docs/dev/20260829_macro_features/
+§1.4, §3.1. The definitions are Phase C's (``my/milestones/kr/modeling/dev/20260829_macro_features/
 01_design/03_stage1b_conditional_ic_phase_c.md`` §2.3) and are **not** restated
 here — this module imports
 :mod:`modeler.analysis.horizon_scan_phase_c_regimes` and renames its output.

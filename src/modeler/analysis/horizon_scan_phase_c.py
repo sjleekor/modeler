@@ -1,6 +1,7 @@
 """Phase C: preregistered conditional-IC tests (Stage 1b).
 
-Design: ``docs/dev/20260829_macro_features/01_design/03_stage1b_conditional_ic_phase_c.md``.
+Design: ``my/milestones/kr/modeling/dev/20260829_macro_features/01_design/
+03_stage1b_conditional_ic_phase_c.md``.
 Contract: ``research/analysis/horizon_scan_macro_20260829.yaml`` ``phase_c``
 (hash recorded in ``05_preregistration_record.md``).
 

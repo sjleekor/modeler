@@ -82,7 +82,7 @@ def _sql_hash(select_sql: str) -> str:
     keeps the same output shape — a fixed NULL guard, a corrected mapping — is
     invisible to it and the stale mart is silently reused. That is the failure
     this key exists to stop; see
-    docs/dev/20260731_raw_features/01_feature_candidate/10_known_issues.md I10.
+    my/milestones/kr/modeling/dev/20260731_raw_features/01_feature_candidate/10_known_issues.md I10.
     """
     return hashlib.sha256(select_sql.encode()).hexdigest()
 

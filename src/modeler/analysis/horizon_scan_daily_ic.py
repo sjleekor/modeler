@@ -12,7 +12,8 @@ statistic: ``ParquetDailyIcSink.emit`` writes down frames ``scan_cell``
 already built, and ``reconcile_daily_ic`` re-derives the summary from those
 stored rows purely to prove the two agree.
 
-Design: ``docs/dev/20260829_macro_features/01_design/01_stage0_daily_ic_persistence.md``.
+Design: ``my/milestones/kr/modeling/dev/20260829_macro_features/01_design/
+01_stage0_daily_ic_persistence.md``.
 
 Two contracts matter and are enforced by the tests:
 

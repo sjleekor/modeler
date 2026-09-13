@@ -1,8 +1,8 @@
 """Phase C regime series, built on the KRX session grid (Stage 1b §2).
 
-Design: ``docs/dev/20260829_macro_features/01_design/03_stage1b_conditional_ic_phase_c.md``
-§2.1 (grid), §2.3 (definitions), §5 (G1/G2), §6.2 (alternative cut), §6.5
-(persistence).
+Design: ``my/milestones/kr/modeling/dev/20260829_macro_features/01_design/
+03_stage1b_conditional_ic_phase_c.md`` §2.1 (grid), §2.3 (definitions), §5
+(G1/G2), §6.2 (alternative cut), §6.5 (persistence).
 
 A regime is a date-level binary ``s_t`` that partitions the daily IC series
 Phase C conditions on. Two things about it are easy to get wrong, and both are

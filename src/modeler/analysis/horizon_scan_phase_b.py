@@ -1,8 +1,8 @@
 """Phase B (financial/event) contract — B-0 preflight, candidate registry,
 outcome-blind readiness freeze, and the receipt-value pairing hard gate.
 
-See ``docs/dev/20260731_raw_features/01_feature_candidate/04_specific_plan_B.md``
-§1 (entry/exit conditions), §2 (pre-registration contract), §6 B-0.
+See ``my/milestones/kr/modeling/dev/20260731_raw_features/01_feature_candidate/
+04_specific_plan_B.md`` §1 (entry/exit conditions), §2 (pre-registration contract), §6 B-0.
 
 This module never reads a label, return, IC, or p-value column (§1.1 rule 6,
 §6 B-0 test list "readiness 단계가 label/return/IC/p-value column을 읽으면
