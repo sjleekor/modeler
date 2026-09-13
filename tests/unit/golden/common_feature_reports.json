@@ -1,0 +1,16 @@
+{
+  "coverage": {
+    "market_kospi_close": {
+      "coverage_ratio": "0.8000",
+      "fact_count": 5,
+      "missing_count": 0,
+      "non_null_count": 4,
+      "null_count": 1,
+      "pit_violation_count": 0,
+      "target_count": 5
+    }
+  },
+  "readiness": {
+    "market_kospi_close": false
+  }
+}

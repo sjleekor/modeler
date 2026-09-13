@@ -1,0 +1,251 @@
+# Fourth preregistration layer: the F-2 statistical-peer relation features and
+# the F-4 financial-risk / life-cycle / transition features.
+#
+# The three earlier layers and their hashes stay immutable — every published
+# Phase A/B/AB/C run is keyed on one of them. This layer only appends Phase B
+# candidates, chosen before any label, IC or p-value was computed for them.
+extends: horizon_scan_macro_20260829.yaml
+schema_version: 5
+
+preregistration:
+  id: expansion_202609
+  registered_at: 2026-09-09
+  base_config_hash_prefix: 236d0d35
+  outcome_blind: true
+  notes:
+    - Phase A's 75-hypothesis population is untouched; all 13 appended families are fdr_include false,
+      so the combined A+B family grows only through m_b_ready, exactly as the three earlier layers did.
+    - The signs, horizons and scan paths here are copied from the two verification reports' own frozen
+      sections (results/f2_relation_stat_verification.md §6, results/f4_fin_risk_verification.md §8),
+      which were written from feature-side measurements only — coverage, distribution, autocorrelation,
+      feature-to-feature rank correlation, event frequency. No forward return or label was read.
+    - The scan machinery has one global sample.start (2014-06-01) and no per-family start, so the
+      per-family effective starts below are recorded, not enforced; each cell reports its own
+      effective_sample_start and stats.min_dates_per_cell handles a thin one.
+    - Effective starts, from the per-year coverage-0.5 rule measured on snapshot 2026-09-08 — relation
+      four 2016; fin_debt_to_assets and fin_net_debt_to_mcap 2016; fin_negative_equity_exit 2017;
+      fin_ext_finance, fin_lifecycle_stage, fin_lifecycle_transition, fin_profit_turn 2018;
+      fin_interest_coverage and fin_dividend_initiation 2019.
+    - Two overlap warnings carried from f4 §7. fin_interest_coverage x fin_gross_profitability's
+      fin_operating_profitability is rho 0.87 on the shared operating-income numerator, so a
+      fin_interest_coverage discovery is not read as an independent financial_risk axis;
+      fin_net_debt_to_mcap x fin_book_to_market is rho 0.52 through the shared market-cap denominator.
+    - fin_lifecycle_stage's Decline end and any distress reading stay held, and this is a permanent
+      limitation rather than a pending backfill — F-9.3 established that OpenDART returns status 013
+      for delisted corporations on both financial endpoints, so the missing delisted financials cannot
+      be collected at all. Survivorship bias is not closable here.
+    - The seven bidirectional families (expected_sign null) fix their sign from the first run's
+      observation and never move it afterwards.
+    - fin_dividend_initiation and fin_negative_equity_exit take the event-cohort path by the frozen
+      5%-of-names rule (f4 §6 measured 0.040 and 0.004 a year). The event grid is phase_b.event_buckets, a
+      fixed protocol value, so their cells run 0-60 rather than the [60, 120] the design draft named
+      for a continuous reading. Both freeze as blocked_exploratory in this round because run_phase_b_event_scan
+      is bound to fin_sue_event's cohort grain and no equivalent fin_risk_event mart exists, which is
+      the correct outcome-blind state and is what fin_risk_event in their dependencies records.
+    - feat_relation_stat moved to relation_stat_v2 to carry the _lag1 columns this config's
+      variant_columns must point at. No peer rule and no column formula changed; dim_peer_monthly
+      rebuilt bit-identically and every number in the F-2 report is unchanged.
+    - Phase C is not opened by this layer. The pair candidates the two reports name
+      (rel_peer_mom x liq_high, rel_peer_mom x market_up, rel_own_minus_peer x vix_high,
+      rel_peer_bigcap_lag x liq_high, fin_debt_to_assets x credit_wide, fin_lifecycle_stage x market_up)
+      go to F-HS-C2 and are deliberately absent from phase_c.pairs.
+    - F-5's derived families (fin_current_ratio, fin_borrowings_to_mcap, fin_altman_z, fin_rnd_to_sales,
+      fin_bm_intangible_adj) are not in this layer because their definitions depend on a tag-coverage PoC that
+      has not run (03 §3).
+
+phase_b:
+  # 102 (macro) + relation 4 families x 6 cells + fin_risk 42 cells = 168.
+  primary_candidate_count_max: 168
+
+families_append:
+  # --- F-2 statistical peer relations (02 §1, f2 report §6) ----------------
+  - family: rel_peer_mom
+    phase: B
+    fdr_family: relation
+    role: phase_b_blocked
+    expected_sign: null
+    features:
+      - {column: rel_peer_mom_20d, role: primary}
+      - {column: rel_peer_mom_60d, role: secondary}
+    primary_horizon_set: [20, 40, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [dim_peer_monthly, feat_relation_stat, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: rel_peer_mom_20d, lag1: rel_peer_mom_20d_lag1}
+
+  - family: rel_own_minus_peer
+    phase: B
+    fdr_family: relation
+    role: phase_b_blocked
+    expected_sign: "-"
+    features: [{column: rel_own_minus_peer_20d, role: primary}]
+    primary_horizon_set: [5, 10, 20]
+    exploratory_horizon_set: [1, 2, 3, 40, 60, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [dim_peer_monthly, feat_relation_stat, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: rel_own_minus_peer_20d, lag1: rel_own_minus_peer_20d_lag1}
+
+  - family: rel_peer_bigcap_lag
+    phase: B
+    fdr_family: relation
+    role: phase_b_blocked
+    expected_sign: "+"
+    features: [{column: rel_peer_bigcap_lag_ret_5d, role: primary}]
+    primary_horizon_set: [5, 10, 20]
+    exploratory_horizon_set: [1, 2, 3, 40, 60, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [dim_peer_monthly, feat_relation_stat, label_scan]
+    official_feature_variant: native_t
+    variant_columns:
+      {native_t: rel_peer_bigcap_lag_ret_5d, lag1: rel_peer_bigcap_lag_ret_5d_lag1}
+
+  - family: rel_peer_dispersion
+    phase: B
+    fdr_family: relation
+    role: phase_b_blocked
+    expected_sign: null
+    features: [{column: rel_peer_dispersion_20d, role: primary}]
+    primary_horizon_set: [20, 40, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [dim_peer_monthly, feat_relation_stat, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: rel_peer_dispersion_20d, lag1: rel_peer_dispersion_20d_lag1}
+
+  # --- F-4 leverage / financial risk (03 §1.1, f4 report §8) ---------------
+  - family: fin_debt_to_assets
+    phase: B
+    fdr_family: financial_risk
+    role: phase_b_blocked
+    expected_sign: null
+    features: [{column: fin_debt_to_assets, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_risk, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_debt_to_assets, lag1: fin_debt_to_assets_lag1}
+
+  - family: fin_net_debt_to_mcap
+    phase: B
+    fdr_family: financial_risk
+    role: phase_b_blocked
+    expected_sign: null
+    features: [{column: fin_net_debt_to_mcap, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_risk, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_net_debt_to_mcap, lag1: fin_net_debt_to_mcap_lag1}
+
+  - family: fin_interest_coverage
+    phase: B
+    fdr_family: financial_risk
+    role: phase_b_blocked
+    expected_sign: "+"
+    features: [{column: fin_interest_coverage, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_risk, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_interest_coverage, lag1: fin_interest_coverage_lag1}
+
+  - family: fin_ext_finance
+    phase: B
+    fdr_family: financial_risk
+    role: phase_b_blocked
+    expected_sign: "-"
+    features: [{column: fin_ext_finance_to_assets, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_risk, label_scan]
+    official_feature_variant: native_t
+    variant_columns:
+      {native_t: fin_ext_finance_to_assets, lag1: fin_ext_finance_to_assets_lag1}
+
+  # --- F-4 life cycle (03 §1.2) --------------------------------------------
+  - family: fin_lifecycle_stage
+    phase: B
+    fdr_family: lifecycle
+    role: phase_b_blocked
+    expected_sign: null
+    features: [{column: fin_lifecycle_stage, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_risk, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_lifecycle_stage, lag1: fin_lifecycle_stage_lag1}
+
+  - family: fin_lifecycle_transition
+    phase: B
+    fdr_family: lifecycle
+    role: phase_b_blocked
+    expected_sign: null
+    features: [{column: fin_lifecycle_transition, role: primary}]
+    primary_horizon_set: [20, 60]
+    exploratory_horizon_set: [1, 5, 10, 40, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_risk, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_lifecycle_transition, lag1: fin_lifecycle_transition_lag1}
+
+  # --- F-4 state transitions (03 §1.3) -------------------------------------
+  - family: fin_profit_turn
+    phase: B
+    fdr_family: transition
+    role: phase_b_blocked
+    expected_sign: "+"
+    features: [{column: fin_profit_turn, role: primary}]
+    primary_horizon_set: [20, 60, 120]
+    exploratory_horizon_set: [1, 5, 10, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_risk, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_profit_turn, lag1: fin_profit_turn_lag1}
+
+  - family: fin_dividend_initiation
+    phase: B
+    fdr_family: transition
+    role: phase_b_blocked
+    expected_sign: "+"
+    features: [{column: fin_dividend_initiation, role: primary}]
+    primary_horizon_set: []
+    exploratory_horizon_set: []
+    include_bucket_primary: false
+    fdr_include: false
+    event_buckets: [[0, 3], [3, 5], [5, 10], [10, 20], [20, 40], [40, 60]]
+    readiness_dependencies: [feat_fin_risk, fin_risk_event, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_dividend_initiation, lag1: fin_dividend_initiation_lag1}
+
+  - family: fin_negative_equity_exit
+    phase: B
+    fdr_family: transition
+    role: phase_b_blocked
+    expected_sign: "+"
+    features: [{column: fin_negative_equity_exit, role: primary}]
+    primary_horizon_set: []
+    exploratory_horizon_set: []
+    include_bucket_primary: false
+    fdr_include: false
+    event_buckets: [[0, 3], [3, 5], [5, 10], [10, 20], [20, 40], [40, 60]]
+    readiness_dependencies: [feat_fin_risk, fin_risk_event, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_negative_equity_exit, lag1: fin_negative_equity_exit_lag1}

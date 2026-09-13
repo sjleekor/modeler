@@ -1,0 +1,523 @@
+schema_version: 4
+horizons: [1, 2, 3, 5, 10, 20, 40, 60, 120]
+buckets: [[0, 5], [5, 10], [10, 20], [20, 40], [40, 60], [60, 120]]
+
+quality:
+  price_limit_regimes:
+    - {start: 2014-06-01, end: 2015-06-14, limit: 0.15}
+    - {start: 2015-06-15, end: null, limit: 0.30}
+  price_limit_multiplier: 1.10
+  ca_abs_share_change: 0.25
+  ca_ratio_product_range: [0.8, 1.25]
+  short_balance_lag_sessions: 2
+shares:
+  disclosed_date_source: rcept_no_yyyymmdd
+  availability: next_krx_session
+  period_end_source: stlm_dt
+  fallback_lag_days: {annual: 90, quarterly: 45}
+  treasury_null_policy: preserve_null
+universe:
+  warmup_window: 60
+  warmup_min_valid: 40
+  tradable_liquidity_window: 20
+  tradable_min_turnover_krw: 100000000
+  tradable_min_close_krw: 1000
+price:
+  market_model_window: 252
+  resid_mom_model_min_valid: 252
+  resid_mom_require_complete_history: true
+  idio_model_min_valid: 126
+  idio_vol_window: 60
+  idio_vol_min_valid: 40
+  turnover_shock_window: 60
+  turnover_shock_include_current: false
+flow:
+  require_complete_window: true
+  nat_feature: flow_nat_proxy_20d
+  short_family_role: exploratory_short_regime
+  partial_membership_policy: unavailable_no_pit_constituents
+execution:
+  variants: [native_t, lag1]
+  lag1_basis: prior_valid_session
+  price_default_official_variant: native_t
+  flow_unverified_same_day_variant: lag1
+  row_order_contract: feature_frame_trade_date_market_ticker_v1
+  sue_nw_order_contract: sue_nw_sorted_v2
+  sue_permutation_order_contract: sue_rank_canonical_v2
+  mapping_contract_version: joint_cs_v2
+discovery:
+  # Phase A §2.3 fixes the global-BH population to this exact (universe,
+  # sample_kind) coordinate; tradable/available are robustness gates, not
+  # alternate discovery populations.
+  universe: broad
+  sample_kind: common_survivor
+sample:
+  start: 2014-06-01
+  holdout_start: 2025-08-01
+  holdout_boundary: label_end_date
+  common_formation_horizon: 120
+  common_survivor_horizon: 120
+  common_survivor_quality_independent: true
+  label_population: all_quality_valid_sessions
+  period_sets:
+    common:
+      - {id: "2014_2016", start: 2014-06-01, end: 2016-12-31}
+      - {id: "2017_2019", start: 2017-01-01, end: 2019-12-31}
+      - {id: "2020_2021", start: 2020-01-01, end: 2021-12-31}
+      - {id: "2022_2023_10", start: 2022-01-01, end: 2023-10-31}
+      - {id: "2023_11_common_end", start: 2023-11-01, end: common_formation_end}
+    available:
+      - {id: "2014_2016", start: 2014-06-01, end: 2016-12-31}
+      - {id: "2017_2019", start: 2017-01-01, end: 2019-12-31}
+      - {id: "2020_2021", start: 2020-01-01, end: 2021-12-31}
+      - {id: "2022_2023_10", start: 2022-01-01, end: 2023-10-31}
+      - {id: "2023_11_2025_03", start: 2023-11-01, end: 2025-03-31}
+      - {id: "2025_04_holdout", start: 2025-04-01, end: horizon_eligible_end}
+stats:
+  ic_unit: date_market
+  daily_market_aggregation: n_obs_weighted
+  nw_lag_cumulative: h_minus_1
+  nw_lag_bucket: width_minus_1
+  nw_gap_policy: calendar_session_distance
+  nw_p_value_distribution: asymptotic_normal
+  global_bh_q: 0.10
+  bh_missing_p_value: 1.0
+  exploratory_abs_t_nw: 3.0
+  min_dates_per_cell: 60
+  min_names_per_date_market: 20
+  min_names_for_spread: 50
+  quantile_count: 5
+  segment_bin_count: 3
+  nonoverlap_min_dates: 20
+  nonoverlap_all_offsets: true
+  nonoverlap_inference: exact_sign_test
+  sparse_primary_grid_families: [px_amihud_20d]
+decision:
+  half_life_fraction: 0.50
+  isolated_spike_neighbor: adjacent_registered_cell_same_scan_type
+  tradable_min_abs_ic_retention: 0.50
+  delay_min_abs_ic_retention: 0.50
+  delay_confirm_p_nw: 0.05
+  available_sign_flip_max_grade: C
+  insufficient_offset_max_grade: B
+placebo:
+  cross_sectional_repeats: 100
+  cross_sectional_block: date_market
+  temporal_long_cell_repeats: 100
+  temporal_min_nw_lag: 59
+  temporal_min_shift_sessions: 120
+  temporal_p_max: 0.10
+  seed: 20260801
+evidence_grade:
+  # Phase A §5 A-8. Order matters: R/C are checked before A/B so a reference
+  # or exploratory-only cell never gets scored as if it screened.
+  evaluation_order: [R, C, A, B, D]
+  A: screen_pass_and_no_core_warning_and_all_offsets_evaluable
+  B: screen_pass_with_nonfatal_warning
+  C: exploratory_or_secondary_or_available_sign_flip
+  D: no_signal_or_wrong_sign_or_robustness_fail
+  R: reference_only
+
+# Phase B (04_specific_plan_B.md) B-0 contract. Frozen before any label/IC/
+# p-value is computed — see horizon_scan_phase_b.py.
+phase_b:
+  primary_candidate_count_max: 38
+  phase_a_primary_count: 75
+  readiness_freeze_before_label_join: true
+  preflight_blocked_role: blocked_exploratory
+  post_freeze_blocked_p_for_bh: 1.0
+  event_buckets: [[0, 3], [3, 5], [5, 10], [10, 20], [20, 40], [40, 60]]
+  # §1.1 condition 3 — pre-existing A0 raw dependency Phase B inherits as-is.
+  # The two new raw tables (dart_filing_receipt_raw, dart_capital_change_raw)
+  # are NOT in this hard-required list: their absence blocks only the specific
+  # candidates that depend on them (via readiness_dependencies), not the run.
+  required_raw_tables:
+    - daily_ohlcv
+    - dart_financial_statement_raw
+    - dart_share_count_raw
+    - dart_shareholder_return_raw
+    - dart_xbrl_fact_raw
+    - dart_xbrl_document
+    - dart_corp_master
+    - stock_master
+    - stock_master_snapshot
+    - stock_master_snapshot_items
+  receipt_value_pairing_required: verified_same_receipt
+  receipt_value_pairing_error_tolerance: 0
+  sue_without_original_filing_source: blocked_exploratory
+  issuance_without_action_source: blocked_exploratory
+  # §5.4 SUE cohort statistics (B-7 core scan). event_primary_sample mirrors
+  # what fin_sue_event.is_primary_constant_sample already enforces; the
+  # market diagnostic threshold is frozen here but its per-market-only IC is
+  # a segment diagnostic left to B-8/B-9, not computed by B-7.
+  event_primary_cohort_scope: pooled_market_neutral_ranks
+  event_primary_sample: constant_60_session_endpoint
+  event_nw_gap_policy: calendar_session_distance
+  min_events_per_market_contribution: 10
+  min_events_per_cohort_total: 30
+  min_events_per_cohort_market_diagnostic: 30
+  min_event_cohorts: 8
+  min_independent_filing_windows: 12
+  grade_a_min_independent_filing_windows: 20
+  # §6 B-8 robustness/null experiments.
+  nonoverlap_min_dates: {default: 20, cumulative_120: 12, bucket_60_120: 12}
+  nonoverlap_valid_offset_ratio_min: 0.80
+  nonoverlap_expected_sign_offset_ratio_min: 0.60
+  event_cluster_confirm_p_max: 0.10
+  event_issuer_bootstrap_repeats: 999
+  event_filing_cycle_bootstrap_repeats: 999
+  event_issuer_bootstrap_seed: 20260802
+  event_filing_cycle_bootstrap_seed: 20260803
+  # §6 B-8 SUE point 5 — event formation ordinal non-overlap diagnostic.
+  # Continuous cells derive their non-overlap stride from the feature's own
+  # horizon width; SUE cohorts have no such natural width, so this splits
+  # the pooled cohort dates into 3 ordinal-interleaved subsamples (each
+  # cohort's formation-date rank mod 3) — chosen so a subsample can still
+  # clear min_event_cohorts (8) even for the sparsest ready cell.
+  event_ordinal_nonoverlap_stride: 3
+
+# primary_horizon_set is preregistered. include_bucket_primary records whether
+# the matching bucket cells enter the global primary count; secondary features
+# and exploratory horizons never enter global BH.
+families:
+  - family: px_reversal_5d
+    phase: A
+    fdr_family: price
+    role: ready
+    expected_sign: "+"
+    features:
+      - {column: px_reversal_5d, role: primary}
+    primary_horizon_set: [1, 2, 3, 5, 10]
+    exploratory_horizon_set: [20, 40, 60, 120]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_price, dim_price_quality_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: px_reversal_5d, lag1: px_reversal_5d_lag1}
+  - family: px_mom_12_1
+    phase: A
+    fdr_family: price
+    role: ready
+    expected_sign: "+"
+    features:
+      - {column: px_mom_12_1, role: primary}
+      - {column: px_mom_6_1, role: secondary}
+    primary_horizon_set: [20, 40, 60, 120]
+    exploratory_horizon_set: [1, 2, 3, 5, 10]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_price, dim_price_quality_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: px_mom_12_1, lag1: px_mom_12_1_lag1}
+  - family: px_resid_mom_12_1
+    phase: A
+    fdr_family: price
+    role: ready
+    expected_sign: "+"
+    features: [{column: px_resid_mom_12_1, role: primary}]
+    primary_horizon_set: [20, 40, 60, 120]
+    exploratory_horizon_set: [1, 2, 3, 5, 10]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_price, dim_price_quality_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: px_resid_mom_12_1, lag1: px_resid_mom_12_1_lag1}
+  - family: px_near_52w_high
+    phase: A
+    fdr_family: price
+    role: ready
+    expected_sign: "+"
+    features: [{column: px_near_52w_high, role: primary}]
+    primary_horizon_set: [20, 40, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 120]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_price, dim_price_quality_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: px_near_52w_high, lag1: px_near_52w_high_lag1}
+  - family: px_maxret_20d
+    phase: A
+    fdr_family: price
+    role: ready
+    expected_sign: "-"
+    features: [{column: px_maxret_20d, role: primary}]
+    primary_horizon_set: [20, 40, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 120]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_price, dim_price_quality_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: px_maxret_20d, lag1: px_maxret_20d_lag1}
+  - family: px_idio_vol_60d
+    phase: A
+    fdr_family: price
+    role: ready
+    expected_sign: "-"
+    features: [{column: px_idio_vol_60d, role: primary}]
+    primary_horizon_set: [20, 40, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 120]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_price, dim_price_quality_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: px_idio_vol_60d, lag1: px_idio_vol_60d_lag1}
+  - family: px_amihud_20d
+    phase: A
+    fdr_family: price
+    role: ready
+    expected_sign: "+"
+    features: [{column: px_amihud_20d, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 20, 40]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_price, dim_price_quality_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: px_amihud_20d, lag1: px_amihud_20d_lag1}
+  - family: px_turnover_shock
+    phase: A
+    fdr_family: price
+    role: ready
+    expected_sign: "+"
+    features: [{column: px_turnover_shock, role: primary}]
+    primary_horizon_set: [5, 10, 20]
+    exploratory_horizon_set: [1, 2, 3, 40, 60, 120]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_price, dim_price_quality_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: px_turnover_shock, lag1: px_turnover_shock_lag1}
+  - family: px_zero_ret_ratio_20d
+    phase: A
+    fdr_family: reference
+    role: reference_only
+    expected_sign: null
+    features: [{column: px_zero_ret_ratio_20d, role: primary}]
+    primary_horizon_set: []
+    exploratory_horizon_set: [1, 5, 20, 60, 120]
+    include_bucket_primary: false
+    fdr_include: false
+    readiness_dependencies: [feat_price, dim_price_quality_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: px_zero_ret_ratio_20d, lag1: px_zero_ret_ratio_20d_lag1}
+  - family: flow_foreign_netbuy_to_volume
+    phase: A
+    fdr_family: flow
+    role: ready
+    expected_sign: "+"
+    features:
+      - {column: flow_foreign_netbuy_to_volume_20d, role: primary}
+      - {column: flow_foreign_netbuy_to_volume_5d, role: secondary}
+      - {column: flow_foreign_netbuy_to_volume_60d, role: secondary}
+    primary_horizon_set: [5, 10, 20]
+    exploratory_horizon_set: [1, 2, 3, 40, 60, 120]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_flow, dim_stock_pit_daily, label_scan]
+    official_feature_variant: lag1
+    variant_columns: {native_t: flow_foreign_netbuy_to_volume_20d, lag1: flow_foreign_netbuy_to_volume_20d_lag1}
+  - family: flow_inst_netbuy_to_volume
+    phase: A
+    fdr_family: flow
+    role: ready
+    expected_sign: "+"
+    features:
+      - {column: flow_inst_netbuy_to_volume_20d, role: primary}
+      - {column: flow_inst_netbuy_to_volume_5d, role: secondary}
+      - {column: flow_inst_netbuy_to_volume_60d, role: secondary}
+    primary_horizon_set: [5, 10, 20]
+    exploratory_horizon_set: [1, 2, 3, 40, 60, 120]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_flow, dim_stock_pit_daily, label_scan]
+    official_feature_variant: lag1
+    variant_columns: {native_t: flow_inst_netbuy_to_volume_20d, lag1: flow_inst_netbuy_to_volume_20d_lag1}
+  - family: flow_individual_netbuy_to_volume
+    phase: A
+    fdr_family: flow
+    role: ready
+    expected_sign: null
+    features:
+      - {column: flow_individual_netbuy_to_volume_20d, role: primary}
+      - {column: flow_individual_netbuy_to_volume_5d, role: secondary}
+    primary_horizon_set: [5, 10, 20]
+    exploratory_horizon_set: [1, 2, 3, 40, 60, 120]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_flow, dim_stock_pit_daily, label_scan]
+    official_feature_variant: lag1
+    variant_columns: {native_t: flow_individual_netbuy_to_volume_20d, lag1: flow_individual_netbuy_to_volume_20d_lag1}
+  - family: flow_foreign_holding_ratio_chg
+    phase: A
+    fdr_family: flow
+    role: ready
+    expected_sign: "+"
+    features: [{column: flow_foreign_holding_ratio_chg_20d, role: primary}]
+    primary_horizon_set: [20, 40, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 120]
+    include_bucket_primary: true
+    fdr_include: true
+    readiness_dependencies: [feat_flow, dim_stock_pit_daily, label_scan]
+    official_feature_variant: lag1
+    variant_columns: {native_t: flow_foreign_holding_ratio_chg_20d, lag1: flow_foreign_holding_ratio_chg_20d_lag1}
+  - family: flow_short_turnover
+    phase: A
+    fdr_family: flow
+    role: exploratory_short_regime
+    expected_sign: "-"
+    features: [{column: flow_short_turnover_20d, role: primary}]
+    primary_horizon_set: [5, 10, 20, 40, 60]
+    exploratory_horizon_set: [1, 2, 3, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_flow, label_scan]
+    official_feature_variant: lag1
+    variant_columns: {native_t: flow_short_turnover_20d, lag1: flow_short_turnover_20d_lag1}
+  - family: flow_short_interest
+    phase: A
+    fdr_family: flow
+    role: exploratory_short_regime
+    expected_sign: "-"
+    features:
+      - {column: flow_short_interest_ratio, role: primary}
+      - {column: flow_short_interest_ratio_chg_20d, role: secondary}
+    primary_horizon_set: [20, 40, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_flow, dim_stock_pit_daily, short_balance_publication_lag, label_scan]
+    official_feature_variant: lag1
+    variant_columns: {native_t: flow_short_interest_ratio, lag1: flow_short_interest_ratio_lag1}
+  - family: flow_days_to_cover
+    phase: A
+    fdr_family: flow
+    role: exploratory_short_regime
+    expected_sign: "-"
+    features: [{column: flow_days_to_cover, role: primary}]
+    primary_horizon_set: [20, 40, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_flow, short_balance_publication_lag, label_scan]
+    official_feature_variant: lag1
+    variant_columns: {native_t: flow_days_to_cover, lag1: flow_days_to_cover_lag1}
+  - family: flow_nat_proxy_20d
+    phase: A
+    fdr_family: flow
+    role: exploratory_short_regime
+    expected_sign: "+"
+    features: [{column: flow_nat_proxy_20d, role: primary}]
+    primary_horizon_set: [20, 40, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_flow, dim_stock_pit_daily, short_balance_publication_lag, label_scan]
+    official_feature_variant: lag1
+    variant_columns: {native_t: flow_nat_proxy_20d, lag1: flow_nat_proxy_20d_lag1}
+  - family: fin_log_mcap
+    phase: B
+    fdr_family: financial
+    role: phase_b_blocked
+    expected_sign: "-"
+    features: [{column: fin_log_mcap, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_scan_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_log_mcap, lag1: fin_log_mcap_lag1}
+  - family: fin_value_z
+    phase: B
+    fdr_family: financial
+    role: phase_b_blocked
+    expected_sign: "+"
+    features: [{column: fin_value_z, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_scan_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_value_z, lag1: fin_value_z_lag1}
+  - family: fin_gross_profitability
+    phase: B
+    fdr_family: financial
+    role: phase_b_blocked
+    expected_sign: "+"
+    features:
+      - {column: fin_gross_profitability, role: primary}
+      - {column: fin_operating_profitability, role: secondary}
+    primary_horizon_set: [20, 40, 60, 120]
+    exploratory_horizon_set: [1, 5, 10]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_scan_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_gross_profitability, lag1: fin_gross_profitability_lag1}
+  - family: fin_asset_growth_yoy
+    phase: B
+    fdr_family: financial
+    role: phase_b_blocked
+    expected_sign: "-"
+    features: [{column: fin_asset_growth_yoy, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_scan_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_asset_growth_yoy, lag1: fin_asset_growth_yoy_lag1}
+  - family: fin_accruals_to_assets
+    phase: B
+    fdr_family: financial
+    role: phase_b_blocked
+    expected_sign: "-"
+    features: [{column: fin_accruals_to_assets, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_fin_scan_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: fin_accruals_to_assets, lag1: fin_accruals_to_assets_lag1}
+  - family: fin_sue
+    phase: B
+    fdr_family: event
+    role: phase_b_blocked
+    expected_sign: "+"
+    features: [{column: fin_sue, role: primary}]
+    primary_horizon_set: []
+    exploratory_horizon_set: []
+    include_bucket_primary: false
+    fdr_include: false
+    event_buckets: [[0, 3], [3, 5], [5, 10], [10, 20], [20, 40], [40, 60]]
+    readiness_dependencies: [dart_filing_receipt_raw, dart_xbrl_fact_raw, fin_sue_event]
+    official_feature_variant: lag1
+    variant_columns: {native_t: fin_sue, lag1: fin_sue_lag1}
+  - family: ev_net_share_issuance_yoy
+    phase: B
+    fdr_family: event
+    role: phase_b_blocked
+    expected_sign: "-"
+    features: [{column: ev_net_share_issuance_yoy, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [dart_capital_change_raw, feat_event_scan_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: ev_net_share_issuance_yoy, lag1: ev_net_share_issuance_yoy_lag1}
+  - family: ev_payout_yield
+    phase: B
+    fdr_family: event
+    role: phase_b_blocked
+    expected_sign: "+"
+    features: [{column: ev_payout_yield, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_event_scan_daily, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: ev_payout_yield, lag1: ev_payout_yield_lag1}

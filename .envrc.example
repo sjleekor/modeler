@@ -1,0 +1,5 @@
+# modeler — 비밀이 없다. 모델링은 parquet만 읽는다.
+# 복사해서 쓴다:  cp .envrc.example .envrc && direnv allow
+
+# 데이터 루트. 시장은 코드가 인자로 받는다 (DataRoot.resolve(market=...)).
+export STOCK_DATA_ROOT="$PWD/../stock_data"

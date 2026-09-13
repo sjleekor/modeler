@@ -1,0 +1,38 @@
+name: test
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout modeler
+        uses: actions/checkout@v4
+        with:
+          path: modeler
+
+      # 경로 의존(`{ path = "../collector", editable = true }`)이 clone만으로는
+      # 복원이 안 된다 — collector/를 나란히 checkout해 로컬과 같은 모양을 만든다.
+      - name: Checkout collector
+        uses: actions/checkout@v4
+        with:
+          repository: sjleekor/collector
+          path: collector
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Sync dependencies
+        working-directory: modeler
+        run: uv sync --extra dev
+
+      - name: Lint (banned-api 포함)
+        working-directory: modeler
+        run: uv run ruff check src tests
+
+      - name: Test
+        working-directory: modeler
+        run: uv run pytest -q

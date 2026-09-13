@@ -1,0 +1,189 @@
+# Third preregistration layer: macro exposure betas (Phase B append) and the
+# first Phase C conditional-IC contract. Base + expansion hashes stay immutable.
+extends: horizon_scan_expansion_20260827.yaml
+schema_version: 5
+
+preregistration:
+  id: macro_20260829
+  registered_at: 2026-08-29
+  base_config_hash_prefix: 889c3e83
+  outcome_blind: true
+  notes:
+    - Stage 0 (daily_ic persistence) changes no statistic; Phase A summaries must equal 889c3e83 canonical.
+    - Interaction (regime x characteristic) is NOT registered as a scan family; under rank IC it reduces to
+      the Phase C conditional-IC difference (01_design/00_overview §1.1).
+    - Macro levels/changes are never cross-sectional families (00_survey/00 §3).
+    - N8 employment regime_candidates from expansion_20260827 stay dormant and are not in phase_c.pairs.
+    - Domestic factors (usdkrw, kr10y) are one session stale in the fact (next_krx_session); their betas pair
+      resid_ret_tau with the change published at tau+1 and use a window ending at the prior session.
+    - Exposure-beta families start ~2014-12 (factor history begins 2014-06-16); px_market_beta from panel start.
+    - Phase C regimes are computed on the KRX session grid, not the fact's weekday grid (2014-2023 holiday rows).
+    - Phase C daily_ic source run ids are CLI arguments recorded in phase_c_run_spec.json, not config.
+
+phase_b:
+  # 78 (expansion) + 6 macro-exposure families x 4 cells.
+  primary_candidate_count_max: 102
+
+phase_c:
+  contract: conditional_ic_v1
+  open_policy: preregistered_pairs
+  holdout_policy: open_once_after_all_selection
+  grid: krx_sessions                 # regimes built on label_scan trade_date grid, fact joined by date
+  sample_start: 2015-06-16           # R1b/R2/R3 need 252 sessions of daily common features (start 2014-06-16)
+  discovery_coordinate: {universe: broad, sample_kind: common_survivor}
+  retention_coordinate: {universe: tradable, sample_kind: common_survivor}
+  regimes:
+    - {id: vix_up,         role: primary,     source: [global_vix_level],                              transform: diff_20_sessions,               cut: gt_zero}
+    - {id: vix_high,       role: primary,     source: [global_vix_level],                              transform: minus_median_252_sessions,      cut: gt_zero}
+    - {id: market_up,      role: primary,     source: [market_kospi_close],                            transform: log_ratio_252_sessions,         cut: gt_zero}
+    - {id: liq_high,       role: primary,     source: [market_kospi_turnover_value, market_kosdaq_turnover_value], transform: log_mean20_over_median252_sum, cut: gt_zero}
+    - {id: term_steep,     role: exploratory, source: [rate_kr_term_spread_10y_3y],                    transform: minus_median_252_sessions,      cut: gt_zero}
+    - {id: kosdaq_rel_up,  role: exploratory, source: [market_kosdaq_ret_1d, market_kospi_ret_1d],     transform: sum20_diff,                     cut: gt_zero}
+    - {id: krw_weak_20d,   role: exploratory, source: [fx_usdkrw_level],                               transform: log_ratio_20_sessions,          cut: gt_zero}
+  pairs:
+    # role primary → enters BH. direction: "+", "-", or null (양방향, sign fixed after first observation).
+    - {id: P1,  role: primary,   family: px_idio_vol_60d,                  cell: {scan_type: cum, h_start: 0, h_end: 60}, regime: vix_up,    direction: "+"}
+    - {id: P2,  role: primary,   family: px_maxret_20d,                    cell: {scan_type: cum, h_start: 0, h_end: 60}, regime: vix_up,    direction: "+"}
+    - {id: P3,  role: primary,   family: px_reversal_5d,                   cell: {scan_type: cum, h_start: 0, h_end: 5},  regime: vix_high,  direction: "+"}
+    - {id: P4,  role: primary,   family: px_mom_12_1,                      cell: {scan_type: cum, h_start: 0, h_end: 60}, regime: market_up, direction: "+"}
+    - {id: P5,  role: primary,   family: px_mom_12_1,                      cell: {scan_type: cum, h_start: 0, h_end: 60}, regime: liq_high,  direction: "+"}
+    - {id: P6,  role: primary,   family: px_amihud_20d,                    cell: {scan_type: cum, h_start: 0, h_end: 60}, regime: liq_high,  direction: "-"}
+    - {id: P7,  role: primary,   family: flow_foreign_netbuy_to_volume,    cell: {scan_type: cum, h_start: 0, h_end: 20}, regime: market_up, direction: "+"}
+    - {id: P8,  role: primary,   family: flow_individual_netbuy_to_volume, cell: {scan_type: cum, h_start: 0, h_end: 20}, regime: market_up, direction: "-"}
+    - {id: P9,  role: primary,   family: px_turnover_shock,                cell: {scan_type: cum, h_start: 0, h_end: 20}, regime: liq_high,  direction: null}
+    - {id: P10, role: primary,   family: flow_inst_netbuy_to_volume,       cell: {scan_type: cum, h_start: 0, h_end: 20}, regime: market_up, direction: null}
+    - {id: P11, role: primary,   family: flow_foreign_netbuy_to_volume,    cell: {scan_type: cum, h_start: 0, h_end: 20}, regime: vix_up,    direction: null}
+    - {id: P12, role: primary,   family: flow_foreign_netbuy_to_volume,    cell: {scan_type: cum, h_start: 0, h_end: 20}, regime: liq_high,  direction: null}
+    - {id: P13, role: primary,   family: flow_inst_netbuy_to_volume,       cell: {scan_type: cum, h_start: 0, h_end: 20}, regime: liq_high,  direction: null}
+    - {id: P14, role: primary,   family: flow_individual_netbuy_to_volume, cell: {scan_type: cum, h_start: 0, h_end: 20}, regime: liq_high,  direction: null}
+    - {id: P15, role: primary,   family: px_market_beta,                   cell: {scan_type: cum, h_start: 0, h_end: 20}, regime: market_up, direction: null}
+    - {id: X1,  role: reference, family: fin_log_mcap,                     cell: {scan_type: cum, h_start: 0, h_end: 60}, regime: market_up, direction: null}
+    - {id: X2,  role: reference, family: fin_log_mcap,                     cell: {scan_type: cum, h_start: 0, h_end: 60}, regime: kosdaq_rel_up, direction: null}
+  exploratory_grid:
+    regimes: [term_steep]
+    families: all_primary_pair_families
+    extra:
+      - {family: px_reversal_5d,    cell: {scan_type: cum, h_start: 0, h_end: 5},  regime: vix_up}
+      - {family: px_idio_vol_60d,   cell: {scan_type: cum, h_start: 0, h_end: 60}, regime: vix_high}
+      - {family: px_maxret_20d,     cell: {scan_type: cum, h_start: 0, h_end: 60}, regime: vix_high}
+      - {family: macro_beta_usdkrw, cell: {scan_type: cum, h_start: 0, h_end: 20}, regime: krw_weak_20d}
+      - {family: macro_beta_vix,    cell: {scan_type: cum, h_start: 0, h_end: 20}, regime: vix_up}
+      - {family: px_amihud_20d,     cell: {scan_type: cum, h_start: 0, h_end: 60}, regime: vix_up}
+    diagnostics: [market_up_24m_variant_for_P1_P2_P4, continuous_z_regression_all_pairs]
+  stats:
+    bh_q: 0.10
+    hac_lag_policy: h_end_minus_1
+    hac_gap_policy: calendar_session_distance
+    p_value_distribution: asymptotic_normal
+    min_dates_per_regime: 250
+    min_share_per_regime: 0.20
+    subperiod_min_dates_per_regime: 40
+    subperiod_sign_rule: ceil_half_of_valid
+    tradable_min_abs_delta_retention: 0.50
+  placebo:
+    regime_circular_shift_repeats: 100
+    min_shift_sessions: 120
+    p_max: 0.10
+    seed: 20260829
+  evidence_grade:
+    A: screen_pass_and_no_warning
+    B: screen_pass_with_nonfatal_warning
+    C: exploratory_or_insufficient_occupancy
+    D: no_discovery_or_gate_fail
+    R: reference_only
+
+families_append:
+  - family: macro_beta_usdkrw
+    phase: B
+    fdr_family: macro_exposure
+    role: phase_b_blocked
+    expected_sign: null
+    features:
+      - {column: macro_beta_usdkrw, role: primary}
+      - {column: macro_rawbeta_usdkrw, role: secondary}
+      - {column: macro_semibeta_usdkrw_up, role: secondary}
+    primary_horizon_set: [20, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 40, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_macro_exposure, common_feature_daily_fact, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: macro_beta_usdkrw, lag1: macro_beta_usdkrw_lag1}
+
+  - family: macro_beta_wti
+    phase: B
+    fdr_family: macro_exposure
+    role: phase_b_blocked
+    expected_sign: null
+    features:
+      - {column: macro_beta_wti, role: primary}
+      - {column: macro_rawbeta_wti, role: secondary}
+    primary_horizon_set: [20, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 40, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_macro_exposure, common_feature_daily_fact, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: macro_beta_wti, lag1: macro_beta_wti_lag1}
+
+  - family: macro_beta_kr10y
+    phase: B
+    fdr_family: macro_exposure
+    role: phase_b_blocked
+    expected_sign: null
+    features:
+      - {column: macro_beta_kr10y, role: primary}
+      - {column: macro_rawbeta_kr10y, role: secondary}
+    primary_horizon_set: [20, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 40, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_macro_exposure, common_feature_daily_fact, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: macro_beta_kr10y, lag1: macro_beta_kr10y_lag1}
+
+  - family: macro_beta_sp500_lag
+    phase: B
+    fdr_family: macro_exposure
+    role: phase_b_blocked
+    expected_sign: null
+    features:
+      - {column: macro_beta_sp500_lag, role: primary}
+      - {column: macro_rawbeta_sp500_lag, role: secondary}
+    primary_horizon_set: [20, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 40, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_macro_exposure, common_feature_daily_fact, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: macro_beta_sp500_lag, lag1: macro_beta_sp500_lag_lag1}
+
+  - family: macro_beta_vix
+    phase: B
+    fdr_family: macro_exposure
+    role: phase_b_blocked
+    expected_sign: "-"
+    features:
+      - {column: macro_beta_vix, role: primary}
+      - {column: macro_rawbeta_vix, role: secondary}
+    primary_horizon_set: [20, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 40, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_macro_exposure, common_feature_daily_fact, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: macro_beta_vix, lag1: macro_beta_vix_lag1}
+
+  - family: px_market_beta
+    phase: B
+    fdr_family: macro_exposure
+    role: phase_b_blocked
+    expected_sign: null
+    features: [{column: px_market_beta, role: primary}]
+    primary_horizon_set: [20, 60]
+    exploratory_horizon_set: [1, 2, 3, 5, 10, 40, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_macro_exposure, common_feature_daily_fact, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: px_market_beta, lag1: px_market_beta_lag1}

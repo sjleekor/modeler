@@ -1,0 +1,193 @@
+# Separate preregistration for the post-2026-08-23 expansion round.
+#
+# The base config and its config_hash remain immutable. This overlay appends
+# only candidates chosen before any new label/IC/p-value is computed.
+extends: horizon_scan_config.yaml
+schema_version: 5
+
+preregistration:
+  id: expansion_20260827
+  registered_at: 2026-08-27
+  base_config_hash_prefix: ab0de634
+  outcome_blind: true
+  notes:
+    - N7 KIS values are diagnostic-only and do not enter this registry.
+    - N2 industry-neutral values are diagnostic-only because current industry is backfilled.
+    - N6 final-vintage families have an evidence-grade cap of B.
+    - N8 common macro levels are Phase C regime candidates, not cross-sectional IC families.
+
+phase_b:
+  # Existing 38 + mcap 4 + filing-activity 20 + N6 16.
+  primary_candidate_count_max: 78
+
+phase_c:
+  open_policy: conditional_on_phase_ab_pattern
+  holdout_policy: open_once_after_all_selection
+  regime_candidates:
+    - feature_code: macro_unemployment_rate_level
+      source_series_id: macro_unemployment_rate
+      transform: level
+      availability: period_end_plus_20_calendar_days
+      role: conditional_regime_only
+    - feature_code: macro_employment_rate_level
+      source_series_id: macro_employment_rate
+      transform: level
+      availability: period_end_plus_20_calendar_days
+      role: conditional_regime_only
+
+families_append:
+  - family: mcap_krx_log
+    phase: B
+    fdr_family: financial
+    role: phase_b_blocked
+    expected_sign: "-"
+    features: [{column: mcap_krx_log, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_market_cap, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: mcap_krx_log, lag1: mcap_krx_log_lag1}
+
+  - family: ev_filing_activity
+    phase: B
+    fdr_family: event
+    role: phase_b_blocked
+    expected_sign: null
+    features:
+      - {column: ev_filing_burst_60d, role: primary}
+      - {column: ev_filing_count_60d, role: secondary}
+      - {column: ev_filing_count_120d, role: secondary}
+      - {column: ev_filing_burst_120d, role: secondary}
+    primary_horizon_set: [20, 60]
+    exploratory_horizon_set: [1, 5, 10, 40, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_filing_activity, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: ev_filing_burst_60d, lag1: ev_filing_burst_60d_lag1}
+
+  - family: ev_amendment_ratio
+    phase: B
+    fdr_family: event
+    role: phase_b_blocked
+    expected_sign: "-"
+    features: [{column: ev_amendment_ratio_1y, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_filing_activity, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: ev_amendment_ratio_1y, lag1: ev_amendment_ratio_1y_lag1}
+
+  - family: own_insider_filing_activity
+    phase: B
+    fdr_family: ownership
+    role: phase_b_blocked
+    expected_sign: null
+    features:
+      - {column: own_insider_filing_burst_60d, role: primary}
+      - {column: own_insider_filing_60d, role: secondary}
+      - {column: own_insider_filing_120d, role: secondary}
+      - {column: own_insider_filing_burst_120d, role: secondary}
+    primary_horizon_set: [20, 60]
+    exploratory_horizon_set: [1, 5, 10, 40, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_filing_activity, label_scan]
+    official_feature_variant: native_t
+    variant_columns:
+      {native_t: own_insider_filing_burst_60d, lag1: own_insider_filing_burst_60d_lag1}
+
+  - family: own_major_filing_activity
+    phase: B
+    fdr_family: ownership
+    role: phase_b_blocked
+    expected_sign: null
+    features:
+      - {column: own_major_filing_60d, role: primary}
+      - {column: own_major_filing_120d, role: secondary}
+    primary_horizon_set: [20, 60]
+    exploratory_horizon_set: [1, 5, 10, 40, 120]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_filing_activity, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: own_major_filing_60d, lag1: own_major_filing_60d_lag1}
+
+  - family: own_amendment_ratio
+    phase: B
+    fdr_family: ownership
+    role: phase_b_blocked
+    expected_sign: "-"
+    features: [{column: own_amendment_ratio_1y, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_filing_activity, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: own_amendment_ratio_1y, lag1: own_amendment_ratio_1y_lag1}
+
+  - family: hc_employee_growth
+    phase: B
+    fdr_family: human_capital
+    role: phase_b_blocked
+    expected_sign: null
+    features: [{column: hc_employee_growth_yoy, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_periodic_extras, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: hc_employee_growth_yoy, lag1: hc_employee_growth_yoy_lag1}
+    source_quality: {status: warn, warning: final_vintage, grade_cap: B}
+
+  - family: hc_productivity
+    phase: B
+    fdr_family: human_capital
+    role: phase_b_blocked
+    expected_sign: null
+    features: [{column: hc_revenue_per_employee, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_periodic_extras, label_scan]
+    official_feature_variant: native_t
+    variant_columns:
+      {native_t: hc_revenue_per_employee, lag1: hc_revenue_per_employee_lag1}
+    source_quality: {status: warn, warning: final_vintage, grade_cap: B}
+
+  - family: own_major_stake_level
+    phase: B
+    fdr_family: ownership
+    role: phase_b_blocked
+    expected_sign: null
+    features: [{column: own_major_stake, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_periodic_extras, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: own_major_stake, lag1: own_major_stake_lag1}
+    source_quality: {status: warn, warning: final_vintage, grade_cap: B}
+
+  - family: own_major_stake_change
+    phase: B
+    fdr_family: ownership
+    role: phase_b_blocked
+    expected_sign: null
+    features: [{column: own_major_stake_chg, role: primary}]
+    primary_horizon_set: [60, 120]
+    exploratory_horizon_set: [20, 40]
+    include_bucket_primary: true
+    fdr_include: false
+    readiness_dependencies: [feat_periodic_extras, label_scan]
+    official_feature_variant: native_t
+    variant_columns: {native_t: own_major_stake_chg, lag1: own_major_stake_chg_lag1}
+    source_quality: {status: warn, warning: final_vintage, grade_cap: B}
