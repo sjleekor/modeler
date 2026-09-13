@@ -22,11 +22,12 @@ import sys
 from datetime import date
 
 from collector.kr.shared import now_kst
+
 from modeler.etl.config import (
     CONFIG_TABLES,
+    DEFAULT_SOURCE,
     RAW_TABLES,
     DataRoot,
-    DEFAULT_SOURCE,
     EngineOptions,
     LakeConfig,
 )

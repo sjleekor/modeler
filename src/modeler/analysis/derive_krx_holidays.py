@@ -38,7 +38,7 @@ from pathlib import Path
 
 import duckdb
 
-from modeler.etl.config import DataRoot, DEFAULT_SOURCE, EngineOptions, LakeConfig
+from modeler.etl.config import DEFAULT_SOURCE, DataRoot, EngineOptions, LakeConfig
 from modeler.etl.lake import connect, register_views
 
 logger = logging.getLogger(__name__)

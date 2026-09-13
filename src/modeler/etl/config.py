@@ -43,7 +43,7 @@ class DataRoot:
     base: Path
 
     @classmethod
-    def resolve(cls, market: str = "kr", *, env: Mapping[str, str] | None = None) -> "DataRoot":
+    def resolve(cls, market: str = "kr", *, env: Mapping[str, str] | None = None) -> DataRoot:
         env = os.environ if env is None else env
         root = env.get("STOCK_DATA_ROOT")
         if not root:

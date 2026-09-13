@@ -16,18 +16,18 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+from collector.kr.shared import (
+    MIN_GROUP_SIZE,
+    OTHER_GROUP,
+    UNKNOWN_GROUP,
+)
+
 from modeler.etl.features.fin_scan import (
     CROSS_SECTION_WITH_INDUSTRY,
     build_fin_scan_daily_sql,
     register_fin_scan_daily_view,
 )
 from modeler.etl.industry import register_industry_group_view
-
-from collector.kr.definitions.industry_groups import (
-    MIN_GROUP_SIZE,
-    OTHER_GROUP,
-    UNKNOWN_GROUP,
-)
 
 
 def test_the_default_path_is_unchanged() -> None:

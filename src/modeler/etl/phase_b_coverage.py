@@ -50,8 +50,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import duckdb
-
 from collector.kr.shared import default_metric_mapping_rules
+
 from modeler.etl.features.event_scan import EVENT_SCAN_TABLE
 from modeler.etl.features.filing_activity import FILING_ACTIVITY_TABLE
 from modeler.etl.features.fin_scan import FIN_SCAN_TABLE

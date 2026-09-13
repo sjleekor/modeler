@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 import duckdb
+
 from modeler.etl.phase_b_quality import (
     register_capital_change_quality_view,
     register_filing_receipt_quality_view,

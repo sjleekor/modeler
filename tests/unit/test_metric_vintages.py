@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 import duckdb
+
 from modeler.etl.marts.metric_vintages import (
     SMVF_TABLE,
     register_stock_metric_vintage_fact_view,
@@ -755,7 +756,7 @@ def test_the_legacy_xbrl_metrics_keep_their_empty_basis() -> None:
 def test_both_ifrs_spellings_are_mapped() -> None:
     # `ifrs_Revenue` carries 184,846 facts against `ifrs-full_Revenue`'s
     # 555,934; mapping only one spelling leaves a quarter of them unread.
-    from collector.kr.definitions.metric_rules import default_metric_mapping_rules
+    from collector.kr.shared import default_metric_mapping_rules
 
     fallback = [r for r in default_metric_mapping_rules() if r.rule_code.startswith("xbrlfb.")]
     revenue_concepts = {r.account_id for r in fallback if r.metric_code == "revenue"}
@@ -766,7 +767,7 @@ def test_both_ifrs_spellings_are_mapped() -> None:
 def test_every_fallback_rule_names_a_basis() -> None:
     # A fallback rule without fs_div would be stranded at fs_basis='' and could
     # never fill the gap it exists for.
-    from collector.kr.definitions.metric_rules import default_metric_mapping_rules
+    from collector.kr.shared import default_metric_mapping_rules
 
     fallback = [r for r in default_metric_mapping_rules() if r.rule_code.startswith("xbrlfb.")]
 

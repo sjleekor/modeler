@@ -25,7 +25,6 @@ look-ahead that already dominates, so the whole universe is resolved together.
 from __future__ import annotations
 
 import duckdb
-
 from collector.kr.shared import (
     MIN_GROUP_SIZE,
     OTHER_GROUP,

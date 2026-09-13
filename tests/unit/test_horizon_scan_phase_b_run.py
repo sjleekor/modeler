@@ -25,6 +25,7 @@ from pathlib import Path
 import duckdb
 import polars as pl
 import pytest
+
 import modeler.analysis.horizon_scan_phase_b_run as phase_b_run
 from modeler.analysis.horizon_scan_config import CONFIG_PATH, load_config
 from modeler.analysis.horizon_scan_phase_b import PHASE_B_CONTENT_HASH_EXCLUDE_NAMES

@@ -6,6 +6,7 @@ from datetime import date, timedelta
 import duckdb
 import polars as pl
 import pytest
+
 from modeler.analysis.horizon_scan_phase_b_robustness import (
     _nonoverlap_min_dates_for_cell,
     compute_nonoverlap_robustness_pass,

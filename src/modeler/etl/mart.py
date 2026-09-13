@@ -25,6 +25,7 @@ import duckdb
 from modeler.etl.config import LakeConfig
 from modeler.etl.lake import _sql_str_literal
 
+
 class StaleMartContract(RuntimeError):
     """A mart exists on disk but was not written under the current contract.
 

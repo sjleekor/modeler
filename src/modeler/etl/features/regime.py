@@ -53,7 +53,7 @@ from modeler.analysis.horizon_scan_phase_c_regimes import (
     REGIME_SPECS,
     build_regime_series_sql,
 )
-from modeler.etl.config import DataRoot, DEFAULT_SOURCE, LakeConfig
+from modeler.etl.config import DEFAULT_SOURCE, DataRoot, LakeConfig
 from modeler.etl.mart import mart_root, materialize, register_mart_view
 
 REGIME_TABLE = "dim_regime_daily"

@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
+
 from modeler.models._02_updown_prob import calibrate as cal
 from modeler.models._02_updown_prob import evaluate as ev
 from modeler.models._02_updown_prob import features as fx

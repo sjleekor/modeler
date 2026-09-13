@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+
 from modeler.analysis.horizon_scan_phase_b_report import (
     COMBINED_AB_REPORT_CONTEXT_KEYS,
     PHASE_B_REPORT_CONTEXT_KEYS,

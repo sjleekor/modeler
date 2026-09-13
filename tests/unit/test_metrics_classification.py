@@ -13,6 +13,8 @@ import math
 import numpy as np
 import polars as pl
 import pytest
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+
 from modeler.etl.metrics import (
     PROB_CLIP,
     binary_auc,
@@ -25,7 +27,6 @@ from modeler.etl.metrics import (
     threshold_economic_report,
     threshold_membership,
 )
-from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 
 RNG = np.random.default_rng(0)
 

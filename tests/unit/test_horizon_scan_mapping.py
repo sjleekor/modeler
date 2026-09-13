@@ -4,6 +4,7 @@ from datetime import date
 
 import polars as pl
 import pytest
+
 from modeler.analysis.horizon_scan_mapping import (
     apply_group_permutation,
     build_and_apply_group_permutation,

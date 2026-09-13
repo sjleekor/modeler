@@ -12,6 +12,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+
 from modeler.etl import labels
 
 

@@ -4,6 +4,7 @@ import datetime
 
 import duckdb
 import pytest
+
 from modeler.etl.stock_pit import build_stock_pit_sql
 from modeler.etl.trading_panel import build_full_panel_sql, build_valid_session_sql
 

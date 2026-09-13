@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+
 from modeler.analysis.horizon_scan_runner import (
     apply_global_bh,
     assert_rows_match_registry,

@@ -17,6 +17,7 @@ from pathlib import Path
 import duckdb
 import polars as pl
 import pytest
+
 from modeler.analysis.horizon_scan_phase_c_regimes import (
     LONG_WINDOW,
     REGIME_IDS,

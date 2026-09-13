@@ -11,6 +11,7 @@ import datetime
 
 import duckdb
 import pytest
+
 from modeler.etl.features import fin_pit
 
 

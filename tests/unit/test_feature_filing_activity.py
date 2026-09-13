@@ -12,6 +12,7 @@ from datetime import date, timedelta
 
 import duckdb
 import pytest
+
 from modeler.etl.features.filing_activity import (
     AMENDMENT_MARKERS,
     INSIDER_MARKER,

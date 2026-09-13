@@ -4,6 +4,7 @@ import statistics
 from datetime import date
 
 import duckdb
+
 from modeler.etl.features.sue_event import SUE_EVENT_TABLE, register_sue_event_view
 from modeler.etl.marts.financial_quarters import register_fin_quarterly_metric_vintage_view
 from modeler.etl.marts.metric_vintages import register_stock_metric_vintage_fact_view

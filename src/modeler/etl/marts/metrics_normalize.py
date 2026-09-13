@@ -23,12 +23,12 @@ Selection semantics reproduced 1:1 from ``_collect_candidates``:
 from __future__ import annotations
 
 import duckdb
-
 from collector.kr.shared import (
     MetricMappingRule,
     default_metric_catalog,
     default_metric_mapping_rules,
 )
+
 from modeler.etl.lake import _sql_str_literal
 
 SMF_VIEW = "stock_metric_fact"

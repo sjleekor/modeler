@@ -2,13 +2,12 @@
 
 The DuckDB common-build mart must reproduce the Postgres build for every
 transform (level/ret/change/vol/stale/yoy/mom/spread/ratio/latest-vintage). The
-oracle (``build_common_feature_daily_facts``) is removed at refactor P5, so its
-output on each synthetic scenario is frozen once into
-``golden/common_feature_daily_fact.json`` and the mart is checked against that.
-
-Regenerate the golden after an intentional build change:
-
-    SDC_UPDATE_GOLDEN=1 uv run pytest tests/unit/test_common_build_mart.py
+oracle (``build_common_feature_daily_facts``) was removed at refactor P5, so its
+output on each synthetic scenario was frozen once into
+``golden/common_feature_daily_fact.json`` and the mart is checked against that —
+the golden is the source of truth here; there is no regen path (modeler/ has no
+Postgres access by design, S6 §2.7). Edit the mart and review the golden diff
+manually for an intentional build change.
 
 See ``docs/dev/20260728_refactor_pipeline/00_refactor_plan.md`` §3.2, §7.4.
 """
@@ -16,7 +15,6 @@ See ``docs/dev/20260728_refactor_pipeline/00_refactor_plan.md`` §3.2, §7.4.
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -25,11 +23,9 @@ from pathlib import Path
 
 import duckdb
 import pytest
-
 from collector.kr.shared import Source
 
 from ._common_fixtures import (
-    MockCommonFeatureBuildStorage,
     _feature,
     _krx_days,
     _multi_feature,
@@ -319,43 +315,8 @@ def _run_mart(scenario: Scenario, monkeypatch) -> dict[str, str | None]:
     return {f"{r[0]}|{r[1]}": (None if r[2] is None else str(r[2])) for r in rows}
 
 
-# --- oracle side (regen only) ----------------------------------------------
-
-
-def _run_oracle(scenario: Scenario) -> dict[str, str | None]:
-    """Postgres build output for a scenario (lazy service import; regen only)."""
-    try:
-        from collector.kr.service.build_common_feature_daily_facts import (
-            build_common_feature_daily_facts,
-        )
-    except ModuleNotFoundError as exc:  # P5 removed the oracle
-        raise RuntimeError(
-            "build service was decommissioned (refactor P5); the golden is now the "
-            "source of truth — edit the mart and review the golden diff manually."
-        ) from exc
-
-    series, catalog, obs, start, end = scenario.build()
-    storage = MockCommonFeatureBuildStorage(series=series, catalog=catalog, observations=obs)
-    build_common_feature_daily_facts(storage, start, end, krx_trading_days=_krx_days)
-    return {
-        f"{f.feature_date}|{f.feature_code}": (
-            None if f.value_numeric is None else str(f.value_numeric)
-        )
-        for f in storage.facts
-    }
-
-
-def _maybe_update_golden() -> None:
-    if os.environ.get("SDC_UPDATE_GOLDEN") != "1":
-        return
-    golden = {sc.name: _run_oracle(sc) for sc in SCENARIOS}
-    _GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _GOLDEN_PATH.write_text(json.dumps(golden, indent=2, sort_keys=True) + "\n")
-
-
 @pytest.fixture(scope="module")
 def golden():
-    _maybe_update_golden()
     return json.loads(_GOLDEN_PATH.read_text())
 
 

@@ -22,6 +22,7 @@ import hashlib
 
 import duckdb
 import pytest
+
 from modeler.etl.features import fin_risk, fin_scan
 from modeler.etl.features.fin_vintage import (
     BASE_OK_SQL,

@@ -21,6 +21,7 @@ from pathlib import Path
 import duckdb
 import polars as pl
 import pytest
+
 import modeler.analysis.horizon_scan_phase_b_joint_permutation as joint_perm
 from modeler.analysis.horizon_scan_phase_b_joint_permutation import (
     _permute_qualifying_sue_ranks,

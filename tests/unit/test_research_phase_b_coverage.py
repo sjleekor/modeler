@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import date
 
 import duckdb
+from collector.kr.shared import default_metric_mapping_rules
+
 from modeler.etl.phase_b_coverage import (
     register_event_coverage_view,
     register_feature_coverage_view,
@@ -12,8 +14,6 @@ from modeler.etl.phase_b_coverage import (
     register_receipt_value_pairing_quality_view,
     register_stock_metric_vintage_quality_view,
 )
-
-from collector.kr.definitions.metric_rules import default_metric_mapping_rules
 
 _VINTAGE_COLUMNS = (
     "ticker VARCHAR, market VARCHAR, metric_code VARCHAR, period_type VARCHAR, "

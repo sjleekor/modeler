@@ -14,6 +14,7 @@ the passed-argv one always worked and must keep working.
 from __future__ import annotations
 
 import pytest
+
 from modeler.analysis import horizon_scan, horizon_scan_phase_c
 
 

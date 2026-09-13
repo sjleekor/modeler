@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+
 from modeler.analysis.horizon_scan_config import CONFIG_PATH, load_config
 from modeler.analysis.horizon_scan_phase_b import (
     build_phase_b_readiness_rows,

@@ -4,6 +4,7 @@ import math
 
 import duckdb
 import pytest
+
 from modeler.analysis.horizon_scan_runner import (
     build_offset_formation_sql,
     run_nonoverlap_offsets,

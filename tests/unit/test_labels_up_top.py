@@ -11,6 +11,7 @@ import hashlib
 
 import duckdb
 import pytest
+
 from modeler.etl import labels
 
 # The label SQL model 01 builds its dataset from. Frozen deliberately: a change

@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+
 from modeler.etl import compute_all
 from modeler.etl.config import CONFIG_TABLES, RAW_TABLES
 

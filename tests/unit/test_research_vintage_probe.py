@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 import duckdb
+
 from modeler.etl.vintage_probe import (
     build_vintage_diff_summary_sql,
     build_vintage_row_diff_sql,

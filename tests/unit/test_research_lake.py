@@ -15,6 +15,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+
 from modeler.etl import lake
 from modeler.etl.config import DataRoot, EngineOptions, LakeConfig
 

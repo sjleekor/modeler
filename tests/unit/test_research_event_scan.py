@@ -4,6 +4,7 @@ from datetime import date
 
 import duckdb
 import pytest
+
 from modeler.etl.features.event_scan import (
     ECONOMIC_DECREASE_REASONS,
     ECONOMIC_INCREASE_REASONS,

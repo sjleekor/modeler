@@ -24,6 +24,7 @@ from datetime import date
 
 import duckdb
 import pytest
+
 from modeler.etl.lake import _common_feature_calendars
 from modeler.etl.marts import reports
 

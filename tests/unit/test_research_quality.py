@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import duckdb
+
 from modeler.etl.quality import (
     build_price_quality_sql,
     diagnose_publication_lag,

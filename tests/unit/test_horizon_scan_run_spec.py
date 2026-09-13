@@ -5,6 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+
 from modeler.analysis.horizon_scan_config import HorizonScanConfig, load_config
 from modeler.analysis.horizon_scan_run_spec import (
     REQUIRED_A0_MARTS,

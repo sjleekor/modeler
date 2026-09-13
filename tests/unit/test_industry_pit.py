@@ -23,6 +23,13 @@ import json
 
 import duckdb
 import pytest
+from collector.kr.shared import (
+    MIN_GROUP_SIZE,
+    OTHER_GROUP,
+    UNKNOWN_GROUP,
+    resolve_groups,
+)
+
 from modeler.etl.config import DataRoot, LakeConfig
 from modeler.etl.features.industry_pit import (
     CHANGE_LOOKBACK_SESSIONS,
@@ -33,13 +40,6 @@ from modeler.etl.features.industry_pit import (
     materialize_industry_pit,
 )
 from modeler.etl.mart import is_materialized
-
-from collector.kr.definitions.industry_groups import (
-    MIN_GROUP_SIZE,
-    OTHER_GROUP,
-    UNKNOWN_GROUP,
-    resolve_groups,
-)
 
 # A run of consecutive weekday sessions is enough: every window in this mart is
 # ROWS-based over a ticker's own valid sessions, so the calendar never enters.

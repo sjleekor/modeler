@@ -1,28 +1,23 @@
 """Golden parity test: DuckDB stock_metric_fact mart == frozen normalize output.
 
 The DuckDB mart must reproduce the Postgres normalize rules exactly. The oracle
-(``normalize_stock_metrics``) is removed at refactor P5, so its output on the
-synthetic fixture is frozen once into ``golden/stock_metric_fact.json`` and the
-mart is checked against that golden — no live service dependency.
-
-Regenerate the golden after an intentional rule change:
-
-    SDC_UPDATE_GOLDEN=1 uv run pytest tests/unit/test_metrics_normalize_mart.py
-
-Regen uses the oracle while it still exists; once the service is gone the golden
-is the source of truth (a rule change then updates the golden via the mart with a
-manual review of the diff). See refactor plan §3.1, §7.4.
+(``normalize_stock_metrics``) was removed at refactor P5, so its output on the
+synthetic fixture was frozen once into ``golden/stock_metric_fact.json`` and the
+mart is checked against that golden — the golden is the source of truth here;
+there is no regen path (modeler/ has no Postgres access by design, S6 §2.7). A
+rule change must edit the mart and review the golden diff manually. See
+refactor plan §3.1, §7.4.
 """
 
 from __future__ import annotations
 
 import json
-import os
 from decimal import Decimal
 from pathlib import Path
 
 import duckdb
 import pytest
+
 from modeler.etl.marts.metrics_normalize import register_stock_metric_fact_view
 
 from ._metric_fixtures import MockMetricStorage
@@ -67,43 +62,6 @@ def _serialize(rec: dict) -> dict:
         out["period_end"] = str(out["period_end"])
     if out.get("value_numeric") is not None:
         out["value_numeric"] = str(out["value_numeric"])
-    return out
-
-
-def _oracle_facts(years: list[int], reprt_codes: list[str]) -> dict[str, dict]:
-    """Postgres normalize output, keyed by string key. Used ONLY to regenerate
-    the golden (lazy service import so the module loads after P5 removes it)."""
-    try:
-        from collector.kr.service.normalize_metrics import normalize_stock_metrics
-    except ModuleNotFoundError as exc:  # P5 removed the oracle
-        raise RuntimeError(
-            "normalize service was decommissioned (refactor P5); the golden is now "
-            "the source of truth. A rule change must edit the mart and review the "
-            "golden diff manually rather than regenerating from the Postgres oracle."
-        ) from exc
-
-    storage = MockMetricStorage()
-    normalize_stock_metrics(storage, years, reprt_codes, batch_size=10)
-    out: dict[str, dict] = {}
-    for f in storage.facts:
-        rec = {
-            "ticker": f.ticker,
-            "market": f.market.value if hasattr(f.market, "value") else f.market,
-            "corp_code": f.corp_code,
-            "metric_code": f.metric_code,
-            "period_type": f.period_type,
-            "period_end": f.period_end,
-            "bsns_year": f.bsns_year,
-            "reprt_code": f.reprt_code,
-            "fs_div": f.fs_div,
-            "value_numeric": _dec(f.value_numeric),
-            "value_text": f.value_text,
-            "unit": f.unit,
-            "source_table": f.source_table,
-            "source_key": f.source_key,
-            "mapping_rule_code": f.mapping_rule_code,
-        }
-        out[_key_str(rec)] = _serialize(rec)
     return out
 
 
@@ -244,17 +202,8 @@ def _load_golden() -> dict[str, dict]:
     return json.loads(_GOLDEN_PATH.read_text())
 
 
-def _maybe_update_golden() -> None:
-    if os.environ.get("SDC_UPDATE_GOLDEN") != "1":
-        return
-    golden = _oracle_facts([2025], ["11011"])
-    _GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _GOLDEN_PATH.write_text(json.dumps(golden, indent=2, sort_keys=True) + "\n")
-
-
 @pytest.fixture(scope="module")
 def golden_and_mart():
-    _maybe_update_golden()
     return _load_golden(), _mart_facts()
 
 

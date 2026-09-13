@@ -12,6 +12,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+
 from modeler.models._02_updown_prob import evaluate as ev
 from modeler.models._02_updown_prob.experiments import recheck_calibration as rc
 from modeler.models._02_updown_prob.experiments import registry as rg

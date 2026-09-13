@@ -19,6 +19,7 @@ from __future__ import annotations
 import datetime as dt
 
 import duckdb
+
 from modeler.analysis.industry_change_report import (
     GROUP_RATE_THRESHOLD_PCT,
     REQUIRED_PAIRS,

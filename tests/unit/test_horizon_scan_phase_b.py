@@ -6,6 +6,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+
 from modeler.analysis.horizon_scan_config import HorizonScanConfig, load_config
 from modeler.analysis.horizon_scan_phase_b import (
     PHASE_B_CONTENT_HASH_EXCLUDE_NAMES,

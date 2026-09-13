@@ -458,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from modeler.analysis.horizon_scan_config import CONFIG_PATH, load_config
-    from modeler.etl.config import DataRoot, DEFAULT_SOURCE, LakeConfig
+    from modeler.etl.config import DEFAULT_SOURCE, DataRoot, LakeConfig
     from modeler.etl.lake import connect, register_persisted_derived_mart
     from modeler.etl.mart import mart_root, register_mart_view
 

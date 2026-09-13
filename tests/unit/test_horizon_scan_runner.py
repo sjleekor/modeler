@@ -5,6 +5,7 @@ from datetime import date
 
 import duckdb
 import pytest
+
 from modeler.analysis.horizon_scan_daily_ic import CELL_IDENTITY_COLUMNS
 from modeler.analysis.horizon_scan_runner import (
     UNIVERSE_SAMPLE_COMBOS,

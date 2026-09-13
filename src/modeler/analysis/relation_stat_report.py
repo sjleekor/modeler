@@ -26,7 +26,7 @@ from pathlib import Path
 
 import duckdb
 
-from modeler.etl.config import DataRoot, DEFAULT_SOURCE, EngineOptions, LakeConfig
+from modeler.etl.config import DEFAULT_SOURCE, DataRoot, EngineOptions, LakeConfig
 from modeler.etl.features.relation_stat import (
     COUNT_COLUMNS,
     DIAGNOSTIC_COLUMNS,

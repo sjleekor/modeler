@@ -22,6 +22,7 @@ import hashlib
 import duckdb
 import numpy as np
 import pytest
+
 from modeler.etl.features import price, relation_stat
 from modeler.etl.trading_panel import build_market_model_sql
 

@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from modeler.etl.config import DataRoot, DEFAULT_SOURCE, LakeConfig  # noqa: E402
+from modeler.etl.config import DEFAULT_SOURCE, DataRoot, LakeConfig  # noqa: E402
 from modeler.etl.features.fin_pit import materialize_fin_pit  # noqa: E402
 from modeler.etl.lake import connect, register_derived_marts, register_views  # noqa: E402
 from modeler.etl.universe import materialize_universe  # noqa: E402

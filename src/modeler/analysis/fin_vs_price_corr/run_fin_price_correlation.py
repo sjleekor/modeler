@@ -7,10 +7,10 @@ materializes `label_daily` if absent, and writes plots/tables under reports/.
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import sys
 from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[4]

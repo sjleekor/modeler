@@ -10,6 +10,7 @@ import math
 
 import numpy as np
 import pytest
+
 from modeler.etl.metrics import newey_west_ols, newey_west_tstat
 
 

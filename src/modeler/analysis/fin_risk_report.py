@@ -26,9 +26,9 @@ from datetime import datetime
 from pathlib import Path
 
 import duckdb
-
 from collector.kr.shared import get_trading_days
-from modeler.etl.config import DataRoot, DEFAULT_SOURCE, EngineOptions, LakeConfig
+
+from modeler.etl.config import DEFAULT_SOURCE, DataRoot, EngineOptions, LakeConfig
 from modeler.etl.features.fin_risk import (
     AVAILABILITY_GROUPS,
     FIN_RISK_TABLE,

@@ -209,6 +209,7 @@ def verify() -> int:
 def build(force: bool) -> int:
     """Materialize the five into the isolated root, in dependency order."""
     from collector.kr.shared import get_trading_days  # noqa: PLC0415
+
     from modeler.etl.config import LakeConfig  # noqa: PLC0415
     from modeler.etl.features.fin_risk import materialize_fin_risk  # noqa: PLC0415
     from modeler.etl.features.relation_stat import (  # noqa: PLC0415

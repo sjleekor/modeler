@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 
 import pytest
+
 from modeler.etl.splits import walk_forward_splits
 
 

@@ -6,6 +6,7 @@ import duckdb
 import numpy as np
 import polars as pl
 import pytest
+
 from modeler.analysis.horizon_scan_permutation import (
     apply_circular_feature_shift,
     circular_shift_session_index,

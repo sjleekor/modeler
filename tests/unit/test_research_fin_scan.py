@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 import duckdb
+
 from modeler.etl.features.fin_scan import FIN_SCAN_TABLE, register_fin_scan_daily_view
 from modeler.etl.marts.financial_quarters import register_fin_quarterly_metric_vintage_view
 from modeler.etl.marts.metric_vintages import register_stock_metric_vintage_fact_view

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+
 from modeler.etl.labels import build_label_scan_sql
 
 

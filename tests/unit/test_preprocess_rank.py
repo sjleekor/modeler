@@ -12,6 +12,7 @@ import datetime
 
 import polars as pl
 import pytest
+
 from modeler.etl import preprocess as pp
 
 D1 = datetime.date(2020, 1, 1)

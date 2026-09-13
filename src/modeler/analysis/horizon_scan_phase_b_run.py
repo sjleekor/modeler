@@ -60,8 +60,8 @@ from typing import Any
 
 import duckdb
 import polars as pl
-
 from collector.kr.shared import get_trading_days
+
 from modeler.analysis.horizon_scan_checkpoint import (
     build_checkpoint_fingerprint,
     canonical_hash,

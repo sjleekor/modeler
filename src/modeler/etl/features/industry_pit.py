@@ -74,12 +74,12 @@ import json
 import logging
 
 import duckdb
-
 from collector.kr.shared import (
     MIN_GROUP_SIZE,
     UNKNOWN_GROUP,
     resolve_groups,
 )
+
 from modeler.etl.config import LakeConfig
 from modeler.etl.mart import (
     _metadata_path,

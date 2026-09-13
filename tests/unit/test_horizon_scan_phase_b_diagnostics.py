@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import duckdb
+
 from modeler.analysis.horizon_scan_phase_b_diagnostics import (
     build_secondary_diagnostic_cells,
     compute_phase_b_rank_correlation,

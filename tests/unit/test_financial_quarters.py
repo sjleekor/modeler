@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 import duckdb
+
 from modeler.etl.marts.financial_quarters import (
     FQMV_TABLE,
     register_fin_quarterly_metric_vintage_view,

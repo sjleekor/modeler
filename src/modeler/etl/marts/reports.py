@@ -23,7 +23,6 @@ from dataclasses import dataclass, field
 from datetime import date
 
 import duckdb
-
 from collector.kr.shared import default_common_feature_catalog
 
 

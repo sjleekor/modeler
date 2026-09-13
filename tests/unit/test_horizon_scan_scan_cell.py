@@ -6,6 +6,7 @@ from typing import Any
 import duckdb
 import polars as pl
 import pytest
+
 from modeler.analysis.horizon_scan_runner import build_formation_sql, run_registry_scan, scan_cell
 
 

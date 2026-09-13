@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+
 from modeler.analysis.horizon_scan_report import (
     PATTERN_DELAYED,
     PATTERN_EXPLORATORY_ONLY,

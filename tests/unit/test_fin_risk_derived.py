@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 
 import pytest
+
 from modeler.etl.features import fin_risk
 
 from .test_fin_risk import _fixture, _instant, _ttm

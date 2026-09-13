@@ -12,6 +12,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+
 from modeler.etl import calendar, mart, universe
 from modeler.etl.config import DataRoot, EngineOptions, LakeConfig
 from modeler.etl.lake import connect, register_views

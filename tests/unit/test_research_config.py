@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 import modeler.etl.config as config_module
 from modeler.etl.config import (
     CONFIG_TABLES,

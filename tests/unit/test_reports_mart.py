@@ -1,29 +1,27 @@
 """Golden parity: DuckDB coverage/readiness reports == frozen Postgres reports.
 
-The Postgres report services are removed at refactor P5, so their output on the
-fixture scenario is frozen into ``golden/common_feature_reports.json`` and the
-DuckDB ``reports`` mart is checked against that. The freshness gate is a mart-only
-unit test (no oracle). Regenerate after an intentional change:
-
-    SDC_UPDATE_GOLDEN=1 uv run pytest tests/unit/test_reports_mart.py
-
-See refactor plan §4, §7.4.
+The Postgres report services were removed at refactor P5, so their output on the
+fixture scenario was frozen into ``golden/common_feature_reports.json`` and the
+DuckDB ``reports`` mart is checked against that — the golden is the source of
+truth here; there is no regen path (modeler/ has no Postgres access by design,
+S6 §2.7). The freshness gate is a mart-only unit test (no oracle). An intentional
+change must edit the mart and review the golden diff manually. See refactor plan
+§4, §7.4.
 """
 
 from __future__ import annotations
 
 import json
-import os
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
 import duckdb
 import pytest
+
 from modeler.etl.marts import common_build, reports
 
 from ._common_fixtures import (
-    MockCommonFeatureBuildStorage,
     _feature,
     _krx_days,
     _obs,
@@ -89,59 +87,8 @@ def _build_mart_con(observations, series_list, catalog, start, end, monkeypatch)
     return con, feature_dates
 
 
-def _oracle_reports() -> dict:
-    """Postgres coverage + readiness for the scenario (regen only; lazy import)."""
-    try:
-        from collector.kr.service.build_common_feature_daily_facts import (
-            build_common_feature_daily_facts,
-        )
-        from collector.kr.service.report_common_feature_coverage import (
-            build_common_feature_coverage_report,
-        )
-        from collector.kr.service.report_common_feature_readiness import (
-            build_common_feature_readiness_report,
-        )
-    except ModuleNotFoundError as exc:  # P5 removed the oracle
-        raise RuntimeError(
-            "report services were decommissioned (refactor P5); the golden is now "
-            "the source of truth — edit the mart and review the golden diff manually."
-        ) from exc
-
-    series, catalog, obs, start, end = _scenario()
-    storage = MockCommonFeatureBuildStorage(series=series, catalog=catalog, observations=obs)
-    build_common_feature_daily_facts(storage, start, end, krx_trading_days=_krx_days)
-    storage.get_common_feature_daily_facts = lambda start, end, feature_codes=None: [  # type: ignore[attr-defined]
-        f for f in storage.facts if start <= f.feature_date <= end
-    ]
-    cov = build_common_feature_coverage_report(storage, start, end, krx_trading_days=_krx_days)
-    rdy = build_common_feature_readiness_report(storage, start, end, krx_trading_days=_krx_days)
-    return {
-        "coverage": {
-            r.feature_code: {
-                "target_count": r.target_count,
-                "fact_count": r.fact_count,
-                "non_null_count": r.non_null_count,
-                "null_count": r.null_count,
-                "missing_count": r.missing_count,
-                "pit_violation_count": r.pit_violation_count,
-                "coverage_ratio": str(r.coverage_ratio),
-            }
-            for r in cov.rows
-        },
-        "readiness": {r.feature_code: r.ready for r in rdy.rows},
-    }
-
-
-def _maybe_update_golden() -> None:
-    if os.environ.get("SDC_UPDATE_GOLDEN") != "1":
-        return
-    _GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _GOLDEN_PATH.write_text(json.dumps(_oracle_reports(), indent=2, sort_keys=True) + "\n")
-
-
 @pytest.fixture(scope="module")
 def golden():
-    _maybe_update_golden()
     return json.loads(_GOLDEN_PATH.read_text())
 
 

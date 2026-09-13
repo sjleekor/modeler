@@ -6,6 +6,7 @@ from datetime import date, timedelta
 import duckdb
 import polars as pl
 import pytest
+
 from modeler.analysis.horizon_scan_daily_ic import (
     DAILY_IC_DIR_NAME,
     DAILY_SPREAD_DIR_NAME,

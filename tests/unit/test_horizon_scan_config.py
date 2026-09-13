@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 import pytest
+
 from modeler.analysis.horizon_scan_config import (
     CONFIG_PATH,
     _canonical_hash,

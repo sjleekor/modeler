@@ -38,13 +38,13 @@ from collections.abc import Sequence
 from datetime import date
 
 import duckdb
-
 from collector.kr.shared import (
     CommonFeatureCatalogEntry,
     CommonFeatureSeries,
     default_common_feature_catalog,
     default_common_feature_series,
 )
+
 from modeler.etl.lake import _sql_str_literal
 
 CFDF_VIEW = "common_feature_daily_fact"

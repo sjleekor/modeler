@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+
 from modeler.etl.features.flow import build_flow_sql
 
 

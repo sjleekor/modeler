@@ -13,6 +13,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+
 from modeler.etl.features import flow, price
 
 

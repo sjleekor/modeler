@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import duckdb
+
 from modeler.etl.config import DataRoot
 from modeler.etl.horizon_scan_inputs import REQUIRED_RAW_INPUTS, build_a0_inputs
 

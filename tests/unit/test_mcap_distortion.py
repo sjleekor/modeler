@@ -15,6 +15,7 @@ from datetime import date, timedelta
 
 import duckdb
 import pytest
+
 from modeler.etl.corporate_actions import (
     MAX_WINDOW_DAYS,
     build_mcap_distortion_sql,

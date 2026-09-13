@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 import duckdb
+
 from modeler.analysis.capital_change_vintage_probe import decide, run
 
 

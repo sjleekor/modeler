@@ -33,12 +33,12 @@ from collections.abc import Sequence
 from datetime import date
 
 import duckdb
-
 from collector.kr.shared import (
     MetricMappingRule,
     default_metric_catalog,
     default_metric_mapping_rules,
 )
+
 from modeler.etl.config import LakeConfig
 from modeler.etl.lake import _sql_str_literal
 from modeler.etl.mart import materialize, register_mart_view

@@ -18,6 +18,7 @@ from pathlib import Path
 import duckdb
 import polars as pl
 import pytest
+
 from modeler.etl.config import DataRoot, LakeConfig
 from modeler.etl.features.regime import REGIME_TABLE
 from modeler.etl.lake import connect, register_views

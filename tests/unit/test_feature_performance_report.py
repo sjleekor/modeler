@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from modeler.analysis.feature_performance_report import (
     ReportContractError,
     _assert_safe_output,

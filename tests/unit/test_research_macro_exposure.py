@@ -15,6 +15,7 @@ from datetime import date, timedelta
 
 import duckdb
 import pytest
+
 from modeler.etl.features.macro_exposure import (
     BETA_MIN_PAIRS,
     COUNT_COLUMNS,

@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
+
 from modeler.analysis.horizon_scan_config import CONFIG_PATH, load_config
 from modeler.analysis.horizon_scan_daily_ic import DAILY_IC_COLUMNS, DAILY_IC_DIR_NAME
 from modeler.analysis.horizon_scan_phase_c import (
@@ -559,6 +560,7 @@ def _synthetic_lake(tmp_path: Path, days: list[date], flags: list[bool]) -> Path
     is the property being demonstrated as much as tested.
     """
     import duckdb
+
     from modeler.analysis.horizon_scan_phase_c_regimes import SOURCE_FEATURE_CODES
 
     lake_root = tmp_path / "data_lake"

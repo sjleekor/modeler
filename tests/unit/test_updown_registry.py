@@ -18,6 +18,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+
 from modeler.etl.config import REPO_ROOT
 from modeler.models._02_updown_prob.evaluate import ECE_CEILING, PRIMARY_ECONOMIC
 from modeler.models._02_updown_prob.experiments import registry as rg

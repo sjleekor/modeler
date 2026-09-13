@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+
 from modeler.analysis.horizon_scan_checkpoint import (
     coordinator_lock,
     load_replicate_checkpoints,

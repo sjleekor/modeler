@@ -7,6 +7,7 @@ from datetime import date, timedelta
 import duckdb
 import polars as pl
 import pytest
+
 import modeler.analysis.horizon_scan_permutation as permutation
 from modeler.analysis.horizon_scan_checkpoint import build_checkpoint_fingerprint
 from modeler.analysis.horizon_scan_permutation import (

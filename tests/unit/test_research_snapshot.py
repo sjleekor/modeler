@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from modeler.etl.config import DataRoot
 from modeler.etl.snapshot import resolve_config, resolve_snapshot
 
