@@ -1,0 +1,110 @@
+{
+  "stage": "E4",
+  "rule": "`05` \u00a72 E4",
+  "by_horizon": {
+    "5": {
+      "run_id": "E1_h5_y_up-hgb_clf_seed0",
+      "label": "y_up",
+      "model": "hgb_clf",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_CLF_GRID",
+      "probability_value": 0.6782879258957518,
+      "economic_value": 0.00016383566933687795,
+      "ece": 0.013583671844114914,
+      "seed_std_probability": 2.5715467288753213e-06,
+      "seed_std_economic": 0.00010947017543585617,
+      "n_seeds": 3,
+      "seed_probability_values": [
+        0.6782879258957518,
+        0.6782892496182796,
+        0.6782842837615768
+      ],
+      "seed_economic_values": [
+        0.00016383566933687795,
+        0.00038192223992917064,
+        0.00028960748491338917
+      ],
+      "replaced_by": null,
+      "variants": {
+        "E4b-monotonic": {
+          "probability_value": 0.6782729591709181,
+          "economic_value": 0.00020667533147471052
+        }
+      }
+    },
+    "20": {
+      "run_id": "E2_h20_FS1h_seed0",
+      "label": "y_up",
+      "model": "hgb_clf",
+      "feature_set": "FS1h",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_CLF_GRID",
+      "probability_value": 0.6687193817318664,
+      "economic_value": 0.012182947113855595,
+      "ece": 0.012691079863050948,
+      "seed_std_probability": 2.8376126994413463e-05,
+      "seed_std_economic": 0.0019390658487262887,
+      "n_seeds": 3,
+      "seed_probability_values": [
+        0.6687193817318664,
+        0.6687494963476953,
+        0.6687760977265667
+      ],
+      "seed_economic_values": [
+        0.012182947113855595,
+        0.011803771300163057,
+        0.008650890303066799
+      ],
+      "replaced_by": null,
+      "variants": {
+        "E4b-monotonic": {
+          "probability_value": 0.6688699853445883,
+          "economic_value": 0.01251552003299336
+        }
+      }
+    },
+    "60": {
+      "run_id": "E1_h60_y_up-logit_seed0",
+      "label": "y_up",
+      "model": "logit",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "LOGIT_GRID",
+      "probability_value": 0.6619541168105673,
+      "economic_value": 0.02156725542811126,
+      "ece": 0.01883798511829472,
+      "seed_std_probability": 0.0,
+      "seed_std_economic": 0.0,
+      "n_seeds": 3,
+      "seed_probability_values": [
+        0.6619541168105673,
+        0.6619541168105673,
+        0.6619541168105673
+      ],
+      "seed_economic_values": [
+        0.02156725542811126,
+        0.02156725542811126,
+        0.02156725542811126
+      ],
+      "replaced_by": null,
+      "variants": {
+        "E4b-monotonic": {
+          "probability_value": 0.6621824534160407,
+          "economic_value": 0.021896236730491077
+        }
+      }
+    }
+  },
+  "notes": [
+    "h5: seed std 0.00000, adopted config kept",
+    "h20: seed std 0.00003, adopted config kept",
+    "h60: seed std 0.00000, adopted config kept"
+  ]
+}

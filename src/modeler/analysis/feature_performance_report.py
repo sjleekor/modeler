@@ -840,7 +840,7 @@ def load_report_bundle(
     repo_root: Path | None = None,
 ) -> ReportBundle:
     """``root`` is the scan root; ``repo_root`` (default: this repo) holds ``docs/target/*``."""
-    repo_root = repo_root if repo_root is not None else Path(__file__).resolve().parents[2]
+    repo_root = repo_root if repo_root is not None else Path(__file__).resolve().parents[3]
     paths, context = resolve_and_validate_paths(
         root,
         snapshot_date=snapshot_date,
@@ -2092,7 +2092,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from modeler.etl.config import DataRoot
 
     args = build_parser().parse_args(argv)
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[3]
     scan_root = DataRoot.resolve(market="kr").output / "scan"
     try:
         bundle = load_report_bundle(

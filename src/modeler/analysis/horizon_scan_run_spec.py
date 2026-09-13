@@ -169,9 +169,9 @@ def analysis_kernel_paths(repo_root: Path) -> list[Path]:
     the Phase B scope narrower than the shared runner.  This explicit list is
     used by both phases and includes newly added ``horizon_scan_*.py`` files.
     """
-    analysis_dir = repo_root / "research" / "analysis"
+    analysis_dir = repo_root / "src" / "modeler" / "analysis"
     return [
-        repo_root / "research" / "etl" / "metrics.py",
+        repo_root / "src" / "modeler" / "etl" / "metrics.py",
         *sorted(analysis_dir.glob("horizon_scan*.py")),
     ]
 

@@ -1,0 +1,108 @@
+{
+  "stage": "E1",
+  "rule": "`05` \u00a72 E1",
+  "by_horizon": {
+    "5": {
+      "run_id": "E1_h5_y_up-hgb_clf_seed0",
+      "label": "y_up",
+      "model": "hgb_clf",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_CLF_GRID",
+      "probability_value": 0.6782879258957518,
+      "economic_value": 0.00016383566933687795,
+      "ece": 0.013583671844114914,
+      "model_by_label": {
+        "y_up": {
+          "model": "hgb_clf",
+          "log_loss": 0.6782879258957518
+        },
+        "y_top": {
+          "model": "hgb_clf",
+          "log_loss": 0.49730544863968973
+        }
+      },
+      "reason": "L-A kept: topk_cost_adjusted_return gap -0.00131 inside the fold spread"
+    },
+    "20": {
+      "run_id": "E1_h20_y_up-hgb_clf_seed0",
+      "label": "y_up",
+      "model": "hgb_clf",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_CLF_GRID",
+      "probability_value": 0.6691156366043632,
+      "economic_value": 0.00939460115829409,
+      "ece": 0.012793242220215693,
+      "model_by_label": {
+        "y_up": {
+          "model": "hgb_clf",
+          "log_loss": 0.6691156366043632
+        },
+        "y_top": {
+          "model": "hgb_clf",
+          "log_loss": 0.5009072995644225
+        }
+      },
+      "reason": "L-A kept: topk_cost_adjusted_return gap +0.00003 inside the fold spread"
+    },
+    "60": {
+      "run_id": "E1_h60_y_up-logit_seed0",
+      "label": "y_up",
+      "model": "logit",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "LOGIT_GRID",
+      "probability_value": 0.6619541168105673,
+      "economic_value": 0.02156725542811126,
+      "ece": 0.01883798511829472,
+      "model_by_label": {
+        "y_up": {
+          "model": "logit",
+          "log_loss": 0.6619541168105673
+        },
+        "y_top": {
+          "model": "logit",
+          "log_loss": 0.5009947330208255
+        }
+      },
+      "reason": "L-A kept: topk_cost_adjusted_return gap -0.00889 inside the fold spread"
+    },
+    "120": {
+      "run_id": "E1_h120_y_up-logit_seed0",
+      "label": "y_up",
+      "model": "logit",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "LOGIT_GRID",
+      "probability_value": 0.657034143863065,
+      "economic_value": 0.16347946784941428,
+      "ece": 0.03212738786967666,
+      "model_by_label": {
+        "y_up": {
+          "model": "logit",
+          "log_loss": 0.657034143863065
+        },
+        "y_top": {
+          "model": "logit",
+          "log_loss": 0.4977708084159441
+        }
+      },
+      "reason": "L-A kept: rank_ic_mean gap -0.12739 favours L-A"
+    }
+  },
+  "notes": [
+    "h5: y_up + hgb_clf",
+    "h20: y_up + hgb_clf",
+    "h60: y_up + logit",
+    "h120: y_up + logit"
+  ]
+}

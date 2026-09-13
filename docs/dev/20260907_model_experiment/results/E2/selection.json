@@ -1,0 +1,167 @@
+{
+  "stage": "E2",
+  "rule": "`05` \u00a72 E2",
+  "by_horizon": {
+    "5": {
+      "run_id": "E1_h5_y_up-hgb_clf_seed0",
+      "label": "y_up",
+      "model": "hgb_clf",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_CLF_GRID",
+      "probability_value": 0.6782879258957518,
+      "economic_value": 0.00016383566933687795,
+      "ece": 0.013583671844114914,
+      "chain": [
+        {
+          "candidate": "FS1",
+          "against": "FS0",
+          "improved": false,
+          "weak": false,
+          "delta_probability": -8.244833803350282e-05,
+          "delta_economic": 0.0005183129101387805,
+          "folds_better": 3,
+          "folds_compared": 5,
+          "reason": "only 3/5 folds improved (need 4)"
+        },
+        {
+          "candidate": "FS1h",
+          "against": "FS0",
+          "improved": false,
+          "weak": false,
+          "delta_probability": -0.00010273620824341467,
+          "delta_economic": -1.2750476225352621e-05,
+          "folds_better": 4,
+          "folds_compared": 5,
+          "reason": "economics fell (-0.00001)"
+        },
+        {
+          "candidate": "FS2",
+          "against": "FS0",
+          "improved": false,
+          "weak": false,
+          "delta_probability": -0.0001791024862296542,
+          "delta_economic": 0.0005158976236842648,
+          "folds_better": 3,
+          "folds_compared": 5,
+          "reason": "only 3/5 folds improved (need 4)"
+        }
+      ]
+    },
+    "20": {
+      "run_id": "E2_h20_FS1h_seed0",
+      "label": "y_up",
+      "model": "hgb_clf",
+      "feature_set": "FS1h",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_CLF_GRID",
+      "probability_value": 0.6687193817318664,
+      "economic_value": 0.012182947113855595,
+      "ece": 0.012691079863050948,
+      "chain": [
+        {
+          "candidate": "FS1",
+          "against": "FS0",
+          "improved": false,
+          "weak": false,
+          "delta_probability": -0.0003735086616419858,
+          "delta_economic": 0.0018856972864341268,
+          "folds_better": 3,
+          "folds_compared": 5,
+          "reason": "only 3/5 folds improved (need 4)"
+        },
+        {
+          "candidate": "FS1h",
+          "against": "FS0",
+          "improved": true,
+          "weak": true,
+          "delta_probability": -0.00039625487249683733,
+          "delta_economic": 0.0027883459555615043,
+          "folds_better": 4,
+          "folds_compared": 5,
+          "reason": "improvement (weak: gap below the fold spread)"
+        },
+        {
+          "candidate": "FS2",
+          "against": "FS1h",
+          "improved": false,
+          "weak": false,
+          "delta_probability": -1.8288838301350197e-05,
+          "delta_economic": -0.0038801794669689003,
+          "folds_better": 3,
+          "folds_compared": 5,
+          "reason": "economics fell (-0.00388); only 3/5 folds improved (need 4)"
+        }
+      ]
+    },
+    "60": {
+      "run_id": "E1_h60_y_up-logit_seed0",
+      "label": "y_up",
+      "model": "logit",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "LOGIT_GRID",
+      "probability_value": 0.6619541168105673,
+      "economic_value": 0.02156725542811126,
+      "ece": 0.01883798511829472,
+      "chain": [
+        {
+          "candidate": "FS1",
+          "against": "FS0",
+          "improved": false,
+          "weak": false,
+          "delta_probability": 6.25651513553871e-05,
+          "delta_economic": 0.009170607290769617,
+          "folds_better": 2,
+          "folds_compared": 5,
+          "reason": "log-loss did not fall (+0.00006); only 2/5 folds improved (need 4)"
+        },
+        {
+          "candidate": "FS1h",
+          "against": "FS0",
+          "improved": false,
+          "weak": false,
+          "delta_probability": 7.611474336477464e-05,
+          "delta_economic": 0.013927306874122306,
+          "folds_better": 2,
+          "folds_compared": 5,
+          "reason": "log-loss did not fall (+0.00008); only 2/5 folds improved (need 4)"
+        },
+        {
+          "candidate": "FS2",
+          "against": "FS0",
+          "improved": false,
+          "weak": false,
+          "delta_probability": 0.0003468312036347676,
+          "delta_economic": 0.012538856838608389,
+          "folds_better": 3,
+          "folds_compared": 5,
+          "reason": "log-loss did not fall (+0.00035); only 3/5 folds improved (need 4)"
+        }
+      ]
+    }
+  },
+  "dropped_horizons": {
+    "120": {
+      "feature_set": "FS0",
+      "run_id": "E1_h120_y_up-logit_seed0",
+      "ece": 0.03212738786967666,
+      "recheck_run_id": "E2_h120_recal-isotonic_seed0",
+      "recheck_ece": 0.03231006804890087,
+      "reason": "ECE 0.0321 > 0.03, and 0.0323 after isotonic \u2014 dropped by `03` \u00a73.3"
+    }
+  },
+  "notes": [
+    "h5: FS0",
+    "h20: FS1h",
+    "h60: FS0",
+    "h120: dropped (no calibrated probability inside the ceiling)"
+  ],
+  "pending_calibration_recheck": []
+}

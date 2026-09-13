@@ -1,0 +1,250 @@
+{
+  "schema_version": 1,
+  "snapshot_date": "2026-08-23",
+  "source": "sj2_remote",
+  "period": {
+    "start": "2015-01-02",
+    "end": "2026-06-10"
+  },
+  "code_rev": "0bf9997",
+  "ab_run_dir": "research/output/horizon_scan/phase=AB/snapshot_date=2026-08-23/source=sj2_remote/config_hash=889c3e8377c2f400907611f7402651eee6a23c2765c051e4eb2a4a59ca36cbea/run_id=20260828T165038-4e0ae8b0",
+  "ab_run_id": "20260828T165038-4e0ae8b0",
+  "ab_content_hash": "0258eb5d172a8885c80e9c9435bc8f07f1a5a0415660619e9eba412feba42938",
+  "config_hash": "889c3e8377c2f400907611f7402651eee6a23c2765c051e4eb2a4a59ca36cbea",
+  "baseline_std_sha256": "655e57066754131fb1ea625f435d0621cb9789a3bf9035869ead6562e6a5f28e",
+  "families": [
+    "ev_amendment_ratio",
+    "ev_filing_activity",
+    "ev_net_share_issuance_yoy",
+    "ev_payout_yield",
+    "fin_gross_profitability",
+    "fin_log_mcap",
+    "fin_value_z",
+    "hc_employee_growth",
+    "hc_productivity",
+    "mcap_krx_log",
+    "own_amendment_ratio",
+    "own_major_filing_activity",
+    "own_major_stake_change",
+    "own_major_stake_level"
+  ],
+  "features": [
+    "ev_amendment_ratio_1y",
+    "ev_filing_burst_60d",
+    "ev_net_share_issuance_yoy",
+    "ev_payout_yield",
+    "fin_gross_profitability",
+    "fin_log_mcap",
+    "fin_value_z",
+    "hc_employee_growth_yoy",
+    "hc_revenue_per_employee",
+    "mcap_krx_log",
+    "own_amendment_ratio_1y",
+    "own_major_filing_60d",
+    "own_major_stake",
+    "own_major_stake_chg"
+  ],
+  "baseline_result_reused": "docs/target/01_20_access_return_rank/grade_a_acceptance_gate_results.json",
+  "candidate_features": [
+    "ev_amendment_ratio_1y",
+    "ev_filing_burst_60d",
+    "ev_net_share_issuance_yoy",
+    "ev_payout_yield",
+    "fin_gross_profitability",
+    "fin_log_mcap",
+    "fin_value_z",
+    "hc_employee_growth_yoy",
+    "hc_revenue_per_employee",
+    "mcap_krx_log",
+    "own_amendment_ratio_1y",
+    "own_major_filing_60d",
+    "own_major_stake",
+    "own_major_stake_chg"
+  ],
+  "records": [
+    {
+      "name": "baseline",
+      "horizon": 5,
+      "n_raw_features": 40,
+      "n_design_features": 80,
+      "best_params": {
+        "max_iter": 100,
+        "learning_rate": 0.1
+      },
+      "mean_rank_ic": 0.11545323110092269,
+      "per_fold_rank_ic": [
+        0.11056543250935544,
+        0.12522085758568202,
+        0.11786062388690544,
+        0.12452714332570845,
+        0.09909209819696208
+      ],
+      "economic": {
+        "horizon": 5,
+        "n_rebalances": 280,
+        "grid_top_decile_spread": 0.00399270399893628,
+        "turnover": 0.6956709356490521,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": -0.0001813216149580332
+      },
+      "train_seconds": 1252.3
+    },
+    {
+      "name": "baseline",
+      "horizon": 20,
+      "n_raw_features": 40,
+      "n_design_features": 80,
+      "best_params": {
+        "max_iter": 100,
+        "learning_rate": 0.1
+      },
+      "mean_rank_ic": 0.14361716245686146,
+      "per_fold_rank_ic": [
+        0.1263632549847266,
+        0.18638810340623202,
+        0.14318749727262667,
+        0.157351759648954,
+        0.10479519697176812
+      ],
+      "economic": {
+        "horizon": 20,
+        "n_rebalances": 70,
+        "grid_top_decile_spread": 0.01616080642369634,
+        "turnover": 0.597381577086539,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.012576516961177108
+      },
+      "train_seconds": 1139.8
+    },
+    {
+      "name": "baseline",
+      "horizon": 60,
+      "n_raw_features": 40,
+      "n_design_features": 80,
+      "best_params": {
+        "max_iter": 200,
+        "learning_rate": 0.01
+      },
+      "mean_rank_ic": 0.17527922158737294,
+      "per_fold_rank_ic": [
+        0.1792420851415361,
+        0.22897187724896034,
+        0.16754562217301508,
+        0.18613397609812482,
+        0.11450254727522831
+      ],
+      "economic": {
+        "horizon": 60,
+        "n_rebalances": 24,
+        "grid_top_decile_spread": 0.024180043119629385,
+        "turnover": 0.6379103058714939,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.02035258128440042
+      },
+      "train_seconds": 1149.9
+    },
+    {
+      "name": "phase_b_candidate",
+      "horizon": 5,
+      "n_raw_features": 54,
+      "n_design_features": 108,
+      "best_params": {
+        "max_iter": 100,
+        "learning_rate": 0.1
+      },
+      "mean_rank_ic": 0.11860302613292335,
+      "per_fold_rank_ic": [
+        0.11471167653515375,
+        0.13074693521060135,
+        0.12085701145898116,
+        0.12794816642185974,
+        0.09875134103802075
+      ],
+      "economic": {
+        "horizon": 5,
+        "n_rebalances": 280,
+        "grid_top_decile_spread": 0.005446418222608113,
+        "turnover": 0.6510702633898423,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.0015399966422690592
+      },
+      "train_seconds": 1126.2
+    },
+    {
+      "name": "phase_b_candidate",
+      "horizon": 20,
+      "n_raw_features": 54,
+      "n_design_features": 108,
+      "best_params": {
+        "max_iter": 200,
+        "learning_rate": 0.01
+      },
+      "mean_rank_ic": 0.14469519156411775,
+      "per_fold_rank_ic": [
+        0.14190961827476953,
+        0.19214116995332234,
+        0.13961530384058282,
+        0.15335669475385347,
+        0.0964531709980606
+      ],
+      "economic": {
+        "horizon": 20,
+        "n_rebalances": 70,
+        "grid_top_decile_spread": 0.01849587988707159,
+        "turnover": 0.4914706440533054,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.015547056022751757
+      },
+      "train_seconds": 1299.6
+    },
+    {
+      "name": "phase_b_candidate",
+      "horizon": 60,
+      "n_raw_features": 54,
+      "n_design_features": 108,
+      "best_params": {
+        "max_iter": 200,
+        "learning_rate": 0.01
+      },
+      "mean_rank_ic": 0.17553569384720483,
+      "per_fold_rank_ic": [
+        0.17526886381796497,
+        0.23688169925211353,
+        0.16266850439118677,
+        0.19023663238619323,
+        0.11262276938856566
+      ],
+      "economic": {
+        "horizon": 60,
+        "n_rebalances": 24,
+        "grid_top_decile_spread": 0.03161060188135475,
+        "turnover": 0.5485467619236231,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.02831932130981301
+      },
+      "train_seconds": 1315.0
+    }
+  ],
+  "validation_summary": {
+    "status": "improved_all_horizons",
+    "deltas": [
+      {
+        "horizon": 5,
+        "mean_rank_ic": 0.003149795032000659,
+        "cost_adjusted_spread": 0.0017213182572270924
+      },
+      {
+        "horizon": 20,
+        "mean_rank_ic": 0.0010780291072562887,
+        "cost_adjusted_spread": 0.002970539061574649
+      },
+      {
+        "horizon": 60,
+        "mean_rank_ic": 0.0002564722598318938,
+        "cost_adjusted_spread": 0.00796674002521259
+      }
+    ],
+    "final_acceptance": "deferred_until_new_mature_h60_holdout"
+  },
+  "holdout_status": "deferred_until_2026_10_or_11_for_mature_h60_labels"
+}

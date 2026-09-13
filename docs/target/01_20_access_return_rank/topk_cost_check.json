@@ -1,0 +1,180 @@
+{
+  "k": 100,
+  "cost_bps_roundtrip": 60.0,
+  "records": [
+    {
+      "name": "baseline",
+      "horizon": 5,
+      "best_params": {
+        "max_iter": 100,
+        "learning_rate": 0.1
+      },
+      "decile": {
+        "horizon": 5,
+        "n_rebalances": 280,
+        "grid_top_decile_spread": 0.003904145897859084,
+        "turnover": 0.6802836231649375,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": -0.0001775558411305409
+      },
+      "topk": {
+        "horizon": 5,
+        "k": 100,
+        "n_rebalances": 280,
+        "mean_names_held": 100.0,
+        "mean_names_scored": 99.86785714285715,
+        "grid_topk_mean_return": 0.004224646742448143,
+        "turnover": 0.7802867383512544,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_return": -0.0004570736876593831
+      },
+      "gate_decile_cost_adjusted_spread": -0.0001775558411305409,
+      "fit_seconds": 124.1
+    },
+    {
+      "name": "baseline",
+      "horizon": 20,
+      "best_params": {
+        "max_iter": 100,
+        "learning_rate": 0.1
+      },
+      "decile": {
+        "horizon": 20,
+        "n_rebalances": 70,
+        "grid_top_decile_spread": 0.01438872783994324,
+        "turnover": 0.5984476378563486,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.01079804201280515
+      },
+      "topk": {
+        "horizon": 20,
+        "k": 100,
+        "n_rebalances": 70,
+        "mean_names_held": 100.0,
+        "mean_names_scored": 99.9,
+        "grid_topk_mean_return": 0.02405615737055097,
+        "turnover": 0.6771014492753623,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_return": 0.019993548674898796
+      },
+      "gate_decile_cost_adjusted_spread": 0.01079804201280515,
+      "fit_seconds": 112.9
+    },
+    {
+      "name": "baseline",
+      "horizon": 60,
+      "best_params": {
+        "max_iter": 200,
+        "learning_rate": 0.01
+      },
+      "decile": {
+        "horizon": 60,
+        "n_rebalances": 23,
+        "grid_top_decile_spread": 0.012243341684184887,
+        "turnover": 0.6481612819892686,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.008354373992249276
+      },
+      "topk": {
+        "horizon": 60,
+        "k": 100,
+        "n_rebalances": 24,
+        "mean_names_held": 100.0,
+        "mean_names_scored": 99.91304347826087,
+        "grid_topk_mean_return": 0.002882895585061983,
+        "turnover": 0.716086956521739,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_return": -0.001413626154068451
+      },
+      "gate_decile_cost_adjusted_spread": 0.008354373992249278,
+      "fit_seconds": 268.3
+    },
+    {
+      "name": "candidate",
+      "horizon": 5,
+      "best_params": {
+        "max_iter": 100,
+        "learning_rate": 0.1
+      },
+      "decile": {
+        "horizon": 5,
+        "n_rebalances": 280,
+        "grid_top_decile_spread": 0.003501725013042877,
+        "turnover": 0.6689540071274429,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": -0.0005119990297217801
+      },
+      "topk": {
+        "horizon": 5,
+        "k": 100,
+        "n_rebalances": 280,
+        "mean_names_held": 100.0,
+        "mean_names_scored": 99.88214285714285,
+        "grid_topk_mean_return": 0.003918353049542816,
+        "turnover": 0.7665591397849463,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_return": -0.0006810017891668617
+      },
+      "gate_decile_cost_adjusted_spread": -0.0005119990297217797,
+      "fit_seconds": 133.1
+    },
+    {
+      "name": "candidate",
+      "horizon": 20,
+      "best_params": {
+        "max_iter": 200,
+        "learning_rate": 0.01
+      },
+      "decile": {
+        "horizon": 20,
+        "n_rebalances": 70,
+        "grid_top_decile_spread": 0.01238587240112172,
+        "turnover": 0.5626965230815856,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.009009693262632207
+      },
+      "topk": {
+        "horizon": 20,
+        "k": 100,
+        "n_rebalances": 70,
+        "mean_names_held": 100.0,
+        "mean_names_scored": 99.94285714285714,
+        "grid_topk_mean_return": 0.019355116850010963,
+        "turnover": 0.6505797101449275,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_return": 0.015451638589141399
+      },
+      "gate_decile_cost_adjusted_spread": 0.009009693262632207,
+      "fit_seconds": 285.5
+    },
+    {
+      "name": "candidate",
+      "horizon": 60,
+      "best_params": {
+        "max_iter": 200,
+        "learning_rate": 0.01
+      },
+      "decile": {
+        "horizon": 60,
+        "n_rebalances": 23,
+        "grid_top_decile_spread": 0.010676995043769184,
+        "turnover": 0.6560163981568683,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.0067408966548279745
+      },
+      "topk": {
+        "horizon": 60,
+        "k": 100,
+        "n_rebalances": 24,
+        "mean_names_held": 100.0,
+        "mean_names_scored": 99.95652173913044,
+        "grid_topk_mean_return": 0.012162457505541797,
+        "turnover": 0.7247826086956521,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_return": 0.007813761853367884
+      },
+      "gate_decile_cost_adjusted_spread": 0.006740896654827978,
+      "fit_seconds": 294.6
+    }
+  ]
+}

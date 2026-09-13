@@ -1,0 +1,113 @@
+{
+  "run": {
+    "stage": "E1",
+    "variant": "y_top-logit",
+    "horizon": 20,
+    "label": "y_top",
+    "model": "logit",
+    "feature_set": "FS0",
+    "flow_variant": "lag1",
+    "preprocess_profile": "rank",
+    "seed": 0,
+    "grid": "LOGIT_GRID",
+    "calibrate": "none",
+    "cal_target": null,
+    "monotonic": false,
+    "optional": false,
+    "inherits": [
+      "E0"
+    ]
+  },
+  "spec": {
+    "model_id": "02_updown_prob",
+    "horizons": [
+      20,
+      5,
+      60,
+      120
+    ],
+    "feature_set": "FS0",
+    "flow_variant": "lag1",
+    "preprocess_profile": "rank",
+    "period_start": "2015-01-02",
+    "period_end": "2025-07-31",
+    "n_folds": 5,
+    "seed": 0,
+    "topk": 100,
+    "cost_bps_roundtrip": 60.0,
+    "tau": 0.6,
+    "label": {
+      "horizons": [
+        20,
+        5,
+        60,
+        120
+      ],
+      "kind": "excess",
+      "bench": "eqw_market",
+      "outputs": [
+        "rank",
+        "up",
+        "top"
+      ]
+    }
+  },
+  "train_config": {
+    "model": "logit",
+    "target": "y_top",
+    "horizon": 20,
+    "grid": [
+      {
+        "C": 0.1
+      },
+      {
+        "C": 1.0
+      },
+      {
+        "C": 10.0
+      }
+    ],
+    "seed": 0,
+    "calibrate": "none",
+    "cal_target": null,
+    "cal_frac": 0.2,
+    "monotonic": false,
+    "date_col": "trade_date",
+    "id_cols": [
+      "ticker",
+      "market"
+    ]
+  },
+  "snapshot": {
+    "snapshot_date": "2026-08-23",
+    "source": "sj2_remote"
+  },
+  "git_sha": "f836659",
+  "code_hash": "e894728f25368deb",
+  "mart_contracts": {
+    "dim_universe_daily": {
+      "analysis_config_hash": "889c3e8377c2f400907611f7402651eee6a23c2765c051e4eb2a4a59ca36cbea",
+      "schema_hash": "562dab0567582a060fb5d27035cb27235eee693f07495293581e87df70583e71",
+      "sql_hash": "cb5b7612f00bc1d520cef818815324fb6cfc643737d20eea2a8eceadc689b279"
+    },
+    "feat_fin_pit": {
+      "analysis_config_hash": "ab0de63411c40ca3b59c1c7e6f8653a8e16d980108bee42f5f8cea8e7fcb6588",
+      "schema_hash": "5151c9dd7fc2c55ab36b63a9288ad8a4a337c1c42e01f3f487a676078360de57",
+      "sql_hash": "e729a9e537ca78b5f00c2059dc12af5a627cbdea3ba943c193e8f8da631f023b"
+    },
+    "feat_flow": {
+      "analysis_config_hash": "236d0d3515043e44e280f0c2c2707ca2cc486aa44b638eb893a7095ddac1110f",
+      "schema_hash": "8932a936dc5d519e848775d7cda45c9f7e3ec4deccaf1a74377756ea36099707",
+      "sql_hash": "1bb97c537cd0656bf49df38e52c9a444bf7484aad68fc1ec6999f0e6b43aad4b"
+    },
+    "feat_price": {
+      "analysis_config_hash": "236d0d3515043e44e280f0c2c2707ca2cc486aa44b638eb893a7095ddac1110f",
+      "schema_hash": "bc1e0c52949bf95ae3ffd364c2d0031e5ac6654ef924549bf99eec4d6a0d38ad",
+      "sql_hash": "110617482d64a50d4ef92ad70defcc23b5b276e2a025452f92a845ccbacec228"
+    }
+  },
+  "dataset_manifest": "/Users/whishaw/wss_p/stock_data_collector/data/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/FS0_h20_lag1_rank/dataset_manifest.json",
+  "grid_name": "LOGIT_GRID",
+  "grid_size": 3,
+  "smoke": false
+}

@@ -151,7 +151,7 @@ HOLDOUT_MD = DOCS_DIR / "grade_a_acceptance_gate_holdout.md"
 
 def _git_commit() -> str:
     try:
-        repo_root = Path(__file__).resolve().parents[4]
+        repo_root = Path(__file__).resolve().parents[5]
         return subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True, cwd=repo_root
         ).strip()

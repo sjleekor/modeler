@@ -1,0 +1,76 @@
+{
+  "stage": "E0",
+  "rule": "`05` \u00a72 E0",
+  "by_horizon": {
+    "5": {
+      "run_id": "E0_h5_MA-rank_seed0",
+      "label": "y_rank",
+      "model": "hgb_reg",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_REG_GRID",
+      "probability_value": 0.6793744219955298,
+      "economic_value": -0.0007633302470720637,
+      "ece": 0.015256408212850061,
+      "rank_ic_rank_profile": 0.11148720872317022,
+      "rank_ic_tree_profile": 0.11422303387188612,
+      "reason": "rank profile Rank IC 0.1115 vs tree 0.1142; tolerance 0.005"
+    },
+    "20": {
+      "run_id": "E0_h20_MA-rank_seed0",
+      "label": "y_rank",
+      "model": "hgb_reg",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_REG_GRID",
+      "probability_value": 0.6704488850128547,
+      "economic_value": 0.006653590051878845,
+      "ece": 0.019428455245011935,
+      "rank_ic_rank_profile": 0.14961226965983204,
+      "rank_ic_tree_profile": 0.15150120622423552,
+      "reason": "rank profile Rank IC 0.1496 vs tree 0.1515; tolerance 0.005"
+    },
+    "60": {
+      "run_id": "E0_h60_MA-rank_seed0",
+      "label": "y_rank",
+      "model": "hgb_reg",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_REG_GRID",
+      "probability_value": 0.6627341165533387,
+      "economic_value": 0.015234183936460232,
+      "ece": 0.027045524448072972,
+      "rank_ic_rank_profile": 0.18015431099628187,
+      "rank_ic_tree_profile": 0.17663111209149335,
+      "reason": "rank profile Rank IC 0.1802 vs tree 0.1766; tolerance 0.005"
+    },
+    "120": {
+      "run_id": "E0_h120_MA-rank_seed0",
+      "label": "y_rank",
+      "model": "hgb_reg",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_REG_GRID",
+      "probability_value": 0.6559472887703003,
+      "economic_value": 0.1870291016316434,
+      "ece": 0.030266919107878244,
+      "rank_ic_rank_profile": 0.1870291016316434,
+      "rank_ic_tree_profile": 0.1791960786225756,
+      "reason": "rank profile Rank IC 0.1870 vs tree 0.1792; tolerance 0.005"
+    }
+  },
+  "notes": [
+    "h5: rank",
+    "h20: rank",
+    "h60: rank",
+    "h120: rank"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "pred_col": "p_cal",
+  "n_folds": 5,
+  "ece": 0.03231006804890087,
+  "ece_ceiling": 0.03,
+  "log_loss": 0.6600322328238558,
+  "ece_fold_max": 0.05088214722221718,
+  "clears_ceiling": false,
+  "rule": "`03` \u00a73.3: over the ceiling after isotonic -> drop from the candidates",
+  "run_id": "E2_h120_recal-isotonic_seed0",
+  "adopted_config": {
+    "run_id": "E1_h120_y_up-logit_seed0",
+    "ece": 0.03212738786967666
+  },
+  "this_run_p_raw_ece": 0.05872129740681929
+}

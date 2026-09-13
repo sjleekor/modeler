@@ -96,7 +96,7 @@ from modeler.etl.lake import connect
 from modeler.etl.mart import mart_root, register_mart_view
 from modeler.etl.snapshot import resolve_config
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 # --- registry / config plumbing ---

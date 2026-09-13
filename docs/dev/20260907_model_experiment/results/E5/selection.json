@@ -1,0 +1,137 @@
+{
+  "stage": "E5",
+  "rule": "`05` \u00a72 E5",
+  "by_horizon": {
+    "5": {
+      "run_id": "E1_h5_y_up-hgb_clf_seed0",
+      "label": "y_up",
+      "model": "hgb_clf",
+      "feature_set": "FS0",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_CLF_GRID",
+      "probability_value": 0.6782879258957518,
+      "economic_value": 0.00016383566933687795,
+      "ece": 0.013583671844114914,
+      "seed_std_probability": 2.5715467288753213e-06,
+      "seed_std_economic": 0.00010947017543585617,
+      "n_seeds": 3,
+      "seed_probability_values": [
+        0.6782879258957518,
+        0.6782892496182796,
+        0.6782842837615768
+      ],
+      "seed_economic_values": [
+        0.00016383566933687795,
+        0.00038192223992917064,
+        0.00028960748491338917
+      ],
+      "replaced_by": null,
+      "variants": {
+        "E4b-monotonic": {
+          "probability_value": 0.6782729591709181,
+          "economic_value": 0.00020667533147471052
+        }
+      },
+      "compared_against": {
+        "probability_value": 0.6782871530918694,
+        "economic_value": 0.0002784551313931459,
+        "basis": "three-seed mean of the adopted config"
+      },
+      "fs3_adopted": false,
+      "fs3_probability_value": 0.6783352509352326,
+      "fs3_economic_value": 0.0006337299410140344,
+      "reason": "FS3 recorded only: did not clear the seed spread on both primaries"
+    },
+    "20": {
+      "run_id": "E2_h20_FS1h_seed0",
+      "label": "y_up",
+      "model": "hgb_clf",
+      "feature_set": "FS1h",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "HGB_CLF_GRID",
+      "probability_value": 0.6687193817318664,
+      "economic_value": 0.012182947113855595,
+      "ece": 0.012691079863050948,
+      "seed_std_probability": 2.8376126994413463e-05,
+      "seed_std_economic": 0.0019390658487262887,
+      "n_seeds": 3,
+      "seed_probability_values": [
+        0.6687193817318664,
+        0.6687494963476953,
+        0.6687760977265667
+      ],
+      "seed_economic_values": [
+        0.012182947113855595,
+        0.011803771300163057,
+        0.008650890303066799
+      ],
+      "replaced_by": null,
+      "variants": {
+        "E4b-monotonic": {
+          "probability_value": 0.6688699853445883,
+          "economic_value": 0.01251552003299336
+        }
+      },
+      "compared_against": {
+        "probability_value": 0.6687483252687095,
+        "economic_value": 0.010879202905695148,
+        "basis": "three-seed mean of the adopted config"
+      },
+      "fs3_adopted": false,
+      "fs3_probability_value": 0.6688782930767001,
+      "fs3_economic_value": 0.009682097195255418,
+      "reason": "FS3 recorded only: did not clear the seed spread on both primaries"
+    },
+    "60": {
+      "run_id": "E5_h60_FS3_seed0",
+      "label": "y_up",
+      "model": "logit",
+      "feature_set": "FS0_FS3",
+      "preprocess_profile": "rank",
+      "flow_variant": "lag1",
+      "seed": 0,
+      "grid": "LOGIT_GRID",
+      "probability_value": 0.6617090640549719,
+      "economic_value": 0.0226788696395407,
+      "ece": 0.02111905406252554,
+      "seed_std_probability": 0.0,
+      "seed_std_economic": 0.0,
+      "n_seeds": 3,
+      "seed_probability_values": [
+        0.6619541168105673,
+        0.6619541168105673,
+        0.6619541168105673
+      ],
+      "seed_economic_values": [
+        0.02156725542811126,
+        0.02156725542811126,
+        0.02156725542811126
+      ],
+      "replaced_by": null,
+      "variants": {
+        "E4b-monotonic": {
+          "probability_value": 0.6621824534160407,
+          "economic_value": 0.021896236730491077
+        }
+      },
+      "compared_against": {
+        "probability_value": 0.6619541168105673,
+        "economic_value": 0.02156725542811126,
+        "basis": "three-seed mean of the adopted config"
+      },
+      "fs3_adopted": true,
+      "fs3_probability_value": 0.6617090640549719,
+      "fs3_economic_value": 0.0226788696395407,
+      "reason": "FS3 adopted: both primaries beyond the seed spread"
+    }
+  },
+  "notes": [
+    "h5: FS3 recorded",
+    "h20: FS3 recorded",
+    "h60: FS3 adopted"
+  ]
+}

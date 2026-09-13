@@ -1,0 +1,166 @@
+{
+  "records": [
+    {
+      "name": "baseline",
+      "horizon": 5,
+      "n_raw_features": 40,
+      "n_design_features": 80,
+      "best_params": {
+        "max_iter": 100,
+        "learning_rate": 0.1
+      },
+      "mean_rank_ic": 0.11545323110092269,
+      "per_fold_rank_ic": [
+        0.11056543250935544,
+        0.12522085758568202,
+        0.11786062388690544,
+        0.12452714332570845,
+        0.09909209819696208
+      ],
+      "economic": {
+        "horizon": 5,
+        "n_rebalances": 280,
+        "grid_top_decile_spread": 0.00399270399893628,
+        "turnover": 0.6956709356490521,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": -0.0001813216149580332
+      },
+      "train_seconds": 1252.3
+    },
+    {
+      "name": "baseline",
+      "horizon": 20,
+      "n_raw_features": 40,
+      "n_design_features": 80,
+      "best_params": {
+        "max_iter": 100,
+        "learning_rate": 0.1
+      },
+      "mean_rank_ic": 0.14361716245686146,
+      "per_fold_rank_ic": [
+        0.1263632549847266,
+        0.18638810340623202,
+        0.14318749727262667,
+        0.157351759648954,
+        0.10479519697176812
+      ],
+      "economic": {
+        "horizon": 20,
+        "n_rebalances": 70,
+        "grid_top_decile_spread": 0.01616080642369634,
+        "turnover": 0.597381577086539,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.012576516961177108
+      },
+      "train_seconds": 1139.8
+    },
+    {
+      "name": "baseline",
+      "horizon": 60,
+      "n_raw_features": 40,
+      "n_design_features": 80,
+      "best_params": {
+        "max_iter": 200,
+        "learning_rate": 0.01
+      },
+      "mean_rank_ic": 0.17527922158737294,
+      "per_fold_rank_ic": [
+        0.1792420851415361,
+        0.22897187724896034,
+        0.16754562217301508,
+        0.18613397609812482,
+        0.11450254727522831
+      ],
+      "economic": {
+        "horizon": 60,
+        "n_rebalances": 24,
+        "grid_top_decile_spread": 0.024180043119629385,
+        "turnover": 0.6379103058714939,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.02035258128440042
+      },
+      "train_seconds": 1149.9
+    },
+    {
+      "name": "candidate",
+      "horizon": 5,
+      "n_raw_features": 45,
+      "n_design_features": 90,
+      "best_params": {
+        "max_iter": 100,
+        "learning_rate": 0.1
+      },
+      "mean_rank_ic": 0.1202324320819695,
+      "per_fold_rank_ic": [
+        0.11874750367076763,
+        0.1280295406336122,
+        0.12169246159149227,
+        0.1267289023015128,
+        0.10596375221246261
+      ],
+      "economic": {
+        "horizon": 5,
+        "n_rebalances": 280,
+        "grid_top_decile_spread": 0.004836213640083596,
+        "turnover": 0.6817317290165429,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.0007458232659843383
+      },
+      "train_seconds": 1274.4
+    },
+    {
+      "name": "candidate",
+      "horizon": 20,
+      "n_raw_features": 45,
+      "n_design_features": 90,
+      "best_params": {
+        "max_iter": 200,
+        "learning_rate": 0.01
+      },
+      "mean_rank_ic": 0.1520589425186206,
+      "per_fold_rank_ic": [
+        0.152870278287298,
+        0.19556772871823916,
+        0.14597006789737127,
+        0.15184579000939616,
+        0.11404084768079836
+      ],
+      "economic": {
+        "horizon": 20,
+        "n_rebalances": 70,
+        "grid_top_decile_spread": 0.013513635843993399,
+        "turnover": 0.5712970415376788,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.010085853594767326
+      },
+      "train_seconds": 1249.2
+    },
+    {
+      "name": "candidate",
+      "horizon": 60,
+      "n_raw_features": 45,
+      "n_design_features": 90,
+      "best_params": {
+        "max_iter": 200,
+        "learning_rate": 0.01
+      },
+      "mean_rank_ic": 0.1839709160762982,
+      "per_fold_rank_ic": [
+        0.1944861044007867,
+        0.23359360847728974,
+        0.16991709070437755,
+        0.189481541986854,
+        0.13237623481218308
+      ],
+      "economic": {
+        "horizon": 60,
+        "n_rebalances": 24,
+        "grid_top_decile_spread": 0.02467110689762202,
+        "turnover": 0.6562597446344888,
+        "cost_bps_roundtrip": 60.0,
+        "cost_adjusted_spread": 0.020733548429815087
+      },
+      "train_seconds": 1238.8
+    }
+  ]
+}

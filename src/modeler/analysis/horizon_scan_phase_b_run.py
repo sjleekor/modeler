@@ -221,7 +221,7 @@ from modeler.etl.phase_b_quality import (
 )
 from modeler.etl.snapshot import resolve_config
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 logger = logging.getLogger(__name__)
 
