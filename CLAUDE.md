@@ -9,14 +9,16 @@
 
 ## 현재 상태
 
-**뼈대만 있다 (2026-09-12).** Python 3.12 + `uv` 환경이 서 있고 테스트가 통과한다.
-모델링 로직은 아직 없다.
+**한국 시장 모델링 코드가 들어와 있다 (2026-09-14, KR 분리 완료).** 버전 `0.14.0`.
 
 ```
 src/modeler/
-├── features/   피쳐 생성 — 미래를 보지 않는 변환만 넣는다
-└── models/     학습·검증
+├── etl/        LakeConfig·DataRoot — stock_data/kr 조립, mart 적재
+├── analysis/   호라이즌 스캔·상관 리포트 등 조사 코드
+└── models/     피쳐 생성·학습·검증 (예: `_01_20_access_return_rank`가 prod 배포 모델)
 ```
+
+미국 시장은 아직 이 구조가 없다 — 모델링 로직이 붙으면 같은 자리(`features/`·`models/`)에 넣는다.
 
 ```bash
 uv sync --extra dev                    # 기본 (pandas·numpy·pyarrow·duckdb·polars·sklearn)
@@ -32,8 +34,13 @@ uv run black src/ tests/
 
 설정은 [`../CLAUDE.md`](../CLAUDE.md)의 공통 툴체인을 따른다.
 
-한국 시장 모델링 코드는 `stock_data_collector/research/`에 있고 이쪽으로 옮길 예정이다 —
-[분리 계획](../my/milestones/kr/refactoring/20260912_project_split/00_candidate_plan/README.md).
+한국 시장 모델링 코드는 옛 `stock_data_collector/research/`에서 여기로 옮겨왔다.
+분리 경과는 [`../my/milestones/kr/refactoring/20260912_project_split/02_result.md`](../my/milestones/kr/refactoring/20260912_project_split/02_result.md)에 있다.
+
+설계·계획 문서 대부분은 [`../my/milestones/kr/modeling/`](../my/milestones/kr/modeling/)에 있다.
+다만 코드가 실행 시점에 읽고 쓰는 baseline·실험 산출물(`docs/target/`,
+`docs/dev/20260907_model_experiment/`, `docs/dev/20260907_additional_feature/`)은
+golden 테스트 픽스처와 같은 이유로 이 저장소 안에 그대로 둔다 — `my/`로 옮기지 않는다.
 
 ---
 
