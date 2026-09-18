@@ -55,6 +55,11 @@ select = ["E", "F", "I", "W", "UP", "TID"]   # TID 가 없으면 아래 banned-a
 "collector.kr.infra".msg    = "modeler는 DB도 설정도 읽지 않는다"
 "collector.kr.service".msg  = "수집 오케스트레이션을 부르지 않는다"
 "collector.kr.cli".msg      = "CLI를 부르지 않는다"
+# 미국도 같은 경계다. 한쪽에만 lint가 걸려 있으면 그쪽만 지켜진다.
+"collector.us.sources".msg  = "원천 접근은 collector/의 일이다"
+"collector.us.store".msg    = "스냅샷 쓰기는 수집의 일이다. modeler는 읽기만 한다"
+"collector.us.cli".msg      = "CLI를 부르지 않는다"
+"collector.us.paths".msg    = "경로는 modeler 자신의 DataRoot로 조립한다"
 
 [tool.black]
 target-version = ["py312"]
