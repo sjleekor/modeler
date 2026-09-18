@@ -7,23 +7,28 @@ import polars as pl
 import pytest
 
 from modeler.etl.metrics import (
+    CostModel,
     benjamini_hochberg,
     choose_nw_lag,
     daily_market_weighted_ic,
     daily_market_weighted_spread,
     decile_membership,
+    drawdown_stats,
     economic_report,
     exact_binomial_sign_test_p,
+    krx_tick_size,
     market_weight_means,
     n_hac_pairs,
     newey_west_tstat,
     newey_west_tstat_legacy,
     per_date_market_quantile_spread,
     per_date_market_rank_ic,
+    per_name_cost_bps,
     portfolio_turnover,
     raw_vs_rank_quantile_spread,
     rebalance_grid,
     topk_economic_report,
+    topk_hysteresis_report,
     topk_membership,
     topk_rebalance_series,
     two_sided_normal_p,
@@ -562,3 +567,145 @@ def test_topk_rejects_a_non_positive_k() -> None:
     df = _topk_frame({1: {"A": 1.0}})
     with pytest.raises(ValueError, match="k must be >= 1"):
         topk_membership(df, pred_col="pred", k=0)
+
+
+# --- R3: drawdown of the rebalance path -------------------------------------
+
+
+def test_drawdown_measures_the_fall_and_how_long_it_lasted() -> None:
+    # +10%, -20%, -10%, +5%, +30%: the peak is step 1's 1.10 and the path never
+    # gets back to it — 1.10*0.8*0.9*1.05*1.30 = 1.081. So every later step is
+    # underwater, which is the case a "how deep" number alone would hide.
+    stats = drawdown_stats([0.10, -0.20, -0.10, 0.05, 0.30])
+    assert stats.max_drawdown == pytest.approx(0.792 / 1.10 - 1)  # trough at step 3
+    assert stats.longest_underwater == 4
+
+
+def test_drawdown_skips_a_rebalance_with_no_return() -> None:
+    # A held-but-unscored rebalance is missing, not a flat step: reading it as
+    # zero would end the drawdown clock early.
+    assert drawdown_stats([0.10, None, -0.20]) == drawdown_stats([0.10, -0.20])
+
+
+def test_drawdown_of_a_path_that_only_rises_is_zero() -> None:
+    stats = drawdown_stats([0.01, 0.02, 0.03])
+    assert stats.max_drawdown == 0.0
+    assert stats.longest_underwater == 0
+
+
+# --- T1-2: per-name round-trip cost -----------------------------------------
+
+
+def test_krx_tick_size_follows_the_price_bands() -> None:
+    # each band is [low, high): 1,000 is the first price that pays the 5 tick.
+    close = np.array([999.0, 1_000.0, 4_999.0, 5_000.0, 49_999.0, 100_000.0, 600_000.0])
+    assert krx_tick_size(close).tolist() == [1, 5, 5, 10, 50, 500, 1_000]
+
+
+def test_per_name_cost_is_higher_for_the_thinner_name() -> None:
+    # Same price and sigma; B trades a tenth of A's value, so the same order is
+    # ten times the participation and sqrt(10) times the impact.
+    df = pl.DataFrame(
+        {
+            "px_turnover_ma20": [1e10, 1e9],
+            "px_vol_20d": [0.02, 0.02],
+            "close": [10_000.0, 10_000.0],
+        }
+    )
+    cost = per_name_cost_bps(df, model=CostModel(capital_krw=1e9, k_names=100))
+    a, b = cost.to_list()
+    # linear part: 1 tick at close 10,000 is 50 (the 10,000-50,000 band), so
+    # 50/10,000 = 50bp of spread, + 2*1.5bp fee + 15bp tax.
+    linear = 50.0 + 3.0 + 15.0
+    assert a - linear == pytest.approx(2 * 1.0 * 0.02 * math.sqrt(1e7 / 1e10) * 10_000)
+    assert (b - linear) / (a - linear) == pytest.approx(math.sqrt(10.0))
+
+
+def test_per_name_cost_is_null_where_it_cannot_be_known() -> None:
+    df = pl.DataFrame(
+        {
+            "px_turnover_ma20": [0.0, None, 1e9],
+            "px_vol_20d": [0.02, 0.02, None],
+            "close": [10_000.0, 10_000.0, 10_000.0],
+        }
+    )
+    got = per_name_cost_bps(df, model=CostModel(capital_krw=1e9)).to_list()
+    assert all(v is None or math.isnan(v) for v in got)
+
+
+def test_cost_model_replaces_the_flat_number_in_the_report() -> None:
+    df = _topk_frame(
+        {1: {"A": 4.0, "B": 3.0, "C": 2.0}, 2: {"A": 4.0, "B": 3.0, "C": 2.0}},
+        {1: {"A": 0.10, "B": 0.06}, 2: {"A": 0.04, "B": 0.02}},
+    ).with_columns(
+        pl.lit(1e10).alias("px_turnover_ma20"),
+        pl.lit(0.02).alias("px_vol_20d"),
+        pl.lit(10_000.0).alias("close"),
+    )
+    kwargs = dict(pred_col="pred", realized_col="realized", horizon=1, k=2)
+    flat = topk_economic_report(df, **kwargs, cost_bps_roundtrip=60.0)
+    modelled = topk_economic_report(df, **kwargs, cost_model=CostModel(capital_krw=1e9))
+
+    assert flat.cost_bps_roundtrip == 60.0
+    assert modelled.cost_bps_roundtrip != 60.0
+    # same list, same returns — only the cost moved
+    assert modelled.grid_topk_mean_return == pytest.approx(flat.grid_topk_mean_return)
+    assert modelled.turnover == pytest.approx(flat.turnover)
+
+
+# --- T1-6: hysteresis --------------------------------------------------------
+
+
+def test_hysteresis_with_no_band_is_the_plain_topk_rule() -> None:
+    """k_out == k_in must reproduce topk_economic_report exactly."""
+    df = _topk_frame(
+        {
+            1: {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0},
+            2: {"A": 1.0, "B": 2.0, "C": 3.0, "D": 4.0},
+            3: {"A": 4.0, "B": 1.0, "C": 3.0, "D": 2.0},
+            4: {"A": 1.0, "B": 2.0, "C": 3.0, "D": 4.0},
+        },
+        {1: {"A": 0.10, "B": 0.06}, 3: {"A": 0.04, "C": 0.02}},
+    )
+    kwargs = dict(pred_col="pred", realized_col="realized", horizon=2, cost_bps_roundtrip=100.0)
+    plain = topk_economic_report(df, k=2, **kwargs)
+    band = topk_hysteresis_report(df, k_in=2, k_out=2, **kwargs)
+
+    assert band.turnover == pytest.approx(plain.turnover)
+    assert band.grid_topk_mean_return == pytest.approx(plain.grid_topk_mean_return)
+    assert band.cost_adjusted_return == pytest.approx(plain.cost_adjusted_return)
+    assert band.n_rebalances == plain.n_rebalances
+
+
+def test_hysteresis_holds_a_name_that_slipped_inside_the_band() -> None:
+    # B is 2nd on date 1 and 3rd on date 3. The tight rule sells B and buys C;
+    # the band buys C and *keeps* B, so the book widens to 3 instead of swapping
+    # a name. Holding above k_in is the documented behaviour — the band trades
+    # less, it does not trade nothing.
+    df = _topk_frame(
+        {
+            1: {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0},
+            2: {"A": 1.0, "B": 2.0, "C": 3.0, "D": 4.0},  # off the grid
+            3: {"A": 4.0, "C": 3.5, "B": 3.0, "D": 1.0},
+            4: {"A": 1.0, "B": 2.0, "C": 3.0, "D": 4.0},  # off the grid
+        },
+        {1: {"A": 0.10, "B": 0.06}, 3: {"A": 0.04, "B": 0.02}},
+    )
+    kwargs = dict(pred_col="pred", realized_col="realized", horizon=2, cost_bps_roundtrip=100.0)
+    tight = topk_hysteresis_report(df, k_in=2, k_out=2, **kwargs)
+    band = topk_hysteresis_report(df, k_in=2, k_out=3, **kwargs)
+
+    assert tight.turnover == pytest.approx(0.5)  # B out, C in
+    assert band.turnover == pytest.approx(1 / 3)  # C in, nothing sold
+    assert band.mean_names_held > tight.mean_names_held
+    # same names earn the same gross here, so the whole gap is the churn
+    assert band.grid_topk_mean_return == pytest.approx(tight.grid_topk_mean_return)
+    assert band.cost_adjusted_return > tight.cost_adjusted_return
+
+
+def test_hysteresis_rejects_a_band_that_is_not_one() -> None:
+    df = _topk_frame({1: {"A": 2.0, "B": 1.0}})
+    with pytest.raises(ValueError):
+        topk_hysteresis_report(
+            df, pred_col="pred", realized_col="realized", horizon=1, k_in=100, k_out=50
+        )

@@ -27,6 +27,7 @@ See ``etl_00`` §6, ``00_shared`` §3.3, and ``etl_03_implementation_plan.md`` �
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -886,6 +887,10 @@ class TopKEconomicReport:
     turnover: float
     cost_bps_roundtrip: float
     cost_adjusted_return: float
+    # R3. Measured on the net rebalance path (``topk_rebalance_series``), not on
+    # daily marks: the portfolio only exists on the rebalance grid.
+    max_drawdown: float = float("nan")
+    longest_drawdown_rebalances: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -898,6 +903,8 @@ class TopKEconomicReport:
             "turnover": self.turnover,
             "cost_bps_roundtrip": self.cost_bps_roundtrip,
             "cost_adjusted_return": self.cost_adjusted_return,
+            "max_drawdown": self.max_drawdown,
+            "longest_drawdown_rebalances": self.longest_drawdown_rebalances,
         }
 
 
@@ -949,11 +956,20 @@ def topk_economic_report(
     date_col: str = "trade_date",
     ticker_col: str = "ticker",
     cost_bps_roundtrip: float = 60.0,
+    cost_model: CostModel | None = None,
+    cost_columns: tuple[str, str, str] = ("px_turnover_ma20", "px_vol_20d", "close"),
 ) -> TopKEconomicReport:
     """Top-k mean realized return on the rebalance grid, net of turnover cost.
 
     ``cost_bps_roundtrip`` is the same business assumption ``economic_report``
     documents — not derived from data.
+
+    Pass a :class:`CostModel` to replace that one number with a per-name
+    square-root impact cost (T1-2); ``df`` must then carry ``cost_columns``
+    (ADV, daily sigma, close). The reported ``cost_bps_roundtrip`` becomes the
+    mean cost of the names actually bought, so a reader comparing runs is
+    comparing the same field either way. Left as ``None`` — the default —
+    nothing about this function changes.
     """
     grid = rebalance_grid(df[date_col].to_list(), horizon)
     picked = _topk_ranked(df, pred_col=pred_col, k=k, date_col=date_col, ticker_col=ticker_col)
@@ -978,8 +994,33 @@ def topk_economic_report(
     held_counts = [len(membership[d]) for d in grid if d in membership]
 
     grid_return = float(np.mean(returns)) if returns else float("nan")
-    cost = 0.0 if turnover != turnover else turnover * cost_bps_roundtrip / 10_000.0
+    effective_bps = cost_bps_roundtrip
+    if cost_model is not None:
+        adv_col, vol_col, close_col = cost_columns
+        bought = picked.filter(pl.col(date_col).is_in(grid)).join(
+            df.select([date_col, ticker_col, adv_col, vol_col, close_col]),
+            on=[date_col, ticker_col],
+            how="inner",
+        )
+        per_name = per_name_cost_bps(
+            bought, model=cost_model, adv_col=adv_col, vol_col=vol_col, close_col=close_col
+        ).drop_nulls().drop_nans()
+        effective_bps = float(per_name.mean()) if per_name.len() else float("nan")
+    cost = 0.0 if turnover != turnover else turnover * effective_bps / 10_000.0
     net = grid_return - cost if grid_return == grid_return else float("nan")
+
+    series = topk_rebalance_series(
+        df,
+        pred_col=pred_col,
+        realized_col=realized_col,
+        horizon=horizon,
+        k=k,
+        date_col=date_col,
+        ticker_col=ticker_col,
+        cost_bps_roundtrip=effective_bps,
+    )
+    path = series["net_return"].to_list() if series.height else []
+    drawdown = drawdown_stats(path)
 
     return TopKEconomicReport(
         horizon=horizon,
@@ -989,9 +1030,139 @@ def topk_economic_report(
         mean_names_scored=float(np.mean(scored_counts)) if scored_counts else float("nan"),
         grid_topk_mean_return=grid_return,
         turnover=turnover,
-        cost_bps_roundtrip=cost_bps_roundtrip,
+        cost_bps_roundtrip=effective_bps,
         cost_adjusted_return=net,
+        max_drawdown=drawdown.max_drawdown,
+        longest_drawdown_rebalances=drawdown.longest_underwater,
     )
+
+
+@dataclass(frozen=True)
+class DrawdownStats:
+    """Drawdown of a rebalance-by-rebalance return path (R3).
+
+    ``max_drawdown`` is the worst peak-to-trough fall of the compounded equity,
+    as a negative fraction (0.0 if the path never falls below its peak).
+    ``longest_underwater`` counts the rebalances between a peak and the return
+    to it — a shallow drawdown that lasts three years is a different problem
+    from a deep one that recovers in two rebalances, and the size alone does not
+    say which happened.
+    """
+
+    max_drawdown: float
+    longest_underwater: int
+
+
+def drawdown_stats(returns: Sequence[float | None]) -> DrawdownStats:
+    """Compound ``returns`` and measure the worst fall and the longest wait.
+
+    ``None``/NaN entries are skipped, not read as zero: a rebalance whose label
+    has not closed yet is missing, and pretending it earned nothing would put a
+    flat step into the path.
+    """
+    equity, peak, worst = 1.0, 1.0, 0.0
+    underwater = longest = 0
+    for r in returns:
+        if r is None or (isinstance(r, float) and math.isnan(r)):
+            continue
+        equity *= 1.0 + r
+        if equity >= peak:
+            peak, underwater = equity, 0
+        else:
+            underwater += 1
+            longest = max(longest, underwater)
+            worst = min(worst, equity / peak - 1.0)
+    return DrawdownStats(max_drawdown=float(worst), longest_underwater=int(longest))
+
+
+# --- T1-2: what a round trip actually costs this name ------------------------
+
+# KRX tick sizes by price band (2023 revision): (price below, tick).
+KRX_TICK_BANDS: tuple[tuple[float, float], ...] = (
+    (1_000, 1),
+    (5_000, 5),
+    (10_000, 10),
+    (50_000, 50),
+    (100_000, 100),
+    (500_000, 500),
+    (float("inf"), 1_000),
+)
+
+
+def krx_tick_size(close: np.ndarray) -> np.ndarray:
+    """Tick size for each close, by KRX's price bands."""
+    out = np.full(close.shape, np.nan, dtype=float)
+    low = 0.0
+    for high, tick in KRX_TICK_BANDS:
+        band = (close >= low) & (close < high)
+        out[band] = tick
+        low = high
+    return out
+
+
+@dataclass(frozen=True)
+class CostModel:
+    """Square-root impact plus the linear costs, per name (T1-2).
+
+    The flat 60bp the rest of this module uses is one number for a universe
+    whose turnover spans three orders of magnitude, so it is too high for a
+    large name and too low for a small one. This is the practitioner standard
+    instead::
+
+        one-way impact = impact_k * sigma_daily * sqrt(Q / ADV)
+
+    with ``Q = capital_krw / k_names`` (the equal-weighted order per name), plus
+    the costs that do not depend on size: the sell-side transfer tax, the
+    commission on both legs, and one tick of spread across the round trip.
+
+    ``impact_k`` is a business assumption like the flat 60bp was — the practice
+    range is 0.5-1.5 and nothing here derives it from our data.
+    """
+
+    capital_krw: float
+    k_names: int = 100
+    impact_k: float = 1.0
+    tax_bps_sell: float = 15.0  # 농특세 포함, 매도 시만 (2025)
+    fee_bps_per_side: float = 1.5  # 온라인 증권사 0.015%
+
+    @property
+    def order_krw(self) -> float:
+        return self.capital_krw / self.k_names
+
+
+def per_name_cost_bps(
+    df: pl.DataFrame,
+    *,
+    model: CostModel,
+    adv_col: str = "px_turnover_ma20",
+    vol_col: str = "px_vol_20d",
+    close_col: str = "close",
+) -> pl.Series:
+    """Round-trip cost in bps for each row, or null where it cannot be known.
+
+    Null (never a guess) when ADV, sigma or close is missing or non-positive: a
+    name with no measurable turnover is one this model has nothing to say about,
+    and filling in the universe mean would quietly make the thinnest names look
+    tradable — which is the very thing this is meant to measure.
+    """
+    adv = df.get_column(adv_col).cast(pl.Float64).to_numpy()
+    vol = df.get_column(vol_col).cast(pl.Float64).to_numpy()
+    close = df.get_column(close_col).cast(pl.Float64).to_numpy()
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        participation = np.where(adv > 0, model.order_krw / adv, np.nan)
+        impact_one_way = model.impact_k * vol * np.sqrt(participation)
+        spread = np.where(close > 0, krx_tick_size(close) / close, np.nan)
+
+    total = (
+        2.0 * impact_one_way * 10_000.0  # buy and sell
+        + spread * 10_000.0  # one tick across the round trip
+        + 2.0 * model.fee_bps_per_side
+        + model.tax_bps_sell
+    )
+    bad = ~np.isfinite(total) | ~np.isfinite(vol) | (vol < 0)
+    total = np.where(bad, np.nan, total)
+    return pl.Series("cost_bps_roundtrip", total, dtype=pl.Float64)
 
 
 def topk_rebalance_series(
@@ -1069,6 +1240,148 @@ def topk_rebalance_series(
             }
         )
     return pl.DataFrame(rows, infer_schema_length=None)
+
+
+@dataclass(frozen=True)
+class TopKHysteresisReport:
+    """Buy-and-hold band: buy at rank ``k_in``, sell only past ``k_out`` (T1-6).
+
+    ``topk_economic_report`` rebuilds the list from scratch every rebalance, so
+    a name that slips from 100th to 101st is sold and bought back later. Our
+    measured turnover is 0.65-0.81 per 20 sessions, and at h5 the break-even
+    cost is 62bp — the strategy pays for that churn before it earns anything.
+    A hysteresis band is Avramov-Cheng-Metzker (2023)'s prescription: the list
+    only changes when a name leaves the wider band.
+
+    ``k_out == k_in`` reproduces the plain top-k rule, so the two are directly
+    comparable on the same grid and the same cost.
+    """
+
+    horizon: int
+    k_in: int
+    k_out: int
+    n_rebalances: int
+    mean_names_held: float
+    mean_names_scored: float
+    grid_topk_mean_return: float
+    turnover: float
+    cost_bps_roundtrip: float
+    cost_adjusted_return: float
+    max_drawdown: float
+    longest_drawdown_rebalances: int
+
+    def as_dict(self) -> dict:
+        return {
+            "horizon": self.horizon,
+            "k_in": self.k_in,
+            "k_out": self.k_out,
+            "n_rebalances": self.n_rebalances,
+            "mean_names_held": self.mean_names_held,
+            "mean_names_scored": self.mean_names_scored,
+            "grid_topk_mean_return": self.grid_topk_mean_return,
+            "turnover": self.turnover,
+            "cost_bps_roundtrip": self.cost_bps_roundtrip,
+            "cost_adjusted_return": self.cost_adjusted_return,
+            "max_drawdown": self.max_drawdown,
+            "longest_drawdown_rebalances": self.longest_drawdown_rebalances,
+        }
+
+
+def topk_hysteresis_report(
+    df: pl.DataFrame,
+    *,
+    pred_col: str,
+    realized_col: str,
+    horizon: int,
+    k_in: int = 100,
+    k_out: int = 200,
+    date_col: str = "trade_date",
+    ticker_col: str = "ticker",
+    cost_bps_roundtrip: float = 60.0,
+) -> TopKHysteresisReport:
+    """Top-k economics under a buy/sell band, on the same grid and cost.
+
+    The rule each rebalance: keep what is held while it still ranks inside
+    ``k_out``, add everything inside ``k_in``. If that leaves fewer than ``k_in``
+    names — only near the end of the sample, where few names are scored — fill
+    from the top of the ranking. Holdings above ``k_in`` are left in place and
+    the book is equal-weighted across whatever it holds, which is what `02`'s
+    top-k does too.
+    """
+    if k_out < k_in:
+        raise ValueError(f"k_out must be >= k_in, got {k_out} < {k_in}")
+    grid = rebalance_grid(df[date_col].to_list(), horizon)
+
+    clean = df.select([date_col, ticker_col, pred_col]).drop_nulls()
+    clean = clean.filter(pl.col(pred_col).is_finite())
+    ranked = clean.with_columns(
+        pl.col(pred_col).rank("ordinal", descending=True).over(date_col).alias("_rank")
+    )
+    labels = df.select([date_col, ticker_col, realized_col]).drop_nulls()
+    labels = labels.filter(pl.col(realized_col).is_finite())
+
+    by_date = {d: grp for (d,), grp in ranked.group_by([date_col], maintain_order=True)}
+    label_by_date = {d: grp for (d,), grp in labels.group_by([date_col], maintain_order=True)}
+
+    held: set = set()
+    turnovers: list[float] = []
+    returns: list[float] = []
+    held_counts: list[int] = []
+    scored_counts: list[int] = []
+    path: list[float] = []
+    for d in grid:
+        day = by_date.get(d)
+        if day is None or day.height == 0:
+            continue
+        rank_of = dict(zip(day[ticker_col].to_list(), day["_rank"].to_list()))
+        keep = {t for t in held if rank_of.get(t, k_out + 1) <= k_out}
+        book = keep | {t for t, r in rank_of.items() if r <= k_in}
+        if len(book) < k_in:
+            for t, _r in sorted(rank_of.items(), key=lambda kv: kv[1]):
+                if len(book) >= k_in:
+                    break
+                book.add(t)
+
+        turnover = None
+        if held:
+            denom = max(len(held), len(book))
+            if denom:
+                turnover = 1.0 - len(held & book) / denom
+                turnovers.append(turnover)
+        held = book
+        held_counts.append(len(book))
+
+        day_labels = label_by_date.get(d)
+        gross = None
+        if day_labels is not None:
+            scored = day_labels.filter(pl.col(ticker_col).is_in(list(book)))
+            if scored.height:
+                gross = float(scored[realized_col].mean())
+                returns.append(gross)
+                scored_counts.append(scored.height)
+        cost = (turnover or 0.0) * cost_bps_roundtrip / 10_000.0
+        path.append(gross - cost if gross is not None else float("nan"))
+
+    turnover_mean = float(np.mean(turnovers)) if turnovers else float("nan")
+    grid_return = float(np.mean(returns)) if returns else float("nan")
+    cost = 0.0 if turnover_mean != turnover_mean else turnover_mean * cost_bps_roundtrip / 10_000.0
+    net = grid_return - cost if grid_return == grid_return else float("nan")
+    drawdown = drawdown_stats(path)
+
+    return TopKHysteresisReport(
+        horizon=horizon,
+        k_in=k_in,
+        k_out=k_out,
+        n_rebalances=len(held_counts),
+        mean_names_held=float(np.mean(held_counts)) if held_counts else float("nan"),
+        mean_names_scored=float(np.mean(scored_counts)) if scored_counts else float("nan"),
+        grid_topk_mean_return=grid_return,
+        turnover=turnover_mean,
+        cost_bps_roundtrip=cost_bps_roundtrip,
+        cost_adjusted_return=net,
+        max_drawdown=drawdown.max_drawdown,
+        longest_drawdown_rebalances=drawdown.longest_underwater,
+    )
 
 
 def evaluate(
