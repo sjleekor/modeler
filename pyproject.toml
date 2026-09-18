@@ -51,6 +51,8 @@ src = ["src"]
 select = ["E", "F", "I", "W", "UP", "TID"]   # TID 가 없으면 아래 banned-api 가 안 먹는다
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
+# collector.lake 는 여기 없다 — 두 저장소가 공유하는 경로 계약이라 modeler가
+# 쓰는 것이 맞다. collector.kr.shared / collector.us.shared 와 같은 자리다.
 "collector.kr.adapters".msg = "원천 접근은 collector/의 일이다"
 "collector.kr.infra".msg    = "modeler는 DB도 설정도 읽지 않는다"
 "collector.kr.service".msg  = "수집 오케스트레이션을 부르지 않는다"

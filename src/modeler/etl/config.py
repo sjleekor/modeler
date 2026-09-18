@@ -11,9 +11,14 @@ See:
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# DataRoot는 collector/에 산다. modeler가 collector를 경로 의존하므로
+# (반대로 두면 순환이고 prod 이미지에 모델링 의존성이 딸려 들어간다) 두
+# 저장소가 공유하는 경로 계약은 그쪽 최상위 모듈에 둔다. 여기서 재노출해
+# ``from modeler.etl.config import DataRoot`` 를 쓰는 39개 파일은 그대로 둔다.
+from collector.lake import DataRoot as DataRoot
 
 # --- repository / lake roots -------------------------------------------------
 
@@ -34,39 +39,6 @@ DERIVED_FEATURE_LAKE_NAME = "feature"
 # raw export, docs/dev/20260730_refactor_dump/00_dual_route_raw_export_plan.md).
 DEFAULT_SOURCE = os.environ.get("SDC_LAKE_SOURCE", "local_mydb")
 REMOTE_SOURCE = "sj2_remote"
-
-
-@dataclass(frozen=True)
-class DataRoot:
-    """stock_data/<market>/ 하나. 계층 조립은 여기서만 한다."""
-
-    base: Path
-
-    @classmethod
-    def resolve(cls, market: str = "kr", *, env: Mapping[str, str] | None = None) -> DataRoot:
-        env = os.environ if env is None else env
-        root = env.get("STOCK_DATA_ROOT")
-        if not root:
-            raise RuntimeError(
-                "STOCK_DATA_ROOT가 없습니다. .envrc를 확인하십시오 (direnv allow)."
-            )
-        return cls(Path(root) / market)
-
-    @property
-    def raw(self) -> Path:
-        return self.base / "raw"
-
-    @property
-    def derived(self) -> Path:
-        return self.base / "derived"
-
-    @property
-    def datasets(self) -> Path:
-        return self.base / "datasets"
-
-    @property
-    def output(self) -> Path:
-        return self.base / "output"
 
 
 # --- table -> lake-root mapping (etl_01 §2) ---------------------------------
