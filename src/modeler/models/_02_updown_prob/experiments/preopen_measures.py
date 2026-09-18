@@ -43,6 +43,7 @@ from modeler.etl.metrics import (
     _quantile_stats,
     _topk_ranked,
     classification_report,
+    neutralize_predictions,
     per_date_rank_ic,
     per_name_cost_bps,
     rebalance_grid,
@@ -77,6 +78,14 @@ TRADABLE_MART = "dim_universe_tradable_daily"
 MCAP_MART = "feat_market_cap"
 INDEX_SERIES = {"market_kospi_krx": "KOSPI", "market_kosdaq_krx": "KOSDAQ"}
 
+# T1-1B. The first pair is what tier1 §1 registered; the second is the same
+# measurement with a size proxy that is not 11% missing, reported beside it so a
+# reader can see whether filling that 11% made the answer. The verdict is read
+# off the registered pair — the sensitivity is not an alternative to choose.
+NEUT_PREREG: tuple[str, ...] = ("fin_log_mcap", "px_amihud_20d")
+NEUT_SENSITIVITY: tuple[str, ...] = ("mcap_krx_log", "px_amihud_20d")
+NEUT_RATIOS: tuple[float, ...] = (0.5, 1.0)
+
 
 def _load_run(stage: str, run_id: str) -> tuple[dict, pl.DataFrame]:
     """A run's summary and its validation predictions, tagged with ``fold_id``."""
@@ -99,9 +108,12 @@ def _load_run(stage: str, run_id: str) -> tuple[dict, pl.DataFrame]:
 def _with_cost_inputs(summary: dict, predictions: pl.DataFrame) -> pl.DataFrame:
     """Join the three columns the cost model needs (ADV, sigma, close)."""
     dataset_dir = Path(summary["dataset_dir"])
-    panel = pl.scan_parquet(dataset_dir / "feat_panel.parquet").select(
-        ["trade_date", "ticker", "market", ADV_COL, VOL_COL]
-    )
+    have = pl.scan_parquet(dataset_dir / "feat_panel.parquet").head(0).collect().columns
+    wanted = ["trade_date", "ticker", "market", ADV_COL, VOL_COL]
+    # the neutralization exposures ride along when this feature set has them:
+    # h5's FS0 does not carry fin_log_mcap, and T1-1B is an h20 measurement.
+    wanted += [c for c in NEUT_PREREG if c in have and c not in wanted]
+    panel = pl.scan_parquet(dataset_dir / "feat_panel.parquet").select(wanted)
     manifest = json.loads((dataset_dir / "dataset_manifest.json").read_text())
     raw_root = manifest["lake"]["raw"]
     con = duckdb.connect()
@@ -343,7 +355,7 @@ def _with_universe_and_buckets(summary: dict, frame: pl.DataFrame) -> pl.DataFra
     )
     mcap = pl.from_arrow(
         con.execute(
-            "SELECT trade_date, ticker, market, mcap_krx, mcap_unreliable "
+            "SELECT trade_date, ticker, market, mcap_krx, mcap_krx_log, mcap_unreliable "
             f"FROM read_parquet('{_mart_glob(summary, MCAP_MART)}')"
         ).arrow()
     )
@@ -451,6 +463,61 @@ def _bucket_rows(frame: pl.DataFrame, summary: dict) -> list[dict]:
     return rows
 
 
+def _neutralization_rows(frame: pl.DataFrame, summary: dict) -> list[dict]:
+    """T1-1B — how much of the score we already have is size and liquidity.
+
+    Nothing is refit. The adopted probabilities are regressed on the exposures
+    inside each ``(date, market)`` and the residual is scored with the same
+    metrics, so the gap is the part of the alpha that size explains.
+    """
+    pred_col = summary["primary_pred_col"]
+    realized = f"raw_label_{summary['horizon']}d"
+    variants: list[tuple[str, tuple[str, ...] | None, float]] = [("raw", None, 0.0)]
+    for label, columns in (("prereg", NEUT_PREREG), ("sensitivity", NEUT_SENSITIVITY)):
+        if not all(c in frame.columns for c in columns):
+            print(f"  중립화 {label}: 컬럼 없음 {columns} — 건너뛴다")
+            continue
+        variants += [(f"{label}_{ratio}", columns, ratio) for ratio in NEUT_RATIOS]
+
+    rows = []
+    for fold_id, fold in _by_fold(frame):
+        part = fold.filter(pl.col("tradable"))
+        for name, columns, ratio in variants:
+            scored = part
+            column = pred_col
+            if columns is not None:
+                scored = part.with_columns(
+                    neutralize_predictions(
+                        part, pred_col=pred_col, on=list(columns), ratio=ratio
+                    ).alias("p_neut")
+                )
+                column = "p_neut"
+            topk = topk_economic_report(
+                scored,
+                pred_col=column,
+                realized_col=realized,
+                horizon=summary["horizon"],
+                k=summary["k"],
+                cost_bps_roundtrip=summary["cost_bps_roundtrip"],
+            )
+            rank = rank_evaluate(scored, pred_col=column, realized_col=realized)
+            rows.append(
+                {
+                    "fold_id": fold_id,
+                    "variant": name,
+                    "exposures": ",".join(columns) if columns else "",
+                    "ratio": ratio,
+                    "rank_ic_mean": rank.rank_ic_mean,
+                    "top_decile_spread": rank.top_decile_spread,
+                    "topk_grid_topk_mean_return": topk.grid_topk_mean_return,
+                    "topk_cost_adjusted_return": topk.cost_adjusted_return,
+                    "topk_turnover": topk.turnover,
+                    "topk_max_drawdown": topk.max_drawdown,
+                }
+            )
+    return rows
+
+
 def _topk_kwargs(summary: dict) -> dict:
     return {
         "pred_col": summary["primary_pred_col"],
@@ -527,6 +594,10 @@ def measure(stage: str, run_id: str) -> None:
         RESULTS_ROOT / "tradable" / f"{run_id}_fold_metrics_tradable.parquet",
     )
     _write(_bucket_rows(frame, summary), RESULTS_ROOT / "by_bucket" / f"{run_id}_by_bucket.parquet")
+    _write(
+        _neutralization_rows(frame, summary),
+        RESULTS_ROOT / "neutralization" / f"{run_id}_neut.parquet",
+    )
     _write(_drawdown_rows(frame, summary), RESULTS_ROOT / "drawdown" / f"{run_id}_drawdown.parquet")
     _write(
         _hysteresis_rows(frame, summary),

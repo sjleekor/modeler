@@ -1242,6 +1242,67 @@ def topk_rebalance_series(
     return pl.DataFrame(rows, infer_schema_length=None)
 
 
+def neutralize_predictions(
+    df: pl.DataFrame,
+    *,
+    pred_col: str,
+    on: Sequence[str],
+    ratio: float = 1.0,
+    group_cols: Sequence[str] = ("trade_date", "market"),
+) -> pl.Series:
+    """Regress the score on the given exposures inside each group; keep the rest.
+
+    T1-1B. The question this answers is not "is a size-neutral model better" —
+    nothing is refit — but **how much of the score we already have is explained
+    by size and liquidity**. Numerai's feature neutralization, with the same
+    knob: ``ratio`` 0 returns the score untouched, 1 returns the OLS residual,
+    and in between it is the straight line between them, because subtracting
+    ``ratio * fitted`` is ``(1 - ratio) * score + ratio * residual``.
+
+    Exposures are converted to percentile ranks inside the group before the fit,
+    so a heavy-tailed variable like market cap cannot let a handful of names set
+    the slope.
+
+    **A missing exposure becomes the group median (0.5), not an exemption.**
+    Leaving those rows on the raw scale — which is what T1-1B first said to do —
+    breaks the comparison outright: the residual has mean ~0 and the raw score
+    ~0.4, so every un-neutralized row sorts past every neutralized one and the
+    top-k becomes "the names whose size we do not know". At the measured 10.9%
+    missing that is not an edge case (execution plan §6.1).
+
+    The intercept is inside the fit, so at ``ratio=1`` the group mean goes too.
+    That is harmless here: every consumer of this score ranks within the group.
+    """
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(f"ratio must be in [0, 1], got {ratio}")
+    if not on:
+        raise ValueError("neutralize on at least one exposure")
+
+    idx = "_neut_row"
+    work = df.with_row_index(idx)
+    out = np.empty(work.height, dtype=float)
+    for _key, grp in work.group_by(list(group_cols), maintain_order=True):
+        rows = grp[idx].to_numpy()
+        pred = grp[pred_col].cast(pl.Float64).to_numpy()
+        design = [np.ones_like(pred)]
+        for column in on:
+            values = grp[column].cast(pl.Float64).to_numpy()
+            known = np.isfinite(values)
+            exposure = np.full(values.shape, 0.5)
+            if known.any():
+                exposure[known] = _rankdata(values[known]) / known.sum()
+            design.append(exposure)
+        matrix = np.column_stack(design)
+        finite = np.isfinite(pred)
+        if finite.sum() <= matrix.shape[1]:
+            out[rows] = pred  # too few rows to fit: leave the group alone
+            continue
+        beta, *_ = np.linalg.lstsq(matrix[finite], pred[finite], rcond=None)
+        fitted = matrix @ beta
+        out[rows] = np.where(finite, pred - ratio * fitted, pred)
+    return pl.Series(f"{pred_col}_neut", out, dtype=pl.Float64)
+
+
 @dataclass(frozen=True)
 class TopKHysteresisReport:
     """Buy-and-hold band: buy at rank ``k_in``, sell only past ``k_out`` (T1-6).

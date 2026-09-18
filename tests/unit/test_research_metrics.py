@@ -19,6 +19,7 @@ from modeler.etl.metrics import (
     krx_tick_size,
     market_weight_means,
     n_hac_pairs,
+    neutralize_predictions,
     newey_west_tstat,
     newey_west_tstat_legacy,
     per_date_market_quantile_spread,
@@ -709,3 +710,70 @@ def test_hysteresis_rejects_a_band_that_is_not_one() -> None:
         topk_hysteresis_report(
             df, pred_col="pred", realized_col="realized", horizon=1, k_in=100, k_out=50
         )
+
+
+# --- T1-1B: prediction neutralization ---------------------------------------
+
+
+def _neut_frame(pred: list[float], size: list[float | None]) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "trade_date": [1] * len(pred),
+            "market": ["KOSPI"] * len(pred),
+            "ticker": [f"T{i}" for i in range(len(pred))],
+            "pred": pred,
+            "size": size,
+        }
+    )
+
+
+def test_neutralize_removes_a_score_that_is_pure_size() -> None:
+    # pred is an exact linear function of the size rank, so nothing survives.
+    df = _neut_frame([0.1, 0.2, 0.3, 0.4], [10.0, 20.0, 30.0, 40.0])
+    out = neutralize_predictions(df, pred_col="pred", on=["size"], ratio=1.0).to_numpy()
+    assert np.allclose(out, 0.0, atol=1e-12)
+
+
+def test_neutralize_keeps_a_score_that_is_orthogonal_to_size() -> None:
+    # Deviations (+0.05, -0.15, +0.15, -0.05) are orthogonal to the size ranks
+    # (0.25, 0.5, 0.75, 1.0), so the slope is zero: only the mean comes off and
+    # the ranking survives untouched. Values are distinct so the order is not a
+    # tie-break artefact.
+    df = _neut_frame([0.45, 0.25, 0.55, 0.35], [10.0, 20.0, 30.0, 40.0])
+    out = neutralize_predictions(df, pred_col="pred", on=["size"], ratio=1.0).to_numpy()
+    assert np.argsort(out).tolist() == np.argsort(df["pred"].to_numpy()).tolist()
+    assert out.mean() == pytest.approx(0.0, abs=1e-12)
+
+
+def test_neutralize_ratio_is_the_line_between_score_and_residual() -> None:
+    df = _neut_frame([0.1, 0.5, 0.2, 0.9], [10.0, 20.0, 30.0, 40.0])
+    kwargs = dict(pred_col="pred", on=["size"])
+    full = neutralize_predictions(df, **kwargs, ratio=1.0).to_numpy()
+    none = neutralize_predictions(df, **kwargs, ratio=0.0).to_numpy()
+    half = neutralize_predictions(df, **kwargs, ratio=0.5).to_numpy()
+    assert np.allclose(none, df["pred"].to_numpy())
+    assert np.allclose(half, 0.5 * none + 0.5 * full)
+
+
+def test_neutralize_puts_a_missing_exposure_at_the_group_median() -> None:
+    """A missing exposure must not leave the row on the raw scale (§6.1)."""
+    df = _neut_frame([0.1, 0.2, 0.3, 0.9], [10.0, 20.0, 30.0, None])
+    out = neutralize_predictions(df, pred_col="pred", on=["size"], ratio=1.0).to_numpy()
+    # every row is on the residual scale — the missing one is not an outlier by
+    # construction, which is what the raw-scale rule would have made it
+    assert abs(out[3]) < 1.0
+    assert out.mean() == pytest.approx(0.0, abs=1e-12)
+
+
+def test_neutralize_leaves_a_group_it_cannot_fit() -> None:
+    # 2 rows, 2 parameters (intercept + one exposure): no residual to speak of,
+    # so the scores are returned untouched rather than forced to zero.
+    df = _neut_frame([0.1, 0.9], [10.0, 20.0])
+    out = neutralize_predictions(df, pred_col="pred", on=["size"], ratio=1.0).to_numpy()
+    assert np.allclose(out, [0.1, 0.9])
+
+
+def test_neutralize_rejects_a_ratio_outside_the_line() -> None:
+    df = _neut_frame([0.1, 0.9], [10.0, 20.0])
+    with pytest.raises(ValueError):
+        neutralize_predictions(df, pred_col="pred", on=["size"], ratio=1.5)
