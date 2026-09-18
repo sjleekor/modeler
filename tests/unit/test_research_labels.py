@@ -42,9 +42,96 @@ def test_labelspec_rejects_bad_params() -> None:
         labels.LabelSpec(horizons=())
 
 
-def test_index_bench_not_implemented() -> None:
-    with pytest.raises(NotImplementedError):
-        labels.build_label_sql(labels.LabelSpec(bench="index"))
+def test_bench_rejects_the_unimplemented_index_swap() -> None:
+    # ``index_bench=True`` adds a second benchmark; swapping the primary one is
+    # not offered, because two label variants would share a dataset directory.
+    with pytest.raises(ValueError):
+        labels.LabelSpec(bench="index")
+
+
+def _index_view(con: duckdb.DuckDBPyConnection, rows: list[tuple]) -> None:
+    values = ",".join(f"(DATE '{d}', '{sid}', {v})" for (d, sid, v) in rows)
+    con.execute(
+        "CREATE VIEW common_feature_observation_raw AS SELECT * FROM (VALUES "
+        + values
+        + ") AS t(observation_date, series_id, value_numeric)"
+    )
+
+
+def test_index_bench_rides_beside_the_eqw_label(tmp_path: Path) -> None:
+    """R5: ``raw_label_idx`` is added, and the eqw label is untouched."""
+    con = duckdb.connect()
+    # Two KOSPI names over 3 sessions. h=1.
+    _ohlcv_view(
+        con,
+        [
+            ("2020-01-01", "A", "KOSPI", 10, 11, 9, 100, 5),
+            ("2020-01-02", "A", "KOSPI", 10, 11, 9, 120, 5),  # +20%
+            ("2020-01-01", "B", "KOSPI", 10, 11, 9, 100, 5),
+            ("2020-01-02", "B", "KOSPI", 10, 11, 9, 100, 5),  # 0%
+        ],
+    )
+    # index rises 10% over the same session -> A beats it by 10pp, B trails 10pp.
+    _index_view(
+        con,
+        [
+            ("2020-01-01", "market_kospi_krx", 1000.0),
+            ("2020-01-02", "market_kospi_krx", 1100.0),
+        ],
+    )
+    spec = labels.LabelSpec(horizons=(1,), outputs=("rank",), index_bench=True)
+    rows = con.execute(
+        labels.build_label_sql(spec) + " ORDER BY ticker"
+    ).fetchall()
+    cols = [d[0] for d in con.execute(labels.build_label_sql(spec)).description]
+    got = [dict(zip(cols, r)) for r in rows]
+
+    assert [g["ticker"] for g in got] == ["A", "B"]
+    # eqw bench is the 10% cross-sectional mean -> unchanged by index_bench
+    assert got[0]["raw_label_1d"] == pytest.approx(0.10)
+    assert got[1]["raw_label_1d"] == pytest.approx(-0.10)
+    # index bench is the index's own 10% move
+    assert got[0]["bench_ret_idx_1d"] == pytest.approx(0.10)
+    assert got[0]["raw_label_idx_1d"] == pytest.approx(0.10)
+    assert got[1]["raw_label_idx_1d"] == pytest.approx(-0.10)
+
+
+def test_index_bench_keeps_rows_the_index_cannot_price(tmp_path: Path) -> None:
+    """A market with no index series keeps its rows, with a NULL benchmark."""
+    con = duckdb.connect()
+    _ohlcv_view(
+        con,
+        [
+            ("2020-01-01", "A", "KOSPI", 10, 11, 9, 100, 5),
+            ("2020-01-02", "A", "KOSPI", 10, 11, 9, 120, 5),
+            ("2020-01-01", "K", "KOSDAQ", 10, 11, 9, 100, 5),
+            ("2020-01-02", "K", "KOSDAQ", 10, 11, 9, 150, 5),
+        ],
+    )
+    _index_view(  # KOSPI only — KOSDAQ's index is absent
+        con,
+        [
+            ("2020-01-01", "market_kospi_krx", 1000.0),
+            ("2020-01-02", "market_kospi_krx", 1100.0),
+        ],
+    )
+    spec = labels.LabelSpec(horizons=(1,), outputs=("rank",), index_bench=True)
+    sql = labels.build_label_sql(spec)
+    cols = [d[0] for d in con.execute(sql).description]
+    got = [dict(zip(cols, r)) for r in con.execute(sql + " ORDER BY ticker").fetchall()]
+
+    assert [g["ticker"] for g in got] == ["A", "K"]  # nothing dropped
+    assert got[1]["market"] == "KOSDAQ"
+    assert got[1]["bench_ret_idx_1d"] is None
+    assert got[1]["raw_label_idx_1d"] is None
+    assert got[1]["raw_label_1d"] is not None  # the eqw label still works
+
+
+def test_index_bench_off_leaves_the_sql_alone() -> None:
+    """Default builds must stay byte-identical — runs already judged on them."""
+    plain = labels.build_label_sql(labels.LabelSpec())
+    assert "idx" not in plain.replace("d_idx", "")
+    assert "common_feature_observation_raw" not in plain
 
 
 # --- forward join over non-halt sessions ------------------------------------

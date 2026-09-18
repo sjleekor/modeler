@@ -21,6 +21,7 @@ import pytest
 
 from modeler.etl.config import DataRoot, LakeConfig
 from modeler.etl.features.regime import REGIME_TABLE
+from modeler.etl.labels import LabelSpec
 from modeler.etl.lake import connect, register_views
 from modeler.etl.mart import mart_glob, mart_table_dir, materialize
 from modeler.etl.universe import UniverseFilter, broad_universe_filter, build_universe_sql
@@ -613,3 +614,13 @@ def test_write_produces_the_artifacts_and_a_manifest_that_pins_the_build(
     index = {d: i for i, d in enumerate(dates)}
     for row in folds.iter_rows(named=True):
         assert index[row["valid_start"]] - index[row["train_end"]] == 20 + 20 + 1
+
+
+def test_dataset_key_separates_the_index_benchmark_panel() -> None:
+    """Two label specs must not share a directory (R5)."""
+    plain = ModelSpec()
+    idx = ModelSpec(label=LabelSpec(horizons=plain.label.horizons, index_bench=True))
+
+    assert bd.dataset_key(plain, 20) == "FS0_h20_lag1_rank"  # unchanged
+    assert bd.dataset_key(idx, 20) == "FS0_h20_lag1_rank_idxbench"
+    assert bd.dataset_key(plain, 20) != bd.dataset_key(idx, 20)

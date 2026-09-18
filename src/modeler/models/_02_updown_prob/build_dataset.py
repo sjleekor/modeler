@@ -64,6 +64,7 @@ KEY_COLS = ("trade_date", "ticker", "market")
 UNIVERSE_VIEW = "dim_universe_daily"
 LABEL_VIEW = "label_daily"
 PRICE_TABLE = "daily_ohlcv"
+INDEX_TABLE = "common_feature_observation_raw"  # only with label.index_bench (R5)
 # The design matrix is a directory of parquet parts, not one file — see
 # :func:`_write_preprocessed` for why.
 STD_DIR = "feat_panel_std"
@@ -95,8 +96,17 @@ def dataset_key(spec: ModelSpec, horizon: int) -> str:
 
     The seed and the model family are *not* in it — they change the fit, not the
     panel, so runs that differ only there share one build (`05` §3 "build 캐시").
+
+    The label spec is not in it either, which is fine only while every build
+    shares one. ``index_bench`` breaks that, so it gets a suffix: without one,
+    the index-benchmark panel would land on the plain one's directory and
+    ``ensure_dataset`` would hand the next run whichever was built first — it
+    compares the feature knobs in the manifest, not the labels. The suffix is
+    added only when the flag is on, so existing paths are untouched (R5,
+    2026-09-18).
     """
-    return f"{spec.feature_set}_h{horizon}_{spec.flow_variant}_{spec.preprocess_profile}"
+    key = f"{spec.feature_set}_h{horizon}_{spec.flow_variant}_{spec.preprocess_profile}"
+    return f"{key}_idxbench" if spec.label.index_bench else key
 
 
 def panel_feature_columns(spec: ModelSpec, horizon: int) -> tuple[list[str], list[str]]:
@@ -355,7 +365,12 @@ def build_dataset(
     marts = sorted(required_mart_columns([*columns, *materials]))
 
     con = connect(config)
-    register_views(con, config, tables=[PRICE_TABLE])
+    raw_tables = [PRICE_TABLE]
+    if spec.label.index_bench:
+        # R5: the index benchmark reads the raw observation table directly —
+        # ``common_feature_daily_fact`` has no KOSDAQ close (labels._index_cte).
+        raw_tables.append(INDEX_TABLE)
+    register_views(con, config, tables=raw_tables)
     contracts = register_read_only(con, config, [UNIVERSE_VIEW, *marts])
     if strict_universe:
         verify_universe_contract(config, spec)

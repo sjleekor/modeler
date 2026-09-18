@@ -13,8 +13,10 @@ Mechanics (etl_00 §2):
   - Benchmark (``eqw_market``): equal-weighted mean forward return within the
     same ``(trade_date, market)`` — robust, PIT-safe, no external index needed.
     ``excess = fwd - bench``; per (date, market) the mean excess is ~0.
-    ``bench="index"`` is reserved for a future market-index swap (one-line, the
-    prediction-target doc §1 note) and currently raises NotImplementedError.
+    ``index_bench=True`` adds a *second* benchmark alongside it:
+    ``bench_ret_idx_{h}d`` / ``raw_label_idx_{h}d``, measured against the
+    KOSPI/KOSDAQ index instead of the universe. It is an addition, not a swap —
+    see :class:`LabelSpec`.
   - Outputs (etl_00 §2.2): per-date winsorized regression (``y_reg_*``), per-date
     percentile rank in [0,1] (``y_rank_*`` — the main target), and a 3-class
     label (``y_cls_*`` ∈ {-1,0,1}) thresholded at the 0.2/0.8 ranks.
@@ -48,7 +50,7 @@ LABEL_TABLE = "label_daily"
 LABEL_SCAN_TABLE = "label_scan"
 
 _VALID_KINDS = ("excess", "abs")
-_VALID_BENCH = ("eqw_market", "index")
+_VALID_BENCH = ("eqw_market",)
 _VALID_OUTPUTS = ("reg", "rank", "cls", "up", "top")
 
 
@@ -73,6 +75,18 @@ class LabelSpec:
     # not use them. Set include_risk=True to emit them into label_daily.
     risk_horizons: Sequence[int] = field(default_factory=lambda: (20,))
     include_risk: bool = False
+    # R5 (holdout gate plan §2.2). Emits ``bench_ret_idx_{h}d`` and
+    # ``raw_label_idx_{h}d`` *beside* the ``bench`` ones, so one panel carries
+    # both and the model keeps training on whatever ``bench`` says.
+    #
+    # Why an addition and not ``bench="index"``: a swap would give two panels
+    # with different labels and the *same* directory, because
+    # ``_02_updown_prob.build_dataset.dataset_key`` is built from the feature
+    # set, horizon, flow variant and profile — the label spec is not in it. The
+    # second build would silently reuse the first (``ensure_dataset`` compares
+    # the manifest's feature knobs, not the labels). Off by default: a default
+    # build has to stay byte-identical to the ones already judged.
+    index_bench: bool = False
 
     def __post_init__(self) -> None:
         if self.kind not in _VALID_KINDS:
@@ -102,20 +116,62 @@ def _forward_cte(price_view: str) -> str:
     """
 
 
-def build_label_sql(spec: LabelSpec, price_view: str = "daily_ohlcv") -> str:
+# The two KRX index series, and which market each one benchmarks. Both are the
+# ``*_krx`` (KRX-direct) variants: the pykrx-sourced twins carry the same codes
+# but are ``active=False`` in the collector's series definitions.
+INDEX_SERIES: tuple[tuple[str, str], ...] = (
+    ("market_kospi_krx", "KOSPI"),
+    ("market_kosdaq_krx", "KOSDAQ"),
+)
+
+
+def _index_cte(index_view: str) -> str:
+    """CTE ``idx``: index close per (market, session), with its own day index.
+
+    Read straight from the raw observation table rather than
+    ``common_feature_daily_fact``: the fact carries ``market_kospi_close`` but
+    has no KOSDAQ close at all (measured 2026-09-18 on snapshot 2026-08-23), and
+    both markets are needed.
+
+    ``i_idx`` is the index's *own* session count, so ``bench_ret_idx_{h}d`` is
+    the market's return over h index sessions. A stock's h sessions skip its halt
+    days, so for a halted name the two windows are not the same calendar span —
+    the benchmark is "what the market did over h sessions", not "over exactly
+    this position's window". The gap only exists for halted names.
+    """
+    pairs = " ".join(
+        f"WHEN '{series}' THEN '{market}'" for series, market in INDEX_SERIES
+    )
+    codes = ", ".join(f"'{series}'" for series, _ in INDEX_SERIES)
+    return f"""
+        idx AS (
+            SELECT observation_date AS trade_date,
+                   CASE series_id {pairs} END AS market,
+                   CAST(value_numeric AS DOUBLE) AS idx_close,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY series_id ORDER BY observation_date
+                   ) AS i_idx
+            FROM {index_view}
+            WHERE series_id IN ({codes})
+              AND value_numeric IS NOT NULL
+        )"""
+
+
+def build_label_sql(
+    spec: LabelSpec,
+    price_view: str = "daily_ohlcv",
+    index_view: str = "common_feature_observation_raw",
+) -> str:
     """SQL producing ``label_daily`` (return labels) from a price view.
 
     ``price_view`` must already be registered. Grain: (trade_date, ticker,
     market). Emits, per horizon h: ``fwd_ret_{h}d``, optionally ``bench_ret_{h}d``,
     ``raw_label_{h}d`` (the regression source), and the requested outputs
     ``y_reg_{h}d`` / ``y_rank_{h}d`` / ``y_cls_{h}d``.
-    """
-    if spec.bench == "index":
-        raise NotImplementedError(
-            "bench='index' not implemented; use 'eqw_market' (prediction_target §1). "
-            "Swapping to KOSPI/KOSDAQ index returns is a future one-line change."
-        )
 
+    With ``spec.index_bench``, ``index_view`` must be registered too, and each
+    horizon also gets ``bench_ret_idx_{h}d`` / ``raw_label_idx_{h}d``.
+    """
     px = _forward_cte(price_view)
     primary = spec.horizons[0]
 
@@ -138,9 +194,18 @@ def build_label_sql(spec: LabelSpec, price_view: str = "daily_ohlcv") -> str:
             SELECT trade_date, market, AVG(fwd_ret_{h}d) AS bench_ret_{h}d
             FROM fwd{h} GROUP BY trade_date, market
         )""")
+        if spec.index_bench:
+            bench_ctes.append(f"""
+        idxbench{h} AS (
+            SELECT a.trade_date, a.market,
+                   f.idx_close / NULLIF(a.idx_close, 0) - 1 AS bench_ret_idx_{h}d
+            FROM idx a
+            JOIN idx f ON f.market = a.market AND f.i_idx = a.i_idx + {h}
+        )""")
 
     # fwd{primary} is the base row set; other horizons/benchmarks LEFT JOIN on.
-    all_ctes = ",\n".join([px] + fwd_ctes + bench_ctes)
+    head = [px] + ([_index_cte(index_view)] if spec.index_bench else [])
+    all_ctes = ",\n".join(head + fwd_ctes + bench_ctes)
     select_cols = _build_select_cols(spec)
     risk_join = ""
     if spec.include_risk:
@@ -162,12 +227,18 @@ def _extra_joins(spec: LabelSpec, primary: int) -> str:
     parts: list[str] = []
     if spec.kind == "excess":
         parts.append(f"JOIN bench{primary} AS m{primary} USING (trade_date, market)")
+    if spec.index_bench:
+        # LEFT, always: a date the index does not have must leave the stock row
+        # in place with a NULL benchmark, not drop it (R5).
+        parts.append(f"LEFT JOIN idxbench{primary} AS x{primary} USING (trade_date, market)")
     for h in spec.horizons:
         if h == primary:
             continue
         parts.append(f"LEFT JOIN fwd{h} AS f{h} USING (trade_date, ticker, market)")
         if spec.kind == "excess":
             parts.append(f"LEFT JOIN bench{h} AS m{h} USING (trade_date, market)")
+        if spec.index_bench:
+            parts.append(f"LEFT JOIN idxbench{h} AS x{h} USING (trade_date, market)")
     if not parts:
         return ""
     return "\n        " + "\n        ".join(parts)
@@ -188,6 +259,14 @@ def _build_select_cols(spec: LabelSpec) -> str:
         else:
             raw = f"{fref}.fwd_ret_{h}d"
         cols.append(f"{raw} AS raw_label_{h}d")
+        if spec.index_bench:
+            # Evaluation-only: the model trains on ``raw_label_{h}d``. These two
+            # ride along so a finished run can be re-scored against the index
+            # without refitting (R5).
+            cols.append(f"x{h}.bench_ret_idx_{h}d")
+            cols.append(
+                f"({fref}.fwd_ret_{h}d - x{h}.bench_ret_idx_{h}d) AS raw_label_idx_{h}d"
+            )
 
         # per-date (within trade_date, market) ranking window.
         # NOTE: PERCENT_RANK() assigns a value to rows whose ORDER BY key is NULL
