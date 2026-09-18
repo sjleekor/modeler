@@ -40,11 +40,17 @@ import polars as pl
 
 from modeler.etl.metrics import (
     CostModel,
+    _quantile_stats,
+    _topk_ranked,
+    classification_report,
+    per_date_rank_ic,
     per_name_cost_bps,
+    rebalance_grid,
     topk_economic_report,
     topk_hysteresis_report,
     topk_rebalance_series,
 )
+from modeler.etl.metrics import evaluate as rank_evaluate
 from modeler.models._02_updown_prob.experiments.run_matrix import RESULTS_ROOT
 
 # The three adopted configs (`results/README.md` §1), as (stage, run_id).
@@ -65,6 +71,11 @@ CAPITALS_KRW: tuple[float, ...] = (1e8, 3e8, 1e9, 3e9)
 IMPACT_K: tuple[float, ...] = (0.5, 1.0, 1.5)
 
 ADV_COL, VOL_COL, CLOSE_COL = "px_turnover_ma20", "px_vol_20d", "close"
+
+# R1/R2 inputs, read as they lie from the snapshot the run was built on.
+TRADABLE_MART = "dim_universe_tradable_daily"
+MCAP_MART = "feat_market_cap"
+INDEX_SERIES = {"market_kospi_krx": "KOSPI", "market_kosdaq_krx": "KOSDAQ"}
 
 
 def _load_run(stage: str, run_id: str) -> tuple[dict, pl.DataFrame]:
@@ -270,6 +281,176 @@ def _bought_names(fold: pl.DataFrame, summary: dict) -> pl.DataFrame:
     )
 
 
+def _mart_glob(summary: dict, mart: str) -> str:
+    manifest = json.loads((Path(summary["dataset_dir"]) / "dataset_manifest.json").read_text())
+    return f"{manifest['lake']['feature_mart']}/{mart}/**/*.parquet"
+
+
+def _raw_glob(summary: dict, table: str) -> str:
+    manifest = json.loads((Path(summary["dataset_dir"]) / "dataset_manifest.json").read_text())
+    return f"{manifest['lake']['raw']}/{table}/**/*.parquet"
+
+
+def _regime_by_market_year(summary: dict, frame: pl.DataFrame) -> pl.DataFrame:
+    """§5.2 — bull/bear per (market, year), on the sessions actually evaluated.
+
+    Not the calendar year: the 2025 rows stop at the formation boundary, and a
+    full-year index return would reach past it into the holdout. Measuring only
+    the sessions inside the evaluated span keeps the label bounded by the data
+    it describes, and keeps working when the holdout ends mid-year.
+    """
+    lo, hi = frame["trade_date"].min(), frame["trade_date"].max()
+    pairs = " ".join(f"WHEN '{k}' THEN '{v}'" for k, v in INDEX_SERIES.items())
+    con = duckdb.connect()
+    rows = pl.from_arrow(
+        con.execute(f"""
+            WITH px AS (
+                SELECT CASE series_id {pairs} END AS market,
+                       observation_date AS d,
+                       CAST(value_numeric AS DOUBLE) AS c,
+                       year(observation_date) AS y
+                FROM read_parquet('{_raw_glob(summary, "common_feature_observation_raw")}')
+                WHERE series_id IN ({", ".join(f"'{k}'" for k in INDEX_SERIES)})
+                  AND value_numeric IS NOT NULL
+                  AND observation_date BETWEEN DATE '{lo}' AND DATE '{hi}'
+            ), bounds AS (
+                SELECT market, y, min(d) AS d0, max(d) AS d1 FROM px GROUP BY 1, 2
+            )
+            SELECT b.market, b.y AS year, p1.c / p0.c - 1 AS index_return
+            FROM bounds b
+            JOIN px p0 ON p0.market = b.market AND p0.d = b.d0
+            JOIN px p1 ON p1.market = b.market AND p1.d = b.d1
+        """).arrow()
+    )
+    con.close()
+    return rows.with_columns(
+        pl.when(pl.col("index_return") > 0)
+        .then(pl.lit("bull"))
+        .otherwise(pl.lit("bear"))
+        .alias("regime")
+    )
+
+
+def _with_universe_and_buckets(summary: dict, frame: pl.DataFrame) -> pl.DataFrame:
+    """Attach the tradable flag (R1) and the three bucket keys (R2, §5.3)."""
+    con = duckdb.connect()
+    tradable = pl.from_arrow(
+        con.execute(
+            "SELECT trade_date, ticker, market, in_universe AS tradable, "
+            "management_filter_available "
+            f"FROM read_parquet('{_mart_glob(summary, TRADABLE_MART)}')"
+        ).arrow()
+    )
+    mcap = pl.from_arrow(
+        con.execute(
+            "SELECT trade_date, ticker, market, mcap_krx, mcap_unreliable "
+            f"FROM read_parquet('{_mart_glob(summary, MCAP_MART)}')"
+        ).arrow()
+    )
+    con.close()
+
+    out = (
+        frame.join(tradable, on=["trade_date", "ticker", "market"], how="left")
+        .join(mcap, on=["trade_date", "ticker", "market"], how="left")
+        .with_columns(pl.col("tradable").fill_null(False))
+    )
+    regimes = _regime_by_market_year(summary, frame)
+    out = out.with_columns(pl.col("trade_date").dt.year().alias("year")).join(
+        regimes.select(["market", "year", "regime", "index_return"]),
+        on=["market", "year"],
+        how="left",
+    )
+    # Buckets are cut per date across BOTH markets, because the buy list is
+    # ranked that way (`_topk_ranked` groups by date alone). Cutting them per
+    # market would describe a portfolio nobody holds.
+    return out.with_columns(
+        pl.col("mcap_krx")
+        .qcut([1 / 3, 2 / 3], labels=["small", "mid", "large"], allow_duplicates=True)
+        .over("trade_date")
+        .cast(pl.Utf8)
+        .alias("size_tertile"),
+        pl.when(pl.col(ADV_COL) >= pl.col(ADV_COL).median().over("trade_date"))
+        .then(pl.lit("liquid"))
+        .otherwise(pl.lit("illiquid"))
+        .alias("liquidity_half"),
+    )
+
+
+def _tradable_rows(frame: pl.DataFrame, summary: dict) -> list[dict]:
+    """R1 — the adopted run re-scored on the tradable universe (1,000원 floor)."""
+    pred_col = summary["primary_pred_col"]
+    realized = f"raw_label_{summary['horizon']}d"
+    rows = []
+    for fold_id, fold in _by_fold(frame):
+        for scope, part in (("base", fold), ("tradable", fold.filter(pl.col("tradable")))):
+            if part.is_empty():
+                continue
+            topk = topk_economic_report(part, **_topk_kwargs(summary))
+            rank = rank_evaluate(part, pred_col=pred_col, realized_col=realized)
+            clf = classification_report(
+                part, pred_col=pred_col, y_col=f"y_up_{summary['horizon']}d", k=summary["k"]
+            )
+            rows.append(
+                {
+                    "fold_id": fold_id,
+                    "scope": scope,
+                    "n_obs": int(part.height),
+                    "log_loss": clf.log_loss,
+                    "ece": clf.ece,
+                    **rank.as_dict(),
+                    **{f"topk_{key}": value for key, value in topk.as_dict().items()},
+                }
+            )
+    return rows
+
+
+def _bucket_rows(frame: pl.DataFrame, summary: dict) -> list[dict]:
+    """R2 — signal and picks per (size, liquidity, regime), on the tradable set."""
+    pred_col = summary["primary_pred_col"]
+    realized = f"raw_label_{summary['horizon']}d"
+    tradable = frame.filter(pl.col("tradable"))
+    grid = rebalance_grid(tradable["trade_date"].to_list(), summary["horizon"])
+    picks = _topk_ranked(
+        tradable, pred_col=pred_col, k=summary["k"], date_col="trade_date", ticker_col="ticker"
+    ).filter(pl.col("trade_date").is_in(grid))
+    picked = tradable.join(
+        picks.select(["trade_date", "ticker"]).with_columns(pl.lit(True).alias("_picked")),
+        on=["trade_date", "ticker"],
+        how="left",
+    ).with_columns(pl.col("_picked").fill_null(False))
+    n_picked_total = int(picked["_picked"].sum())
+
+    rows = []
+    keys = ["size_tertile", "liquidity_half", "regime"]
+    for bucket, part in picked.group_by(keys, maintain_order=True):
+        if any(v is None for v in bucket):
+            continue
+        ic = per_date_rank_ic(part, pred_col=pred_col, realized_col=realized)
+        ics = ic["rank_ic"].drop_nulls().to_numpy()
+        spread, tmb, hit, _ = _quantile_stats(
+            part, pred_col=pred_col, realized_col=realized, date_col="trade_date"
+        )
+        chosen = part.filter(pl.col("_picked"))
+        realized_ok = chosen.filter(pl.col(realized).is_not_null())
+        rows.append(
+            {
+                **dict(zip(keys, bucket)),
+                "n_obs": int(part.height),
+                "n_dates": int(ic.height),
+                "n_unreliable_mcap": int(part["mcap_unreliable"].sum() or 0),
+                "rank_ic_mean": float(ics.mean()) if ics.size else float("nan"),
+                "top_decile_spread": spread,
+                "hit_ratio_top": hit,
+                "topk_share": chosen.height / n_picked_total if n_picked_total else float("nan"),
+                "topk_mean_return": float(realized_ok[realized].mean())
+                if realized_ok.height
+                else float("nan"),
+                "index_return_mean": float(part["index_return"].mean()),
+            }
+        )
+    return rows
+
+
 def _topk_kwargs(summary: dict) -> dict:
     return {
         "pred_col": summary["primary_pred_col"],
@@ -335,6 +516,17 @@ def measure(stage: str, run_id: str) -> None:
     summary, predictions = _load_run(stage, run_id)
     frame = _with_cost_inputs(summary, predictions)
 
+    frame = _with_universe_and_buckets(summary, frame)
+    if frame["management_filter_available"].any():
+        print("  관리종목 필터가 생겼다 — R1의 전제를 다시 보라")
+    else:
+        print("  관리종목: 원천 없음 (management_filter_available = FALSE)")
+
+    _write(
+        _tradable_rows(frame, summary),
+        RESULTS_ROOT / "tradable" / f"{run_id}_fold_metrics_tradable.parquet",
+    )
+    _write(_bucket_rows(frame, summary), RESULTS_ROOT / "by_bucket" / f"{run_id}_by_bucket.parquet")
     _write(_drawdown_rows(frame, summary), RESULTS_ROOT / "drawdown" / f"{run_id}_drawdown.parquet")
     _write(
         _hysteresis_rows(frame, summary),
