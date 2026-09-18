@@ -391,9 +391,14 @@ formation 구간에서 h60의 비용 반영 초과수익이 사이즈·유동성
 바뀌는 것은 읽는 법이다. 상세는
 [`my/.../20260916_holdout_gate_plan.md`](../../../../../my/milestones/kr/modeling/plan/20260916_holdout_gate_plan.md) §3.1.
 
-**5번은 FS3 마트가 필요하고, 그 마트는 08-23 공유 snapshot에 없다.** E5가 격리 lake
-(`kr/derived/_e5`)에 따로 만든 것들이라, 새 snapshot에서 같은 것이 나오는지 개봉 전에
-확인해야 한다 (같은 문서 §2.2의 F3).
+**5번은 FS3 마트 다섯이 필요하다.** 08-23에서는 그 다섯이 공유 snapshot의 것과 달라 E5가
+격리 lake(`kr/derived/_e5`)에 따로 만들었지만, **새 snapshot에서는 격리가 필요 없다** —
+현재 코드의 `sql_hash`가 격리 lake와 같고, 공유 08-23 쪽이 F-5.x 이전 코드의 산물이다
+(F3, 2026-09-18 확인).
+
+**다만 이 다섯은 모델 02가 만들지 않는다.** `build_dataset`는 읽기만 한다. 만드는 곳은
+horizon scan Phase B와 `fin_risk_report`·`relation_stat_report`, `isolated_lake --build`이고
+`compute_all`에는 없다. **새 snapshot에서 이 다섯이 없으면 5번은 아예 못 돈다.**
 
 ### 같이 고정하는 것
 
