@@ -97,8 +97,9 @@
     "snapshot_date": "2026-08-23",
     "source": "sj2_remote"
   },
-  "git_sha": "f836659",
-  "code_hash": "e894728f25368deb",
+  "git_sha": "b8a2893",
+  "code_hash": "c287f05169439caf",
+  "model_code_hash": "70b6a70bf165d10d",
   "mart_contracts": {
     "dim_universe_daily": {
       "analysis_config_hash": "889c3e8377c2f400907611f7402651eee6a23c2765c051e4eb2a4a59ca36cbea",
@@ -121,7 +122,7 @@
       "sql_hash": "110617482d64a50d4ef92ad70defcc23b5b276e2a025452f92a845ccbacec228"
     }
   },
-  "dataset_manifest": "/Users/whishaw/wss_p/stock_data_collector/data/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/FS0_h5_lag1_rank/dataset_manifest.json",
+  "dataset_manifest": "/Users/whishaw/wss_p/modeler/../stock_data/kr/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/FS0_h5_lag1_rank/dataset_manifest.json",
   "grid_name": "HGB_CLF_GRID_E1",
   "grid_size": 4,
   "smoke": false

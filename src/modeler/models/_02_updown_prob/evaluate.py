@@ -31,6 +31,7 @@ from modeler.etl.metrics import (
     reliability_table,
     threshold_economic_report,
     topk_economic_report,
+    topk_rebalance_series,
 )
 from modeler.etl.metrics import (
     evaluate as rank_evaluate,
@@ -56,6 +57,7 @@ class RunEvaluation:
     fold_metrics: pl.DataFrame
     reliability: pl.DataFrame
     economics: pl.DataFrame
+    rebalance_returns: pl.DataFrame
     yearly: pl.DataFrame
     by_market: pl.DataFrame
     summary: dict
@@ -163,6 +165,46 @@ def fold_rows(result: TrainResult, *, k: int, cost_bps: float, tau: float) -> li
                 }
             )
     return rows
+
+
+def _rebalance_returns(result: TrainResult, *, k: int, cost_bps: float) -> pl.DataFrame:
+    """The top-k return path per fold, not just the fold's mean (`03` §6).
+
+    ``economics.parquet`` records what the buy list earned over a fold; this
+    records what it earned at each rebalance. Strategy drawdown, buy-hold
+    hysteresis and CSCV all read a path, and a run that keeps only the means
+    cannot be re-read for any of them without training again.
+
+    Nothing here feeds a preregistered metric — the fold numbers still come from
+    ``topk_economic_report``. It is a record, written once so it need not be
+    recomputed.
+    """
+    config = result.config
+    frames: list[pl.DataFrame] = []
+    for fold in result.folds:
+        if fold.predictions is None:
+            continue
+        for pred_col in _probability_columns(result):
+            if fold.predictions.get_column(pred_col).null_count() == fold.predictions.height:
+                continue
+            series = topk_rebalance_series(
+                fold.predictions,
+                pred_col=pred_col,
+                realized_col=config.realized_column,
+                horizon=config.horizon,
+                k=k,
+                date_col=config.date_col,
+                cost_bps_roundtrip=cost_bps,
+            )
+            if series.is_empty():
+                continue
+            frames.append(
+                series.with_columns(
+                    pl.lit(fold.fold_id).alias("fold_id"),
+                    pl.lit(pred_col).alias("pred_col"),
+                ).select(["fold_id", "pred_col", *series.columns])
+            )
+    return pl.concat(frames, how="vertical_relaxed") if frames else pl.DataFrame()
 
 
 def _breakdown(result: TrainResult, by: str, *, k: int) -> pl.DataFrame:
@@ -295,6 +337,7 @@ def evaluate_run(
         fold_metrics=fold_metrics,
         reliability=_reliability(result, n_bins=n_bins),
         economics=_economics(fold_metrics),
+        rebalance_returns=_rebalance_returns(result, k=k, cost_bps=cost_bps),
         yearly=_breakdown(result, "year", k=k),
         by_market=_breakdown(result, "market", k=k),
         summary=summary,

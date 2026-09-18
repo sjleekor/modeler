@@ -48,6 +48,6 @@ shape: (5, 52)
 └─────────┴──────────┴─────────┴─────────┴───┴─────────────┴─────────────┴────────────┴────────────┘
 ```
 
-- predictions: `/Users/whishaw/wss_p/stock_data_collector/data/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/FS1h_h20_lag1_rank/predictions_valid__E2_h20_FS1h_seed0.parquet`
+- predictions: `/Users/whishaw/wss_p/modeler/../stock_data/kr/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/FS1h_h20_lag1_rank/predictions_valid__E2_h20_FS1h_seed0.parquet`
 - panel rows: 5223425
-- elapsed: 5158.6s
+- elapsed: 5036.9s

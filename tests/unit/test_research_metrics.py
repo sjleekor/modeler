@@ -25,6 +25,7 @@ from modeler.etl.metrics import (
     rebalance_grid,
     topk_economic_report,
     topk_membership,
+    topk_rebalance_series,
     two_sided_normal_p,
 )
 
@@ -463,6 +464,75 @@ def test_topk_economic_report_nets_turnover_cost_against_the_buy_list_return() -
     assert report.turnover == pytest.approx(0.5)
     assert report.grid_topk_mean_return == pytest.approx((0.08 + 0.03) / 2)
     assert report.cost_adjusted_return == pytest.approx(report.grid_topk_mean_return - 0.005)
+
+
+def test_topk_rebalance_series_reproduces_the_report() -> None:
+    # Same frame as the report test above: grid = [1, 3], k=2, one name swapped.
+    # The series is the report's inputs before they were averaged, so its means
+    # have to land on the report's floats exactly — this is what lets drawdown
+    # and CSCV read the series instead of re-deriving the economics.
+    df = _topk_frame(
+        {
+            1: {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0},
+            2: {"A": 1.0, "B": 2.0, "C": 3.0, "D": 4.0},
+            3: {"A": 4.0, "B": 1.0, "C": 3.0, "D": 2.0},
+            4: {"A": 1.0, "B": 2.0, "C": 3.0, "D": 4.0},
+        },
+        {
+            1: {"A": 0.10, "B": 0.06},
+            3: {"A": 0.04, "C": 0.02},
+        },
+    )
+    kwargs = dict(
+        pred_col="pred", realized_col="realized", horizon=2, k=2, cost_bps_roundtrip=100.0
+    )
+
+    report = topk_economic_report(df, **kwargs)
+    series = topk_rebalance_series(df, **kwargs)
+
+    assert series.height == report.n_rebalances
+    assert series["rebalance_date"].to_list() == [1, 3]
+    assert series["n_held"].to_list() == [2, 2]
+    # first row has no earlier list to trade against, so no turnover and no cost
+    assert series["turnover"].to_list() == [None, pytest.approx(0.5)]
+    assert series["net_return"][0] == pytest.approx(series["gross_return"][0])
+
+    gross = series["gross_return"].drop_nulls().to_numpy()
+    turns = series["turnover"].drop_nulls().to_numpy()
+    assert float(gross.mean()) == pytest.approx(report.grid_topk_mean_return)
+    assert float(turns.mean()) == pytest.approx(report.turnover)
+
+
+def test_topk_rebalance_series_keeps_a_held_but_unscored_rebalance() -> None:
+    # Date 3's holdings have no closed label yet. The row stays (it is held, and
+    # it still costs turnover) but carries a null return rather than a zero,
+    # which would otherwise drag a drawdown path toward flat.
+    rows = [
+        {"trade_date": 1, "ticker": "A", "pred": 4.0, "realized": 0.10},
+        {"trade_date": 1, "ticker": "B", "pred": 3.0, "realized": 0.20},
+        {"trade_date": 1, "ticker": "C", "pred": 1.0, "realized": 0.0},
+        {"trade_date": 2, "ticker": "A", "pred": 1.0, "realized": 0.0},
+        {"trade_date": 2, "ticker": "B", "pred": 2.0, "realized": 0.0},
+        {"trade_date": 2, "ticker": "C", "pred": 4.0, "realized": 0.0},
+        {"trade_date": 3, "ticker": "A", "pred": 4.0, "realized": None},
+        {"trade_date": 3, "ticker": "B", "pred": 3.0, "realized": None},
+        {"trade_date": 3, "ticker": "C", "pred": 1.0, "realized": None},
+    ]
+    series = topk_rebalance_series(
+        pl.DataFrame(rows),
+        pred_col="pred",
+        realized_col="realized",
+        horizon=2,
+        k=2,
+        cost_bps_roundtrip=100.0,
+    )
+
+    assert series["rebalance_date"].to_list() == [1, 3]
+    assert series["n_held"].to_list() == [2, 2]
+    assert series["n_scored"].to_list() == [2, 0]
+    assert series["gross_return"][1] is None
+    assert series["net_return"][1] is None
+    assert series["turnover"][1] == pytest.approx(0.0)
 
 
 def test_topk_report_holds_names_whose_label_has_not_closed_yet() -> None:

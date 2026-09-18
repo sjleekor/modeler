@@ -47,12 +47,12 @@ import shutil
 import subprocess
 import time
 import traceback
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import polars as pl
 
-from modeler.etl.config import REPO_ROOT, LakeConfig
+from modeler.etl.config import REPO_ROOT, DataRoot, LakeConfig
 from modeler.etl.manifest import current_git_sha
 from modeler.models._02_updown_prob import build_dataset as bd
 from modeler.models._02_updown_prob import evaluate as ev
@@ -364,6 +364,7 @@ def execute_run(
     _write_frame(report.fold_metrics, out_dir / "fold_metrics.parquet")
     _write_frame(report.reliability, out_dir / "reliability.parquet")
     _write_frame(report.economics, out_dir / "economics.parquet")
+    _write_frame(report.rebalance_returns, out_dir / "rebalance_returns.parquet")
     _write_frame(report.yearly, out_dir / "yearly.parquet")
     _write_frame(report.by_market, out_dir / "by_market.parquet")
     (out_dir / "summary.md").write_text(
@@ -675,6 +676,7 @@ def run_stage(
     force_build: bool = False,
     force_runs: bool = False,
     allow_concurrent: bool = False,
+    lake_root: Path | None = None,
 ) -> int:
     runs = resolve_stage(stage, horizon=horizon, variant=variant, smoke=smoke)
     if dry_run:
@@ -686,7 +688,23 @@ def run_stage(
         )
 
     config = lake_config()
+    if lake_root is not None:
+        # E5 reads marts the shared snapshot does not have: `02` §1.5 wants five
+        # rebuilt on 08-23 and `02` §5 forbids rebuilding A0's, so E5 built them
+        # into an isolated root (``kr/derived/_e5``) and symlinked the rest —
+        # see ``isolated_lake``. The old code reached it through
+        # ``SDC_DATA_LAKE_ROOT``; S4's path refactor replaced that with
+        # ``STOCK_DATA_ROOT`` + market, and ``_e5`` sits *inside* ``kr/derived``
+        # where no value of ``STOCK_DATA_ROOT`` can address it. Without this the
+        # E5 runs are not reproducible (2026-09-18).
+        #
+        # The whole root moves, datasets included, so a run on the isolated lake
+        # cannot silently reuse a panel built from the shared one — the reuse
+        # check in ``ensure_dataset`` keys on the spec, not on which marts fed it.
+        config = replace(config, root=DataRoot(base=lake_root))
     print(f"{stage}: {len(runs)} runs on snapshot {config.snapshot_date}/{config.source}")
+    if lake_root is not None:
+        print(f"  lake root: {lake_root} (not the shared one)")
     records: list[sel.RunRecord] = []
     failures: list[str] = []
     for run in runs:
@@ -787,6 +805,13 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-concurrent", action="store_true", help="run even if a horizon scan is running"
     )
     parser.add_argument(
+        "--lake-root",
+        type=Path,
+        default=None,
+        help="read marts (and write datasets) under this lake root instead of the "
+        "shared one — E5's isolated lake is $STOCK_DATA_ROOT/kr/derived/_e5",
+    )
+    parser.add_argument(
         "--clean-smoke", action="store_true", help=f"delete results/{SMOKE_DIR}/ and exit"
     )
     args = parser.parse_args(argv)
@@ -808,6 +833,7 @@ def main(argv: list[str] | None = None) -> int:
         force_build=args.force_build,
         force_runs=args.force_runs,
         allow_concurrent=args.allow_concurrent,
+        lake_root=args.lake_root,
     )
 
 

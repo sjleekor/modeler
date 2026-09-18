@@ -84,9 +84,9 @@
     "snapshot_date": "2026-08-23",
     "source": "sj2_remote"
   },
-  "git_sha": "b5b2ae4",
-  "code_hash": "7dc324333cedd22d",
-  "model_code_hash": "580de17e26acca4a",
+  "git_sha": "b8a2893",
+  "code_hash": "318d0b43fb71ef25",
+  "model_code_hash": "70b6a70bf165d10d",
   "mart_contracts": {
     "dim_universe_daily": {
       "analysis_config_hash": "889c3e8377c2f400907611f7402651eee6a23c2765c051e4eb2a4a59ca36cbea",
@@ -119,7 +119,7 @@
       "sql_hash": "3705f359b0bc984669bede299d67bb46547b2d579c70e3ef788ed6acf719cab6"
     }
   },
-  "dataset_manifest": "/Users/whishaw/wss_p/stock_data_collector/data/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/FS0_FS3_h60_lag1_rank/dataset_manifest.json",
+  "dataset_manifest": "/Users/whishaw/wss_p/stock_data/kr/derived/_e5/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/FS0_FS3_h60_lag1_rank/dataset_manifest.json",
   "grid_name": "LOGIT_GRID",
   "grid_size": 3,
   "smoke": false

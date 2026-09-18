@@ -994,6 +994,83 @@ def topk_economic_report(
     )
 
 
+def topk_rebalance_series(
+    df: pl.DataFrame,
+    *,
+    pred_col: str,
+    realized_col: str,
+    horizon: int,
+    k: int = 100,
+    date_col: str = "trade_date",
+    ticker_col: str = "ticker",
+    cost_bps_roundtrip: float = 60.0,
+) -> pl.DataFrame:
+    """``topk_economic_report`` unaggregated — one row per rebalance date.
+
+    The report returns five numbers for a whole fold; drawdown, hysteresis and
+    CSCV all need the series those numbers were averaged from, and a run that
+    only writes the report throws it away. This computes the same quantities the
+    same way and keeps them per date. It does not change the report: the two are
+    separate code paths, and ``test_topk_rebalance_series_reproduces_the_report``
+    pins them to the same floats.
+
+    Rows are the grid dates on which a buy list exists — the same set the report
+    counts as ``n_rebalances``. ``gross_return`` is null where no held name has a
+    closed label yet (those dates are held but unscored, see the report's
+    ``mean_names_scored``), and ``turnover`` is null on the first such row
+    because there is no earlier list to trade against — the report's mean
+    turnover skips that pair too.
+
+    **``net_return.mean()`` is not the report's ``cost_adjusted_return``.** The
+    report subtracts one mean turnover from one mean return, and the two means
+    run over different date sets whenever a rebalance is held but unscored. Read
+    the report for the fold number and this series for the path.
+    """
+    grid = rebalance_grid(df[date_col].to_list(), horizon)
+    picked = _topk_ranked(df, pred_col=pred_col, k=k, date_col=date_col, ticker_col=ticker_col)
+    membership = {
+        d: set(grp[ticker_col].to_list())
+        for (d,), grp in picked.group_by([date_col], maintain_order=True)
+    }
+
+    labels = df.select([date_col, ticker_col, realized_col]).drop_nulls()
+    labels = labels.filter(pl.col(realized_col).is_finite())
+    scored = picked.join(labels, on=[date_col, ticker_col], how="inner")
+
+    cost_rate = cost_bps_roundtrip / 10_000.0
+    rows: list[dict] = []
+    previous: set | None = None
+    for d in grid:
+        if d not in membership:
+            continue
+        held = membership[d]
+        day = scored.filter(pl.col(date_col) == d)
+        gross = float(day[realized_col].mean()) if day.height else None
+
+        turnover: float | None = None
+        if previous is not None:
+            denom = max(len(previous), len(held))
+            if denom:
+                turnover = 1.0 - len(previous & held) / denom
+        previous = held
+
+        cost = turnover * cost_rate if turnover is not None else 0.0
+        rows.append(
+            {
+                "rebalance_date": d,
+                "horizon": horizon,
+                "k": k,
+                "n_held": len(held),
+                "n_scored": int(day.height),
+                "gross_return": gross,
+                "turnover": turnover,
+                "cost_bps_roundtrip": cost_bps_roundtrip,
+                "net_return": gross - cost if gross is not None else None,
+            }
+        )
+    return pl.DataFrame(rows, infer_schema_length=None)
+
+
 def evaluate(
     df: pl.DataFrame,
     *,

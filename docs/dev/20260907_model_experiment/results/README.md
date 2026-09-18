@@ -432,8 +432,45 @@ h마다 채택 후보 하나 + 확률 기준선 하나, 총 **6 run**이다.
 | 경로 | 내용 |
 |---|---|
 | [`E0/`](E0/) ~ [`E5/`](E5/) | 단계별 run 기록. 각 run 디렉터리에 `summary.json`·`summary.md`·`fold_metrics`·`reliability`·`yearly`·`by_market`·`economics` |
+| `E*/*/rebalance_returns.parquet` | **채택 3 run만** (2026-09-18 추가). top-k의 리밸런스별 수익 경로 — `economics.parquet`이 평균으로 접기 전의 값이다. 전략 MDD·hysteresis·CSCV가 읽는다 |
 | `E*/selection.json` | 그 단계의 결정과 근거 문장 |
 | `E*/runs.md` | 단계별 run 표 |
 | [`recheck/E2/`](recheck/E2/) | `03` §3.3의 조건부 ECE 재보정. 사전등록 run 수에 들어가지 않으므로 단계 디렉터리 밖에 있다 |
 
 실행 명령과 단계별 진행 기록은 [`../06_implementation_plan.md`](../06_implementation_plan.md) §3에 있다.
+
+---
+
+## 재현 확인 (2026-09-18)
+
+**채택 3 run을 처음부터 다시 만들어 기록과 대조했다. 셋 다 재현됐다.**
+
+프로젝트 분리 S9가 모델 02 데이터셋 60.7G를 "다시 만들 수 있다"는 판단으로 지웠는데, 그 판단을
+실제로 확인한 것은 이번이 처음이다. 계기는 리밸런스별 수익 경로를 남기는 코드 변경이었다 —
+어차피 다시 돌려야 해서 같은 김에 쟀다.
+
+| 대조 | 무엇 | 결과 |
+|---|---|---|
+| **입력** | 새 `dataset_manifest.json` 대 [`discarded_datasets/`](../../../../../my/milestones/kr/refactoring/20260912_project_split/02_plan_revised/discarded_datasets/)의 보존본 | `row_count`·`n_dates`·`design_columns`·`null_ratios`·`mart_contracts` **전부 일치** |
+| **출력 (가)** | `log_loss`·`brier`·`ece`·`auc_*`·`rank_ic_*`·회전율·보유 종목 수 | **비트 단위 일치** |
+| **출력 (나)** | 실현 수익의 날짜별 평균으로 만드는 지표 13개 | 상대차 최대 **1.75e-14** (문턱 1e-12) |
+
+(나)가 마지막 자리에서 흔들리는 기전은 확인하지 않았다. 날짜별 값을 모아 다시 평균하는 지표가
+전부 여기 들어가므로 새로 쓴 parquet의 행 그룹 경계 탓으로 **추정**한다. 입력이 같다는 것은
+대조 (1)이 말한다.
+
+**h60은 격리 lake로 돌려야 재현된다.** E5는 `kr/derived/_e5`의 `feat_fin_risk` v2를 읽는다.
+공유 snapshot의 v1으로 돌리면 재무 5개 family의 결측이 약 2배가 되고 ECE가 0.0211 → 0.0143으로
+움직인다 — 재현 실패가 아니라 **다른 run**이다. 그 진입로(`SDC_DATA_LAKE_ROOT`)가 S4 경로
+리팩토링에서 사라져 있었고, 2026-09-18에 `run_matrix --lake-root`로 되살렸다.
+
+```bash
+# h5 · h20 — 공유 snapshot
+uv run python -m modeler.models._02_updown_prob.experiments.run_matrix --stage E2 --h 20 --variant FS1h
+# h60 — 격리 lake. 빼먹으면 조용히 다른 마트로 돈다
+uv run python -m modeler.models._02_updown_prob.experiments.run_matrix --stage E5 --h 60 --variant FS3 \
+  --lake-root "$STOCK_DATA_ROOT/kr/derived/_e5"
+```
+
+판정 기준과 경위는
+[`my/milestones/kr/modeling/plan/20260918_execution_plan.md`](../../../../../my/milestones/kr/modeling/plan/20260918_execution_plan.md) §2에 있다.
