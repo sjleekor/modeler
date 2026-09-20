@@ -462,7 +462,7 @@ wheels = [
 
 [[package]]
 name = "collector"
-version = "0.14.1"
+version = "0.15.0"
 source = { editable = "../collector" }
 dependencies = [
     { name = "duckdb" },
@@ -1516,7 +1516,7 @@ requires-dist = [
     { name = "collector", editable = "../collector" },
     { name = "duckdb", specifier = ">=1.5" },
     { name = "feature-engine", marker = "extra == 'features'", specifier = ">=1.9" },
-    { name = "lightgbm", marker = "extra == 'eval'" },
+    { name = "lightgbm", marker = "extra == 'eval'", specifier = ">=4.6,<5" },
     { name = "matplotlib", marker = "extra == 'eval'", specifier = ">=3.8" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pandas", specifier = ">=2.0" },

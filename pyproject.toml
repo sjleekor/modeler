@@ -38,7 +38,7 @@ features = [
 eval = [
     "skfolio>=1.0",          # purged CV (mlfinlab 대체)
     "alphalens-reloaded",    # 피쳐 예측력 검증
-    "lightgbm",              # 기준선 모델
+    "lightgbm>=4.6,<5",      # 기준선 모델
     "matplotlib>=3.8",
 ]
 
