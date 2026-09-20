@@ -121,6 +121,324 @@ def test_split_factors_excludes_splits_after_base_date(tmp_path: Path, lake: UsL
     assert result["split_factor"].item() == pytest.approx(1 / 7)
 
 
+def test_split_factors_drops_zero_to_factor(tmp_path: Path, lake: UsLake) -> None:
+    """``to_factor=0``(2026-09-20 실측 결함)은 가격을 보지 않고 무조건 버린다."""
+    _write_corp_actions(
+        tmp_path,
+        [
+            {
+                "symbol": "AIV",
+                "ex_date": date(2019, 2, 20),
+                "kind": "split",
+                "to_factor": 0.0,
+                "for_factor": 0.0,
+            }
+        ],
+    )
+    _write_prices(
+        tmp_path,
+        [
+            {
+                "date": date(2019, 2, 19),
+                "symbol": "AIV",
+                "open": 40.0,
+                "high": 40.0,
+                "low": 40.0,
+                "close": 40.0,
+                "volume": 100.0,
+            },
+            {
+                "date": date(2019, 2, 20),
+                "symbol": "AIV",
+                "open": 40.0,
+                "high": 40.0,
+                "low": 40.0,
+                "close": 40.0,
+                "volume": 100.0,
+            },
+        ],
+    )
+
+    diagnostics: dict[str, int] = {}
+    result = split_factors(lake, base_date=date(2026, 1, 1), diagnostics=diagnostics).collect()
+
+    assert result.height == 0
+    assert diagnostics["invalid_factor"] == 1
+    assert diagnostics["confirmed"] == 0
+    assert diagnostics["rejected_price_mismatch"] == 0
+    assert diagnostics["unverifiable"] == 0
+
+
+def test_split_factors_drops_price_mismatched_split(tmp_path: Path, lake: UsLake) -> None:
+    """가짜 ex_date(2026-09-20 실측 — 같은 배율 중복 분할)는 가격이 안 맞아 버려진다.
+
+    AMZN 2022-05-26 사례를 축소했다 — 20:1 분할 행이 있는데 그날 가격은 정상
+    상승(약 4%)이라 20배 근처와 전혀 안 맞는다.
+    """
+    _write_corp_actions(
+        tmp_path,
+        [
+            {
+                "symbol": "FAKE",
+                "ex_date": date(2022, 5, 26),
+                "kind": "split",
+                "to_factor": 1.0,
+                "for_factor": 20.0,
+            }
+        ],
+    )
+    _write_prices(
+        tmp_path,
+        [
+            {
+                "date": date(2022, 5, 25),
+                "symbol": "FAKE",
+                "open": 2135.50,
+                "high": 2135.50,
+                "low": 2135.50,
+                "close": 2135.50,
+                "volume": 100.0,
+            },
+            {
+                "date": date(2022, 5, 26),
+                "symbol": "FAKE",
+                "open": 2221.55,
+                "high": 2221.55,
+                "low": 2221.55,
+                "close": 2221.55,
+                "volume": 100.0,
+            },
+        ],
+    )
+
+    diagnostics: dict[str, int] = {}
+    result = split_factors(lake, base_date=date(2026, 1, 1), diagnostics=diagnostics).collect()
+
+    assert result.height == 0
+    assert diagnostics["rejected_price_mismatch"] == 1
+    assert diagnostics["confirmed"] == 0
+    assert diagnostics["unverifiable"] == 0
+
+
+def test_split_factors_keeps_price_confirmed_forward_split(tmp_path: Path, lake: UsLake) -> None:
+    """진짜 분할(가격이 배율만큼 실제로 움직인다)은 살아남는다.
+
+    AMZN 2022-06-06 20:1 사례를 축소했다 — 그날 가격이 20분의 1로 떨어진다.
+    """
+    _write_corp_actions(
+        tmp_path,
+        [
+            {
+                "symbol": "REAL",
+                "ex_date": date(2022, 6, 6),
+                "kind": "split",
+                "to_factor": 20.0,
+                "for_factor": 1.0,
+            }
+        ],
+    )
+    _write_prices(
+        tmp_path,
+        [
+            {
+                "date": date(2022, 6, 3),
+                "symbol": "REAL",
+                "open": 2447.00,
+                "high": 2447.00,
+                "low": 2447.00,
+                "close": 2447.00,
+                "volume": 100.0,
+            },
+            {
+                "date": date(2022, 6, 6),
+                "symbol": "REAL",
+                "open": 124.97,
+                "high": 124.97,
+                "low": 124.97,
+                "close": 124.97,
+                "volume": 100.0,
+            },
+        ],
+    )
+
+    diagnostics: dict[str, int] = {}
+    result = split_factors(lake, base_date=date(2026, 1, 1), diagnostics=diagnostics).collect()
+
+    assert result.height == 1
+    assert result["split_factor"].item() == pytest.approx(1 / 20)
+    assert diagnostics["confirmed"] == 1
+    assert diagnostics["rejected_price_mismatch"] == 0
+    assert diagnostics["unverifiable"] == 0
+
+
+def test_split_factors_keeps_price_confirmed_reverse_split(tmp_path: Path, lake: UsLake) -> None:
+    """액면병합(가격이 배율만큼 오른다)도 같은 규칙으로 살아남는다."""
+    _write_corp_actions(
+        tmp_path,
+        [
+            {
+                "symbol": "MERGE",
+                "ex_date": date(2023, 1, 10),
+                "kind": "split",
+                "to_factor": 1.0,
+                "for_factor": 10.0,
+            }
+        ],
+    )
+    _write_prices(
+        tmp_path,
+        [
+            {
+                "date": date(2023, 1, 9),
+                "symbol": "MERGE",
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 100.0,
+            },
+            {
+                "date": date(2023, 1, 10),
+                "symbol": "MERGE",
+                "open": 10.0,
+                "high": 10.0,
+                "low": 10.0,
+                "close": 10.0,
+                "volume": 100.0,
+            },
+        ],
+    )
+
+    diagnostics: dict[str, int] = {}
+    result = split_factors(lake, base_date=date(2026, 1, 1), diagnostics=diagnostics).collect()
+
+    assert result.height == 1
+    assert result["split_factor"].item() == pytest.approx(10.0)
+    assert diagnostics["confirmed"] == 1
+
+
+def test_split_factors_keeps_unverifiable_split(tmp_path: Path, lake: UsLake) -> None:
+    """이 심볼의 원시 가격이 아예 없어 검증이 안 되면 버리지 않고 살린다."""
+    _write_corp_actions(
+        tmp_path,
+        [
+            {
+                "symbol": "NOPRICE",
+                "ex_date": date(2020, 1, 15),
+                "kind": "split",
+                "to_factor": 2.0,
+                "for_factor": 1.0,
+            }
+        ],
+    )
+    # NOPRICE의 가격은 하나도 없다 — 다른 심볼만 있다.
+    _write_prices(
+        tmp_path,
+        [
+            {
+                "date": date(2020, 1, 15),
+                "symbol": "OTHER",
+                "open": 50.0,
+                "high": 50.0,
+                "low": 50.0,
+                "close": 50.0,
+                "volume": 100.0,
+            }
+        ],
+    )
+
+    diagnostics: dict[str, int] = {}
+    result = split_factors(lake, base_date=date(2026, 1, 1), diagnostics=diagnostics).collect()
+
+    assert result.height == 1
+    assert result["symbol"].item() == "NOPRICE"
+    assert result["split_factor"].item() == pytest.approx(1 / 2)
+    assert diagnostics["unverifiable"] == 1
+    assert diagnostics["confirmed"] == 0
+    assert diagnostics["rejected_price_mismatch"] == 0
+
+
+def test_split_factors_price_tolerance_boundary(tmp_path: Path, lake: UsLake) -> None:
+    """1.5배 허용 경계 — ``|log(ratio/f)| < log(1.5)``는 엄격 부등호다.
+
+    ``f=2``(2:1 분할)일 때 허용 구간은 ``ratio/f`` 기준 (1/1.5, 1.5)다.
+    ``ratio/f = 1.49``는 안(확인) · ``ratio/f = 1.5`` 정각은 밖(버림)이다.
+    """
+    _write_corp_actions(
+        tmp_path,
+        [
+            {
+                "symbol": "IN",
+                "ex_date": date(2021, 3, 1),
+                "kind": "split",
+                "to_factor": 1.0,
+                "for_factor": 2.0,
+            },
+            {
+                "symbol": "OUT",
+                "ex_date": date(2021, 3, 1),
+                "kind": "split",
+                "to_factor": 1.0,
+                "for_factor": 2.0,
+            },
+        ],
+    )
+    prev_close = 100.0
+    # ratio/f = 1.49 -> ratio = 2 * 1.49 = 2.98 -> ex_close = 100 * 2.98 = 298.0
+    in_bound_close = prev_close * 2.0 * 1.49
+    # ratio/f = 1.5 정각 -> ratio = 3.0 -> ex_close = 300.0 (경계, 버림)
+    out_bound_close = prev_close * 2.0 * 1.5
+
+    _write_prices(
+        tmp_path,
+        [
+            {
+                "date": date(2021, 2, 26),
+                "symbol": "IN",
+                "open": prev_close,
+                "high": prev_close,
+                "low": prev_close,
+                "close": prev_close,
+                "volume": 100.0,
+            },
+            {
+                "date": date(2021, 3, 1),
+                "symbol": "IN",
+                "open": in_bound_close,
+                "high": in_bound_close,
+                "low": in_bound_close,
+                "close": in_bound_close,
+                "volume": 100.0,
+            },
+            {
+                "date": date(2021, 2, 26),
+                "symbol": "OUT",
+                "open": prev_close,
+                "high": prev_close,
+                "low": prev_close,
+                "close": prev_close,
+                "volume": 100.0,
+            },
+            {
+                "date": date(2021, 3, 1),
+                "symbol": "OUT",
+                "open": out_bound_close,
+                "high": out_bound_close,
+                "low": out_bound_close,
+                "close": out_bound_close,
+                "volume": 100.0,
+            },
+        ],
+    )
+
+    diagnostics: dict[str, int] = {}
+    result = split_factors(lake, base_date=date(2026, 1, 1), diagnostics=diagnostics).collect()
+
+    assert result["symbol"].to_list() == ["IN"]
+    assert diagnostics["confirmed"] == 1
+    assert diagnostics["rejected_price_mismatch"] == 1
+
+
 def test_split_factors_ignores_dividend_rows(tmp_path: Path, lake: UsLake) -> None:
     frame = pl.DataFrame(
         {
