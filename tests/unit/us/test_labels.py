@@ -6,6 +6,7 @@ import math
 from datetime import date, timedelta
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -181,28 +182,93 @@ def test_bucket_sic2_preserves_row_order() -> None:
 # --- neutralize_cross_section ----------------------------------------------------
 
 
-def test_neutralize_cross_section_residual_mean_is_zero_for_pure_group_effects() -> None:
-    """노이즈 없이 순수 decile·sic2 그룹 효과만 있으면 잔차가 거의 0이어야 한다."""
-    adv_effect = {i: i * 0.01 for i in range(10)}
-    sic_effect = {"A": 0.05, "B": -0.05}
+def test_neutralize_cross_section_residual_zero_for_any_monotonic_size_effect() -> None:
+    """``L1``이 ``adv_20d``의 순수 단조함수면(모양과 무관하게) 잔차가 거의 0이어야 한다.
+
+    2026-09-20 순위 공간 정정 전에는 이 테스트가 "10분위 더미 + sic2 더미로
+    걷을 수 있는 순수 계단형 효과"를 박아 뒀다 — 그 정의(수준 공간, 10분위
+    더미)를 이제 안 쓴다. 새 정의에서는 ``x=percentile_rank(log(adv_20d))``·
+    ``y=percentile_rank(L1)``이라, ``L1``이 ``adv_20d``에 대해 **단조증가**면
+    동순위가 없는 한 ``y``가 ``x``와 정확히 같아진다(둘 다 같은 순서를 그대로
+    반영하는 백분위이므로) — 그러면 회귀의 ``x`` 항 하나만으로 정확히 설명되고
+    (계수 1, 나머지 0인 해가 존재), ``x^2``·sic2 더미와 무관하게 잔차가 0이
+    된다. 사이즈 효과가 선형이든 3차든 로그든 상관없다는 뜻이라, 예전 계단형
+    가정보다 오히려 더 일반적인 보장이다. sic2 더미가 이 항등식을 깨지 않도록
+    여기서는 sic2를 하나로 고정한다(더미 분리 자체는
+    ``test_neutralize_cross_section_minority_sic2_does_not_perfectly_fit``가 딴다).
+    """
+    n = 200
     rows = []
-    for decile in range(10):
-        for i in range(25):  # 데실마다 25종목, sic2는 둘 다 20종목 넘게
-            sic = "A" if i % 2 == 0 else "B"
-            adv = math.exp(decile + i * 1e-4)  # decile 순서를 그대로 보존
-            rows.append(
-                {
-                    "adv_20d": adv,
-                    "sic2": sic,
-                    "L1": adv_effect[decile] + sic_effect[sic],
-                }
-            )
+    for k in range(n):
+        adv = math.exp(k * 1e-3)  # 오름차순 고유값 -> rank(log(adv))-1 == k
+        l1 = math.log1p(k) ** 3 + 7.0  # adv에 대해 순수 단조(모양은 무관하다)
+        rows.append({"adv_20d": adv, "sic2": "A", "L1": l1})
     df = pl.DataFrame(rows)
 
     result = neutralize_cross_section(df)
 
     assert abs(result["L2"].sum()) < 1e-8
-    assert result["L2"].abs().max() < 1e-6
+    assert result["L2"].abs().max() < 1e-8
+
+
+def test_neutralize_cross_section_removes_pure_linear_size_effect_rank_correlation() -> None:
+    """``L1``이 사이즈에 순수 선형이면, ``L2``와 ``log(adv_20d)``의 순위상관이 0에
+    가까워야 한다 — 게이트(``mean|ρ| < 0.03``)가 실제로 재는 지표다.
+    """
+    n = 500
+    x = np.array([k / (n - 1) for k in range(n)])
+    l1 = 3.0 * x + 0.7
+    df = pl.DataFrame(
+        {
+            "adv_20d": [math.exp(k * 1e-3) for k in range(n)],
+            "sic2": ["A" if k % 2 == 0 else "B" for k in range(n)],
+            "L1": l1.tolist(),
+        }
+    )
+
+    result = neutralize_cross_section(df)
+
+    rho = np.corrcoef(
+        result["L2"].rank(method="average").to_numpy(),
+        result["adv_20d"].log().rank(method="average").to_numpy(),
+    )[0, 1]
+    assert abs(rho) < 0.05
+
+
+def test_neutralize_cross_section_quadratic_term_reduces_residual_for_hump_shaped_effect() -> None:
+    """``x^2`` 항이 실제로 회귀에 들어가는지 확인한다.
+
+    순위 공간에서 뚜렷한 오목(가운데가 높은, hump형) 크기효과를 주면 1차항
+    (``x``)만으로는 못 걷는다 — [0,1]에서 ``x``만으로 표현 가능한 함수는
+    전부 단조라, 오목한 모양 자체를 설명할 수 없기 때문이다. 실제 구현(``x``
+    와 ``x^2``를 같이 회귀)과, ``x^2``을 뺀 대조군을 직접 풀어 비교한다.
+    """
+    n = 400
+    x = np.array([k / (n - 1) for k in range(n)])
+    sic = np.array(["A" if k % 2 == 0 else "B" for k in range(n)])
+    # 오목한 패턴 + 동순위를 막는 아주 작은(1e-9) 선형 항.
+    l1 = (x - x**2) + 1e-9 * np.arange(n)
+    df = pl.DataFrame(
+        {
+            "adv_20d": [math.exp(k * 1e-3) for k in range(n)],
+            "sic2": sic.tolist(),
+            "L1": l1.tolist(),
+        }
+    )
+
+    result = neutralize_cross_section(df)
+    quad_sse = float((result["L2"].to_numpy() ** 2).sum())
+
+    # 대조군: x^2 없이(절편 + x + sic2 더미만) 같은 y를 직접 회귀한다.
+    n_rows = df.height
+    denom = max(n_rows - 1, 1)
+    y = (pl.Series(l1.tolist()).rank(method="min").cast(pl.Float64) - 1) / denom
+    dummy = np.array([1.0 if s == "B" else 0.0 for s in sic])
+    design_linear = np.column_stack([np.ones(n_rows), x, dummy])
+    beta_lin, *_ = np.linalg.lstsq(design_linear, y.to_numpy(), rcond=None)
+    linear_sse = float(((y.to_numpy() - design_linear @ beta_lin) ** 2).sum())
+
+    assert quad_sse < linear_sse * 0.5
 
 
 def test_neutralize_cross_section_minority_sic2_does_not_perfectly_fit() -> None:
@@ -241,6 +307,45 @@ def test_add_l2_applies_independently_per_date() -> None:
     assert result["date"].n_unique() == 2
     means = result.group_by("date").agg(pl.col("L2").mean().alias("m"))
     assert means["m"].abs().max() < 1e-8
+
+
+def test_add_l2_ranks_within_each_date_not_pooled_globally() -> None:
+    """순위 변환이 그날 횡단면 '안'에서만 되는지 확인한다.
+
+    두 날짜를 합친 뒤 날짜 구분 없이 전역으로 순위를 매기면(잘못된 구현) 각
+    날짜를 따로 계산한 것과 다른 ``L2``가 나온다 — ``adv_20d`` 절대 스케일이
+    날짜마다 크게 다르면(여기서는 1.0 vs 1000.0) 전역 순위가 각 날짜 안의
+    상대 순위를 압축해 x 범위가 [0,1]이 아니게 되기 때문이다. ``add_l2``는
+    날짜별로 따로 계산해야(``partition_by("date")``) 이 문제가 없다.
+    """
+    n = 20
+    rows = []
+    for d, scale in [(date(2020, 1, 1), 1.0), (date(2020, 2, 1), 1_000.0)]:
+        for k in range(n):
+            rows.append(
+                {
+                    "date": d,
+                    "adv_20d": scale + k,
+                    "sic2": "A" if k % 2 == 0 else "B",
+                    "L1": math.sin(k * 0.3),  # 임의의 비단조 패턴
+                }
+            )
+    combined = pl.DataFrame(rows)
+
+    per_date_result = add_l2(combined)
+
+    # 날짜별로 직접 호출해 이어붙인 것과 완전히 같아야 한다.
+    expected_parts = [
+        neutralize_cross_section(combined.filter(pl.col("date") == d).drop("date"))
+        for d in combined["date"].unique(maintain_order=True)
+    ]
+    expected_l2 = np.concatenate([p["L2"].to_numpy() for p in expected_parts])
+    assert per_date_result["L2"].to_numpy() == pytest.approx(expected_l2)
+
+    # 대조군: 두 날짜를 구분 없이 하나의 횡단면으로 (잘못) 합쳐 순위를 매기면
+    # 값이 달라진다 — add_l2가 실제로 날짜별로 분리해서 도는지의 증거다.
+    pooled = neutralize_cross_section(combined.drop("date"))
+    assert not np.allclose(pooled["L2"].to_numpy(), per_date_result["L2"].to_numpy())
 
 
 # --- build_labels: 종가·종가 수익 --------------------------------------------------
@@ -471,3 +576,44 @@ def test_build_labels_ticker_reuse_gap_blocks_cross_company_return(
     # t21의 값(500.0)을 쓰지 않는다 — 공백 앞 마지막 값(t 자신, 10.0)으로 닫혀 L0=0.
     assert row["L0"][0] == pytest.approx(0.0)
     assert diag["closed_by_reason"]["ticker_reuse_gap"] == 1
+
+
+def test_build_labels_l0_and_l1_unchanged_by_rank_space_l2(tmp_path: Path, lake: UsLake) -> None:
+    """``L2`` 중립화를 순위 공간으로 바꿔도 ``L0``·``L1``은 그대로여야 한다.
+
+    ``L0``(개별 종목 수익)·``L1``(그날 유니버스 동일가중 초과수익)은 중립화
+    구현과 독립이다 — 백테스트 수익이 이 둘에서 나오므로 바뀌면 안 된다.
+    """
+    _write_trading_calendar(tmp_path, _CALENDAR)
+    _write_corp_actions(tmp_path)
+    _write_listing_snapshots(tmp_path, [])
+    _write_prices(
+        tmp_path,
+        [
+            _price_row(_T, "AAA", 10.0),
+            _price_row(_T21, "AAA", 12.0),  # L0 = 0.20
+            _price_row(_T, "BBB", 20.0),
+            _price_row(_T21, "BBB", 19.0),  # L0 = -0.05
+            _price_row(_T, "CCC", 5.0),
+            _price_row(_T21, "CCC", 5.5),  # L0 = 0.10
+        ],
+    )
+    panel = _panel_df(
+        [
+            _panel_row(_T, "AAA", close=10.0, adj_close=10.0),
+            _panel_row(_T, "BBB", close=20.0, adj_close=20.0),
+            _panel_row(_T, "CCC", close=5.0, adj_close=5.0),
+        ]
+    )
+
+    labels, _ = build_labels(lake, panel=panel)
+
+    l0 = {row["symbol"]: row["L0"] for row in labels.to_dicts()}
+    assert l0["AAA"] == pytest.approx(0.20)
+    assert l0["BBB"] == pytest.approx(-0.05)
+    assert l0["CCC"] == pytest.approx(0.10)
+
+    expected_mean = (0.20 + (-0.05) + 0.10) / 3
+    l1 = {row["symbol"]: row["L1"] for row in labels.to_dicts()}
+    for symbol, l0_value in l0.items():
+        assert l1[symbol] == pytest.approx(l0_value - expected_mean)

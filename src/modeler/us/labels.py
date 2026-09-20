@@ -4,9 +4,22 @@
 |---|---|
 | L0 | ``adj_close(t+21)/adj_close(t) - 1``. 거래일 21일 뒤(``HORIZON_TRADING_DAYS``) |
 | L1 | ``L0 - mean_universe(L0)`` (그날 유니버스 동일가중 — 라벨 벤치마크, ``02`` §3) |
-| L2 | L1을 그날 횡단면에서 ``log(adv_20d)`` 10분위 더미 + ``sic2`` 더미에 회귀한 잔차 |
+| L2 | ``x=log(adv_20d)``·``y=L1``의 백분위 순위로 ``y ~ x + x^2 + sic2``를 회귀한 잔차 |
 | y_rank | L2의 그날 횡단면 백분위 순위 [0,1] |
 | y_up | ``L2 > 0`` |
+
+**L2를 수준(level) 공간이 아니라 순위(rank) 공간에서 중립화한다.** 처음 구현은
+``log(adv_20d)`` 10분위 더미로 중립화했는데, M1 완료 판정(``02`` §7)이 요구하는
+``max|ρ(L2, log(adv_20d))| < 0.02``에 크게 못 미쳤다(실측 0.169, ``mcap_rank``는
+0.244 — 레이크 결함을 고친 뒤에도 그대로였다). 원인은 10분위 더미가 데실
+"사이" 평균차만 걷고 데실 "안"의 연속적 크기효과를 못 걷는 것, 그리고 게이트가
+재는 것은 rank 상관인데 회귀는 수준에서 한다는 것 — 정의가 서로 안 맞았다.
+그래서 ``x``·``y`` 모두 그날 횡단면 백분위 순위로 바꾸고, 순위상 비선형
+크기효과까지 걷도록 ``x^2``을 더했다. 게이트 기준도 함께 바꿨다 — 종목 약
+4,000개면 순위상관의 표준오차가 ``1/√4000 ≈ 0.016``이라, 완벽히 중립화된
+데이터도 96개월 중 일부 달은 ``|ρ|``가 0.03~0.05까지 나온다. ``max|ρ| < 0.02``는
+잡음 바닥보다 낮은 값을 96개월 전부에 요구한 셈이라 애초에 달성 불가능했다 —
+새 기준은 ``mean|ρ| < 0.03``(두 축 모두)이고 ``max|ρ|``는 기록만 한다.
 
 **가격이 끊긴 종목** (``t``에 유니버스에 있었는데 ``t+21``에 가격이 정확히 없는 종목)은
 사유별로 닫는다 (``02`` §2.1): ``listing_snapshots.financial_status``가 마지막
@@ -121,8 +134,8 @@ def bucket_sic2(df: pl.DataFrame, *, min_group_size: int = MIN_SIC2_GROUP_SIZE) 
 
     ``group_by().join()``이 아니라 ``.over()``로 그룹 크기를 구한다 — join은
     행 순서를 보장하지 않아, join 결과에 원래 순서로 계산한 다른 컬럼을 붙이면
-    조용히 어긋난다 (``neutralize_cross_section``의 ``adv_decile``이 실제로 이
-    문제를 겪었다).
+    조용히 어긋난다 (예전 구현의 ``adv_decile``이 실제로 이 문제를 겪었다 — 지금은
+    ``neutralize_cross_section``이 순위를 elementwise로만 계산해 이 문제가 없다).
     """
     return df.with_columns(
         pl.when(pl.col("sic2").is_null())
@@ -134,49 +147,69 @@ def bucket_sic2(df: pl.DataFrame, *, min_group_size: int = MIN_SIC2_GROUP_SIZE) 
     )
 
 
-def _adv_decile(df: pl.DataFrame) -> pl.Series:
-    """``log(adv_20d)`` 10분위 (0..9). 동순위는 ordinal rank로 깬다.
+def _percentile_rank(series: pl.Series) -> pl.Series:
+    """SQL ``PERCENT_RANK()``와 같은 정의: ``(rank-1)/(n-1)``, 동순위는 최소 rank. [0,1].
 
-    ``qcut``이 아니라 순위 기반 등분이다 — 동일 경계값이 많아도(듬성듬성한
-    ADV 분포) 에러 없이 항상 10개 구간으로 나뉜다.
+    회귀 입력(``x``·``y``)과 최종 출력 ``y_rank`` 모두 이 정의 하나로 통일한다 —
+    ``modeler.etl.labels``의 한국 라벨과 같은 관례다. 순위는 단조변환에 불변이라
+    ``log(adv_20d)``의 순위와 ``adv_20d``의 순위는 같다 — 그래도 정의(``x=log(adv_20d)``의
+    백분위)를 코드에 그대로 드러내려고 ``log()``를 명시해서 넘긴다.
     """
-    n = df.height
-    ranks = df["adv_20d"].log().rank(method="ordinal")
-    return ((ranks - 1) * 10 // n).clip(0, 9).cast(pl.Int32)
+    n = series.len()
+    denom = max(n - 1, 1)
+    return (series.rank(method="min").cast(pl.Float64) - 1) / denom
 
 
 def neutralize_cross_section(df: pl.DataFrame) -> pl.DataFrame:
     """한 날짜(횡단면)의 ``L1``을 중립화한 잔차 ``L2``와 ``y_rank``·``y_up``을 붙인다.
 
-    회귀는 절편 + (``log(adv_20d)`` 10분위 더미, 기준 하나 드롭) + (``sic2_bucket``
-    더미, 기준 하나 드롭)이고 ``numpy.linalg.lstsq``로 푼다. 절편이 있으므로
-    잔차의 합은 부동소수점 오차 안에서 0이다 (``02`` §7 완료 판정).
+    **순위(rank) 공간에서 중립화한다** (2026-09-20 정정 — 모듈 docstring 참고).
+    ``x``=``log(adv_20d)``의 그날 횡단면 백분위 순위, ``y``=``L1``의 그날 횡단면
+    백분위 순위(둘 다 ``_percentile_rank``, [0,1])로 바꾼 뒤, 회귀는 절편 +
+    ``x`` + ``x^2``(순위상 비선형 크기효과까지 걷는다) + (``sic2_bucket`` 더미,
+    기준 하나 드롭)이고 ``numpy.linalg.lstsq``로 푼다. 절편이 있으므로 잔차의
+    합은 부동소수점 오차 안에서 0이다 (``02`` §7 완료 판정).
+
+    ``lstsq``는 SVD 기반이라 ``x``·``x^2``가 극단(순위 0·1 부근)에서 거의
+    공선(共線)이 되거나 사실상 특이행렬이 되는 경우도 최소노름해로 처리한다 —
+    별도 예외 처리가 필요 없다(더미는 ``drop_first``로 완전공선만 미리 없앤다).
 
     ``df``는 ``date``가 하나뿐이어야 하고 ``adv_20d``·``sic2``·``L1`` 컬럼이
-    있어야 한다. ``y_rank``는 SQL ``PERCENT_RANK()``와 같은 정의
-    (``(rank-1)/(n-1)``, 동순위는 최소 rank) — ``modeler.etl.labels``의 한국
-    라벨과 같은 관례다.
+    있어야 한다.
     """
     n = df.height
     bucketed = bucket_sic2(df)
-    # _adv_decile은 반드시 join 뒤(bucketed)의 행 순서로 계산해야 한다 — bucket_sic2가
-    # 쓰는 left join은 행 순서를 보장하지 않는다. df에서 계산해 붙이면 조용히
-    # 어긋난다(직접 겪은 버그 — L2·log(adv_20d) 월별 rank 상관이 0.37까지 뛰었다).
-    bucketed = bucketed.with_columns(_adv_decile(bucketed).alias("adv_decile"))
 
-    dummy_cols = bucketed.select(["adv_decile", "sic2_bucket"]).to_dummies(
-        columns=["adv_decile", "sic2_bucket"], drop_first=True
+    x = _percentile_rank(bucketed["adv_20d"].log())
+    y = _percentile_rank(bucketed["L1"])
+    bucketed = bucketed.with_columns(x.alias("adv_rank"))
+
+    dummy_cols = bucketed.select(["sic2_bucket"]).to_dummies(
+        columns=["sic2_bucket"], drop_first=True
     )
+    # ``sic2_bucket``의 고유값이 하나뿐이면(그날 횡단면 전부 같은 버킷 — 실데이터에는
+    # 거의 없지만 방어한다) polars ``to_dummies(drop_first=True)``가 (0, 0)짜리
+    # DataFrame을 준다((n, 0)이 아니다 — 실측 polars 1.44.2). 그대로 column_stack에
+    # 넣으면 행 수가 안 맞아 죽는다. 더미가 없다는 뜻이니 (n, 0) 배열로 바로잡는다.
+    if dummy_cols.width == 0:
+        dummy_arr = np.empty((n, 0), dtype=np.float64)
+    else:
+        dummy_arr = dummy_cols.to_numpy().astype(np.float64)
+    x_arr = x.to_numpy().astype(np.float64)
     design = np.column_stack(
-        [np.ones(n, dtype=np.float64), dummy_cols.to_numpy().astype(np.float64)]
+        [
+            np.ones(n, dtype=np.float64),
+            x_arr,
+            x_arr**2,
+            dummy_arr,
+        ]
     )
-    y = bucketed["L1"].to_numpy().astype(np.float64)
-    beta, _residuals, _rank, _sv = np.linalg.lstsq(design, y, rcond=None)
-    residual = y - design @ beta
+    y_arr = y.to_numpy().astype(np.float64)
+    beta, _residuals, _rank, _sv = np.linalg.lstsq(design, y_arr, rcond=None)
+    residual = y_arr - design @ beta
 
     l2 = pl.Series("L2", residual)
-    denom = max(n - 1, 1)
-    percent_rank = (l2.rank(method="min").cast(pl.Float64) - 1) / denom
+    percent_rank = _percentile_rank(l2)
 
     return bucketed.with_columns(
         l2,
@@ -196,7 +229,7 @@ def add_l2(df: pl.DataFrame) -> pl.DataFrame:
     if not parts:
         return df.with_columns(
             pl.lit(None, dtype=pl.String).alias("sic2_bucket"),
-            pl.lit(None, dtype=pl.Int32).alias("adv_decile"),
+            pl.lit(None, dtype=pl.Float64).alias("adv_rank"),
             pl.lit(None, dtype=pl.Float64).alias("L2"),
             pl.lit(None, dtype=pl.Float64).alias("y_rank"),
             pl.lit(None, dtype=pl.Boolean).alias("y_up"),
