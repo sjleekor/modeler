@@ -202,7 +202,7 @@ def test_neutralize_cross_section_residual_zero_for_any_monotonic_size_effect() 
     for k in range(n):
         adv = math.exp(k * 1e-3)  # 오름차순 고유값 -> rank(log(adv))-1 == k
         l1 = math.log1p(k) ** 3 + 7.0  # adv에 대해 순수 단조(모양은 무관하다)
-        rows.append({"adv_20d": adv, "sic2": "A", "L1": l1})
+        rows.append({"adv_20d": adv, "mcap_rank": None, "sic2": "A", "L1": l1})
     df = pl.DataFrame(rows)
 
     result = neutralize_cross_section(df)
@@ -214,13 +214,23 @@ def test_neutralize_cross_section_residual_zero_for_any_monotonic_size_effect() 
 def test_neutralize_cross_section_removes_pure_linear_size_effect_rank_correlation() -> None:
     """``L1``이 사이즈에 순수 선형이면, ``L2``와 ``log(adv_20d)``의 순위상관이 0에
     가까워야 한다 — 게이트(``mean|ρ| < 0.03``)가 실제로 재는 지표다.
+
+    ``x``와 완전히 동순위 없는 순수 단조 관계만 주면(잡음 없음) 회귀가
+    정확히 적합돼(``test_neutralize_cross_section_residual_zero_for_any_monotonic_size_effect``
+    참고) 잔차가 부동소수점 오차(1e-16 수준) 뿐이다 — 이 크기의 "신호"에
+    순위상관을 재면 진짜 관계가 아니라 반올림 오차의 우연한 패턴을 재는
+    꼴이라(``mcap_rank`` 항 추가로 설계행렬 열이 하나 더 늘기만 해도 반올림
+    패턴이 바뀌어 값이 크게 흔들린다 — 2026-09-20 실측), 아주 작은(``0.1``)
+    독립 잡음을 더해 잔차가 실제 크기를 갖게 한다.
     """
     n = 500
+    rng = np.random.default_rng(0)
     x = np.array([k / (n - 1) for k in range(n)])
-    l1 = 3.0 * x + 0.7
+    l1 = 3.0 * x + 0.7 + rng.normal(scale=0.1, size=n)
     df = pl.DataFrame(
         {
             "adv_20d": [math.exp(k * 1e-3) for k in range(n)],
+            "mcap_rank": [None] * n,
             "sic2": ["A" if k % 2 == 0 else "B" for k in range(n)],
             "L1": l1.tolist(),
         }
@@ -251,6 +261,7 @@ def test_neutralize_cross_section_quadratic_term_reduces_residual_for_hump_shape
     df = pl.DataFrame(
         {
             "adv_20d": [math.exp(k * 1e-3) for k in range(n)],
+            "mcap_rank": [None] * n,
             "sic2": sic.tolist(),
             "L1": l1.tolist(),
         }
@@ -273,9 +284,14 @@ def test_neutralize_cross_section_quadratic_term_reduces_residual_for_hump_shape
 
 def test_neutralize_cross_section_minority_sic2_does_not_perfectly_fit() -> None:
     """20종목 미만 sic2는 '기타'로 묶여야 한다 — 안 묶이면 그 종목들의 잔차가 0이 된다."""
-    rows = [{"adv_20d": 1_000.0 + i, "sic2": "BIG", "L1": 0.0} for i in range(30)]
+    rows = [
+        {"adv_20d": 1_000.0 + i, "mcap_rank": None, "sic2": "BIG", "L1": 0.0} for i in range(30)
+    ]
     tiny_l1 = [0.5, -0.3, 0.9]
-    rows += [{"adv_20d": 2_000.0 + i, "sic2": "TINY", "L1": v} for i, v in enumerate(tiny_l1)]
+    rows += [
+        {"adv_20d": 2_000.0 + i, "mcap_rank": None, "sic2": "TINY", "L1": v}
+        for i, v in enumerate(tiny_l1)
+    ]
     df = pl.DataFrame(rows)
 
     result = neutralize_cross_section(df)
@@ -288,6 +304,74 @@ def test_neutralize_cross_section_minority_sic2_does_not_perfectly_fit() -> None
     assert len(residuals) > 1
 
 
+# --- neutralize_cross_section: mcap_rank 항 (2026-09-20 추가) ---------------------
+
+
+def test_neutralize_cross_section_mcap_rank_ranked_among_present_rows_only() -> None:
+    """``m``은 그날 ``mcap_rank``가 있는 행끼리만 순위를 매겨야 한다.
+
+    전체 횡단면(결측 포함)으로 매기면 분모(n-1)가 부풀어 있는 값들의 상대
+    순위가 압축된다 — 여기서는 결측 20개, 있는 값 5개(균등 간격)를 섞어서,
+    있는 값의 백분위가 **5개 기준**(분모 4)으로 나오는지 본다. 전체 25개
+    기준(분모 24)으로 나오면 버그다. 결측 행은 ``mcap_rank_pct=0``·
+    ``has_mcap=False``를 받아야 한다 — 회귀의 ``m``·``m^2`` 항이 그 행에는
+    구조적으로 0을 곱하는 셈이라, 어떤 계수가 나오든 그 항의 영향을 안 받는다.
+    """
+    present_ranks = [10, 20, 30, 40, 50]
+    n_missing = 20
+    rows = [
+        {"adv_20d": 1_000.0 + i, "mcap_rank": r, "sic2": "A", "L1": float(i)}
+        for i, r in enumerate(present_ranks)
+    ]
+    rows += [
+        {"adv_20d": 2_000.0 + i, "mcap_rank": None, "sic2": "A", "L1": float(i) * 0.1}
+        for i in range(n_missing)
+    ]
+    df = pl.DataFrame(rows)
+
+    result = neutralize_cross_section(df)
+
+    present = result.filter(pl.col("mcap_rank").is_not_null()).sort("mcap_rank")
+    assert present["mcap_rank_pct"].to_list() == pytest.approx([0.0, 0.25, 0.5, 0.75, 1.0])
+    assert present["has_mcap"].to_list() == [True] * 5
+
+    missing = result.filter(pl.col("mcap_rank").is_null())
+    assert missing["mcap_rank_pct"].to_list() == [0.0] * n_missing
+    assert missing["has_mcap"].to_list() == [False] * n_missing
+
+
+def test_neutralize_cross_section_removes_pure_linear_mcap_size_effect_rank_correlation() -> None:
+    """``L1``이 ``mcap_rank``에 순수 선형이면, ``L2``와 ``mcap_rank``의 순위상관이
+    0에 가까워야 한다 — ``m``·``m^2`` 항을 추가한 이유 그 자체를 검증한다
+    (``02`` §2 실측 — ADV 축만으로는 ``mean|ρ(L2, mcap_rank)|`` 0.0764로 미달).
+
+    작은(``0.1``) 독립 잡음을 더한다 — 잡음이 아예 없으면 회귀가 정확히
+    적합돼 잔차가 부동소수점 오차 수준이라, 그 순위상관이 반올림 오차의
+    우연한 패턴이 된다(ADV 축의 같은 꼴 테스트 참고).
+    """
+    n = 500
+    mcap = np.arange(n)
+    rng = np.random.default_rng(0)
+    l1 = 3.0 * (mcap / (n - 1)) + 0.7 + rng.normal(scale=0.1, size=n)
+    adv = rng.permutation(n).astype(float) + 1.0  # mcap 순서와 무관한 순열
+    df = pl.DataFrame(
+        {
+            "adv_20d": adv.tolist(),
+            "mcap_rank": mcap.tolist(),
+            "sic2": ["A" if k % 2 == 0 else "B" for k in range(n)],
+            "L1": l1.tolist(),
+        }
+    )
+
+    result = neutralize_cross_section(df)
+
+    rho = np.corrcoef(
+        result["L2"].rank(method="average").to_numpy(),
+        result["mcap_rank"].rank(method="average").to_numpy(),
+    )[0, 1]
+    assert abs(rho) < 0.05
+
+
 def test_add_l2_applies_independently_per_date() -> None:
     rows = []
     for d, shift in [(date(2020, 1, 1), 0.0), (date(2020, 2, 1), 10.0)]:
@@ -296,6 +380,7 @@ def test_add_l2_applies_independently_per_date() -> None:
                 {
                     "date": d,
                     "adv_20d": 1_000.0 + i,
+                    "mcap_rank": None,
                     "sic2": "A" if i % 2 == 0 else "B",
                     "L1": shift + (i % 3) * 0.01,
                 }
@@ -326,6 +411,7 @@ def test_add_l2_ranks_within_each_date_not_pooled_globally() -> None:
                 {
                     "date": d,
                     "adv_20d": scale + k,
+                    "mcap_rank": None,
                     "sic2": "A" if k % 2 == 0 else "B",
                     "L1": math.sin(k * 0.3),  # 임의의 비단조 패턴
                 }
@@ -617,3 +703,90 @@ def test_build_labels_l0_and_l1_unchanged_by_rank_space_l2(tmp_path: Path, lake:
     l1 = {row["symbol"]: row["L1"] for row in labels.to_dicts()}
     for symbol, l0_value in l0.items():
         assert l1[symbol] == pytest.approx(l0_value - expected_mean)
+
+
+def test_build_labels_l0_and_l1_unchanged_when_mcap_rank_term_added(
+    tmp_path: Path, lake: UsLake
+) -> None:
+    """``mcap_rank`` 항(``m``·``m^2``·``has_mcap``)을 더해도 ``L0``·``L1``은 그대로여야 한다.
+
+    사이즈 항은 ``L2`` 중립화에만 들어간다 — ``L0``·``L1``은 애초에 ``mcap_rank``를
+    안 쓴다. ``mcap_rank``가 있는 종목과 없는 종목을 섞어서 확인한다.
+    """
+    _write_trading_calendar(tmp_path, _CALENDAR)
+    _write_corp_actions(tmp_path)
+    _write_listing_snapshots(tmp_path, [])
+    _write_prices(
+        tmp_path,
+        [
+            _price_row(_T, "AAA", 10.0),
+            _price_row(_T21, "AAA", 12.0),  # L0 = 0.20
+            _price_row(_T, "BBB", 20.0),
+            _price_row(_T21, "BBB", 19.0),  # L0 = -0.05
+            _price_row(_T, "CCC", 5.0),
+            _price_row(_T21, "CCC", 5.5),  # L0 = 0.10
+        ],
+    )
+    panel = _panel_df(
+        [
+            _panel_row(_T, "AAA", close=10.0, adj_close=10.0, mcap_rank=1),
+            _panel_row(_T, "BBB", close=20.0, adj_close=20.0, mcap_rank=2),
+            _panel_row(_T, "CCC", close=5.0, adj_close=5.0, mcap_rank=None),  # 결측도 섞는다
+        ]
+    )
+
+    labels, _ = build_labels(lake, panel=panel)
+
+    l0 = {row["symbol"]: row["L0"] for row in labels.to_dicts()}
+    assert l0["AAA"] == pytest.approx(0.20)
+    assert l0["BBB"] == pytest.approx(-0.05)
+    assert l0["CCC"] == pytest.approx(0.10)
+
+    expected_mean = (0.20 + (-0.05) + 0.10) / 3
+    l1 = {row["symbol"]: row["L1"] for row in labels.to_dicts()}
+    for symbol, l0_value in l0.items():
+        assert l1[symbol] == pytest.approx(l0_value - expected_mean)
+
+
+def test_build_labels_counts_constant_has_mcap_months(tmp_path: Path, lake: UsLake) -> None:
+    """``has_mcap``이 그 달 전체에서 상수(전부 1이거나 전부 0)인 달 수를 센다.
+
+    그 열이 상수면 절편과 완전공선이 된다(``labels.py`` ``neutralize_cross_section``
+    참고) — ``lstsq``가 최소노름해로 처리해 죽지는 않지만, 몇 달인지는 세서
+    보고해야 한다.
+    """
+    date1 = _T
+    date2 = _CALENDAR[1]
+    date1_t21 = _CALENDAR[21]
+    date2_t21 = _CALENDAR[22]
+
+    _write_trading_calendar(tmp_path, _CALENDAR)
+    _write_corp_actions(tmp_path)
+    _write_listing_snapshots(tmp_path, [])
+    _write_prices(
+        tmp_path,
+        [
+            _price_row(date1, "A1", 10.0),
+            _price_row(date1_t21, "A1", 11.0),
+            _price_row(date1, "A2", 20.0),
+            _price_row(date1_t21, "A2", 21.0),
+            _price_row(date2, "B1", 30.0),
+            _price_row(date2_t21, "B1", 31.0),
+            _price_row(date2, "B2", 40.0),
+            _price_row(date2_t21, "B2", 41.0),
+        ],
+    )
+    panel = _panel_df(
+        [
+            # date1: mcap_rank가 전부 있다 (has_mcap 전부 True — 상수).
+            _panel_row(date1, "A1", close=10.0, adj_close=10.0, mcap_rank=1),
+            _panel_row(date1, "A2", close=20.0, adj_close=20.0, mcap_rank=2),
+            # date2: mcap_rank가 전부 없다 (has_mcap 전부 False — 상수).
+            _panel_row(date2, "B1", close=30.0, adj_close=30.0, mcap_rank=None),
+            _panel_row(date2, "B2", close=40.0, adj_close=40.0, mcap_rank=None),
+        ]
+    )
+
+    _, diag = build_labels(lake, panel=panel)
+
+    assert diag["constant_has_mcap_months"] == 2

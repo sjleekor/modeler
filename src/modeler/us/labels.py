@@ -4,7 +4,7 @@
 |---|---|
 | L0 | ``adj_close(t+21)/adj_close(t) - 1``. 거래일 21일 뒤(``HORIZON_TRADING_DAYS``) |
 | L1 | ``L0 - mean_universe(L0)`` (그날 유니버스 동일가중 — 라벨 벤치마크, ``02`` §3) |
-| L2 | ``x=log(adv_20d)``·``y=L1``의 백분위 순위로 ``y ~ x + x^2 + sic2``를 회귀한 잔차 |
+| L2 | 순위 공간 회귀 잔차 ``y~x+x²+m+m²+has_mcap+sic2`` (``x``=adv_20d, ``m``=mcap_rank 순위) |
 | y_rank | L2의 그날 횡단면 백분위 순위 [0,1] |
 | y_up | ``L2 > 0`` |
 
@@ -20,6 +20,22 @@
 데이터도 96개월 중 일부 달은 ``|ρ|``가 0.03~0.05까지 나온다. ``max|ρ| < 0.02``는
 잡음 바닥보다 낮은 값을 96개월 전부에 요구한 셈이라 애초에 달성 불가능했다 —
 새 기준은 ``mean|ρ| < 0.03``(두 축 모두)이고 ``max|ρ|``는 기록만 한다.
+
+**그런데 ADV 축만으로는 mcap 축이 안 걷힌다** (2026-09-20 추가 정정, ``02``
+§2 최신). ADV 순위 공간 중립화 뒤 ``L2 vs log(adv_20d)`` mean|ρ|는 0.0065로
+기준(0.03)을 통과했지만, ``L2 vs mcap_rank`` mean|ρ|는 0.0764로 그대로
+미달이었다. 최소 시총 데실의 평균 ``adv_rank``가 0.206뿐이다 — 거래대금과
+시총이 다른 축이라(페니주·고회전 초소형주는 시총이 작아도 거래대금이 낮지
+않다), ADV만 걷어서는 시총 효과가 남는다(``07_risks.md`` Y1 — 알파가
+사이즈 팩터). 그래서 ``m=percentile_rank(mcap_rank)``·``m^2``·결측
+지시변수 ``has_mcap``을 회귀에 더한다. ``mcap_rank``는 유니버스의
+70.2%에만 있고 빈 30%가 무작위가 아니다(초대형주·REIT가 몰려 있다) —
+그래서 주축이 아니라 추가 항이다. **``m``은 그날 ``mcap_rank``가 있는
+행끼리만 순위를 매긴다** — 전체 횡단면으로 매기면 결측 행이 0을 받아
+"가장 작은 시총"처럼 보인다. 결측 행은 ``m=0``으로 두고 ``has_mcap=0``
+지시변수가 그 그룹의 절편을 따로 잡아, ``m``·``m^2`` 항의 영향을 받지
+않게 한다 — 없는 30%도 ``x``·``x^2``·``sic2``로는 그대로 중립화된다.
+``L2 vs mcap_rank`` 게이트는 ``mcap_rank``가 있는 행에서만 잰다(``02`` §7).
 
 **가격이 끊긴 종목** (``t``에 유니버스에 있었는데 ``t+21``에 가격이 정확히 없는 종목)은
 사유별로 닫는다 (``02`` §2.1): ``listing_snapshots.financial_status``가 마지막
@@ -160,29 +176,58 @@ def _percentile_rank(series: pl.Series) -> pl.Series:
     return (series.rank(method="min").cast(pl.Float64) - 1) / denom
 
 
+def _percentile_rank_where(values: pl.Series, present: pl.Series) -> pl.Series:
+    """``present``가 참인 행끼리만 ``_percentile_rank``를 매기고, 나머지는 0.0.
+
+    ``mcap_rank``처럼 그날 횡단면에 결측이 섞인 축을 위한 것이다. ``present``
+    가 거짓인 행을 포함해 통째로 순위를 매기면 결측 행이 최저 순위(0)를
+    받아, 마치 "가장 작은 시총"인 것처럼 왜곡된다(모듈 docstring 참고) —
+    그래서 ``present`` 인 값만 추려 그 안에서 백분위 순위를 매긴 뒤, 원래
+    위치(불리언 마스크, 순서에 의존하지 않는다)에 되돌려 넣는다. 결측 행은
+    0.0을 받지만, 호출부가 같이 붙이는 ``has_mcap`` 지시변수가 그 행들을
+    회귀에서 따로 떼어내므로(``m``·``m^2`` 항의 영향을 받지 않는다) 이
+    0.0이 "가장 작은 시총"으로 해석되지 않는다.
+    """
+    mask = present.to_numpy()
+    result = np.zeros(present.len(), dtype=np.float64)
+    result[mask] = _percentile_rank(values.filter(present)).to_numpy()
+    return pl.Series(result)
+
+
 def neutralize_cross_section(df: pl.DataFrame) -> pl.DataFrame:
     """한 날짜(횡단면)의 ``L1``을 중립화한 잔차 ``L2``와 ``y_rank``·``y_up``을 붙인다.
 
     **순위(rank) 공간에서 중립화한다** (2026-09-20 정정 — 모듈 docstring 참고).
-    ``x``=``log(adv_20d)``의 그날 횡단면 백분위 순위, ``y``=``L1``의 그날 횡단면
-    백분위 순위(둘 다 ``_percentile_rank``, [0,1])로 바꾼 뒤, 회귀는 절편 +
-    ``x`` + ``x^2``(순위상 비선형 크기효과까지 걷는다) + (``sic2_bucket`` 더미,
-    기준 하나 드롭)이고 ``numpy.linalg.lstsq``로 푼다. 절편이 있으므로 잔차의
-    합은 부동소수점 오차 안에서 0이다 (``02`` §7 완료 판정).
+    ``x``=``log(adv_20d)``의 그날 횡단면 백분위 순위(100% 있다), ``m``=``mcap_rank``의
+    **그 값이 있는 행끼리만** 매긴 백분위 순위(없으면 0), ``has_mcap``=``mcap_rank``
+    유무 지시변수, ``y``=``L1``의 그날 횡단면 백분위 순위(``_percentile_rank``,
+    [0,1])로 바꾼 뒤, 회귀는 절편 + ``x`` + ``x^2`` + ``m`` + ``m^2`` +
+    ``has_mcap`` + (``sic2_bucket`` 더미, 기준 하나 드롭)이고
+    ``numpy.linalg.lstsq``로 푼다. 절편이 있으므로 잔차의 합은 부동소수점
+    오차 안에서 0이다 (``02`` §7 완료 판정).
 
     ``lstsq``는 SVD 기반이라 ``x``·``x^2``가 극단(순위 0·1 부근)에서 거의
     공선(共線)이 되거나 사실상 특이행렬이 되는 경우도 최소노름해로 처리한다 —
     별도 예외 처리가 필요 없다(더미는 ``drop_first``로 완전공선만 미리 없앤다).
+    ``has_mcap``이 그 횡단면 전체에서 상수(전부 1이거나 전부 0)면 절편과
+    완전공선이 되는데(전부 1인 경우) 이 역시 ``lstsq``가 최소노름해로 처리한다
+    — 어느 쪽으로 계수가 나뉘든 ``design @ beta``(따라서 잔차)는 불변이다.
 
-    ``df``는 ``date``가 하나뿐이어야 하고 ``adv_20d``·``sic2``·``L1`` 컬럼이
-    있어야 한다.
+    ``df``는 ``date``가 하나뿐이어야 하고 ``adv_20d``·``mcap_rank``·``sic2``·
+    ``L1`` 컬럼이 있어야 한다.
     """
     n = df.height
     bucketed = bucket_sic2(df)
 
     x = _percentile_rank(bucketed["adv_20d"].log())
     y = _percentile_rank(bucketed["L1"])
-    bucketed = bucketed.with_columns(x.alias("adv_rank"))
+    has_mcap = bucketed["mcap_rank"].is_not_null()
+    m = _percentile_rank_where(bucketed["mcap_rank"], has_mcap)
+    bucketed = bucketed.with_columns(
+        x.alias("adv_rank"),
+        m.alias("mcap_rank_pct"),
+        has_mcap.alias("has_mcap"),
+    )
 
     dummy_cols = bucketed.select(["sic2_bucket"]).to_dummies(
         columns=["sic2_bucket"], drop_first=True
@@ -196,11 +241,16 @@ def neutralize_cross_section(df: pl.DataFrame) -> pl.DataFrame:
     else:
         dummy_arr = dummy_cols.to_numpy().astype(np.float64)
     x_arr = x.to_numpy().astype(np.float64)
+    m_arr = m.to_numpy().astype(np.float64)
+    has_mcap_arr = has_mcap.cast(pl.Float64).to_numpy()
     design = np.column_stack(
         [
             np.ones(n, dtype=np.float64),
             x_arr,
             x_arr**2,
+            m_arr,
+            m_arr**2,
+            has_mcap_arr,
             dummy_arr,
         ]
     )
@@ -230,6 +280,8 @@ def add_l2(df: pl.DataFrame) -> pl.DataFrame:
         return df.with_columns(
             pl.lit(None, dtype=pl.String).alias("sic2_bucket"),
             pl.lit(None, dtype=pl.Float64).alias("adv_rank"),
+            pl.lit(None, dtype=pl.Float64).alias("mcap_rank_pct"),
+            pl.lit(None, dtype=pl.Boolean).alias("has_mcap"),
             pl.lit(None, dtype=pl.Float64).alias("L2"),
             pl.lit(None, dtype=pl.Float64).alias("y_rank"),
             pl.lit(None, dtype=pl.Boolean).alias("y_up"),
@@ -492,6 +544,17 @@ def build_labels(
     l1_df = l0_df.with_columns((pl.col("L0") - pl.col("L0").mean().over("date")).alias("L1"))
     labeled = add_l2(l1_df).sort(["date", "symbol"])
 
+    # ``has_mcap``이 그 달 횡단면 전체에서 상수(전부 1이거나 전부 0)면 그 열이
+    # 절편과 완전공선이 된다 — ``lstsq``가 최소노름해로 처리해 죽지는 않지만
+    # (``neutralize_cross_section`` 참고), 몇 개 달이 그런지는 세서 보고한다.
+    if labeled.height:
+        has_mcap_variety = labeled.group_by("date").agg(
+            pl.col("has_mcap").n_unique().alias("n_unique")
+        )
+        constant_has_mcap_months = int((has_mcap_variety["n_unique"] <= 1).sum())
+    else:
+        constant_has_mcap_months = 0
+
     diagnostics: dict[str, object] = {
         "rebalance_dates_total": len(rebalance_dates),
         "rebalance_dates_usable": len(usable_dates),
@@ -506,5 +569,6 @@ def build_labels(
             "count": implausible.height,
             "symbols": sorted(implausible["symbol"].unique().to_list()),
         },
+        "constant_has_mcap_months": constant_has_mcap_months,
     }
     return labeled, diagnostics
