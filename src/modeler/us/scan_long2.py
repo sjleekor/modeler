@@ -1,8 +1,9 @@
-"""N1 — 2차 사전등록(롱 쪽 검정) 등급표 코드. **실행은 N2다.**
+"""N1 — 2차 사전등록(롱 쪽 검정) 등급표 코드. **N2가 실행했고, N2 재실행이
+G1을 실측 회전율로 고쳤다.**
 
 정본: ``my/milestones/us/plan/20260921_long_side/00_candidate_plan/
-01_preregistration.md``(태그 ``us2-features-frozen``). 이 문서 §3~§6을 그대로
-구현한다 — 해석이 갈리면 그 문서를 따른다.
+01_preregistration.md``(태그 ``us2-features-frozen-v2``, G1 개정 포함). 이
+문서 §3~§6을 그대로 구현한다 — 해석이 갈리면 그 문서를 따른다.
 
     uv run --offline python -m modeler.us.scan_long2
 
@@ -20,17 +21,23 @@
    in-sample IC로 하나를 골랐다(``01`` §2가 지적한 바로 그 문제). 여기서는
    고르지 않는다.
 
+**G1 개정(2026-09-21, N2 재실행)**: 동결본은 회전율을 월 100%(전량 교체)로
+가정했다. 실측하면 밸류 계열(``sp_ttm``)은 월 12.6%, 유동성 계열
+(``log_dvol_20``)은 92.7%로 피쳐마다 크게 다르다 — 100% 가정은 회전이 느린
+피쳐의 비용을 최대 8배 과다 청구했다. ``G1``은 이제
+``LONG > basket_turnover × basket_cost_roundtrip``(= ``effective_cost``)를
+본다(``01`` §3 "G1 개정"). ``basket_cost_roundtrip``(비용 원단위)은 그대로
+남고, ``basket_turnover``(실측 월 회전율)·``effective_cost``(G1 판정값)가
+새로 붙는다. **G1 말고는 아무것도 안 바꿨다** — G2·G3·등급 문턱·placebo
+시드·유니버스·방향 규칙은 동결본 그대로다.
+
 **개발 구간만 읽는다.** ``scan.DEV_END``·``scan.assert_dev_window``와 같은
 벽을 그대로 쓰되, ``--dev-end``로 바꿔 받을 수 있게 인자로 뺐다(N2가
-2026-06-30으로 넓힐 것이다, ``01`` 문서 밖 지시).
+2026-06-30으로 넓혔다).
 
 **피쳐를 더하거나 정의를 바꾸지 않는다**(``us-features-frozen`` 동결,
 ``scan.FEATURE_REGISTRY`` 44개 그대로). ``scan``·``scan_long``·``cost``·
 ``metrics``의 기존 함수·동작도 바꾸지 않는다 — 전부 그대로 불러 쓴다.
-
-**N1은 이 코드를 실제 레이크(``us_features_v1``·``us_labels_v1``)에 돌리지
-않는다.** ``build_scan_inputs``는 CLI가 쓸 조립 함수로 존재하지만, 단위테스트는
-전부 합성 데이터만 쓴다. 실제 레이크로 등급표를 만드는 것은 N2다.
 """
 
 from __future__ import annotations
@@ -277,6 +284,59 @@ def monthly_basket_diagnostics(
     return per_month.sort(group_col)
 
 
+def monthly_basket_turnover(
+    df: pl.DataFrame,
+    *,
+    feature_col: str,
+    sign: Literal["+", "-"],
+    min_names: int = scan.MIN_NAMES,
+    top_k: int = TOP_K,
+    group_col: str = "month_idx",
+) -> pl.DataFrame:
+    """``01`` §3 "G1 개정": 월별 top-100 바스켓 회전율 ``turn_t``.
+
+    ``turn_t = |cur \\ prev| / |cur|`` — **직전 리밸런스**(달력상 바로 전달이
+    아니라, ``_ranked``의 ``min_names`` 필터를 통과해 실제로 바스켓이 존재하는
+    직전 월)의 top-100 대비 **이번 달 새로 들어온 종목 수** 나누기 **이번 달
+    바스켓 크기**다. 종목이 빠진 비율이 아니라 "새로 들어온" 비율을 쓴다 —
+    바스켓 크기가 고정(``top_k``, 유니버스가 그보다 작은 달은 유니버스
+    전체)이라 대칭 차집합을 써도 같은 값이 나오지만(같은 크기 두 집합이라
+    ``|cur\\prev| == |prev\\cur|``), 지시된 정의를 그대로 따른다.
+
+    **첫 달은 직전 바스켓이 없어 회전율을 잴 수 없다** — 그 달은 이 표에
+    행 자체가 없다(평균에도 안 들어간다, 지시 "첫 달은 회전율을 잴 수
+    없으므로 평균에서 뺀다").
+    """
+    ranked = _ranked(
+        df, feature_col=feature_col, sign=sign, min_names=min_names, group_col=group_col
+    )
+    schema = {group_col: df.schema[group_col], "n": pl.Int64, "turnover": pl.Float64}
+    if ranked.height == 0:
+        return pl.DataFrame(schema=schema)
+    top_mask = pl.col("_r") > (pl.col("_n") - top_k)
+    baskets = (
+        ranked.filter(top_mask)
+        .group_by(group_col, maintain_order=True)
+        .agg(pl.col("symbol").alias("symbols"))
+        .sort(group_col)
+    )
+    if baskets.height < 2:
+        return pl.DataFrame(schema=schema)
+    months = baskets[group_col].to_list()
+    symbol_sets = [set(row) for row in baskets["symbols"].to_list()]
+    rows: list[dict[str, object]] = []
+    for i in range(1, len(months)):
+        cur = symbol_sets[i]
+        prev = symbol_sets[i - 1]
+        if not cur:
+            continue
+        new_names = cur - prev
+        rows.append({group_col: months[i], "n": len(cur), "turnover": len(new_names) / len(cur)})
+    if not rows:
+        return pl.DataFrame(schema=schema)
+    return pl.DataFrame(rows).with_columns(pl.col(group_col).cast(df.schema[group_col]))
+
+
 def _safe_mean(table: pl.DataFrame, col: str) -> float:
     if table.height == 0:
         return float("nan")
@@ -330,9 +390,15 @@ def _sign_label(x: float) -> str | None:
 
 
 def check_g1(long_mean: float, cost_mean: float) -> bool:
-    """G1 — ``01`` §3: ``LONG > 그 바스켓의 왕복 비용``. ``cost_mean``은
-    호출부가 :func:`monthly_basket_diagnostics`의 ``basket_cost_roundtrip``
-    시계열 평균으로 채운다(``cost.cost_roundtrip`` 산출값, G1이 이걸로 채운다)."""
+    """G1 — ``01`` §3 "G1 개정": ``LONG > 실측 월 회전율 × 바스켓 왕복 비용``.
+
+    ``cost_mean``은 함수 이름 그대로 "비교할 비용"을 받는 순수 함수다 —
+    호출부(:func:`scan_one`)가 이제 ``basket_cost_roundtrip``(비용 원단위)이
+    아니라 **``effective_cost``**(= ``basket_turnover × basket_cost_roundtrip``의
+    월별 평균, :func:`monthly_basket_turnover`·:func:`monthly_basket_diagnostics`
+    조합)를 채워 넣는다. 회전율이 월 100%였던 동결본 가정을 실측으로 바꾼
+    것이 이 함수 밖(호출부)의 변화이고, 이 함수 자체의 비교 로직(``long_mean
+    > cost_mean``)은 바뀌지 않았다."""
     return math.isfinite(long_mean) and math.isfinite(cost_mean) and long_mean > cost_mean
 
 
@@ -411,6 +477,8 @@ class LongScanRow2:
     LONG_d10: float
     t_LONG_d10: float
     basket_cost_roundtrip: float
+    basket_turnover: float
+    effective_cost: float
     LONG_L2: float
     t_LONG_L2: float
     basket_l2_mean: float
@@ -442,6 +510,8 @@ class LongScanRow2:
             "LONG_d10": self.LONG_d10,
             "t_LONG_d10": self.t_LONG_d10,
             "basket_cost_roundtrip": self.basket_cost_roundtrip,
+            "basket_turnover": self.basket_turnover,
+            "effective_cost": self.effective_cost,
             "LONG_L2": self.LONG_L2,
             "t_LONG_L2": self.t_LONG_L2,
             "basket_l2_mean": self.basket_l2_mean,
@@ -606,6 +676,18 @@ def scan_one(
     basket_price_median = _safe_mean(basket_table, "basket_price_median")
     basket_pct_ge5 = _safe_mean(basket_table, "basket_pct_ge5")
 
+    # G1 개정(01 §3) — 실측 월 회전율 turn_t × 그 달 비용 cost_t 의 평균을
+    # 낸다. 첫 달은 turn_t 가 없어 monthly_basket_turnover 표에 행 자체가
+    # 없으므로 inner join 이 자연히 뺀다(지시 "첫 달은 평균에서 뺀다").
+    turnover_table = monthly_basket_turnover(
+        feat, feature_col=feature_col, sign=dspec.sign, top_k=TOP_K
+    )
+    basket_turnover = _safe_mean(turnover_table, "turnover")
+    effective_table = turnover_table.join(
+        basket_table.select("month_idx", "basket_cost_roundtrip"), on="month_idx", how="inner"
+    ).with_columns((pl.col("turnover") * pl.col("basket_cost_roundtrip")).alias("effective_cost_t"))
+    effective_cost = _safe_mean(effective_table, "effective_cost_t")
+
     feature_side = feat.select("month_idx", "symbol", pl.col(feature_col).alias("value"))
     real_abs_t = abs(t_long) if math.isfinite(t_long) else float("nan")
 
@@ -624,7 +706,7 @@ def scan_one(
 
     gate_failed, grade, placebo_max, placebo_p = evaluate_gates(
         long_mean=long_mean,
-        cost_mean=basket_cost_roundtrip,
+        cost_mean=effective_cost,
         t_long_l2=t_long_l2,
         long_l2_mean=long_l2_mean,
         t_long=t_long,
@@ -654,6 +736,8 @@ def scan_one(
         LONG_d10=long_d10_mean,
         t_LONG_d10=t_long_d10,
         basket_cost_roundtrip=basket_cost_roundtrip,
+        basket_turnover=basket_turnover,
+        effective_cost=effective_cost,
         LONG_L2=long_l2_mean,
         t_LONG_L2=t_long_l2,
         basket_l2_mean=basket_l2_mean,
@@ -748,7 +832,7 @@ def main(argv: list[str] | None = None) -> int:
         "modeler_git_commit": scan._git_commit(modeler_repo),
         "preregistration": (
             "my/milestones/us/plan/20260921_long_side/00_candidate_plan/01_preregistration.md"
-            " (태그 us2-features-frozen)"
+            " (태그 us2-features-frozen-v2, G1 개정 포함)"
         ),
         "dev_start": scan.DEV_START.isoformat(),
         "dev_end": args.dev_end.isoformat(),
@@ -765,6 +849,16 @@ def main(argv: list[str] | None = None) -> int:
             "k": G1_K,
             "source": "modeler.us.cost.cost_roundtrip",
         },
+        "g1_revision": {
+            "date": "2026-09-21",
+            "what_changed": (
+                "동결본은 회전율을 월 100%로 가정했다(근거 오류). 실측 월 회전율"
+                "(basket_turnover)로 바꿨다 — G1은 이제 LONG > effective_cost"
+                "(= basket_turnover 시계열 평균 x cost_t 의 평균)를 본다."
+                " G1 말고는 아무것도 안 바꿨다"
+            ),
+            "measured_turnover_examples": {"sp_ttm": 0.126, "log_dvol_20": 0.927},
+        },
         "g2_t_threshold": G2_T_THRESHOLD,
         "grade_thresholds": {
             "A": f"|t_LONG| >= {GRADE_A_ABS_T} and LONG > 0",
@@ -772,7 +866,7 @@ def main(argv: list[str] | None = None) -> int:
             "C": f"{GRADE_C_ABS_T} <= |t_LONG| < {GRADE_B_ABS_T} (부호 무관)",
             "D": "그 아래, 또는 |t_LONG|이 커도 LONG<=0이라 A/B/C 밖",
             "R": "G3(placebo) 탈락",
-            "X": "G1(비용) 또는 G2(중립화 생존) 탈락",
+            "X": "G1(LONG <= effective_cost) 또는 G2(중립화 생존) 탈락",
         },
         "direction_convention": {
             "registered": "01 §2 등록 부호를 그대로 쓴다",

@@ -2,10 +2,11 @@
 읽지 않는다(N1 §0 "허용: 합성 데이터 단위 테스트. 금지: 실제 레이크로 등급표를
 만드는 것").
 
-``01_preregistration.md``(``us2-features-frozen``)이 요구하는 것들을 검사한다:
-G1(비용, ``cost.py``)·G2(중립화 생존)·G3(placebo, ``scan.py``와 같은 50개
-shift)의 순서와 각 조건, 등급 경계, 방향(등록/양방향), top-100·상위10% 병존,
-개발 구간 날짜 벽(``--dev-end``).
+``01_preregistration.md``(``us2-features-frozen-v2``, G1 개정 포함)이 요구하는
+것들을 검사한다: G1(``01`` §3 "G1 개정" — 실측 회전율 × 비용, ``cost.py``)·
+G2(중립화 생존)·G3(placebo, ``scan.py``와 같은 50개 shift)의 순서와 각 조건,
+등급 경계, 방향(등록/양방향), top-100·상위10% 병존, 개발 구간 날짜 벽
+(``--dev-end``), 회전율(``monthly_basket_turnover``)·``effective_cost`` 계산.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from modeler.us.scan_long2 import (
     grade_from_long_stats,
     load_features_and_labels,
     monthly_basket_diagnostics,
+    monthly_basket_turnover,
     monthly_bottom100_short,
     run_scan_long2,
     scan_one,
@@ -373,7 +375,134 @@ def test_scan_one_g1_fails_when_basket_is_illiquid_and_signal_is_thin() -> None:
     # G1 판정에 쓴 비용 자체는 그래도 채워져 있어야 한다(진단 칸은 게이트와
     # 무관하게 항상 계산한다, 01 §7 완료 판정).
     assert math.isfinite(row.basket_cost_roundtrip)
+    assert math.isfinite(row.basket_turnover)
+    assert math.isfinite(row.effective_cost)
     assert math.isfinite(row.LONG_L2)
+
+
+# --- 5b. G1 개정 — 회전율(turnover)·effective_cost ----------------------------
+
+
+def _turnover_df(feat_by_month: dict[int, list[float]]) -> pl.DataFrame:
+    rows = []
+    for m, feats in feat_by_month.items():
+        for i, f in enumerate(feats):
+            rows.append({"month_idx": m, "symbol": f"S{i:02d}", "feat": f})
+    return pl.DataFrame(rows)
+
+
+def test_monthly_basket_turnover_zero_percent_when_basket_never_changes() -> None:
+    """세 달 내내 top-10 바스켓이 같으면(피쳐 순서 불변) 회전율은 0% 다."""
+    ascending = list(range(20))  # sign="+" -> top10 = 인덱스10~19(S10~S19), 매달 같다
+    df = _turnover_df({1: ascending, 2: ascending, 3: ascending})
+    table = monthly_basket_turnover(df, feature_col="feat", sign="+", min_names=20, top_k=10)
+
+    assert table.height == 2  # 첫 달(month_idx=1)은 빠진다
+    assert sorted(table["month_idx"].to_list()) == [2, 3]
+    assert table["turnover"].to_list() == pytest.approx([0.0, 0.0])
+
+
+def test_monthly_basket_turnover_hundred_percent_on_full_swap() -> None:
+    """매달 top-10 바스켓이 완전히 바뀌면(동결본이 가정했던 상황) 회전율 100%다."""
+    ascending = list(range(20))  # top10 = S10~S19
+    descending = list(range(19, -1, -1))  # top10 = S00~S09 (완전 교체)
+    df = _turnover_df({1: ascending, 2: descending, 3: ascending})
+    table = monthly_basket_turnover(df, feature_col="feat", sign="+", min_names=20, top_k=10)
+
+    assert table.height == 2
+    assert table.sort("month_idx")["turnover"].to_list() == pytest.approx([1.0, 1.0])
+
+
+def test_monthly_basket_turnover_fifty_percent_on_half_swap() -> None:
+    """top-10 바스켓의 절반만 바뀌면(5/10) 회전율 50%다."""
+
+    def _feats(top_members: set[int]) -> list[float]:
+        return [100.0 + i if i in top_members else float(i) for i in range(20)]
+
+    month1 = _feats({0, 1, 2, 3, 4, 5, 6, 7, 8, 9})
+    month2 = _feats({5, 6, 7, 8, 9, 10, 11, 12, 13, 14})  # 5개 겹침, 5개 신규
+    month3 = _feats({10, 11, 12, 13, 14, 15, 16, 17, 18, 19})  # month2 대비 5개 신규
+    df = _turnover_df({1: month1, 2: month2, 3: month3})
+    table = monthly_basket_turnover(df, feature_col="feat", sign="+", min_names=20, top_k=10)
+
+    assert table.height == 2
+    assert table.sort("month_idx")["turnover"].to_list() == pytest.approx([0.5, 0.5])
+
+
+def test_monthly_basket_turnover_excludes_first_month_from_output() -> None:
+    """직전 바스켓이 없는 첫 달은 표에 행 자체가 없다 — 평균에서 저절로 빠진다."""
+    ascending = list(range(20))
+    df = _turnover_df({1: ascending})  # 달이 하나뿐 -> 회전율을 잴 수 없다
+    table = monthly_basket_turnover(df, feature_col="feat", sign="+", min_names=20, top_k=10)
+    assert table.height == 0
+
+
+def _cost_turnover_df(
+    feat_by_month: dict[int, list[float]], *, n_symbols: int = 20
+) -> pl.DataFrame:
+    """비용을 상수로 고정한(가격·변동성·ADV 전부 같은 값) 회전율 테스트용 프레임."""
+    rows = []
+    for m, feats in feat_by_month.items():
+        for i in range(n_symbols):
+            rows.append(
+                {
+                    "month_idx": m,
+                    "symbol": f"S{i:02d}",
+                    "feat": feats[i],
+                    "close": 100.0,
+                    "adv_20d": 5e7,
+                    "sigma_daily": 0.02,
+                    "L2": 0.0,
+                    "price_ge_5": True,
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+def test_effective_cost_equals_turnover_times_cost_when_cost_constant() -> None:
+    """비용이 매달 상수면 ``effective_cost`` = 회전율 평균 x 비용이어야 한다 —
+    ``scan_one``이 두 표(:func:`monthly_basket_turnover`·
+    :func:`monthly_basket_diagnostics`)를 합쳐 내는 것과 같은 조합이다."""
+
+    def _feats(top_members: set[int]) -> list[float]:
+        return [100.0 + i if i in top_members else float(i) for i in range(20)]
+
+    month1 = _feats({0, 1, 2, 3, 4, 5, 6, 7, 8, 9})
+    month2 = _feats({5, 6, 7, 8, 9, 10, 11, 12, 13, 14})
+    month3 = _feats({10, 11, 12, 13, 14, 15, 16, 17, 18, 19})
+    df = _cost_turnover_df({1: month1, 2: month2, 3: month3})
+
+    turnover_table = monthly_basket_turnover(
+        df, feature_col="feat", sign="+", min_names=20, top_k=10
+    )
+    basket_table = monthly_basket_diagnostics(
+        df,
+        feature_col="feat",
+        sign="+",
+        min_names=20,
+        top_k=10,
+        q_dollar=cost_mod.DEFAULT_Q_DOLLAR,
+        k=cost_mod.DEFAULT_K,
+    )
+    raw_cost = basket_table["basket_cost_roundtrip"][0]  # 상수라 매달 같다
+    assert basket_table["basket_cost_roundtrip"].to_list() == pytest.approx(
+        [raw_cost, raw_cost, raw_cost]
+    )
+
+    joined = turnover_table.join(
+        basket_table.select("month_idx", "basket_cost_roundtrip"), on="month_idx", how="inner"
+    ).with_columns((pl.col("turnover") * pl.col("basket_cost_roundtrip")).alias("effective_cost_t"))
+    effective_cost = float(joined["effective_cost_t"].mean())
+    basket_turnover = float(turnover_table["turnover"].mean())
+
+    assert basket_turnover == pytest.approx(0.5)
+    assert effective_cost == pytest.approx(0.5 * raw_cost)
+
+    # G1 개정의 핵심: 회전율이 낮으면 옛 규칙(원단위 비용)으로는 걸렸을 LONG이
+    # 새 규칙(effective_cost)으로는 통과할 수 있다.
+    long_between = (effective_cost + raw_cost) / 2
+    assert check_g1(long_between, raw_cost) is False  # 개정 전 규칙이면 X
+    assert check_g1(long_between, effective_cost) is True  # 개정 뒤에는 통과
 
 
 # --- 6. G3 placebo — scan.py와 같은 shift·시드 ---------------------------------
@@ -510,6 +639,8 @@ def _bare_row(feature: str, family: str, universe: str, t_long: float) -> LongSc
         LONG_d10=0.01,
         t_LONG_d10=t_long,
         basket_cost_roundtrip=0.001,
+        basket_turnover=0.5,
+        effective_cost=0.0005,
         LONG_L2=0.01,
         t_LONG_L2=t_long,
         basket_l2_mean=0.01,
@@ -717,6 +848,8 @@ def test_run_scan_long2_row_columns_match_preregistration_spec() -> None:
         "LONG_d10",
         "t_LONG_d10",
         "basket_cost_roundtrip",
+        "basket_turnover",
+        "effective_cost",
         "LONG_L2",
         "t_LONG_L2",
         "basket_l2_mean",
