@@ -24,13 +24,12 @@ h21의 ``content_hash``가 이 파라미터화 전과 같아야 재현이 깨지
 from __future__ import annotations
 
 import argparse
-import subprocess
 from pathlib import Path
 
 from modeler.etl.config import DataRoot
 from modeler.us.benchmark import ew_minus_spy_monthly, spy_total_return_daily
 from modeler.us.cost import DEFAULT_K, DEFAULT_Q_DOLLAR, cost_grid, daily_volatility
-from modeler.us.dataset import write_dataset
+from modeler.us.dataset import git_commit, write_dataset
 from modeler.us.labels import HORIZON_TRADING_DAYS, build_labels
 from modeler.us.lake import UsLake
 
@@ -43,22 +42,6 @@ def _dataset_name(horizon: int) -> str:
         return DATASET_NAME
     return f"us_labels_h{horizon}_v1"
 
-
-def _git_commit(repo: Path) -> str:
-    """``repo``의 HEAD 커밋. 트리가 더러우면 ``-dirty``를 붙인다 (``build_panel.py``와 같다)."""
-    head = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    dirty = subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    return f"{head}-dirty" if dirty else head
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -73,6 +56,12 @@ def main(argv: list[str] | None = None) -> int:
         "--name",
         default=None,
         help="데이터셋 이름 (기본: h21이면 us_labels_v1, 아니면 us_labels_h{horizon}_v1)",
+    )
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="커밋 안 된 트리로도 만든다. **버리는 실험용이다** — "
+        "manifest 의 커밋으로 다시 만들 수 없게 된다.",
     )
     args = parser.parse_args(argv)
     dataset_name = args.name or _dataset_name(args.horizon)
@@ -89,8 +78,8 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = {
         "input_table_snapshots": lake.snapshot_manifest(),
-        "modeler_git_commit": _git_commit(modeler_repo),
-        "collector_git_commit": _git_commit(collector_repo),
+        "modeler_git_commit": git_commit(modeler_repo, allow_dirty=args.allow_dirty),
+        "collector_git_commit": git_commit(collector_repo, allow_dirty=args.allow_dirty),
         "horizon_trading_days": args.horizon,
         "labels_start": str(labels["date"].min()) if labels.height else None,
         "labels_end": str(labels["date"].max()) if labels.height else None,

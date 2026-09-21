@@ -87,3 +87,78 @@ def test_write_dataset_overwrites_existing_files(tmp_path: Path) -> None:
 
     written = pl.read_parquet(dataset_dir / "part.parquet")
     assert written.height == 2
+
+
+# --- 더러운 트리로는 데이터셋을 안 만든다 (2026-09-22) -------------------------
+
+
+def _git(tmp_path):
+    """작은 git 저장소 하나. 커밋이 하나 있고 트리는 깨끗하다."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run = lambda *a: subprocess.run(  # noqa: E731
+        ["git", "-C", str(repo), *a], check=True, capture_output=True
+    )
+    run("init", "-q")
+    run("config", "user.email", "t@t")
+    run("config", "user.name", "t")
+    (repo / "a.txt").write_text("1")
+    run("add", "-A")
+    run("commit", "-qm", "first")
+    return repo
+
+
+def test_git_commit_returns_head_when_clean(tmp_path):
+    from modeler.us.dataset import git_commit
+
+    head = git_commit(_git(tmp_path))
+    assert len(head) == 40 and "-dirty" not in head
+
+
+def test_git_commit_refuses_a_dirty_tree(tmp_path):
+    """**manifest 의 커밋으로 다시 만들 수 없게 되는 것**을 막는다.
+
+    `us_features_v1` 이 실제로 `d38d1d44…-dirty` 로 만들어졌고, 지금 코드로
+    `sp_ttm` 을 다시 계산하면 168,161행 중 17행이 다르다 (2026-09-21).
+    """
+    import pytest
+
+    from modeler.us.dataset import DirtyWorktreeError, git_commit
+
+    repo = _git(tmp_path)
+    (repo / "a.txt").write_text("2")
+    with pytest.raises(DirtyWorktreeError, match="--allow-dirty"):
+        git_commit(repo)
+
+
+def test_git_commit_allows_dirty_when_asked(tmp_path):
+    """버리는 실험용 탈출구. 대신 `-dirty` 가 manifest 에 남는다."""
+    from modeler.us.dataset import git_commit
+
+    repo = _git(tmp_path)
+    (repo / "a.txt").write_text("2")
+    assert git_commit(repo, allow_dirty=True).endswith("-dirty")
+
+
+def test_untracked_file_also_counts_as_dirty(tmp_path):
+    """새 파일을 안 세면 '피쳐 하나 더 만들고 커밋 안 함' 이 통과한다."""
+    import pytest
+
+    from modeler.us.dataset import DirtyWorktreeError, git_commit
+
+    repo = _git(tmp_path)
+    (repo / "new.py").write_text("x")
+    with pytest.raises(DirtyWorktreeError):
+        git_commit(repo)
+
+
+def test_all_three_builders_share_one_git_commit():
+    """세 빌더가 각자 복사본을 두지 않는다 — 하나만 고치면 벌어진다."""
+    from modeler.us import build_features, build_labels, build_panel
+    from modeler.us.dataset import git_commit
+
+    for mod in (build_panel, build_features, build_labels):
+        assert mod.git_commit is git_commit
+        assert not hasattr(mod, "_git_commit")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,47 @@ from typing import Any
 import polars as pl
 
 from modeler.etl.config import DataRoot
+
+
+class DirtyWorktreeError(RuntimeError):
+    """커밋 안 된 변경으로 데이터셋을 만들려고 했다."""
+
+
+def git_commit(repo: Path, *, allow_dirty: bool = False) -> str:
+    """``repo``의 HEAD 커밋. **더러우면 거부한다.**
+
+    manifest의 ``modeler_git_commit``은 "이 커밋으로 이 명령을 돌리면 같은
+    ``content_hash``가 나온다"는 약속이다. 더러운 트리로 만들면 **그 약속이
+    어느 커밋으로도 지켜지지 않는다.**
+
+    실제로 그렇게 됐다. ``us_features_v1``의 manifest가
+    ``d38d1d44…-dirty``이고, 지금 코드로 ``sp_ttm``을 다시 계산하면
+    168,161행 중 17행이 다르다 (2026-09-21 확인 · 미국 2차 후속 ``02`` §6).
+
+    ``allow_dirty``는 **버리는 실험용**이다. 남길 데이터셋에는 쓰지 않는다.
+    """
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if not dirty:
+        return head
+    if not allow_dirty:
+        raise DirtyWorktreeError(
+            f"{repo} 에 커밋 안 된 변경이 있다. 데이터셋을 만들면 manifest 의 "
+            f"커밋({head[:12]})으로 다시 만들 수 없다.\n"
+            f"먼저 커밋하거나, 버리는 실험이면 --allow-dirty 를 준다.\n"
+            f"{dirty[:500]}"
+        )
+    return f"{head}-dirty"
 
 
 def content_hash(df: pl.DataFrame) -> str:

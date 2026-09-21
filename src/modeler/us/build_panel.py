@@ -11,11 +11,10 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 from pathlib import Path
 
 from modeler.etl.config import DataRoot
-from modeler.us.dataset import write_dataset
+from modeler.us.dataset import git_commit, write_dataset
 from modeler.us.lake import UsLake
 from modeler.us.panel import build_panel
 
@@ -29,31 +28,17 @@ UNIVERSE_FILTER = (
 )
 
 
-def _git_commit(repo: Path) -> str:
-    """``repo``의 HEAD 커밋. 작업 트리가 더러우면 ``-dirty``를 붙인다.
-
-    더러운 트리로 만든 데이터셋은 어느 코드로 만들었는지 커밋만으로는 못 찾는다.
-    그 사실을 manifest에 남겨야 나중에 재현이 안 될 때 원인을 안다.
-    """
-    head = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    dirty = subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    return f"{head}-dirty" if dirty else head
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--name", default=DATASET_NAME, help=f"데이터셋 이름 (기본: {DATASET_NAME})"
+    )
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="커밋 안 된 트리로도 만든다. **버리는 실험용이다** — "
+        "manifest 의 커밋으로 다시 만들 수 없게 된다.",
     )
     args = parser.parse_args(argv)
 
@@ -65,8 +50,8 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = {
         "input_table_snapshots": lake.snapshot_manifest(),
-        "modeler_git_commit": _git_commit(modeler_repo),
-        "collector_git_commit": _git_commit(collector_repo),
+        "modeler_git_commit": git_commit(modeler_repo, allow_dirty=args.allow_dirty),
+        "collector_git_commit": git_commit(collector_repo, allow_dirty=args.allow_dirty),
         "universe_filter": UNIVERSE_FILTER,
         "panel_start": str(panel["date"].min()),
         "panel_end": str(panel["date"].max()),
