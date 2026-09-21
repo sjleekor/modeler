@@ -15,6 +15,13 @@ CPCV(``skfolio.CombinatorialPurgedCV``)로 채택 설정 하나를 재학습하�
 루프는 이 모듈에 없다 — ``m4_run``의 모델 적합 함수에 묶여 있어
 ``m6_run.py``가 직접 오케스트레이션한다. 이 모듈은 그 결과(경로별 Sharpe
 목록)를 받아 PBO·DSR을 계산하는 부분만 담당한다.
+
+``m7_run.py``(holdout 개봉, ``06`` M7)도 이 모듈을 그대로 재사용한다 —
+``excess_over_series``(``excess_over``의 월별 시계열 버전, permutation
+귀무 확률 계산용)와 ``s_spread_long_short``/``s_long_short_summary``(``S``의
+롱/숏 기여 분해, M6이 처음 손으로 낸 것을 재사용 가능하게 옮겼다),
+``sign_flip_permutation_probability``(M8이 쓸 갈래 A 귀무 확률)만 새로
+더했다.
 """
 
 from __future__ import annotations
@@ -60,14 +67,18 @@ __all__ = [
     "monthly_cost_drag",
     "portfolio_track",
     "excess_over",
+    "excess_over_series",
     "hit_rate",
     "s_spread",
+    "s_spread_long_short",
+    "s_long_short_summary",
     "breakeven_q_dollar",
     "sensitivity_grid",
     "sharpe_ratio",
     "expected_max_sharpe",
     "deflated_sharpe_ratio",
     "pbo_fraction_nonpositive",
+    "sign_flip_permutation_probability",
 ]
 
 
@@ -250,6 +261,27 @@ def excess_over(
     return float(diff.mean()), diff.len()
 
 
+def excess_over_series(
+    track: pl.DataFrame,
+    benchmark: pl.DataFrame,
+    *,
+    return_col: str = "net_return",
+    benchmark_col: str,
+    date_col: str = "date",
+) -> pl.DataFrame:
+    """``excess_over``와 같은 조인이지만 평균 하나가 아니라 ``(date, excess)`` 시계열을 준다.
+
+    ``m7_run``의 부호 뒤섞기(permutation) 귀무 확률 계산(``06`` M8)이 월별
+    시계열을 그대로 필요로 한다 — ``excess_over``는 스칼라 평균만 준다.
+    """
+    merged = track.join(benchmark, on=date_col, how="inner").sort(date_col)
+    schema = {date_col: pl.Date, "excess": pl.Float64}
+    if merged.height == 0:
+        return pl.DataFrame(schema=schema)
+    diff = (pl.col(return_col) - pl.col(benchmark_col)).alias("excess")
+    return merged.select(date_col, diff).drop_nulls()
+
+
 def hit_rate(picked: pl.DataFrame, *, value_col: str = "L2") -> float:
     """top-k로 뽑힌 (날짜, 종목) 전체에서 ``value_col`` > 0인 비율."""
     values = picked[value_col].drop_nulls()
@@ -280,6 +312,94 @@ def s_spread(
         min_names=min_names,
         fraction=fraction,
     )
+
+
+def s_spread_long_short(
+    df: pl.DataFrame,
+    *,
+    pred_col: str = "pred",
+    value_col: str = "L0",
+    date_col: str = "date",
+    min_names: int = MIN_NAMES,
+    fraction: float = DECILE_FRACTION,
+) -> pl.DataFrame:
+    """``S``를 월별로 롱(상위−유니버스)·숏(유니버스−하위) 기여로 가른다.
+
+    ``modeler.us.scan.decile_spread``와 같은 top/bottom 정의(``pred_col``의
+    ordinal rank, ``min_names`` 미만인 날짜는 뺀다)를 쓴다 — M6 보고서가
+    처음 손으로 낸 분해("S 의 88% 가 숏 쪽")를 재사용 가능한 함수로 옮긴
+    것뿐이고 숫자를 다시 정의하지 않는다.
+
+    반환: ``date, top, universe, bottom, spread, long_excess, short_excess``
+    (``spread == long_excess + short_excess``, 부동소수점 오차 안에서).
+    """
+    ranked = df.with_columns(
+        pl.col(pred_col).rank("ordinal").over(date_col).alias("_r"),
+        pl.len().over(date_col).alias("_n"),
+    ).filter(pl.col("_n") >= min_names)
+    schema = {
+        date_col: pl.Date,
+        "top": pl.Float64,
+        "universe": pl.Float64,
+        "bottom": pl.Float64,
+        "spread": pl.Float64,
+        "long_excess": pl.Float64,
+        "short_excess": pl.Float64,
+    }
+    if ranked.height == 0:
+        return pl.DataFrame(schema=schema)
+    ranked = ranked.with_columns(((pl.col("_r") - 1) / (pl.col("_n") - 1)).alias("_pct"))
+    top = (
+        ranked.filter(pl.col("_pct") >= 1 - fraction)
+        .group_by(date_col)
+        .agg(pl.col(value_col).mean().alias("top"))
+    )
+    bottom = (
+        ranked.filter(pl.col("_pct") <= fraction)
+        .group_by(date_col)
+        .agg(pl.col(value_col).mean().alias("bottom"))
+    )
+    universe = ranked.group_by(date_col).agg(pl.col(value_col).mean().alias("universe"))
+    return (
+        top.join(bottom, on=date_col, how="inner")
+        .join(universe, on=date_col, how="inner")
+        .with_columns(
+            (pl.col("top") - pl.col("bottom")).alias("spread"),
+            (pl.col("top") - pl.col("universe")).alias("long_excess"),
+            (pl.col("universe") - pl.col("bottom")).alias("short_excess"),
+        )
+        .sort(date_col)
+    )
+
+
+def s_long_short_summary(monthly: pl.DataFrame) -> dict[str, float | int]:
+    """``s_spread_long_short`` 출력의 시계열 평균과 롱/숏 몫.
+
+    ``long_share + short_share == 1.0``(부동소수점 오차 안에서) — 몫은
+    ``long_excess``·``short_excess``의 시계열 평균 합을 분모로 쓴다(각 달의
+    비중이 아니라 전체 기간 평균의 비중, M6 보고서와 같은 정의).
+    """
+    if monthly.height == 0:
+        return {
+            "S": float("nan"),
+            "long_excess_mean": float("nan"),
+            "short_excess_mean": float("nan"),
+            "long_share": float("nan"),
+            "short_share": float("nan"),
+            "n_months": 0,
+        }
+    s_mean = float(monthly["spread"].mean())
+    long_mean = float(monthly["long_excess"].mean())
+    short_mean = float(monthly["short_excess"].mean())
+    total = long_mean + short_mean
+    return {
+        "S": s_mean,
+        "long_excess_mean": long_mean,
+        "short_excess_mean": short_mean,
+        "long_share": long_mean / total if total else float("nan"),
+        "short_share": short_mean / total if total else float("nan"),
+        "n_months": monthly.height,
+    }
 
 
 # --- 4. 손익분기 자금규모 · 민감도표 --------------------------------------------
@@ -507,3 +627,63 @@ def pbo_fraction_nonpositive(path_values: Sequence[float]) -> float:
     if not values:
         return float("nan")
     return sum(1 for v in values if v <= 0) / len(values)
+
+
+# --- 6. 부호 뒤섞기 permutation — 갈래 A 귀무 확률 -------------------------------
+
+
+def sign_flip_permutation_probability(
+    series_map: dict[str, Sequence[float]],
+    *,
+    n_perm: int = 1000,
+    seed: int,
+) -> dict[str, float | int]:
+    """``series_map``의 모든 시계열이 동시에 양수 평균이 되는 귀무 확률.
+
+    ``06`` M8 지시: holdout 월수익을 부호 뒤섞기(permutation) ``n_perm``회
+    해서 판정 넷(``E``·``E_ew``·``I``·``S``)이 전부 양수로 나오는 비율을
+    낸다 — "갈래 A가 잡음만으로도 나올 확률"이다.
+
+    한 시행 안에서는 **같은 부호 벡터 하나**를 ``series_map``의 모든
+    시계열에 곱한다(달마다 독립으로 ±1을 하나씩 뽑는다) — 넷은 서로 다른
+    벤치마크·정의를 쓰지만 같은 달의 시장 실현 하나를 공유하므로, "그 달의
+    실현이 우연히 플러스/마이너스로 뒤집혔다면" 이라는 귀무가설은 네
+    시계열에 같은 뒤집힘을 준다는 뜻이다. 시계열마다 독립으로 부호를
+    뽑으면 실제로는 상관된 네 지표를 인위적으로 독립시켜 귀무 확률을
+    낮게(더 엄격하게) 왜곡한다.
+
+    모든 시계열은 길이가 같아야 한다(``date``로 이미 정렬해 넘긴다는 전제 —
+    이 함수는 날짜를 보지 않고 위치로만 대응시킨다).
+    """
+    keys = list(series_map)
+    if not keys:
+        raise ValueError("series_map이 비어 있습니다")
+    arrays = [np.asarray(series_map[k], dtype=float) for k in keys]
+    lengths = {a.size for a in arrays}
+    if len(lengths) != 1:
+        raise ValueError(
+            f"series 길이가 다릅니다: {dict(zip(keys, (a.size for a in arrays), strict=True))}"
+        )
+    n = lengths.pop()
+    if n == 0:
+        return {
+            "n_perm": n_perm,
+            "n_months": 0,
+            "seed": seed,
+            "keys": keys,
+            "probability_all_positive": float("nan"),
+        }
+
+    rng = np.random.default_rng(seed)
+    hits = 0
+    for _ in range(n_perm):
+        signs = rng.choice(np.array([-1.0, 1.0]), size=n)
+        if all(bool(np.mean(a * signs) > 0) for a in arrays):
+            hits += 1
+    return {
+        "n_perm": n_perm,
+        "n_months": n,
+        "seed": seed,
+        "keys": keys,
+        "probability_all_positive": hits / n_perm,
+    }

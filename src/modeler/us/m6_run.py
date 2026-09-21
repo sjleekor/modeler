@@ -85,17 +85,20 @@ DECOMPOSITION_AXES: tuple[str, ...] = ("mcap_rank_bucket", "adv_tertile", "sic2_
 # --- 1. 유니버스 조립 ----------------------------------------------------------
 
 
-def build_universe(root: DataRoot) -> tuple[UsLake, pl.DataFrame]:
-    """``us_labels_v1``(개발 구간)에 ``sigma_daily``를 붙인 유니버스 프레임.
+def bucket_universe(lake: UsLake, labels_df: pl.DataFrame) -> pl.DataFrame:
+    """라벨 프레임에 ``sigma_daily``와 R2 분해축 버킷을 붙인다 — 개발·holdout 공용.
 
     ``sigma_daily``는 라벨 데이터셋에 저장돼 있지 않다(``build_labels.py``가
     manifest의 비용 격자 계산에만 썼다) — ``cost.daily_volatility``로 다시
     조인한다(공식은 그대로 ``cost.py``의 것).
+
+    ``labels_df``가 어느 날짜창(개발 구간 ``load_dev_frame`` 또는 holdout
+    ``m7_run.load_holdout_frame``)에서 왔는지는 이 함수가 상관하지 않는다 —
+    받은 프레임 그대로에 sigma·버킷만 붙인다(``m7_run``이 같은 버킷 정의를
+    holdout에 재사용한다, ``06`` M7).
     """
-    lake = UsLake.resolve()
-    labels_dev = load_dev_frame(root, "us_labels_v1")
     sigma = cost_mod.daily_volatility(lake).select("date", "symbol", "sigma_daily").collect()
-    universe = labels_dev.join(sigma, on=["date", "symbol"], how="left")
+    universe = labels_df.join(sigma, on=["date", "symbol"], how="left")
     universe = cross_sectional_percentile(universe, "adv_20d", date_col="date", out_col="_adv_pct")
     universe = universe.with_columns(
         pl.when(pl.col("_adv_pct") < 1.0 / 3.0)
@@ -111,7 +114,14 @@ def build_universe(root: DataRoot) -> tuple[UsLake, pl.DataFrame]:
         .alias("mcap_rank_bucket"),
         pl.col("date").dt.year().alias("year"),
     ).drop("_adv_pct")
-    return lake, universe
+    return universe
+
+
+def build_universe(root: DataRoot) -> tuple[UsLake, pl.DataFrame]:
+    """``us_labels_v1``(개발 구간)에 ``sigma_daily``를 붙인 유니버스 프레임."""
+    lake = UsLake.resolve()
+    labels_dev = load_dev_frame(root, "us_labels_v1")
+    return lake, bucket_universe(lake, labels_dev)
 
 
 def load_oof(root: DataRoot, run_id: str) -> pl.DataFrame:

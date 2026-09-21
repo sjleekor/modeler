@@ -181,6 +181,26 @@ def test_excess_over_computes_mean_difference() -> None:
     assert value == pytest.approx((0.01 + 0.03) / 2)
 
 
+def test_excess_over_series_matches_excess_over_mean() -> None:
+    """``m7_run``의 permutation 재료 — ``excess_over``의 평균과 어긋나면 안 된다."""
+    track = pl.DataFrame({"date": [D1, D2, D3], "net_return": [0.02, 0.04, -0.01]})
+    bench = pl.DataFrame({"date": [D1, D2, D3], "bench": [0.01, 0.01, 0.02]})
+    series = m.excess_over_series(track, bench, benchmark_col="bench")
+    mean_value, n = m.excess_over(track, bench, benchmark_col="bench")
+    assert series["date"].to_list() == [D1, D2, D3]
+    assert series["excess"].to_list() == pytest.approx([0.01, 0.03, -0.03])
+    assert float(series["excess"].mean()) == pytest.approx(mean_value)
+    assert series.height == n
+
+
+def test_excess_over_series_empty_when_no_overlap() -> None:
+    track = pl.DataFrame({"date": [D1], "net_return": [0.02]})
+    bench = pl.DataFrame({"date": [D2], "bench": [0.01]})
+    series = m.excess_over_series(track, bench, benchmark_col="bench")
+    assert series.height == 0
+    assert series.columns == ["date", "excess"]
+
+
 def test_hit_rate_fraction_positive() -> None:
     picked = pl.DataFrame({"L2": [0.1, -0.1, 0.2, -0.2, 0.0]})
     assert m.hit_rate(picked) == pytest.approx(2 / 5)
@@ -296,3 +316,121 @@ def test_pbo_fraction_nonpositive() -> None:
     assert m.pbo_fraction_nonpositive([0.1, -0.1, 0.2, -0.2, 0.0]) == pytest.approx(3 / 5)
     assert math.isnan(m.pbo_fraction_nonpositive([]))
     assert math.isnan(m.pbo_fraction_nonpositive([float("nan")]))
+
+
+# --- 8. s_spread_long_short · s_long_short_summary (M7 추가) ---------------------
+
+
+def _long_short_frame() -> pl.DataFrame:
+    """symbol 10개, pred=1..10, L0=pred와 같은 방향(0.01×pred).
+
+    fraction=0.2 -> top 2(pred 9,10) 평균 L0=0.095, bottom 2(pred 1,2)
+    평균 L0=0.015, universe 평균=0.055 -> spread=0.08, long=0.04, short=0.04.
+    """
+    n = 10
+    return pl.DataFrame(
+        {
+            "date": [D1] * n,
+            "symbol": [f"S{i}" for i in range(n)],
+            "pred": [float(i) for i in range(1, n + 1)],
+            "L0": [0.01 * i for i in range(1, n + 1)],
+        }
+    )
+
+
+def test_s_spread_long_short_matches_hand_computed_values() -> None:
+    df = _long_short_frame()
+    monthly = m.s_spread_long_short(df, min_names=5, fraction=0.2)
+    assert monthly.height == 1
+    row = monthly.row(0, named=True)
+    assert row["top"] == pytest.approx(0.095)
+    assert row["bottom"] == pytest.approx(0.015)
+    assert row["universe"] == pytest.approx(0.055)
+    assert row["spread"] == pytest.approx(0.08)
+    assert row["long_excess"] == pytest.approx(0.04)
+    assert row["short_excess"] == pytest.approx(0.04)
+    assert row["long_excess"] + row["short_excess"] == pytest.approx(row["spread"])
+
+
+def test_s_spread_long_short_drops_dates_below_min_names() -> None:
+    df = _long_short_frame()
+    monthly = m.s_spread_long_short(df, min_names=20, fraction=0.2)
+    assert monthly.height == 0
+    assert monthly.columns == [
+        "date",
+        "top",
+        "universe",
+        "bottom",
+        "spread",
+        "long_excess",
+        "short_excess",
+    ]
+
+
+def test_s_long_short_summary_shares_sum_to_one() -> None:
+    monthly = m.s_spread_long_short(_long_short_frame(), min_names=5, fraction=0.2)
+    summary = m.s_long_short_summary(monthly)
+    assert summary["S"] == pytest.approx(0.08)
+    assert summary["long_share"] == pytest.approx(0.5)
+    assert summary["short_share"] == pytest.approx(0.5)
+    assert summary["long_share"] + summary["short_share"] == pytest.approx(1.0)
+    assert summary["n_months"] == 1
+
+
+def test_s_long_short_summary_empty_input() -> None:
+    empty = pl.DataFrame(
+        schema={
+            "date": pl.Date,
+            "top": pl.Float64,
+            "universe": pl.Float64,
+            "bottom": pl.Float64,
+            "spread": pl.Float64,
+            "long_excess": pl.Float64,
+            "short_excess": pl.Float64,
+        }
+    )
+    summary = m.s_long_short_summary(empty)
+    assert summary["n_months"] == 0
+    assert math.isnan(summary["S"])
+
+
+# --- 9. sign_flip_permutation_probability (M7 추가 — M8 갈래 A 귀무 확률 재료) -----
+
+
+def test_sign_flip_permutation_probability_all_zero_series_never_positive() -> None:
+    """모든 값이 0이면 부호를 아무리 뒤섞어도 평균은 항상 0이다 — 절대 양수가 아니다."""
+    series = {"E": [0.0] * 12, "E_ew": [0.0] * 12, "I": [0.0] * 12, "S": [0.0] * 12}
+    result = m.sign_flip_permutation_probability(series, n_perm=200, seed=1)
+    assert result["probability_all_positive"] == 0.0
+    assert result["n_months"] == 12
+
+
+def test_sign_flip_permutation_probability_reproducible_with_same_seed() -> None:
+    series = {"E": [0.01, -0.02, 0.03], "E_ew": [0.02, 0.01, -0.01], "I": [0.0, 0.05, 0.02]}
+    first = m.sign_flip_permutation_probability(series, n_perm=500, seed=42)
+    second = m.sign_flip_permutation_probability(series, n_perm=500, seed=42)
+    assert first["probability_all_positive"] == second["probability_all_positive"]
+
+
+def test_sign_flip_permutation_probability_single_month_shared_sign_is_all_or_nothing() -> None:
+    """한 시행 안에서는 같은 부호 벡터를 시리즈 전부에 곱한다 — 한 달짜리면 뒤집힐 때
+    넷이 같이 뒤집혀 대략 절반은 전부 양수, 절반은 전부 음수가 된다."""
+    series = {"E": [1.0], "E_ew": [1.0], "I": [1.0], "S": [1.0]}
+    result = m.sign_flip_permutation_probability(series, n_perm=5000, seed=7)
+    assert result["probability_all_positive"] == pytest.approx(0.5, abs=0.03)
+
+
+def test_sign_flip_permutation_probability_mismatched_lengths_raise() -> None:
+    with pytest.raises(ValueError, match="길이가 다릅니다"):
+        m.sign_flip_permutation_probability({"E": [0.1, 0.2], "S": [0.1]}, n_perm=10, seed=0)
+
+
+def test_sign_flip_permutation_probability_empty_series_map_raises() -> None:
+    with pytest.raises(ValueError, match="비어"):
+        m.sign_flip_permutation_probability({}, n_perm=10, seed=0)
+
+
+def test_sign_flip_permutation_probability_empty_series_returns_nan() -> None:
+    result = m.sign_flip_permutation_probability({"E": [], "S": []}, n_perm=10, seed=0)
+    assert result["n_months"] == 0
+    assert math.isnan(result["probability_all_positive"])
