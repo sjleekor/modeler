@@ -874,3 +874,32 @@ def test_run_scan_long2_row_columns_match_preregistration_spec() -> None:
     )
     row = scan_one(dspec, universe="all", inputs=inputs, placebo_shifts=_TEST_PLACEBO_SHIFTS)
     assert set(row.as_dict().keys()) == expected_columns
+
+
+# --- 데이터셋 판을 코드에 박지 않는다 (2026-09-22) ----------------------------
+
+
+def test_dataset_names_follow_the_version():
+    """3차는 **사양을 안 바꾸고 데이터만 v2 로** 바꾼다 (T-D1).
+
+    이름이 코드에 박혀 있으면 그 약속을 지킬 수가 없다.
+    """
+    from modeler.us import scan_long2
+
+    assert scan_long2.dataset_names("v1") == (
+        "us_features_v1",
+        "us_labels_v1",
+        "us_labels_h63_v1",
+    )
+    assert scan_long2.dataset_names("v2") == (
+        "us_features_v2",
+        "us_labels_v2",
+        "us_labels_h63_v2",
+    )
+
+
+def test_default_version_is_v1_until_someone_changes_it():
+    """기본을 v2 로 슬쩍 바꾸면 옛 결과를 다시 못 만든다. **인자로 준다.**"""
+    from modeler.us import scan_long2
+
+    assert scan_long2.DATASET_VERSION == "v1"

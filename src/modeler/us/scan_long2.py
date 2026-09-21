@@ -562,11 +562,28 @@ class ScanInputs2:
     total_months: int
 
 
+#: 데이터셋 판. **이름을 코드에 박지 않는다** (2026-09-22).
+#:
+#: 3차는 **사양을 한 글자도 안 바꾸고 데이터만 v2 로 바꾼다** — 누수 둘을
+#: 고친 판이다 (3차 계획 T-D1). 이름이 박혀 있으면 그 "사양을 안 바꾼다"를
+#: 지킬 수가 없다.
+DATASET_VERSION = "v1"
+
+
+def dataset_names(version: str = DATASET_VERSION) -> tuple[str, str, str]:
+    """``(features, labels_h21, labels_h63)`` 이름."""
+    return (
+        f"us_features_{version}",
+        f"us_labels_{version}",
+        f"us_labels_h63_{version}",
+    )
+
+
 def load_features_and_labels(
-    root: DataRoot, *, dev_end: date = DEV_END
+    root: DataRoot, *, dev_end: date = DEV_END, version: str = DATASET_VERSION
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """``us_features_v1``·``us_labels_v1``·``us_labels_h63_v1``을 개발 구간까지만
-    읽는다(``scan.load_dev_frame`` 그대로 재사용) — ``sigma_daily``는 아직
+    """피쳐·라벨(h21·h63)을 개발 구간까지만 읽는다
+    (``scan.load_dev_frame`` 그대로 재사용) — ``sigma_daily``는 아직
     안 붙어 있다(레이크가 있어야 조인할 수 있다, :func:`build_scan_inputs`
     참고).
 
@@ -574,13 +591,17 @@ def load_features_and_labels(
     데이터셋으로 ``--dev-end`` 벽을 단위테스트하려면 ``UsLake``(레이크) 없이도
     부를 수 있는 진입점이 있어야 한다.
     """
-    features_dev = scan.load_dev_frame(root, "us_features_v1", dev_end=dev_end)
-    labels_dev = scan.load_dev_frame(root, "us_labels_v1", dev_end=dev_end)
-    labels63_dev = scan.load_dev_frame(root, "us_labels_h63_v1", dev_end=dev_end)
+    features, labels21, labels63 = dataset_names(version)
+    features_dev = scan.load_dev_frame(root, features, dev_end=dev_end)
+    labels_dev = scan.load_dev_frame(root, labels21, dev_end=dev_end)
+    labels63_dev = scan.load_dev_frame(root, labels63, dev_end=dev_end)
     return features_dev, labels_dev, labels63_dev
 
 
-def build_scan_inputs(root: DataRoot, lake: UsLake, *, dev_end: date = DEV_END) -> ScanInputs2:
+def build_scan_inputs(
+    root: DataRoot, lake: UsLake, *, dev_end: date = DEV_END,
+    version: str = DATASET_VERSION,
+) -> ScanInputs2:
     """레이크가 아니라 이미 만들어진 데이터셋을 읽는다(``scan.
     build_scan_inputs``와 같은 관례) — ``sigma_daily``만 예외로
     ``cost.daily_volatility(lake)``에서 조인한다(``m6_run.bucket_universe``와
@@ -589,7 +610,9 @@ def build_scan_inputs(root: DataRoot, lake: UsLake, *, dev_end: date = DEV_END) 
     **N1은 이 함수를 실행하지 않는다** — CLI(:func:`main`)가 쓸 조립 코드로
     존재할 뿐이다(N2가 실제로 부른다).
     """
-    features_dev, labels_dev, labels63_dev = load_features_and_labels(root, dev_end=dev_end)
+    features_dev, labels_dev, labels63_dev = load_features_and_labels(
+        root, dev_end=dev_end, version=version
+    )
     sigma = cost_mod.daily_volatility(lake).select("date", "symbol", "sigma_daily").collect()
     labels_dev = labels_dev.join(sigma, on=["date", "symbol"], how="left")
 
@@ -806,19 +829,30 @@ def main(argv: list[str] | None = None) -> int:
         default=DEV_END,
         help=f"개발 구간 끝 날짜 (기본: {DEV_END.isoformat()}). N2에서 2026-06-30으로 넓힌다",
     )
+    parser.add_argument(
+        "--dataset-version",
+        default=DATASET_VERSION,
+        help=f"읽을 데이터셋 판 (기본: {DATASET_VERSION}). 3차는 v2 다 — "
+        "**사양은 안 바뀐다. 데이터만 바뀐다**",
+    )
     args = parser.parse_args(argv)
 
     root = DataRoot.resolve(market="us")
     lake = UsLake.resolve()
     shifts = scan.select_placebo_shifts()
-    inputs = build_scan_inputs(root, lake, dev_end=args.dev_end)
+    inputs = build_scan_inputs(root, lake, dev_end=args.dev_end, version=args.dataset_version)
     rows = run_scan_long2(inputs, placebo_shifts=shifts)
 
     table = pl.DataFrame([row.as_dict() for row in rows])
     # N2 운영 지시("두 실행을 구분해서 남겨라 — dev_end 를 manifest 와 컬럼에") —
     # 사전등록(``01``)에는 없는 요구라 LongScanRow2(``as_dict`` 26개 필드, N1이
     # 이미 테스트해 둔 계약)는 건드리지 않고 CLI 출력 표에만 부가한다.
-    table = table.with_columns(pl.lit(args.dev_end.isoformat()).alias("dev_end"))
+    table = table.with_columns(
+        pl.lit(args.dev_end.isoformat()).alias("dev_end"),
+        # **어느 데이터 판으로 낸 표인지 행마다 남긴다.** v1(누수 있음)과
+        # v2(고침)의 표를 나란히 놓고 볼 것이라 섞이면 안 된다 (3차 T-D2).
+        pl.lit(args.dataset_version).alias("dataset_version"),
+    )
 
     snapshot_date = args.snapshot_date or date.today().isoformat()
     out_dir = root.output / OUTPUT_DIR_NAME / f"snapshot_date={snapshot_date}"
