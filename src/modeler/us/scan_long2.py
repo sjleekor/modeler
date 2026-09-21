@@ -731,6 +731,10 @@ def main(argv: list[str] | None = None) -> int:
     rows = run_scan_long2(inputs, placebo_shifts=shifts)
 
     table = pl.DataFrame([row.as_dict() for row in rows])
+    # N2 운영 지시("두 실행을 구분해서 남겨라 — dev_end 를 manifest 와 컬럼에") —
+    # 사전등록(``01``)에는 없는 요구라 LongScanRow2(``as_dict`` 26개 필드, N1이
+    # 이미 테스트해 둔 계약)는 건드리지 않고 CLI 출력 표에만 부가한다.
+    table = table.with_columns(pl.lit(args.dev_end.isoformat()).alias("dev_end"))
 
     snapshot_date = args.snapshot_date or date.today().isoformat()
     out_dir = root.output / OUTPUT_DIR_NAME / f"snapshot_date={snapshot_date}"
