@@ -1,27 +1,12 @@
-"""피쳐 family — ``04_feature_test_plan.md`` §3의 F1\\~F16.
+"""``modeler.us.features.FAMILY_ORDER`` 단위 테스트.
 
-**파일 하나에 family 하나다** (``06_execution_steps.md`` M2). 검정 대상은
-F1\\~F14의 44개고, F15(시장 수준 4개)·F16(캘린더 1개)은 단독 검정을 하지 않는다 —
-상호작용·분해 축·정규화에만 쓴다.
-
-각 family 모듈은 ``add_<family>(panel, lake, ...) -> pl.DataFrame``을 내놓고,
-피쳐마다 ``<이름>_isna`` 플래그를 같이 낸다. 결측 자체가 정보인 경우가 있다
-(``iv_isna``는 유동성 프록시, 재무 결측은 외국발행사 플래그다).
-
-``FAMILY_ORDER``는 그 16개 함수를 F1\\~F16 순서로 엮은 것이다
-(``06_execution_steps.md`` M3 — ``build_features.py``가 이 순서로 순회하며
-패널에 피쳐를 붙인다). **매핑을 추가하는 것이지 피쳐를 추가하는 것이 아니다**
-— 각 함수는 이미 있고 정의도 그대로다(``us-features-frozen`` 태그, R6 동결).
-순서 자체는 최종 컬럼 집합에 영향이 없다(각 family가 자기 컬럼만 join으로
-더할 뿐 서로의 출력을 읽지 않는다) — 그래도 재현·manifest 기록을 위해 고정한다.
+레이크를 전혀 안 읽는다 — 매핑 자체(순서·개수·중복 없음·이름-함수 짝)만 본다.
+실제 family 계산 로직은 각 ``test_feature_*.py``가 이미 검정한다.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
-import polars as pl
-
+from modeler.us.features import FAMILY_ORDER
 from modeler.us.features.calendar import add_calendar
 from modeler.us.features.earnings import add_earnings
 from modeler.us.features.filing_activity import add_filing_activity
@@ -38,13 +23,8 @@ from modeler.us.features.reversal import add_reversal
 from modeler.us.features.short import add_short
 from modeler.us.features.valuation import add_valuation
 from modeler.us.features.volatility import add_volatility
-from modeler.us.lake import UsLake
 
-AddFamilyFn = Callable[[pl.DataFrame, UsLake], pl.DataFrame]
-
-#: (family 이름, add_<family> 함수) — F1~F16 순서, ``04_feature_test_plan.md``
-#: §3 그대로다.
-FAMILY_ORDER: tuple[tuple[str, AddFamilyFn], ...] = (
+_EXPECTED = (
     ("F1_momentum", add_momentum),
     ("F2_reversal", add_reversal),
     ("F3_volatility", add_volatility),
@@ -62,3 +42,23 @@ FAMILY_ORDER: tuple[tuple[str, AddFamilyFn], ...] = (
     ("F15_market", add_market),
     ("F16_calendar", add_calendar),
 )
+
+
+def test_family_order_has_16_entries() -> None:
+    assert len(FAMILY_ORDER) == 16
+
+
+def test_family_order_names_are_unique() -> None:
+    names = [name for name, _ in FAMILY_ORDER]
+    assert len(names) == len(set(names))
+
+
+def test_family_order_matches_f1_through_f16_in_plan_order() -> None:
+    """``04_feature_test_plan.md`` §3의 F1~F16 순서 그대로다."""
+    assert FAMILY_ORDER == _EXPECTED
+
+
+def test_family_order_functions_are_the_add_family_functions_themselves() -> None:
+    """매핑이 감싸거나 복사한 함수가 아니라 각 모듈의 ``add_<family>`` 그 자체를 가리킨다."""
+    for (_, fn), (_, expected_fn) in zip(FAMILY_ORDER, _EXPECTED, strict=True):
+        assert fn is expected_fn

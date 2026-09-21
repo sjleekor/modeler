@@ -13,6 +13,7 @@ import pytest
 from modeler.etl.config import DataRoot
 from modeler.us.labels import (
     DISTRESS_SHOCK,
+    HORIZON_TRADING_DAYS,
     MAX_PLAUSIBLE_ABS_L0,
     OTHER_SIC2,
     UNCLASSIFIED_SIC2,
@@ -790,3 +791,81 @@ def test_build_labels_counts_constant_has_mcap_months(tmp_path: Path, lake: UsLa
     _, diag = build_labels(lake, panel=panel)
 
     assert diag["constant_has_mcap_months"] == 2
+
+
+# --- horizon 파라미터 (2026-09-21 추가, ``06`` M3 — h5·h63 IC 감쇠 확인용) --------
+
+
+def test_build_labels_horizon_parameter_uses_custom_maturity_offset(
+    tmp_path: Path, lake: UsLake
+) -> None:
+    """``horizon=5``를 주면 t+21이 아니라 t+5(거래일) 가격으로 L0를 계산한다.
+
+    L0·L1·L2의 정의 자체(``adj_close(t+horizon)/adj_close(t) - 1`` 등)는 그대로다
+    — 창 길이만 인자로 뺐다(``04`` §4, ``06`` M3). ``t+21``에 일부러 다른 값(999.0)을
+    심어 뒀는데 그 값이 L0에 안 들어가면 진짜로 h5 오프셋을 쓴 것이다.
+    """
+    t5 = _CALENDAR[5]
+    _write_trading_calendar(tmp_path, _CALENDAR)
+    _write_corp_actions(tmp_path)
+    _write_listing_snapshots(tmp_path, [])
+    _write_prices(
+        tmp_path,
+        [
+            _price_row(_T, "AAA", 10.0),
+            _price_row(t5, "AAA", 12.0),
+            _price_row(_T21, "AAA", 999.0),  # horizon=5면 쓰이면 안 되는 값
+            _price_row(_T, "MKT", 100.0),
+            _price_row(t5, "MKT", 101.0),
+            _price_row(_T21, "MKT", 200.0),
+        ],
+    )
+    panel = _panel_df(
+        [
+            _panel_row(_T, "AAA", close=10.0, adj_close=10.0),
+            _panel_row(_T, "MKT", close=100.0, adj_close=100.0),
+        ]
+    )
+
+    labels, diag = build_labels(lake, panel=panel, horizon=5)
+
+    row = labels.filter(pl.col("symbol") == "AAA")
+    assert row.height == 1
+    assert row["L0"][0] == pytest.approx(12.0 / 10.0 - 1)
+    assert diag["rebalance_dates_usable"] == 1
+    assert diag["dropped_rebalance_dates"] == []
+
+
+def test_build_labels_default_horizon_matches_horizon_trading_days_constant(
+    tmp_path: Path, lake: UsLake
+) -> None:
+    """``horizon``을 안 주면 기존과 같은 ``HORIZON_TRADING_DAYS``(h21)를 쓴다.
+
+    파라미터화가 h21의 기본 동작을 바꾸지 않았는지 보는 회귀 테스트다 —
+    ``build_labels(lake, panel=panel)``과 ``build_labels(lake, panel=panel,
+    horizon=HORIZON_TRADING_DAYS)``가 같은 결과를 내야 한다.
+    """
+    _write_trading_calendar(tmp_path, _CALENDAR)
+    _write_corp_actions(tmp_path)
+    _write_listing_snapshots(tmp_path, [])
+    _write_prices(
+        tmp_path,
+        [
+            _price_row(_T, "AAA", 10.0),
+            _price_row(_T21, "AAA", 11.0),
+            _price_row(_T, "MKT", 100.0),
+            _price_row(_T21, "MKT", 101.0),
+        ],
+    )
+    panel = _panel_df(
+        [
+            _panel_row(_T, "AAA", close=10.0, adj_close=10.0),
+            _panel_row(_T, "MKT", close=100.0, adj_close=100.0),
+        ]
+    )
+
+    default_labels, default_diag = build_labels(lake, panel=panel)
+    explicit_labels, explicit_diag = build_labels(lake, panel=panel, horizon=HORIZON_TRADING_DAYS)
+
+    assert default_labels.equals(explicit_labels)
+    assert default_diag == explicit_diag

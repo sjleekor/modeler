@@ -2,7 +2,7 @@
 
 | 층 | 정의 |
 |---|---|
-| L0 | ``adj_close(t+21)/adj_close(t) - 1``. 거래일 21일 뒤(``HORIZON_TRADING_DAYS``) |
+| L0 | ``adj_close(t+horizon)/adj_close(t) - 1``. 기본 h21, ``horizon`` 인자로 h5·h63도 낸다 |
 | L1 | ``L0 - mean_universe(L0)`` (그날 유니버스 동일가중 — 라벨 벤치마크, ``02`` §3) |
 | L2 | 순위 공간 회귀 잔차 ``y~x+x²+m+m²+has_mcap+sic2`` (``x``=adv_20d, ``m``=mcap_rank 순위) |
 | y_rank | L2의 그날 횡단면 백분위 순위 [0,1] |
@@ -450,22 +450,31 @@ def _label_one_date(
 
 
 def build_labels(
-    lake: UsLake, *, panel: pl.DataFrame | None = None
+    lake: UsLake, *, panel: pl.DataFrame | None = None, horizon: int = HORIZON_TRADING_DAYS
 ) -> tuple[pl.DataFrame, dict[str, object]]:
     """``L0``·``L1``·``L2``·``y_rank``·``y_up``이 붙은 라벨 DataFrame을 만든다.
 
     ``panel``을 안 주면 ``panel.build_panel(lake)``로 만든다.
 
+    ``horizon``은 리밸런스 ``t``에서 라벨 만기까지의 거래일 수다. 기본값은
+    주 horizon인 ``HORIZON_TRADING_DAYS``(h21)다 — ``04_feature_test_plan.md``
+    §4가 단일피쳐 검정에서 h5·h63의 IC 감쇠도 보라고 해서 인자로 뺐다
+    (``06_execution_steps.md`` M2\\~M3). **L0·L1·L2의 정의 자체는 바뀌지
+    않는다** — "거래일 21일 뒤" 대신 "거래일 ``horizon``일 뒤"로 창 길이만
+    달라진다. ``MAX_TICKER_GAP_DAYS``(티커 재사용 공백 문턱, 60일 고정)는
+    horizon과 무관하게 그대로다 — h21 기준으로 잡은 값이라 h5는 더 넉넉하게,
+    h63은 더 빠듯하게 걸러지지만, 이 모듈이 판단할 문제가 아니라 손대지 않는다.
+
     반환: (라벨 DataFrame, diagnostics). diagnostics에는
     ``rebalance_dates_total``·``rebalance_dates_usable``·
-    ``dropped_rebalance_dates``(``t+21``이 데이터 밖이라 뺀 리밸런스일)·
+    ``dropped_rebalance_dates``(``t+horizon``이 데이터 밖이라 뺀 리밸런스일)·
     ``closed_by_reason``(사유별 종가 처리 수)이 있다.
     """
     if panel is None:
         panel = build_panel(lake)
 
     rebalance_dates = sorted(panel["date"].unique().to_list())
-    offsets = trading_day_offsets(lake, rebalance_dates, HORIZON_TRADING_DAYS)
+    offsets = trading_day_offsets(lake, rebalance_dates, horizon)
 
     max_price_date = lake.scan("prices_daily").select(pl.col("date").max()).collect().item()
 
