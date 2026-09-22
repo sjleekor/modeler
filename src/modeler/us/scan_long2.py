@@ -186,10 +186,10 @@ def _ranked(
     long_short_monthly``는 자기 안에서 같은 준비를 따로 한다 — 그 함수는
     바꾸지 않는다는 지시라 고치지 않는다)."""
     scored = df.with_columns(scan_long.scored_column(feature_col, sign).alias("_score"))
-    return scored.with_columns(
-        pl.col("_score").rank(method="ordinal").over(group_col).alias("_r"),
-        pl.len().over(group_col).cast(pl.Int64).alias("_n"),
-    ).filter(pl.col("_n") >= min_names)
+    # 동점 순서를 고정한다 (2026-09-22) — `scan_long.ordinal_rank_stable` 참고.
+    return scan_long.ordinal_rank_stable(scored, group_col=group_col).filter(
+        pl.col("_n") >= min_names
+    )
 
 
 def monthly_bottom100_short(

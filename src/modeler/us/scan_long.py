@@ -34,6 +34,7 @@ placebo도 매기지 않는다** — 방향(``effective_sign``)은 개발 구간
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -117,6 +118,71 @@ def scored_column(feature_col: str, sign: Literal["+", "-"]) -> pl.Expr:
 # --- 2. 월별 long_t · short_t · top100_t ------------------------------------
 
 
+#: 동점을 가르는 시드 (2026-09-22).
+#:
+#: **`rank(method="ordinal")` 은 동점을 행 순서로 가르는데 polars 가 그 순서를
+#: 보장하지 않는다.** 같은 입력으로 두 번 돌려 `filing_lag` 의 placebo 가
+#: 1.7648 -> 1.5570 으로 달라졌다. 44개 중 23개가 동점투성이고
+#: `iv_isna` 는 동점 묶음이 평균 2,010종목이다 — top-100 이 "그 중 아무 100개"였다.
+#:
+#: **종목마다 고정된 키**여야 한다. 달마다 새로 뽑으면 회전율이 95% 가 되어
+#: G1(비용)이 전부 죽는다. 지금 동작은 우연히 안정적이었다(`iv_isna` 회전율
+#: 5\~10%) — 그 성질을 유지하면서 재현만 보장한다.
+#:
+#: 알파벳 순이 아니라 해시다. 2,010종목 중 알파벳 앞 100개를 사는 것은
+#: "임의"라고 말하기 어렵다. `hashlib` 을 쓰는 이유는 polars `.hash()` 가
+#: 판 사이에서 안정하다고 보장되지 않기 때문이다.
+TIE_BREAK_SEED = b"us-long-scan-tie-2026"
+
+_TIE_CACHE: dict[str, int] = {}
+
+
+def _tie_key(symbol: str) -> int:
+    digest = hashlib.blake2b(
+        symbol.encode("utf-8"), key=TIE_BREAK_SEED, digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big")
+
+
+def with_tie_break(df: pl.DataFrame, *, symbol_col: str = "symbol") -> pl.DataFrame:
+    """``_tie`` 열을 붙인다. 이미 있으면 그대로 둔다 (멱등).
+
+    종목 이름만으로 정해지므로 **달이 바뀌어도 같은 값**이다.
+    """
+    if "_tie" in df.columns:
+        return df
+    if symbol_col not in df.columns:
+        raise ValueError(f"동점을 가를 수 없다: {symbol_col!r} 열이 없다")
+    symbols = df[symbol_col].unique().to_list()
+    for sym in symbols:
+        if sym not in _TIE_CACHE:
+            _TIE_CACHE[sym] = _tie_key(sym)
+    mapping = {sym: _TIE_CACHE[sym] for sym in symbols}
+    return df.with_columns(
+        pl.col(symbol_col).replace_strict(mapping, return_dtype=pl.UInt64).alias("_tie")
+    )
+
+
+def ordinal_rank_stable(
+    df: pl.DataFrame, *, score_col: str = "_score", group_col: str = "month_idx"
+) -> pl.DataFrame:
+    """``_r``(1..n)·``_n`` 을 **결정적으로** 붙인다.
+
+    ``(group, score, _tie)`` 로 정렬한 뒤 그 순서로 번호를 매긴다.
+    ``rank(method="ordinal").over(...)`` 와 결과 모양은 같고 동점 순서만
+    정해진다. ``ordinal`` 을 쓰는 이유(값이 0에 몰린 피쳐가 ``average`` 에서
+    어느 쪽에도 안 걸려 그 달이 NaN 이 되는 것)는 그대로 유효하다.
+    """
+    return (
+        with_tie_break(df)
+        .sort([group_col, score_col, "_tie"])
+        .with_columns(
+            pl.int_range(1, pl.len() + 1).over(group_col).cast(pl.Int64).alias("_r"),
+            pl.len().over(group_col).cast(pl.Int64).alias("_n"),
+        )
+    )
+
+
 def long_short_monthly(
     df: pl.DataFrame,
     *,
@@ -140,10 +206,9 @@ def long_short_monthly(
     반환: ``group_col, n, long, short, top100`` (``group_col``으로 정렬됨).
     """
     scored = df.with_columns(scored_column(feature_col, sign).alias("_score"))
-    ranked = scored.with_columns(
-        pl.col("_score").rank(method="ordinal").over(group_col).alias("_r"),
-        pl.len().over(group_col).cast(pl.Int64).alias("_n"),
-    ).filter(pl.col("_n") >= min_names)
+    ranked = ordinal_rank_stable(scored, group_col=group_col).filter(
+        pl.col("_n") >= min_names
+    )
     empty_schema = {
         group_col: df.schema[group_col],
         "n": pl.Int64,

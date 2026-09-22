@@ -1,0 +1,58 @@
+{
+  "snapshot_date": "2026-09-08",
+  "horizon": 20,
+  "holdout_start": "2025-08-01",
+  "train_first_formation": "2015-01-02",
+  "train_last_formation": "2025-07-03",
+  "train_last_label_end": "2025-07-31",
+  "train_last_label_end_halted": "2025-08-26",
+  "purge_sessions": 20,
+  "n_train_rows_dropped_by_label_end": 537,
+  "n_train_tickers_dropped_by_label_end": 61,
+  "eval_first_formation": "2025-08-01",
+  "eval_last_formation": "2026-09-07",
+  "eval_last_label_end": "2026-08-27",
+  "n_eval_sessions": 268,
+  "n_rebalances_held": 14,
+  "n_rebalances_matured": 13,
+  "rebalance_dates": [
+    "2025-08-01",
+    "2025-09-01",
+    "2025-09-29",
+    "2025-11-03",
+    "2025-12-01",
+    "2025-12-30",
+    "2026-01-29",
+    "2026-03-04",
+    "2026-04-01",
+    "2026-04-29",
+    "2026-06-01",
+    "2026-06-30",
+    "2026-07-29",
+    "2026-08-27"
+  ],
+  "unmatured_rebalance_dates": [
+    "2026-08-27"
+  ],
+  "closed_names_by_rebalance": {
+    "2025-08-01": 2645,
+    "2025-09-01": 2654,
+    "2025-09-29": 2653,
+    "2025-11-03": 2655,
+    "2025-12-01": 2667,
+    "2025-12-30": 2683,
+    "2026-01-29": 2683,
+    "2026-03-04": 2664,
+    "2026-04-01": 2658,
+    "2026-04-29": 2648,
+    "2026-06-01": 2660,
+    "2026-06-30": 2649,
+    "2026-07-29": 2592,
+    "2026-08-27": 0
+  },
+  "price_data_last_date": "2026-09-07",
+  "notes": [
+    "\uc694\uccad\ud55c \ud3c9\uac00 \ub05d 2026-09-16 \uc774 \uc774 snapshot \uc758 \uac00\uaca9 \ub9c8\uc9c0\ub9c9 \ub0a0 2026-09-07 \ubcf4\ub2e4 \ub4a4\ub2e4 \u2014 \ub370\uc774\ud130\uac00 \uc788\ub294 \ub370\uae4c\uc9c0\ub9cc \uc798\ub838\ub2e4",
+    "\ub77c\ubca8\uc774 \uc548 \ub2eb\ud78c \ub9ac\ubc38\ub7f0\uc2a4 1\uac1c\ub294 \uac1c\uc218\ub85c\ub9cc \uae30\ub85d\ud558\uace0 \uc810\uc218\uc5d0 \ub123\uc9c0 \uc54a\ub294\ub2e4"
+  ]
+}

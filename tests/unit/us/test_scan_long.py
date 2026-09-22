@@ -95,6 +95,7 @@ def test_long_short_monthly_matches_hand_computed_values() -> None:
     df = pl.DataFrame(
         {
             "month_idx": [1] * 10,
+            "symbol": [f"S{i:02d}" for i in range(10)],
             "x": list(range(1, 11)),
             "L0": [float(v) / 10 for v in range(1, 11)],  # 0.1..1.0
         }
@@ -112,6 +113,7 @@ def test_long_short_monthly_sign_flip_swaps_top_and_bottom() -> None:
     df = pl.DataFrame(
         {
             "month_idx": [1] * 10,
+            "symbol": [f"S{i:02d}" for i in range(10)],
             "x": list(range(1, 11)),
             "L0": [float(v) / 10 for v in range(1, 11)],
         }
@@ -135,6 +137,7 @@ def test_long_short_monthly_top100_falls_back_to_full_group_when_smaller() -> No
     df = pl.DataFrame(
         {
             "month_idx": [1] * 10,
+            "symbol": [f"S{i:02d}" for i in range(10)],
             "x": list(range(1, 11)),
             "L0": [float(v) for v in range(1, 11)],
         }
@@ -147,6 +150,7 @@ def test_long_short_monthly_drops_months_below_min_names() -> None:
     df = pl.DataFrame(
         {
             "month_idx": [1, 1, 2, 2, 2, 2, 2],
+            "symbol": [f"S{i:02d}" for i in range(7)],
             "x": [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 5.0],
             "L0": [0.1, 0.2, 0.1, 0.2, 0.3, 0.4, 0.5],
         }
@@ -156,7 +160,9 @@ def test_long_short_monthly_drops_months_below_min_names() -> None:
 
 
 def test_long_short_monthly_empty_when_no_month_qualifies() -> None:
-    df = pl.DataFrame({"month_idx": [1, 1], "x": [1.0, 2.0], "L0": [0.1, 0.2]})
+    df = pl.DataFrame(
+        {"month_idx": [1, 1], "symbol": ["S0", "S1"], "x": [1.0, 2.0], "L0": [0.1, 0.2]}
+    )
     table = long_short_monthly(df, feature_col="x", sign="+", value_col="L0", min_names=10)
     assert table.height == 0
     assert set(table.columns) == {"month_idx", "n", "long", "short", "top100"}
