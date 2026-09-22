@@ -644,6 +644,8 @@ def _bare_row(feature: str, family: str, universe: str, t_long: float) -> LongSc
         LONG_L2=0.01,
         t_LONG_L2=t_long,
         basket_l2_mean=0.01,
+        cut_inside_tie=0.0,
+        basket_tie_fraction=0.0,
         basket_adv_median=1e7,
         adv_ratio=1.0,
         basket_price_median=50.0,
@@ -853,6 +855,11 @@ def test_run_scan_long2_row_columns_match_preregistration_spec() -> None:
         "LONG_L2",
         "t_LONG_L2",
         "basket_l2_mean",
+        # 2026-09-22 에 더했다 — 사전등록 `01` §5 에 없던 칸이다.
+        # top-100 이 동점에서 정의되지 않던 것을 고치면서(`01_tie_break.md`),
+        # **이 등급이 임의 추출 위에 있나**를 사람이 볼 수 있게 남긴다.
+        "cut_inside_tie",
+        "basket_tie_fraction",
         "basket_adv_median",
         "adv_ratio",
         "basket_price_median",

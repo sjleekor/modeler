@@ -245,6 +245,19 @@ def monthly_basket_diagnostics(
     컬럼이 있어야 한다. 비용은 ``cost.cost_roundtrip``을 **그대로** 부른다
     (``01`` §3 G1 "비용은 ... cost.py를 그대로 쓴다") — spread·impact를 여기서
     다시 조립하지 않는다.
+
+    **동점 진단 둘도 여기서 낸다** (2026-09-22 · ``01_tie_break.md``).
+
+    ``cut_inside_tie``
+        top-100 경계가 동점 묶음 **안**을 지나는가. 같은 점수인데 누구는
+        들어오고 누구는 빠졌다는 뜻이다.
+    ``basket_tie_fraction``
+        바스켓에서 **임의로 뽑힌 몫**. 경계 동점 묶음이 바스켓에서 차지하는
+        비율이고, 경계가 동점 안이 아니면 0이다. ``iv_isna``처럼 값이 둘뿐인
+        피쳐는 **1.0**이 된다 — 바스켓 전체가 아무 100개다.
+
+    **이 둘이 없으면 표를 보는 사람이 "이 등급은 임의 추출 위에 있다"를
+    알 수 없다.**
     """
     ranked = _ranked(
         df, feature_col=feature_col, sign=sign, min_names=min_names, group_col=group_col
@@ -258,6 +271,8 @@ def monthly_basket_diagnostics(
         "basket_pct_ge5": pl.Float64,
         "basket_l2_mean": pl.Float64,
         "basket_cost_roundtrip": pl.Float64,
+        "cut_inside_tie": pl.Boolean,
+        "basket_tie_fraction": pl.Float64,
     }
     if ranked.height == 0:
         return pl.DataFrame(schema=schema)
@@ -267,8 +282,24 @@ def monthly_basket_diagnostics(
         ).alias("_cost_roundtrip")
     )
     top100_mask = pl.col("_r") > (pl.col("_n") - top_k)
+    # 경계 점수 — 바스켓에 든 것 중 가장 낮은 순위의 점수다.
+    ranked = ranked.with_columns(
+        pl.col("_score")
+        .filter(pl.col("_r") == (pl.col("_n") - top_k + 1))
+        .first()
+        .over(group_col)
+        .alias("_cut_score")
+    )
+    at_cut = pl.col("_score") == pl.col("_cut_score")
+    excluded_at_cut = (~top100_mask & at_cut).sum()
     per_month = ranked.group_by(group_col, maintain_order=True).agg(
         pl.first("_n").cast(pl.Int64).alias("n"),
+        (excluded_at_cut > 0).alias("cut_inside_tie"),
+        pl.when(excluded_at_cut > 0)
+        .then((top100_mask & at_cut).sum() / top100_mask.sum())
+        .otherwise(0.0)
+        .cast(pl.Float64)
+        .alias("basket_tie_fraction"),
         pl.col("adv_20d").filter(top100_mask).median().alias("basket_adv_median"),
         pl.col("adv_20d").median().alias("universe_adv_median"),
         pl.col("close").filter(top100_mask).median().alias("basket_price_median"),
@@ -482,6 +513,8 @@ class LongScanRow2:
     LONG_L2: float
     t_LONG_L2: float
     basket_l2_mean: float
+    cut_inside_tie: float
+    basket_tie_fraction: float
     basket_adv_median: float
     adv_ratio: float
     basket_price_median: float
@@ -515,6 +548,8 @@ class LongScanRow2:
             "LONG_L2": self.LONG_L2,
             "t_LONG_L2": self.t_LONG_L2,
             "basket_l2_mean": self.basket_l2_mean,
+            "cut_inside_tie": self.cut_inside_tie,
+            "basket_tie_fraction": self.basket_tie_fraction,
             "basket_adv_median": self.basket_adv_median,
             "adv_ratio": self.adv_ratio,
             "basket_price_median": self.basket_price_median,
@@ -688,6 +723,14 @@ def scan_one(
     )
     basket_cost_roundtrip = _safe_mean(basket_table, "basket_cost_roundtrip")
     basket_l2_mean = _safe_mean(basket_table, "basket_l2_mean")
+    # 동점 진단 — 달 평균이다. `cut_inside_tie` 는 "경계가 동점 안이었던 달의
+    # 비율", `basket_tie_fraction` 은 "바스켓에서 임의로 뽑힌 몫의 달 평균".
+    cut_inside_tie = (
+        float(basket_table["cut_inside_tie"].cast(pl.Float64).mean() or 0.0)
+        if basket_table.height
+        else 0.0
+    )
+    basket_tie_fraction = _safe_mean(basket_table, "basket_tie_fraction")
     basket_adv_median = _safe_mean(basket_table, "basket_adv_median")
     universe_adv_median = _safe_mean(basket_table, "universe_adv_median")
     adv_ratio_defined = (
@@ -764,6 +807,8 @@ def scan_one(
         LONG_L2=long_l2_mean,
         t_LONG_L2=t_long_l2,
         basket_l2_mean=basket_l2_mean,
+        cut_inside_tie=cut_inside_tie,
+        basket_tie_fraction=basket_tie_fraction,
         basket_adv_median=basket_adv_median,
         adv_ratio=adv_ratio,
         basket_price_median=basket_price_median,

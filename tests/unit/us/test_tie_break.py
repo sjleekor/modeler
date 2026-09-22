@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import polars as pl
+import pytest
 
 from modeler.us import scan_long
 
@@ -117,3 +118,77 @@ def test_rank_covers_every_row_exactly_once():
     for m in range(2):
         rs = sorted(ranked.filter(pl.col("month_idx") == m)["_r"].to_list())
         assert rs == list(range(1, 51))
+
+
+# --- 동점 진단 칸 (2026-09-22) ------------------------------------------------
+
+
+def _diag_frame(values: list[float]) -> pl.DataFrame:
+    """한 달치. `values` 가 곧 피쳐 값이다."""
+    n = len(values)
+    return pl.DataFrame(
+        {
+            "month_idx": [0] * n,
+            "symbol": [f"S{i:04d}" for i in range(n)],
+            "f": values,
+            "L0": [0.01] * n,
+            "L2": [0.0] * n,
+            "close": [50.0] * n,
+            "adv_20d": [1e7] * n,
+            "sigma_daily": [0.02] * n,
+            "price_ge_5": [True] * n,
+        }
+    )
+
+
+def test_binary_feature_reports_the_whole_basket_as_arbitrary():
+    """`iv_isna` 같은 값 둘짜리 피쳐는 **바스켓 전체가 아무 100개**다."""
+    from modeler.us import scan_long2
+
+    df = _diag_frame([1.0] * 300 + [0.0] * 300)
+    out = scan_long2.monthly_basket_diagnostics(
+        df, feature_col="f", sign="+", min_names=10, top_k=100
+    )
+    assert out.height == 1
+    row = out.row(0, named=True)
+    assert row["cut_inside_tie"] is True
+    assert row["basket_tie_fraction"] == 1.0  # 100개 전부 동점 묶음에서 왔다
+
+
+def test_no_ties_reports_nothing_arbitrary():
+    from modeler.us import scan_long2
+
+    df = _diag_frame([float(i) for i in range(600)])
+    row = scan_long2.monthly_basket_diagnostics(
+        df, feature_col="f", sign="+", min_names=10, top_k=100
+    ).row(0, named=True)
+    assert row["cut_inside_tie"] is False
+    assert row["basket_tie_fraction"] == 0.0
+
+
+def test_tie_that_sits_entirely_inside_the_basket_is_not_arbitrary():
+    """동점이어도 **경계를 안 걸치면** 임의 선택이 아니다 — 다 들어온다."""
+    from modeler.us import scan_long2
+
+    # 상위 50개가 같은 값(경계 밖) · 나머지는 전부 다름
+    df = _diag_frame([1000.0] * 50 + [float(i) for i in range(550)])
+    row = scan_long2.monthly_basket_diagnostics(
+        df, feature_col="f", sign="+", min_names=10, top_k=100
+    ).row(0, named=True)
+    assert row["cut_inside_tie"] is False
+    assert row["basket_tie_fraction"] == 0.0
+
+
+def test_partial_tie_at_the_cut_is_counted():
+    """경계 동점 묶음이 30개인데 바스켓에 10개만 들어오면 10/100 이다."""
+    from modeler.us import scan_long2
+
+    # 값 큰 것 90개(고유) + 경계 동점 30개 + 아래 480개(고유, 더 작음)
+    df = _diag_frame(
+        [2000.0 + i for i in range(90)] + [500.0] * 30 + [float(i) for i in range(480)]
+    )
+    row = scan_long2.monthly_basket_diagnostics(
+        df, feature_col="f", sign="+", min_names=10, top_k=100
+    ).row(0, named=True)
+    assert row["cut_inside_tie"] is True
+    assert row["basket_tie_fraction"] == pytest.approx(10 / 100)
