@@ -749,7 +749,9 @@ def test_load_features_and_labels_joins_universe_flag_for_flow_dataset(tmp_path:
     dates = [date(2020, 1, 2), date(2020, 2, 3)]
     _write_synthetic_datasets(root, dates=dates, n_symbols=3)
     flow_rows = [
-        {"date": d, "symbol": f"S{s:02d}", "ftd_share_20": float(s)} for d in dates for s in range(3)
+        {"date": d, "symbol": f"S{s:02d}", "ftd_share_20": float(s)}
+        for d in dates
+        for s in range(3)
     ]
     write_dataset(pl.DataFrame(flow_rows), root, "us_features_flow_v1", manifest={})
 
