@@ -26,13 +26,15 @@ import polars as pl
 
 from modeler.etl.config import DataRoot
 
-#: 18표. 알파벳 순 — ``01_data_readiness.md`` §1 실측 그대로다.
+#: 18표(``01_data_readiness.md`` §1 실측) + ``ftd_fails``(us4 F17, 2026-09-27
+#: 추가 — 알파벳 순 그대로 끼워 넣는다). 알파벳 순.
 US_TABLES: tuple[str, ...] = (
     "company_meta",
     "corp_actions",
     "earnings_calendar",
     "filings_index",
     "filings_sub",
+    "ftd_fails",
     "fundamentals",
     "index_constituents",
     "insider_owners",
@@ -65,6 +67,7 @@ ASOF_AXIS: dict[str, str | None] = {
     "earnings_calendar": "date",
     "filings_index": "acceptance_datetime",
     "filings_sub": "filed",
+    "ftd_fails": "settlement_date",
     "fundamentals": "filed",
     "index_constituents": "as_of",
     "insider_owners": None,
