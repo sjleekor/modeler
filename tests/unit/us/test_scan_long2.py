@@ -25,22 +25,36 @@ from modeler.us import scan, scan_long, scan_long2
 from modeler.us.dataset import write_dataset
 from modeler.us.scan import FEATURE_REGISTRY, FeatureSpec
 from modeler.us.scan_long2 import (
+    F17_FEATURE_REGISTRY,
+    F18_FEATURE_REGISTRY,
+    F19_FEATURE_REGISTRY,
+    FULL_FEATURE_REGISTRY,
+    NEW_FEATURE_REGISTRY,
     DirectionSpec,
     LongScanRow2,
     ScanInputs2,
+    _fill_missing_feature_columns,
+    _lag_days_from_manifest,
+    _output_dir_name,
+    _parse_families,
     all_direction_specs,
     apply_bh_within_family,
+    apply_lag_metadata,
+    build_arg_parser,
     check_g1,
     check_g2,
     check_g3,
     compute_placebo_abs_t_long2,
     direction_specs_for,
+    direction_specs_for_families,
     evaluate_gates,
+    feature_registry_for,
     grade_from_long_stats,
     load_features_and_labels,
     monthly_basket_diagnostics,
     monthly_basket_turnover,
     monthly_bottom100_short,
+    read_lag_metadata,
     run_scan_long2,
     scan_one,
 )
@@ -872,6 +886,10 @@ def test_run_scan_long2_row_columns_match_preregistration_spec() -> None:
         "missing_rate",
         "high_missing",
         "bh_q",
+        # us4 초안 §6 — 2026-09-28에 더했다. 등급표에 사용 가능일 축 이름·
+        # 지연 상수를 남긴다(기존 44개 family는 항상 null).
+        "available_from",
+        "lag_days",
         "gate_failed",
         "grade",
     }
@@ -910,3 +928,315 @@ def test_default_version_is_v1_until_someone_changes_it():
     from modeler.us import scan_long2
 
     assert scan_long2.DATASET_VERSION == "v1"
+
+
+# --- us4 초안 §3 U-D1~U-D3, §5, §6, §7 — 입력 선택 옵션 -----------------------
+#
+# 여기서부터는 이번에 새로 더한 것만 검사한다: F17~F19 레지스트리 추가,
+# --features-dataset·--families·--run-tag 입력 선택, 없는 컬럼을 만나도 안
+# 죽는 것, available_from·lag_days 두 칸. 통계량·게이트·등급·동점 처리·
+# placebo·비용 계산(위 섹션들)은 전혀 건드리지 않았다 — 새로 만든 함수만 쓴다.
+
+
+# --- A. 새 family 레지스트리 (F17·F18·F19) ------------------------------------
+
+
+def test_f17_registry_has_three_registered_negative_features() -> None:
+    assert {spec.feature for spec in F17_FEATURE_REGISTRY} == {
+        "ftd_share_20",
+        "ftd_days_20",
+        "ftd_chg",
+    }
+    assert all(spec.family == "F17" for spec in F17_FEATURE_REGISTRY)
+    assert all(spec.expected_sign == "-" for spec in F17_FEATURE_REGISTRY)
+
+
+def test_f18_registry_has_four_unregistered_features() -> None:
+    """``00_draft.md`` U-Q3: 넷 다 부호 미등록 — 하나를 고르지 않는다."""
+    assert {spec.feature for spec in F18_FEATURE_REGISTRY} == {
+        "cancel_ratio_20",
+        "hidden_share_20",
+        "oddlot_share_20",
+        "fill_ratio_20",
+    }
+    assert all(spec.family == "F18" for spec in F18_FEATURE_REGISTRY)
+    assert all(spec.expected_sign is None for spec in F18_FEATURE_REGISTRY)
+
+
+def test_f19_registry_has_three_registered_positive_features() -> None:
+    assert {spec.feature for spec in F19_FEATURE_REGISTRY} == {
+        "inst_n_log",
+        "inst_breadth_chg",
+        "inst_shares_chg",
+    }
+    assert all(spec.family == "F19" for spec in F19_FEATURE_REGISTRY)
+    assert all(spec.expected_sign == "+" for spec in F19_FEATURE_REGISTRY)
+
+
+def test_new_feature_registry_is_exactly_the_ten_new_features() -> None:
+    assert len(NEW_FEATURE_REGISTRY) == 10
+    assert len(FULL_FEATURE_REGISTRY) == 44 + 10
+
+
+def test_f18_unregistered_features_get_both_directions_like_iv_isna() -> None:
+    """기존 ``iv_isna`` 등 미등록 넷과 완전히 같은 처리 — 새 로직을 안
+    만들었다는 것을 ``direction_specs_for``(안 바뀐 함수)로 직접 확인한다."""
+    for spec in F18_FEATURE_REGISTRY:
+        rows = direction_specs_for(spec)
+        assert len(rows) == 2
+        directions = {r.direction: r.sign for r in rows}
+        assert directions == {"both_a": "+", "both_b": "-"}
+
+
+# --- B. --families 입력 선택 --------------------------------------------------
+
+
+def test_feature_registry_for_none_is_exactly_the_original_44() -> None:
+    """지정하지 않으면 지금 동작 그대로 — 새 family가 조용히 안 섞인다."""
+    assert feature_registry_for(None) == FEATURE_REGISTRY
+    assert len(feature_registry_for(None)) == 44
+
+
+def test_feature_registry_for_selects_new_families_only() -> None:
+    selected = feature_registry_for(["F17", "F18"])
+    assert {spec.family for spec in selected} == {"F17", "F18"}
+    assert len(selected) == 3 + 4
+
+
+def test_feature_registry_for_can_also_select_an_original_family() -> None:
+    selected = feature_registry_for(["F1_momentum"])
+    assert {spec.feature for spec in selected} == {"mom_12_1", "mom_6_1", "mom_1m"}
+
+
+def test_feature_registry_for_unknown_family_is_empty_not_an_error() -> None:
+    assert feature_registry_for(["NOPE"]) == ()
+
+
+def test_direction_specs_for_families_none_matches_all_direction_specs() -> None:
+    assert direction_specs_for_families(None) == all_direction_specs()
+
+
+def test_direction_specs_for_families_f18_yields_eight_rows() -> None:
+    """4개 피쳐 x 양방향 2행 = 8."""
+    specs = direction_specs_for_families(["F18"])
+    assert len(specs) == 8
+    assert {s.feature for s in specs} == {
+        "cancel_ratio_20",
+        "hidden_share_20",
+        "oddlot_share_20",
+        "fill_ratio_20",
+    }
+
+
+def test_parse_families_none_when_not_given() -> None:
+    assert _parse_families(None) is None
+
+
+def test_parse_families_splits_and_strips() -> None:
+    assert _parse_families("F17, F18,F19") == ["F17", "F18", "F19"]
+
+
+def test_parse_families_empty_string_is_none_families() -> None:
+    # argparse 는 "--families ''" 를 빈 문자열로 준다 — 토큰이 하나도 안 남으면
+    # 빈 리스트를 돌려준다(None 이 아니다: "지정은 했다"는 사실은 남는다).
+    assert _parse_families("") == []
+
+
+# --- C. 없는 컬럼 처리 — 죽지 않는다 -------------------------------------------
+
+
+def test_fill_missing_feature_columns_adds_null_column() -> None:
+    df = pl.DataFrame({"date": [date(2020, 1, 1)], "symbol": ["S00"], "existing": [1.0]})
+    filled = _fill_missing_feature_columns(df, ("existing", "ftd_share_20"))
+    assert "ftd_share_20" in filled.columns
+    assert filled["ftd_share_20"].null_count() == 1
+    assert filled["ftd_share_20"].dtype == pl.Float64
+
+
+def test_fill_missing_feature_columns_is_a_no_op_when_nothing_missing() -> None:
+    df = pl.DataFrame({"a": [1.0], "b": [2.0]})
+    filled = _fill_missing_feature_columns(df, ("a", "b"))
+    assert filled.columns == df.columns
+
+
+def test_missing_feature_column_reports_full_missing_rate_without_raising() -> None:
+    """us4 초안: "데이터셋에 그 컬럼이 없으면 그 행은 결측 100%로 표에 남기되
+    에러로 죽지 않는다." ``scan._missing_rate``(안 바뀐 함수) 자체로 확인한다
+    — 없는 컬럼을 그냥 넘기면 polars가 ColumnNotFoundError 를 던진다."""
+    features_dev = pl.DataFrame(
+        {
+            "date": [date(2020, 1, 1)] * 3,
+            "symbol": ["S00", "S01", "S02"],
+            "price_ge_5": [True, True, True],
+        }
+    )
+    filled = _fill_missing_feature_columns(features_dev, ("ftd_share_20",))
+    missing_rate = scan._missing_rate(filled, "ftd_share_20", universe="all")
+    assert missing_rate == pytest.approx(1.0)
+
+
+# --- D. available_from · lag_days --------------------------------------------
+
+
+def test_lag_days_from_manifest_finds_known_key_for_f17() -> None:
+    manifest = {"LAG_FTD_DAYS": 20}
+    assert _lag_days_from_manifest(manifest, "F17") == pytest.approx(20.0)
+
+
+def test_lag_days_from_manifest_looks_under_lag_constants_container() -> None:
+    manifest = {"lag_constants": {"LAG_13F_DAYS": 60}}
+    assert _lag_days_from_manifest(manifest, "F19") == pytest.approx(60.0)
+
+
+def test_lag_days_from_manifest_is_none_for_f18_even_if_present() -> None:
+    """F18은 상수가 아니라 표(``MIDAS_AVAILABLE_FROM``)다 — 후보 키 자체가
+    없으므로 manifest에 무엇이 있든 lag_days는 null이다."""
+    manifest = {"MIDAS_FALLBACK_LAG_DAYS": 90}
+    assert _lag_days_from_manifest(manifest, "F18") is None
+
+
+def test_lag_days_from_manifest_is_none_when_key_missing_or_not_numeric() -> None:
+    assert _lag_days_from_manifest({}, "F17") is None
+    assert _lag_days_from_manifest({"LAG_FTD_DAYS": "twenty"}, "F17") is None
+    assert _lag_days_from_manifest({"LAG_FTD_DAYS": True}, "F17") is None  # bool은 int 서브클래스
+
+
+def test_read_lag_metadata_reads_manifest_written_by_write_dataset(tmp_path: Path) -> None:
+    root = DataRoot(base=tmp_path)
+    df = pl.DataFrame({"date": [date(2020, 1, 1)], "symbol": ["S00"], "ftd_share_20": [0.1]})
+    write_dataset(
+        df,
+        root,
+        "us_features_flow_v1",
+        manifest={"lag_constants": {"LAG_FTD_DAYS": 20, "LAG_13F_DAYS": 60}},
+    )
+
+    lag_metadata = read_lag_metadata(root, "us_features_flow_v1")
+
+    assert lag_metadata["F17"] == ("half_month_end+20d", pytest.approx(20.0))
+    assert lag_metadata["F19"] == ("period_end+LAG_13F", pytest.approx(60.0))
+    assert lag_metadata["F18"] == ("MIDAS_AVAILABLE_FROM table", None)
+
+
+def test_read_lag_metadata_missing_manifest_file_does_not_raise(tmp_path: Path) -> None:
+    root = DataRoot(base=tmp_path)
+    lag_metadata = read_lag_metadata(root, "us_features_does_not_exist_v1")
+    assert lag_metadata["F17"] == ("half_month_end+20d", None)
+    assert lag_metadata["F18"] == ("MIDAS_AVAILABLE_FROM table", None)
+    assert lag_metadata["F19"] == ("period_end+LAG_13F", None)
+
+
+def test_read_lag_metadata_malformed_manifest_does_not_raise(tmp_path: Path) -> None:
+    root = DataRoot(base=tmp_path)
+    dataset_dir = root.datasets / "us_features_broken_v1"
+    dataset_dir.mkdir(parents=True)
+    (dataset_dir / "manifest.json").write_text("{ not valid json")
+
+    lag_metadata = read_lag_metadata(root, "us_features_broken_v1")
+    assert lag_metadata["F17"] == ("half_month_end+20d", None)
+
+
+def test_apply_lag_metadata_fills_known_family_and_leaves_others_null() -> None:
+    row_new = _bare_row("ftd_share_20", "F17", "all", 3.0)
+    row_old = _bare_row("mom_1m", "F1_momentum", "all", 3.0)
+    lag_metadata = {"F17": ("half_month_end+20d", 20.0)}
+
+    apply_lag_metadata([row_new, row_old], lag_metadata)
+
+    assert row_new.available_from == "half_month_end+20d"
+    assert row_new.lag_days == pytest.approx(20.0)
+    assert row_old.available_from is None
+    assert row_old.lag_days is None
+
+
+def test_run_scan_long2_without_lag_metadata_leaves_columns_null() -> None:
+    inputs = _tiny_single_feature_inputs()
+    dspec = DirectionSpec(
+        feature="feat", family="F17", direction="registered", sign="-", expected_sign="-"
+    )
+    rows = run_scan_long2(inputs, placebo_shifts=_TEST_PLACEBO_SHIFTS, direction_specs=[dspec])
+    assert all(row.available_from is None and row.lag_days is None for row in rows)
+
+
+def test_run_scan_long2_with_lag_metadata_fills_matching_family() -> None:
+    inputs = _tiny_single_feature_inputs()
+    dspec = DirectionSpec(
+        feature="feat", family="F17", direction="registered", sign="-", expected_sign="-"
+    )
+    lag_metadata = {"F17": ("half_month_end+20d", 20.0)}
+    rows = run_scan_long2(
+        inputs,
+        placebo_shifts=_TEST_PLACEBO_SHIFTS,
+        direction_specs=[dspec],
+        lag_metadata=lag_metadata,
+    )
+    assert all(row.available_from == "half_month_end+20d" for row in rows)
+    assert all(row.lag_days == pytest.approx(20.0) for row in rows)
+
+
+# --- E. run_scan_long2에 direction_specs를 안 주면 지금과 같다 -----------------
+
+
+def test_run_scan_long2_default_direction_specs_unchanged() -> None:
+    """``direction_specs``를 안 주면 지금까지와 똑같이 44개 전부를 돈다 —
+    회귀 방지용(§ B에서 만든 필터가 기본 경로를 건드리지 않았는지)."""
+    inputs = _synthetic_scan_inputs2()
+    rows_default = run_scan_long2(inputs, placebo_shifts=_TEST_PLACEBO_SHIFTS)
+    rows_explicit = run_scan_long2(
+        inputs, placebo_shifts=_TEST_PLACEBO_SHIFTS, direction_specs=all_direction_specs()
+    )
+    assert (
+        len(rows_default) == len(rows_explicit) == len(all_direction_specs()) * len(scan.UNIVERSES)
+    )
+
+
+# --- F. 출력 디렉터리 이름 -----------------------------------------------------
+
+
+def test_output_dir_name_without_tag_is_unchanged() -> None:
+    assert _output_dir_name("2026-09-28", None) == "snapshot_date=2026-09-28"
+
+
+def test_output_dir_name_with_tag_inserts_it_after_the_date() -> None:
+    assert _output_dir_name("2026-09-28", "us4") == "snapshot_date=2026-09-28_us4"
+
+
+def test_output_dir_name_empty_tag_is_same_as_no_tag() -> None:
+    assert _output_dir_name("2026-09-28", "") == "snapshot_date=2026-09-28"
+
+
+# --- G. CLI 옵션 파싱 ----------------------------------------------------------
+
+
+def test_build_arg_parser_defaults_match_current_behavior() -> None:
+    args = build_arg_parser().parse_args([])
+    assert args.features_dataset is None
+    assert args.families is None
+    assert args.run_tag is None
+    assert args.snapshot_date is None
+    assert args.dataset_version == "v1"
+
+
+def test_build_arg_parser_parses_new_options() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--features-dataset",
+            "us_features_flow_v1",
+            "--families",
+            "F17,F18,F19",
+            "--run-tag",
+            "us4",
+        ]
+    )
+    assert args.features_dataset == "us_features_flow_v1"
+    assert args.families == "F17,F18,F19"
+    assert args.run_tag == "us4"
+
+
+def test_build_arg_parser_still_parses_existing_options() -> None:
+    args = build_arg_parser().parse_args(
+        ["--dev-end", "2026-06-30", "--dataset-version", "v2", "--snapshot-date", "2026-10-11"]
+    )
+    assert args.dev_end == date(2026, 6, 30)
+    assert args.dataset_version == "v2"
+    assert args.snapshot_date == "2026-10-11"

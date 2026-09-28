@@ -162,6 +162,78 @@ def all_direction_specs() -> list[DirectionSpec]:
     return out
 
 
+# --- 1b. us4 family 확장 — 입력 선택뿐이다 (``00_draft.md`` §3 U-D3·§5·§7) ------
+#
+# **여기서부터가 이 모듈이 이번에 더하는 전부다.** 통계량·게이트·등급·동점
+# 처리·placebo·비용 계산 코드(section 2~5)는 단 한 줄도 건드리지 않는다 —
+# 새 family도 결국 ``scan.FeatureSpec``·``DirectionSpec``으로 바뀌어 기존
+# ``scan_one``을 그대로 통과한다.
+
+#: F17 결제실패(FTD) — ``00_draft.md`` §5.1. 셋 다 부호 등록(전부 −).
+F17_FEATURE_REGISTRY: tuple[scan.FeatureSpec, ...] = (
+    scan.FeatureSpec("ftd_share_20", "F17", "-"),
+    scan.FeatureSpec("ftd_days_20", "F17", "-"),
+    scan.FeatureSpec("ftd_chg", "F17", "-"),
+)
+
+#: F18 주문흐름(MIDAS) — ``00_draft.md`` §5.2·U-Q3. 넷 다 **부호 미등록** —
+#: ``direction_specs_for``가 기존 ``iv_isna`` 등과 똑같이 양방향 2행을 낸다.
+F18_FEATURE_REGISTRY: tuple[scan.FeatureSpec, ...] = (
+    scan.FeatureSpec("cancel_ratio_20", "F18", None),
+    scan.FeatureSpec("hidden_share_20", "F18", None),
+    scan.FeatureSpec("oddlot_share_20", "F18", None),
+    scan.FeatureSpec("fill_ratio_20", "F18", None),
+)
+
+#: F19 기관보유(13F, 조건부) — ``00_draft.md`` §5.3. 셋 다 부호 등록(전부 +).
+F19_FEATURE_REGISTRY: tuple[scan.FeatureSpec, ...] = (
+    scan.FeatureSpec("inst_n_log", "F19", "+"),
+    scan.FeatureSpec("inst_breadth_chg", "F19", "+"),
+    scan.FeatureSpec("inst_shares_chg", "F19", "+"),
+)
+
+#: 새 family 셋을 합친 것 — ``scan.FEATURE_REGISTRY``(44, 동결)는 그대로 두고
+#: **여기 덧붙이기만 한다**(``features/`` 패키지도, ``scan.py``도 안 건드린다).
+NEW_FEATURE_REGISTRY: tuple[scan.FeatureSpec, ...] = (
+    F17_FEATURE_REGISTRY + F18_FEATURE_REGISTRY + F19_FEATURE_REGISTRY
+)
+
+#: 44개(동결) + 새 family 셋 — ``--families``가 고를 수 있는 전체 후보.
+FULL_FEATURE_REGISTRY: tuple[scan.FeatureSpec, ...] = scan.FEATURE_REGISTRY + NEW_FEATURE_REGISTRY
+
+
+def feature_registry_for(families: list[str] | None = None) -> tuple[scan.FeatureSpec, ...]:
+    """``--families``(``main``의 CLI 옵션) 입력 선택.
+
+    ``families=None``이면 **지금 동작 그대로** ``scan.FEATURE_REGISTRY``(44개
+    고정)를 돌려준다 — 새 family가 추가됐다고 기본 스캔 범위가 조용히
+    넓어지면 안 된다(``00_draft.md`` U-D2 "44개는 다시 안 본다").
+
+    family 이름을 주면 :data:`FULL_FEATURE_REGISTRY`(44 + F17·F18·F19)에서
+    그 family에 속한 것만 걸러 돌려준다 — 기존 44개 family 이름
+    (``F1_momentum`` 등)도 그대로 걸 수 있다.
+    """
+    if families is None:
+        return scan.FEATURE_REGISTRY
+    wanted = set(families)
+    return tuple(spec for spec in FULL_FEATURE_REGISTRY if spec.family in wanted)
+
+
+def direction_specs_for_families(families: list[str] | None = None) -> list[DirectionSpec]:
+    """:func:`feature_registry_for`가 고른 피쳐들의 방향 행 전부.
+
+    ``families=None``이면 :func:`all_direction_specs`와 정확히 같다(같은
+    44개에서 같은 순서로 만든다) — 별도로 다시 구현하지 않고 그 함수를
+    그대로 부른다.
+    """
+    if families is None:
+        return all_direction_specs()
+    out: list[DirectionSpec] = []
+    for spec in feature_registry_for(families):
+        out.extend(direction_specs_for(spec))
+    return out
+
+
 # --- 2. 월별 통계량 -----------------------------------------------------------
 #
 # LONG(top-100)·LONG_d10(상위10%)·LONG_L2(top-100, L2)는 scan_long.
@@ -529,6 +601,12 @@ class LongScanRow2:
     gate_failed: str
     grade: Grade
     bh_q: float | None = None
+    #: us4 초안 §6 "등급표에 들어갈 칸 ... available_from(사용 가능일 축
+    #: 이름)·lag_days(상수) 둘을 더한다". :func:`apply_lag_metadata`가
+    #: ``run_scan_long2`` 안에서 채운다(``scan_one``은 안 건드린다) — 기존
+    #: 44개 family는 항상 null이다.
+    available_from: str | None = None
+    lag_days: float | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -562,6 +640,8 @@ class LongScanRow2:
             "missing_rate": self.missing_rate,
             "high_missing": self.high_missing,
             "bh_q": self.bh_q,
+            "available_from": self.available_from,
+            "lag_days": self.lag_days,
             "gate_failed": self.gate_failed,
             "grade": self.grade,
         }
@@ -582,6 +662,92 @@ def apply_bh_within_family(rows: list[LongScanRow2]) -> None:
         qvals = benjamini_hochberg(pvals)
         for row, q in zip(group_rows, qvals, strict=True):
             row.bh_q = float(q) if math.isfinite(q) else None
+
+
+# --- 5b. available_from · lag_days — us4 초안 §6, 코디네이터 보충(2026-09-28) --
+#
+# ``available_from``은 그 family가 PIT로 쓸 수 있게 되는 **축 이름**이다 —
+# F17·F19처럼 "기준일 + 고정 지연일수" 하나면 숫자까지 적고, F18처럼 상수가
+# 아니라 분기별 표(``MIDAS_AVAILABLE_FROM``)면 표 이름만 적는다. **이 문자열
+# 자체는 코드에 적어 둔 설명이지 manifest에서 읽는 값이 아니다.**
+#
+# ``lag_days``는 그 반대로 **manifest에 실제 상수가 있을 때만** 채운다 — 아직
+# ``us_features_flow_v1``이 없어(다른 에이전트가 만드는 중이다) manifest 키
+# 이름이 확정되지 않았으므로, 후보 키를 몇 개 찔러보고 **하나도 없으면 조용히
+# null로 남긴다**(``00_draft.md`` "실패해도 행이 있다"와 같은 태도).
+#: F18은 상수가 아니라 분기별 표라 애초에 후보 키가 없다 — lag_days는 항상 null.
+_FAMILY_AVAILABLE_FROM: dict[str, str] = {
+    "F17": "half_month_end+20d",
+    "F18": "MIDAS_AVAILABLE_FROM table",
+    "F19": "period_end+LAG_13F",
+}
+
+#: family -> manifest에서 lag 상수를 찾을 때 시도해 볼 키 이름들(우선순위 순).
+#: F18은 여기 없다 — 상수 자체가 없는 family라 찾지 않는다.
+_FAMILY_LAG_MANIFEST_KEYS: dict[str, tuple[str, ...]] = {
+    "F17": ("LAG_FTD_DAYS", "LAG_FTD", "lag_ftd_days"),
+    "F19": ("LAG_13F_DAYS", "LAG_13F", "lag_13f_days"),
+}
+
+
+def _lag_days_from_manifest(manifest: dict[str, object], family: str) -> float | None:
+    """``manifest``(피쳐 데이터셋 manifest.json을 읽은 dict)에서 ``family``의
+    지연 상수를 찾는다. 최상위, 또는 흔히 쓰는 컨테이너 키(``lag_constants``)
+    밑을 둘 다 본다 — 키 이름도 컨테이너 이름도 아직 정해지지 않았다(다른
+    에이전트가 ``us_features_flow_v1``을 만드는 중이다). 후보 키가 없는
+    family(F18)나, 있어도 값이 하나도 안 잡히면 ``None``이다. 값이 있어도
+    숫자가 아니면(문자열·bool 등) 무시한다 — ``bool``은 ``int``의 서브클래스라
+    따로 걸러낸다."""
+    candidates = _FAMILY_LAG_MANIFEST_KEYS.get(family, ())
+    if not candidates:
+        return None
+    containers: list[object] = [manifest]
+    nested = manifest.get("lag_constants")
+    if isinstance(nested, dict):
+        containers.append(nested)
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in candidates:
+            value = container.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+    return None
+
+
+def read_lag_metadata(
+    root: DataRoot, dataset_name: str
+) -> dict[str, tuple[str | None, float | None]]:
+    """``dataset_name`` 데이터셋의 ``manifest.json``에서 family별
+    ``(available_from, lag_days)``를 읽는다. manifest 파일이 없거나
+    JSON이 깨져 있어도 예외를 던지지 않고 :data:`_FAMILY_AVAILABLE_FROM`
+    (available_from만, lag_days는 전부 null)으로 채운다."""
+    manifest_path = root.datasets / dataset_name / "manifest.json"
+    manifest: dict[str, object] = {}
+    if manifest_path.exists():
+        try:
+            loaded = json.loads(manifest_path.read_text())
+            if isinstance(loaded, dict):
+                manifest = loaded
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+    return {
+        family: (available_from, _lag_days_from_manifest(manifest, family))
+        for family, available_from in _FAMILY_AVAILABLE_FROM.items()
+    }
+
+
+def apply_lag_metadata(
+    rows: list[LongScanRow2], lag_metadata: dict[str, tuple[str | None, float | None]]
+) -> None:
+    """``row.family``로 ``lag_metadata``를 찾아 ``available_from``·
+    ``lag_days``를 채운다(``apply_bh_within_family``와 같은 "행 리스트를
+    제자리에서 채운다" 관례). ``lag_metadata``에 없는 family(기존 44개 전부)는
+    둘 다 ``None``으로 남는다 — ``LongScanRow2``의 기본값 그대로다."""
+    for row in rows:
+        available_from, lag_days = lag_metadata.get(row.family, (None, None))
+        row.available_from = available_from
+        row.lag_days = lag_days
 
 
 # --- 6. 입력 조립 -------------------------------------------------------------
@@ -615,7 +781,11 @@ def dataset_names(version: str = DATASET_VERSION) -> tuple[str, str, str]:
 
 
 def load_features_and_labels(
-    root: DataRoot, *, dev_end: date = DEV_END, version: str = DATASET_VERSION
+    root: DataRoot,
+    *,
+    dev_end: date = DEV_END,
+    version: str = DATASET_VERSION,
+    features_dataset: str | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """피쳐·라벨(h21·h63)을 개발 구간까지만 읽는다
     (``scan.load_dev_frame`` 그대로 재사용) — ``sigma_daily``는 아직
@@ -625,17 +795,46 @@ def load_features_and_labels(
     :func:`build_scan_inputs`에서 이 부분만 뺀 이유: 디스크에 쓴 합성
     데이터셋으로 ``--dev-end`` 벽을 단위테스트하려면 ``UsLake``(레이크) 없이도
     부를 수 있는 진입점이 있어야 한다.
+
+    ``features_dataset``: 피쳐를 읽을 데이터셋 이름을 직접 지정한다(예:
+    ``us_features_flow_v1``, us4 초안 U-D3) — **라벨(h21·h63)은 그대로
+    ``version``(``--dataset-version``)으로 읽는다.** 지정하지 않으면 기존과
+    같이 ``dataset_names(version)[0]``(``us_features_<version>``)을 읽는다.
     """
-    features, labels21, labels63 = dataset_names(version)
-    features_dev = scan.load_dev_frame(root, features, dev_end=dev_end)
+    default_features, labels21, labels63 = dataset_names(version)
+    features_name = features_dataset if features_dataset is not None else default_features
+    features_dev = scan.load_dev_frame(root, features_name, dev_end=dev_end)
     labels_dev = scan.load_dev_frame(root, labels21, dev_end=dev_end)
     labels63_dev = scan.load_dev_frame(root, labels63, dev_end=dev_end)
     return features_dev, labels_dev, labels63_dev
 
 
+def _fill_missing_feature_columns(
+    features_dev: pl.DataFrame, feature_columns: tuple[str, ...]
+) -> pl.DataFrame:
+    """``feature_columns`` 중 ``features_dev``에 없는 컬럼을 전부 null
+    (``Float64``)로 채워 넣는다.
+
+    us4 초안 "데이터셋에 그 컬럼이 없으면 그 행은 결측 100%로 표에 남기되
+    에러로 죽지 않는다"를 여기서 지킨다 — 이 함수를 거치고 나면
+    ``feature_columns``는 전부 실제 컬럼으로 존재하므로, 뒤따르는
+    ``.select(base_cols)``나 ``scan._missing_rate``가 없는 컬럼을 만나 죽는
+    일이 없다(값이 전부 null이라 ``is_null().mean()``이 자연히 1.0이 된다 —
+    별도의 "결측 100%" 특수 처리를 새로 안 만든다)."""
+    missing = [c for c in feature_columns if c not in features_dev.columns]
+    if not missing:
+        return features_dev
+    return features_dev.with_columns([pl.lit(None, dtype=pl.Float64).alias(c) for c in missing])
+
+
 def build_scan_inputs(
-    root: DataRoot, lake: UsLake, *, dev_end: date = DEV_END,
+    root: DataRoot,
+    lake: UsLake,
+    *,
+    dev_end: date = DEV_END,
     version: str = DATASET_VERSION,
+    features_dataset: str | None = None,
+    feature_columns: tuple[str, ...] | None = None,
 ) -> ScanInputs2:
     """레이크가 아니라 이미 만들어진 데이터셋을 읽는다(``scan.
     build_scan_inputs``와 같은 관례) — ``sigma_daily``만 예외로
@@ -644,14 +843,24 @@ def build_scan_inputs(
 
     **N1은 이 함수를 실행하지 않는다** — CLI(:func:`main`)가 쓸 조립 코드로
     존재할 뿐이다(N2가 실제로 부른다).
+
+    ``features_dataset``: :func:`load_features_and_labels`로 그대로 넘긴다
+    (U-D3). ``feature_columns``: 이번 스캔이 실제로 쓸 피쳐 컬럼들 —
+    ``--families``로 걸러진 레지스트리에서 뽑는다. 지정하지 않으면 기존과
+    같이 ``scan.FEATURE_COLUMNS``(44개)를 쓴다. 이 중 ``features_dataset``에
+    없는 컬럼은 :func:`_fill_missing_feature_columns`가 null로 채운다 —
+    없는 피쳐를 골랐다고 여기서 죽지 않는다.
     """
     features_dev, labels_dev, labels63_dev = load_features_and_labels(
-        root, dev_end=dev_end, version=version
+        root, dev_end=dev_end, version=version, features_dataset=features_dataset
     )
     sigma = cost_mod.daily_volatility(lake).select("date", "symbol", "sigma_daily").collect()
     labels_dev = labels_dev.join(sigma, on=["date", "symbol"], how="left")
 
-    base_cols = ["date", "symbol", "price_ge_5", *scan.FEATURE_COLUMNS]
+    wanted_cols = feature_columns if feature_columns is not None else scan.FEATURE_COLUMNS
+    features_dev = _fill_missing_feature_columns(features_dev, wanted_cols)
+
+    base_cols = ["date", "symbol", "price_ge_5", *wanted_cols]
     core21 = scan._with_month_idx(
         features_dev.select(base_cols).join(
             labels_dev.select("date", "symbol", "L0", "L2", "close", "adv_20d", "sigma_daily"),
@@ -826,19 +1035,33 @@ def scan_one(
 
 
 def run_scan_long2(
-    inputs: ScanInputs2, *, placebo_shifts: list[int] | None = None
+    inputs: ScanInputs2,
+    *,
+    placebo_shifts: list[int] | None = None,
+    direction_specs: list[DirectionSpec] | None = None,
+    lag_metadata: dict[str, tuple[str | None, float | None]] | None = None,
 ) -> list[LongScanRow2]:
     """``01`` §6 검정 절차 전부 — 44개 피쳐 × 방향(registered 1개 또는
     both_a/both_b 2개) × 유니버스(``scan.UNIVERSES``) = 96행.
+
+    ``direction_specs``를 지정하지 않으면 **지금과 똑같이**
+    :func:`all_direction_specs`(44개 전부)를 쓴다 — ``--families``로 걸러진
+    행 목록을 주면 그것만 돈다(:func:`direction_specs_for_families`). 통계량·
+    게이트·등급 계산(``scan_one``)은 어느 경우든 그대로다.
+
+    ``lag_metadata``(:func:`read_lag_metadata`)를 주면 :func:`apply_lag_metadata`로
+    ``available_from``·``lag_days``를 채운다 — 안 주면(``None``) 전부 null로
+    남는다(``LongScanRow2`` 기본값).
     """
     shifts = placebo_shifts if placebo_shifts is not None else scan.select_placebo_shifts()
+    specs = direction_specs if direction_specs is not None else all_direction_specs()
     rows = [
         scan_one(dspec, universe=universe, inputs=inputs, placebo_shifts=shifts)
         for universe in scan.UNIVERSES
-        for spec in scan.FEATURE_REGISTRY
-        for dspec in direction_specs_for(spec)
+        for dspec in specs
     ]
     apply_bh_within_family(rows)
+    apply_lag_metadata(rows, lag_metadata or {})
     return rows
 
 
@@ -861,7 +1084,27 @@ def _gate_failed_distribution(rows: list[LongScanRow2], *, universe: str) -> dic
     return counts
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parse_families(raw: str | None) -> list[str] | None:
+    """``--families``(쉼표로 나눈 문자열)를 리스트로 바꾼다. 지정하지 않으면
+    (``raw is None``) ``None``을 그대로 돌려준다 — :func:`feature_registry_for`·
+    :func:`direction_specs_for_families`가 그걸 "지금 동작 그대로(전부)"로
+    읽는다. 빈 칸·앞뒤 공백은 버린다."""
+    if raw is None:
+        return None
+    return [f.strip() for f in raw.split(",") if f.strip()]
+
+
+def _output_dir_name(snapshot_date: str, run_tag: str | None) -> str:
+    """``snapshot_date=<날짜>`` 뒤에 ``run_tag``가 있으면 ``_<태그>``를 끼운다
+    (us4 초안 §7 ``..._us4_devend...`` 관례). ``run_tag``가 없으면 지금과
+    똑같이 ``snapshot_date=<날짜>``다."""
+    name = f"snapshot_date={snapshot_date}"
+    if run_tag:
+        name += f"_{run_tag}"
+    return name
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--snapshot-date",
@@ -878,29 +1121,80 @@ def main(argv: list[str] | None = None) -> int:
         "--dataset-version",
         default=DATASET_VERSION,
         help=f"읽을 데이터셋 판 (기본: {DATASET_VERSION}). 3차는 v2 다 — "
-        "**사양은 안 바뀐다. 데이터만 바뀐다**",
+        "**사양은 안 바뀐다. 데이터만 바뀐다**. 라벨(h21·h63)은 항상 이 값으로 읽는다",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--features-dataset",
+        default=None,
+        help="피쳐를 읽을 데이터셋 이름을 직접 지정한다(예: us_features_flow_v1,"
+        " us4 초안 U-D3). 라벨·패널은 여전히 --dataset-version으로 읽는다."
+        " 지정하지 않으면 지금과 같이 us_features_<--dataset-version>을 읽는다",
+    )
+    parser.add_argument(
+        "--families",
+        default=None,
+        help="스캔할 family를 쉼표로 골라 고른다(예: F17,F18,F19). 지정하지"
+        " 않으면 지금과 같이 44개(scan.FEATURE_REGISTRY) 전부를 스캔한다",
+    )
+    parser.add_argument(
+        "--run-tag",
+        default=None,
+        help="출력 디렉터리 이름에 끼워 넣을 태그(예: us4) —"
+        " snapshot_date=<날짜>_<태그> 형태가 된다. 지정하지 않으면 지금과 같다",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    families = _parse_families(args.families)
 
     root = DataRoot.resolve(market="us")
     lake = UsLake.resolve()
     shifts = scan.select_placebo_shifts()
-    inputs = build_scan_inputs(root, lake, dev_end=args.dev_end, version=args.dataset_version)
-    rows = run_scan_long2(inputs, placebo_shifts=shifts)
+
+    # families 를 지정했을 때만 direction_specs·feature_columns 를 새로
+    # 계산한다 — 지정하지 않으면(None) 아래 함수들이 전부 "지금 동작 그대로"를
+    # 돌려준다(feature_registry_for·direction_specs_for_families·
+    # build_scan_inputs 의 기본 인자 참고).
+    direction_specs = direction_specs_for_families(families) if families is not None else None
+    feature_columns: tuple[str, ...] | None = None
+    if direction_specs is not None:
+        # 순서를 유지한 채 중복만 없앤다(dict는 삽입 순서를 지킨다).
+        feature_columns = tuple(dict.fromkeys(dspec.feature for dspec in direction_specs))
+
+    features_dataset_name = args.features_dataset or dataset_names(args.dataset_version)[0]
+    lag_metadata = read_lag_metadata(root, features_dataset_name)
+
+    inputs = build_scan_inputs(
+        root,
+        lake,
+        dev_end=args.dev_end,
+        version=args.dataset_version,
+        features_dataset=args.features_dataset,
+        feature_columns=feature_columns,
+    )
+    rows = run_scan_long2(
+        inputs,
+        placebo_shifts=shifts,
+        direction_specs=direction_specs,
+        lag_metadata=lag_metadata,
+    )
 
     table = pl.DataFrame([row.as_dict() for row in rows])
     # N2 운영 지시("두 실행을 구분해서 남겨라 — dev_end 를 manifest 와 컬럼에") —
-    # 사전등록(``01``)에는 없는 요구라 LongScanRow2(``as_dict`` 26개 필드, N1이
-    # 이미 테스트해 둔 계약)는 건드리지 않고 CLI 출력 표에만 부가한다.
+    # 사전등록(``01``)에는 없는 요구라 LongScanRow2(``as_dict`` 계약)는
+    # 건드리지 않고 CLI 출력 표에만 부가한다.
     table = table.with_columns(
         pl.lit(args.dev_end.isoformat()).alias("dev_end"),
         # **어느 데이터 판으로 낸 표인지 행마다 남긴다.** v1(누수 있음)과
         # v2(고침)의 표를 나란히 놓고 볼 것이라 섞이면 안 된다 (3차 T-D2).
         pl.lit(args.dataset_version).alias("dataset_version"),
+        pl.lit(features_dataset_name).alias("features_dataset"),
     )
 
     snapshot_date = args.snapshot_date or date.today().isoformat()
-    out_dir = root.output / OUTPUT_DIR_NAME / f"snapshot_date={snapshot_date}"
+    out_dir = root.output / OUTPUT_DIR_NAME / _output_dir_name(snapshot_date, args.run_tag)
     out_dir.mkdir(parents=True, exist_ok=True)
     table.write_parquet(out_dir / "feature_scan_long2.parquet")
     table.write_csv(out_dir / "feature_scan_long2.csv")
@@ -952,7 +1246,14 @@ def main(argv: list[str] | None = None) -> int:
             "both_a": "부호 미등록 넷 — '+' (값이 클수록 상위)",
             "both_b": "부호 미등록 넷 — '-' (값이 작을수록 상위). in-sample로 고르지 않는다",
         },
-        "n_features_tested": len(scan.FEATURE_REGISTRY),
+        "n_features_tested": (
+            len(scan.FEATURE_REGISTRY)
+            if direction_specs is None
+            else len({dspec.feature for dspec in direction_specs})
+        ),
+        "families": families,
+        "features_dataset": features_dataset_name,
+        "run_tag": args.run_tag,
         "row_count": table.height,
         "grade_distribution": {u: _grade_distribution(rows, universe=u) for u in scan.UNIVERSES},
         "gate_failed_distribution": {
