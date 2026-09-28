@@ -30,6 +30,7 @@ from modeler.us.m4_splits import build_wf_folds
 from modeler.us.m4_transform import cross_sectional_percentile
 from modeler.us.m5_ensemble import (
     DEV_END,
+    _latest_run_dir,
     adoption_verdict,
     build_ensemble_oof,
     fold_rank_ics,
@@ -288,6 +289,39 @@ def test_load_m4_comparison_does_not_confuse_lgbm_with_lgbm_on_l1(tmp_path: Path
 
 def test_m5_ensemble_reuses_scan_dev_end_directly() -> None:
     assert DEV_END is SCAN_DEV_END
+
+
+# --- 6. _latest_run_dir — run_tag(us4 입력 선택) ---------------------------------
+
+
+def test_latest_run_dir_without_run_tag_matches_current_behavior(tmp_path: Path) -> None:
+    root = DataRoot(base=tmp_path)
+    _write_m4_run(root, "m4_ridge", "20260921", {"rank_ic_mean": 0.05})
+
+    run_dir = _latest_run_dir(root, "m4_ridge")
+
+    assert run_dir is not None
+    assert run_dir == root.output / "model_runs" / "m4_ridge_20260921"
+
+
+def test_latest_run_dir_with_run_tag_only_sees_tagged_directory(tmp_path: Path) -> None:
+    root = DataRoot(base=tmp_path)
+    # 태그 없는 자리(지금 동작)에 하나, us4 태그 아래에 다른 스냅샷 하나.
+    _write_m4_run(root, "m4_ridge", "20260921", {"rank_ic_mean": 0.05})
+    tagged_dir = root.output / "model_runs" / "us4_flow" / "m4_ridge_20260928"
+    tagged_dir.mkdir(parents=True, exist_ok=True)
+    (tagged_dir / "metrics.json").write_text(json.dumps({"rank_ic_mean": 0.02}))
+
+    run_dir = _latest_run_dir(root, "m4_ridge", run_tag="us4_flow")
+
+    assert run_dir == tagged_dir
+
+
+def test_latest_run_dir_with_run_tag_missing_directory_returns_none(tmp_path: Path) -> None:
+    root = DataRoot(base=tmp_path)
+    _write_m4_run(root, "m4_ridge", "20260921", {"rank_ic_mean": 0.05})
+
+    assert _latest_run_dir(root, "m4_ridge", run_tag="us4_flow") is None
 
 
 def test_m5_ensemble_build_wf_folds_rejects_holdout_dates() -> None:

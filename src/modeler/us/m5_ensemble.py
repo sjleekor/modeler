@@ -267,8 +267,16 @@ def _run_dir_snapshot_suffix(dir_name: str, model_id: str) -> str | None:
     return suffix if suffix.isdigit() else None
 
 
-def _latest_run_dir(root: DataRoot, model_id: str) -> Path | None:
+def _latest_run_dir(root: DataRoot, model_id: str, *, run_tag: str | None = None) -> Path | None:
+    """``model_id_<snapshot>`` 중 가장 최신 산출물 디렉터리.
+
+    ``run_tag``(us4 입력 선택 — ``m4_run.model_runs_dir``와 같은 규칙)를 주면
+    ``output/model_runs/<run_tag>`` 아래에서만 찾는다. 지정하지 않으면(기본)
+    지금과 완전히 같다 — ``output/model_runs`` 바로 아래를 본다.
+    """
     base = root.output / "model_runs"
+    if run_tag:
+        base = base / run_tag
     if not base.is_dir():
         return None
     candidates = sorted(

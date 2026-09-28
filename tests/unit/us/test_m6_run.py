@@ -19,7 +19,13 @@ import pytest
 
 from modeler.etl.config import DataRoot
 from modeler.us.m4_run import M4Inputs
-from modeler.us.m6_run import CPCV_N_FOLDS, CPCV_N_TEST_FOLDS, _gather_trials, run_cpcv
+from modeler.us.m6_run import (
+    CPCV_N_FOLDS,
+    CPCV_N_TEST_FOLDS,
+    _gather_trials,
+    load_oof,
+    run_cpcv,
+)
 
 
 def _make_inputs(n_months: int = 48, n_symbols: int = 20) -> M4Inputs:
@@ -140,3 +146,80 @@ def test_gather_trials_missing_run_raises(tmp_path: Path) -> None:
     root = DataRoot(base=tmp_path)
     with pytest.raises(FileNotFoundError):
         _gather_trials(root)
+
+
+# --- 3. load_oof / _gather_trials — run_tag(us4 입력 선택) -----------------------
+
+
+def _write_oof_fold(
+    root: DataRoot, run_id: str, fold_id: int, *, run_tag: str | None = None
+) -> None:
+    base = root.output / "model_runs"
+    if run_tag:
+        base = base / run_tag
+    pred_dir = base / run_id / "predictions"
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    df = pl.DataFrame(
+        {
+            "date": [date(2020, 1, 2)],
+            "symbol": ["S000"],
+            "pred": [0.5],
+            "fold_id": [fold_id],
+            "L2": [0.1],
+            "y_rank": [0.5],
+        }
+    )
+    df.write_parquet(pred_dir / f"fold_{fold_id}.parquet")
+
+
+def test_load_oof_without_run_tag_matches_current_behavior(tmp_path: Path) -> None:
+    root = DataRoot(base=tmp_path)
+    _write_oof_fold(root, "m4_ridge_20260921", 1)
+
+    oof = load_oof(root, "m4_ridge_20260921")
+
+    assert oof.height == 1
+
+
+def test_load_oof_with_run_tag_only_sees_tagged_directory(tmp_path: Path) -> None:
+    root = DataRoot(base=tmp_path)
+    _write_oof_fold(root, "m4_ridge_20260928", 1, run_tag="us4_flow")
+
+    with pytest.raises(FileNotFoundError):
+        load_oof(root, "m4_ridge_20260928")  # 태그 없이 찾으면(기본) 안 보인다
+
+    oof = load_oof(root, "m4_ridge_20260928", run_tag="us4_flow")
+    assert oof.height == 1
+
+
+def _write_run_with_tag(
+    root: DataRoot,
+    run_id: str,
+    *,
+    grid_search: list[dict] | None,
+    rank_ic_mean: float,
+    run_tag: str | None = None,
+) -> None:
+    base = root.output / "model_runs"
+    if run_tag:
+        base = base / run_tag
+    out_dir = base / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"rank_ic_mean": rank_ic_mean}
+    if grid_search is not None:
+        payload["grid_search"] = grid_search
+    (out_dir / "metrics.json").write_text(json.dumps(payload))
+
+
+def test_gather_trials_with_run_tag_only_sees_tagged_directory(tmp_path: Path) -> None:
+    root = DataRoot(base=tmp_path)
+    for model_id in ("m4_ridge", "m4_enet", "m4_ols3", "m4_lgbm", "m5_ensemble"):
+        _write_run_with_tag(
+            root, f"{model_id}_20260928", grid_search=None, rank_ic_mean=0.01, run_tag="us4_flow"
+        )
+
+    with pytest.raises(FileNotFoundError):
+        _gather_trials(root)  # 태그 없이 찾으면(기본) 지금 동작과 같이 안 보인다
+
+    trials = _gather_trials(root, run_tag="us4_flow")
+    assert sum(len(v) for v in trials.values()) == 5

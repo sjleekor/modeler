@@ -19,6 +19,13 @@ M4·M5가 저장한 OOF 예측(``m4_ridge_*``·``m4_enet_*``·``m4_ols3_*``·
 경로가 없다. **지표 구간은 OOF 검증 fold가 있는 2020-05~2025-04(60개월)
 뿐이다** — 개발 구간 전체(2018-09~2025-06, 82개월)가 아니다. 첫 fold의
 학습 구간(2018-09~2020-03)은 어느 모델도 검증받지 않았기 때문이다.
+
+**입력 선택(us4, 2026-09-28)**: ``--features-dataset``·``--labels-version``·
+``--model-input-from``·``--run-tag``로 M4와 같은 입력 선택을 받는다 —
+CPCV(``run_cpcv``)가 ``build_m4_inputs``로 Ridge를 다시 학습하므로 M4가 쓴
+피쳐·라벨 판과 맞춰야 한다. ``--run-tag``는 M4·M5 산출물을 찾는 경로에도
+그대로 쓴다(``load_oof``·``_gather_trials``). 넷 다 지정하지 않으면 지금과
+완전히 같다.
 """
 
 from __future__ import annotations
@@ -43,7 +50,14 @@ from modeler.us import cost as cost_mod
 from modeler.us import metrics as m
 from modeler.us.lake import UsLake
 from modeler.us.m4_models import fit_predict_ridge
-from modeler.us.m4_run import M4Inputs, build_m4_inputs
+from modeler.us.m4_run import (
+    DEFAULT_FEATURES_DATASET,
+    DEFAULT_LABELS_VERSION,
+    M4Inputs,
+    build_m4_inputs,
+    labels_dataset_name,
+    model_runs_dir,
+)
 from modeler.us.m4_transform import cross_sectional_percentile, to_design_arrays
 from modeler.us.m5_ensemble import _latest_run_dir  # 모델 id 접두어 충돌 방어 재사용 (2026-09-21)
 from modeler.us.scan import HAC_LAG, MIN_NAMES, load_dev_frame, monthly_rank_ic
@@ -117,15 +131,18 @@ def bucket_universe(lake: UsLake, labels_df: pl.DataFrame) -> pl.DataFrame:
     return universe
 
 
-def build_universe(root: DataRoot) -> tuple[UsLake, pl.DataFrame]:
-    """``us_labels_v1``(개발 구간)에 ``sigma_daily``를 붙인 유니버스 프레임."""
+def build_universe(
+    root: DataRoot, *, labels_dataset: str = labels_dataset_name(DEFAULT_LABELS_VERSION)
+) -> tuple[UsLake, pl.DataFrame]:
+    """``labels_dataset``(개발 구간, 기본 ``us_labels_v1`` = 지금 동작)에
+    ``sigma_daily``를 붙인 유니버스 프레임."""
     lake = UsLake.resolve()
-    labels_dev = load_dev_frame(root, "us_labels_v1")
+    labels_dev = load_dev_frame(root, labels_dataset)
     return lake, bucket_universe(lake, labels_dev)
 
 
-def load_oof(root: DataRoot, run_id: str) -> pl.DataFrame:
-    pred_dir = root.output / "model_runs" / run_id / "predictions"
+def load_oof(root: DataRoot, run_id: str, *, run_tag: str | None = None) -> pl.DataFrame:
+    pred_dir = model_runs_dir(root, run_tag=run_tag) / run_id / "predictions"
     parts = sorted(pred_dir.glob("fold_*.parquet"))
     if not parts:
         raise FileNotFoundError(f"{pred_dir}에 fold_*.parquet가 없습니다")
@@ -398,9 +415,9 @@ def run_cpcv(inputs: M4Inputs) -> dict:
 # --- 4. DSR --------------------------------------------------------------------
 
 
-def _gather_trials(root: DataRoot) -> dict[str, list[float]]:
+def _gather_trials(root: DataRoot, *, run_tag: str | None = None) -> dict[str, list[float]]:
     def _metrics(model_id: str) -> dict:
-        run_dir = _latest_run_dir(root, model_id)
+        run_dir = _latest_run_dir(root, model_id, run_tag=run_tag)
         if run_dir is None:
             raise FileNotFoundError(f"{model_id}_* 산출물이 없습니다 — M4/M5를 먼저 돌리십시오")
         return json.loads((run_dir / "metrics.json").read_text())
@@ -416,7 +433,13 @@ def _gather_trials(root: DataRoot) -> dict[str, list[float]]:
     return trials
 
 
-def run_dsr(root: DataRoot, ridge_track: pl.DataFrame, ridge_ic_hat: float) -> dict:
+def run_dsr(
+    root: DataRoot,
+    ridge_track: pl.DataFrame,
+    ridge_ic_hat: float,
+    *,
+    run_tag: str | None = None,
+) -> dict:
     """DSR — 채택 모델(Ridge)의 실제 top-100 월수익으로 ``SR_hat``·왜도·첨도를
     재고, ``N``개 시행의 IC를 Sharpe 척도로 근사해 ``sr_var_across_trials``를
     낸다(``metrics.deflated_sharpe_ratio`` 참고).
@@ -439,7 +462,7 @@ def run_dsr(root: DataRoot, ridge_track: pl.DataFrame, ridge_ic_hat: float) -> d
     skewness, kurt = m.sample_skew_kurtosis(returns)
     n_obs = len([r for r in returns if r is not None and math.isfinite(r)])
 
-    trials = _gather_trials(root)
+    trials = _gather_trials(root, run_tag=run_tag)
     all_ics = [ic for lst in trials.values() for ic in lst]
     n_trials = len(all_ics)
     finite_ics = [ic for ic in all_ics if math.isfinite(ic)]
@@ -496,14 +519,40 @@ def _fmt(x: float | None, nd: int = 4) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot-date", default=None)
+    parser.add_argument(
+        "--features-dataset",
+        default=DEFAULT_FEATURES_DATASET,
+        help=f"CPCV 재학습에 쓸 피쳐 데이터셋 (기본: {DEFAULT_FEATURES_DATASET} = 지금 동작)."
+        " M4를 어느 데이터셋으로 돌렸든 CPCV는 같은 판으로 맞춰야 한다",
+    )
+    parser.add_argument(
+        "--labels-version",
+        default=DEFAULT_LABELS_VERSION,
+        choices=("v1", "v2"),
+        help=f"라벨 데이터셋 판 (기본: {DEFAULT_LABELS_VERSION} = 지금 동작)",
+    )
+    parser.add_argument(
+        "--model-input-from",
+        default=None,
+        type=Path,
+        help="CPCV 재학습의 모델 입력을 M3 manifest 대신 이 scan_long2 산출물에서"
+        " 읽는다(m4_run과 같은 규칙). 지정하지 않으면 지금과 같이 M3 manifest를 읽는다",
+    )
+    parser.add_argument(
+        "--run-tag",
+        default=None,
+        help="M4·M5 산출물을 찾을 때(REQUIRED_RUN_IDS 등)·CPCV 이하 자체 산출물을 쓸 때"
+        " 쓰는 태그 — output/model_runs/<태그>/...를 본다. 지정하지 않으면 지금과 같다",
+    )
     args = parser.parse_args(argv)
     snapshot_date = args.snapshot_date or date.today().isoformat()
+    labels_dataset = labels_dataset_name(args.labels_version)
 
     t0 = time.monotonic()
     root = DataRoot.resolve(market="us")
     modeler_repo = Path(__file__).resolve().parents[3]
 
-    lake, universe = build_universe(root)
+    lake, universe = build_universe(root, labels_dataset=labels_dataset)
     dev_dates = sorted(universe["date"].unique().to_list())
     universe_ew_all = bm.universe_equal_weight_monthly(universe)
     spy_all = bm.spy_monthly_return(lake, dev_dates)
@@ -513,14 +562,14 @@ def main(argv: list[str] | None = None) -> int:
 
     run_ids = list(REQUIRED_RUN_IDS)
     for rid in OPTIONAL_RUN_IDS:
-        if (root.output / "model_runs" / rid).is_dir():
+        if (model_runs_dir(root, run_tag=args.run_tag) / rid).is_dir():
             run_ids.append(rid)
 
     results: dict[str, ModelMetrics] = {}
     oof_dates_by_run: dict[str, list] = {}
     for run_id in run_ids:
         print(f"=== {run_id} ===", flush=True)
-        oof = load_oof(root, run_id)
+        oof = load_oof(root, run_id, run_tag=args.run_tag)
         joined = joined_frame(oof, universe)
         oof_dates = sorted(joined["date"].unique().to_list())
         oof_dates_by_run[run_id] = oof_dates
@@ -549,7 +598,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     print("=== CPCV (Ridge alpha=100) ===", flush=True)
-    inputs = build_m4_inputs(root)
+    inputs = build_m4_inputs(
+        root,
+        features_dataset=args.features_dataset,
+        labels_dataset=labels_dataset,
+        model_input_from=args.model_input_from,
+    )
     cpcv_result = run_cpcv(inputs)
     print(
         f"  n_paths={cpcv_result['n_paths']} "
@@ -558,9 +612,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print("=== DSR ===", flush=True)
-    adopted_track = m.portfolio_track(joined_frame(load_oof(root, ADOPTED_RUN_ID), universe))
+    adopted_track = m.portfolio_track(
+        joined_frame(load_oof(root, ADOPTED_RUN_ID, run_tag=args.run_tag), universe)
+    )
     ridge_ic_hat = results[ADOPTED_RUN_ID].rank_ic_mean
-    dsr_result = run_dsr(root, adopted_track, ridge_ic_hat)
+    dsr_result = run_dsr(root, adopted_track, ridge_ic_hat, run_tag=args.run_tag)
     print(
         f"  N={dsr_result['n_trials']} SR_hat(월)={_fmt(dsr_result['sr_hat_monthly'])} "
         f"DSR={_fmt(dsr_result['dsr'], 4)}",
@@ -574,10 +630,18 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
-    out_dir = root.output / "m6_metrics" / snapshot_date
+    out_base = root.output / "m6_metrics"
+    if args.run_tag:
+        out_base = out_base / args.run_tag
+    out_dir = out_base / snapshot_date
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "snapshot_date": snapshot_date,
+        "run_tag": args.run_tag,
+        "features_dataset": args.features_dataset,
+        "labels_dataset": labels_dataset,
+        "model_input_from": str(args.model_input_from) if args.model_input_from else None,
+        "model_input_features_source": inputs.model_input_source,
         "modeler_git_commit": _git_commit(modeler_repo),
         "oof_window": {
             run_id: {"n_months": len(d), "start": d[0].isoformat(), "end": d[-1].isoformat()}

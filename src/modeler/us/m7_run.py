@@ -26,6 +26,12 @@
 파일이 새로 더하는 것은 셋뿐이다: holdout 재학습·예측 루프, 갈래 판정
 (``00`` §3.2, 부호만), 갈래 A 귀무 확률(``06`` M8 재료, 부호 뒤섞기
 permutation).
+
+**입력 선택(us4, 2026-09-28)**: ``--features-dataset``·``--labels-version``·
+``--model-input-from``·``--run-tag``로 M4와 같은 입력 선택을 받는다 — 학습
+(``build_m4_inputs``)과 holdout(``load_holdout_frame``) 양쪽에 같은 판을
+쓴다. 넷 다 지정하지 않으면 지금과 완전히 같다. **채택 모델(Ridge)·재학습
+1회·holdout 벽은 이 옵션과 무관하게 그대로다.**
 """
 
 from __future__ import annotations
@@ -46,7 +52,14 @@ from modeler.us import benchmark as bm
 from modeler.us import metrics as m
 from modeler.us.lake import UsLake
 from modeler.us.m4_models import fit_predict_ridge
-from modeler.us.m4_run import _dataset_manifest_field, build_m4_inputs
+from modeler.us.m4_run import (
+    DEFAULT_FEATURES_DATASET,
+    DEFAULT_LABELS_VERSION,
+    _dataset_manifest_field,
+    build_m4_inputs,
+    labels_dataset_name,
+    model_runs_dir,
+)
 from modeler.us.m4_transform import rank_transform, to_design_arrays
 from modeler.us.m6_run import (
     ADOPTED_RIDGE_ALPHA,
@@ -313,8 +326,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--snapshot-date", default=None)
     parser.add_argument("--n-permutation", type=int, default=PERMUTATION_N)
     parser.add_argument("--permutation-seed", type=int, default=PERMUTATION_SEED)
+    parser.add_argument(
+        "--features-dataset",
+        default=DEFAULT_FEATURES_DATASET,
+        help=f"학습·holdout 양쪽에 쓸 피쳐 데이터셋 (기본: {DEFAULT_FEATURES_DATASET} = 지금"
+        " 동작)",
+    )
+    parser.add_argument(
+        "--labels-version",
+        default=DEFAULT_LABELS_VERSION,
+        choices=("v1", "v2"),
+        help=f"라벨 데이터셋 판 (기본: {DEFAULT_LABELS_VERSION} = 지금 동작)",
+    )
+    parser.add_argument(
+        "--model-input-from",
+        default=None,
+        type=Path,
+        help="모델 입력 피쳐를 M3 manifest 대신 이 scan_long2 산출물에서 읽는다"
+        "(m4_run과 같은 규칙). 지정하지 않으면 지금과 같이 M3 manifest를 읽는다",
+    )
+    parser.add_argument(
+        "--run-tag",
+        default=None,
+        help="산출물 디렉터리에 끼워 넣을 태그 — output/model_runs/<태그>/... 형태가 된다."
+        " 지정하지 않으면 지금과 같다",
+    )
     args = parser.parse_args(argv)
     snapshot_date = args.snapshot_date or date.today().isoformat()
+    labels_dataset = labels_dataset_name(args.labels_version)
 
     t0 = time.monotonic()
     root = DataRoot.resolve(market="us")
@@ -323,11 +362,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # 1. 학습 — 개발 구간 전체, 한 번 --------------------------------------------
     print("학습 입력 조립 (개발 구간 전체) ...", flush=True)
-    train_inputs = build_m4_inputs(root)  # build_wf_folds를 안 써서 walk-forward가 아니다
+    train_inputs = build_m4_inputs(
+        root,
+        features_dataset=args.features_dataset,
+        labels_dataset=labels_dataset,
+        model_input_from=args.model_input_from,
+    )  # build_wf_folds를 안 써서 walk-forward가 아니다
     assert_dev_window(train_inputs.core)  # 재확인 — holdout이 섞였으면 여기서 죽는다
     model_features = train_inputs.model_features
     train_dates = train_inputs.dates
-    print(f"  모델 입력 6개: {model_features} (M3: {train_inputs.m3_manifest_path})")
+    print(
+        f"  모델 입력 {len(model_features)}개: {model_features} "
+        f"(출처: {train_inputs.model_input_source})"
+    )
     print(
         f"  학습 프레임: {train_inputs.core.height}행, "
         f"{train_dates[0]}~{train_dates[-1]} ({len(train_dates)}개월)"
@@ -335,8 +382,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # 2. holdout 프레임 조립 -------------------------------------------------------
     print("holdout 프레임 조립 ...", flush=True)
-    features_holdout = load_holdout_frame(root, "us_features_v1")
-    labels_holdout = load_holdout_frame(root, "us_labels_v1")
+    features_holdout = load_holdout_frame(root, args.features_dataset)
+    labels_holdout = load_holdout_frame(root, labels_dataset)
     holdout_core = build_holdout_core(features_holdout, labels_holdout, model_features)
     holdout_dates = sorted(holdout_core["date"].unique().to_list())
     assert_holdout_window(holdout_core)
@@ -409,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 10. 산출물 ----------------------------------------------------------------------
     run_id = f"m7_holdout_{snapshot_date.replace('-', '')}"
-    out_dir = root.output / "model_runs" / run_id
+    out_dir = model_runs_dir(root, run_tag=args.run_tag) / run_id
     pred_dir = out_dir / "predictions"
     pred_dir.mkdir(parents=True, exist_ok=True)
     joined.write_parquet(pred_dir / "holdout.parquet")
@@ -417,12 +464,13 @@ def main(argv: list[str] | None = None) -> int:
 
     config = {
         "run_id": run_id,
+        "run_tag": args.run_tag,
         "adopted_model": "M-L Ridge (M5 §5 채택)",
         "alpha": ADOPTED_RIDGE_ALPHA,
         "feature_cols": model_features,
         "design_matrix": "rank([0,1], 결측 0.5) + _isna 플래그, 06 §2",
         "m3_manifest_path": str(train_inputs.m3_manifest_path),
-        "model_input_features_source": "us_features_v1 manifest.model_input_features.all (M3)",
+        "model_input_features_source": train_inputs.model_input_source,
         "walk_forward": False,
         "retrain_count": 1,
         "train_window": {
@@ -436,12 +484,16 @@ def main(argv: list[str] | None = None) -> int:
             **_window_summary(holdout_core, holdout_dates),
         },
         "input_datasets": {
-            "us_features_v1": {
-                "content_hash": _dataset_manifest_field(root, "us_features_v1", "content_hash"),
+            train_inputs.features_dataset: {
+                "content_hash": _dataset_manifest_field(
+                    root, train_inputs.features_dataset, "content_hash"
+                ),
                 "train_row_count": train_inputs.features_row_count,
             },
-            "us_labels_v1": {
-                "content_hash": _dataset_manifest_field(root, "us_labels_v1", "content_hash"),
+            train_inputs.labels_dataset: {
+                "content_hash": _dataset_manifest_field(
+                    root, train_inputs.labels_dataset, "content_hash"
+                ),
                 "train_row_count": train_inputs.labels_row_count,
             },
         },
@@ -455,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
 
     payload = {
         "snapshot_date": snapshot_date,
+        "run_tag": args.run_tag,
         "branch": branch.to_dict(),
         "metrics": metrics_result.to_dict(),
         "s_long_short": s_summary,

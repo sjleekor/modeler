@@ -10,10 +10,19 @@ M-G on L1(대조군, 타깃 L1의 횡단면 순위) 다섯을 ``05_validation_pr
 ``load_dev_frame``이 잘라내고, 모든 프레임이 ``assert_dev_window``를 거친다
 — holdout을 열 경로가 이 파일 안에 없다.
 
-**피쳐를 더하거나 정의를 바꾸지 않는다** (R6 동결). 모델 입력 여섯은 손으로
-박지 않고 M3 산출물(``feature_scan`` manifest의 ``model_input_features["all"]``)
-에서 읽는다. OLS-3의 세 컬럼(``OLS3_FEATURES``)은 예외다 — 등급과 무관하게
-``03`` §4가 사전등록한 GKX null model이라 M3 목록과 별개다.
+**피쳐를 더하거나 정의를 바꾸지 않는다** (R6 동결). 모델 입력은 기본으로
+M3 산출물(``feature_scan`` manifest의 ``model_input_features["all"]``)에서
+손으로 박지 않고 읽는다. OLS-3의 세 컬럼(``OLS3_FEATURES``)은 예외다 —
+등급과 무관하게 ``03`` §4가 사전등록한 GKX null model이라 M3 목록과
+별개다. OLS-3 세 컬럼은 ``--features-dataset``을 무엇으로 주든 항상
+``DEFAULT_FEATURES_DATASET``(``us_features_v1``)에서 읽는다 — 다른 family
+데이터셋(예: ``us_features_flow_v1``)엔 그 컬럼이 없다.
+
+**입력 선택(us4, 2026-09-28)**: ``--features-dataset``·``--labels-version``·
+``--model-input-from``으로 어느 피쳐·라벨 판을 읽을지, 모델 입력 피쳐를
+M3 manifest 대신 ``scan_long2`` 등급표(``--model-input-from``)에서 읽을지
+고를 수 있다. 통계·검증·비용 계산 코드는 이 옵션과 무관하게 그대로다 —
+셋 다 지정하지 않으면 지금 동작과 완전히 같다.
 """
 
 from __future__ import annotations
@@ -21,6 +30,7 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import math
 import subprocess
 import time
 from collections.abc import Callable
@@ -56,6 +66,7 @@ from modeler.us.m4_splits import (
 )
 from modeler.us.m4_transform import cross_sectional_percentile, rank_transform, to_design_arrays
 from modeler.us.scan import (
+    DEDUP_RHO_THRESHOLD,
     DEV_END,
     DEV_START,
     HAC_LAG,
@@ -64,6 +75,7 @@ from modeler.us.scan import (
     ic_and_t,
     load_dev_frame,
     monthly_rank_ic,
+    pairwise_avg_rank_corr,
 )
 
 # --- 0. 상수 ------------------------------------------------------------------
@@ -76,6 +88,29 @@ OLS3_FEATURES: tuple[str, ...] = ("mcap_rank", "bm", "mom_12_1")
 
 #: M3 산출물 디렉터리 이름 — ``scan.py``의 ``main()``이 쓰는 것과 같다.
 FEATURE_SCAN_DIR_NAME = "feature_scan"
+
+#: 기본 피쳐 데이터셋 — ``--features-dataset`` 기본값(=지금 동작). OLS-3
+#: 세 컬럼(``OLS3_FEATURES``)은 ``--features-dataset``을 무엇으로 주든
+#: 항상 이 데이터셋에서 읽는다(모듈 docstring 참고).
+DEFAULT_FEATURES_DATASET = "us_features_v1"
+
+#: 기본 라벨 데이터셋 판 — ``--labels-version`` 기본값(=지금 동작).
+DEFAULT_LABELS_VERSION = "v1"
+
+
+def labels_dataset_name(version: str) -> str:
+    """``--labels-version``(``v1``|``v2``) -> 데이터셋 이름. 손으로 이어
+    붙이는 자리를 하나로 모은다."""
+    return f"us_labels_{version}"
+
+
+#: ``--model-input-from``이 보는 등급 — ``scan.dedup_ab_features``와 같은
+#: 집합(A·B). scan_long2 문서(``01`` §1)의 등급 문턱 자체는 여기서 새로
+#: 정하지 않는다 — scan_long2가 이미 매긴 ``grade`` 칸을 그대로 읽는다.
+SCAN_AB_GRADES: frozenset[str] = frozenset({"A", "B"})
+
+#: ``--model-input-from``이 보는 유니버스 — 공식 유니버스(``price_ge_5``)만.
+SCAN_PRIMARY_UNIVERSE = "price_ge_5"
 
 #: rank IC 평가는 항상 L2(중립화 잔차)와 예측의 스피어만 상관이다
 #: (``05`` §4 "정의: 월별 spearman(예측, L2) 평균") — 학습 타깃이 ``y_rank``든
@@ -107,6 +142,181 @@ def load_m3_model_input_features(root: DataRoot) -> tuple[list[str], Path]:
     return list(features), manifest_path
 
 
+# --- 1b. --model-input-from: scan_long2 산출물에서 A·B 등급 피쳐 읽기 -----------
+#
+# M3(``scan.py``, 44개 고정)와 별개로, us4 family(F17~F19 등)는 등급이
+# ``scan_long2.py`` 산출물(``feature_scan_long2.parquet``, ``feature``·
+# ``direction``·``universe``·``grade``·``t_LONG`` 칸)에 있다. 여기서부터는
+# **그 표에서 모델 입력을 뽑는 선택 로직뿐이다** — scan_long2의 통계·게이트
+# 계산은 건드리지 않는다.
+
+
+@dataclass(frozen=True)
+class ScanFeatureCandidate:
+    """scan_long2 등급표에서 뽑은 모델 입력 후보 하나(피쳐당 하나)."""
+
+    feature: str
+    t_long: float
+    grade: str
+    direction: str
+
+
+def select_scan_ab_features(
+    scan_table: pl.DataFrame, *, universe: str = SCAN_PRIMARY_UNIVERSE
+) -> list[ScanFeatureCandidate]:
+    """scan_long2 산출물에서 ``universe`` 행 중 등급 A·B만 골라 피쳐 하나당
+    후보 하나로 합친다(``--model-input-from``).
+
+    양방향(both_a/both_b) 행이 둘 다 A·B 등급이면 |t_LONG|이 더 큰 쪽만
+    남긴다 — 피쳐는 하나고, 모델(rank_transform 거친 값)은 방향(부호)을
+    보지 않으므로 같은 피쳐를 두 번 넣을 이유가 없다. 반환은 |t_LONG|
+    내림차순 — :func:`dedup_correlated_candidates`가 이 순서를
+    "먼저 살아남는 쪽" 우선순위로 그대로 쓴다(``scan.dedup_ab_features``와
+    같은 관례).
+
+    **순수 함수다** — 피쳐 실측값을 보지 않는다. 상관 기반 중복 제거는
+    :func:`dedup_correlated_candidates`가 따로, 실제 피쳐 값으로 한다.
+    """
+    required_cols = {"feature", "direction", "universe", "grade", "t_LONG"}
+    missing = required_cols - set(scan_table.columns)
+    if missing:
+        raise ValueError(f"scan 산출물에 칸이 빠졌습니다: {sorted(missing)}")
+
+    rows = (
+        scan_table.filter(
+            (pl.col("universe") == universe) & pl.col("grade").is_in(sorted(SCAN_AB_GRADES))
+        )
+        .select("feature", "direction", "grade", "t_LONG")
+        .iter_rows(named=True)
+    )
+
+    best_by_feature: dict[str, ScanFeatureCandidate] = {}
+    for row in rows:
+        t_long = row["t_LONG"]
+        if t_long is None or not math.isfinite(t_long):
+            continue
+        candidate = ScanFeatureCandidate(
+            feature=row["feature"],
+            t_long=float(t_long),
+            grade=row["grade"],
+            direction=row["direction"],
+        )
+        current = best_by_feature.get(candidate.feature)
+        if current is None or abs(candidate.t_long) > abs(current.t_long):
+            best_by_feature[candidate.feature] = candidate
+
+    return sorted(best_by_feature.values(), key=lambda c: abs(c.t_long), reverse=True)
+
+
+def dedup_correlated_candidates(
+    candidates: list[ScanFeatureCandidate],
+    core: pl.DataFrame,
+    *,
+    rho_threshold: float = DEDUP_RHO_THRESHOLD,
+) -> tuple[list[str], list[dict[str, object]]]:
+    """|평균 순위상관| > ``rho_threshold``면 |t_LONG|이 큰 쪽만 남긴다.
+
+    ``scan.dedup_ab_features``와 같은 알고리즘이다 — 상관 계산 자체
+    (``scan.pairwise_avg_rank_corr``)와 문턱(``scan.DEDUP_RHO_THRESHOLD``)을
+    그대로 재사용한다("중복 제거 규칙이 기존 코드에 있으면 그대로 태운다").
+    입력이 ``scan.FeatureScanRow``(M3 스키마) 대신
+    :class:`ScanFeatureCandidate`(scan_long2 스키마)라 얇은 래퍼로 따로 둔다
+    — 상관 계산 코드 자체는 한 줄도 새로 안 짠다.
+
+    ``candidates``는 이미 |t_LONG| 내림차순이어야 한다
+    (:func:`select_scan_ab_features`가 그렇게 돌려준다). ``core``는
+    ``month_idx``와 후보 피쳐 컬럼을 담은 프레임(대상 유니버스로 이미 필터된
+    것)이어야 한다 — ``scan.pairwise_avg_rank_corr``의 요구사항 그대로다.
+    """
+    kept: list[ScanFeatureCandidate] = []
+    dropped: list[dict[str, object]] = []
+    for candidate in candidates:
+        collision: tuple[str, float] | None = None
+        for kept_candidate in kept:
+            rho = pairwise_avg_rank_corr(core, candidate.feature, kept_candidate.feature)
+            if math.isfinite(rho) and abs(rho) > rho_threshold:
+                collision = (kept_candidate.feature, rho)
+                break
+        if collision is None:
+            kept.append(candidate)
+        else:
+            dropped.append(
+                {
+                    "feature": candidate.feature,
+                    "collides_with": collision[0],
+                    "rho": collision[1],
+                }
+            )
+    return [c.feature for c in kept], dropped
+
+
+def resolve_model_input_features(
+    root: DataRoot,
+    *,
+    features_dev: pl.DataFrame,
+    labels_dev: pl.DataFrame,
+    model_input_from: Path | None,
+) -> tuple[list[str], Path, str, list[dict[str, object]]]:
+    """모델 입력 피쳐 목록을 정한다.
+
+    ``model_input_from``이 ``None``이면(기본) **지금과 완전히 같다** —
+    :func:`load_m3_model_input_features`(M3 manifest)를 읽는다.
+
+    지정하면 그 scan_long2 산출물(parquet)에서 등급 A·B(``price_ge_5``
+    유니버스)만 골라(:func:`select_scan_ab_features`), 이미 로드된
+    ``features_dev``(``--features-dataset``)·``labels_dev``(``price_ge_5``가
+    있는 라벨 데이터셋)로 상관 기반 중복을 뺀다
+    (:func:`dedup_correlated_candidates`).
+
+    반환: (피쳐 목록, 출처 경로, 출처 설명 문자열, 상관 중복으로 뺀 목록).
+    출처 설명·중복 목록은 manifest에 그대로 남긴다(``write_run`` 참고).
+    """
+    if model_input_from is None:
+        features, manifest_path = load_m3_model_input_features(root)
+        source = f"{manifest_path} model_input_features.all (M3)"
+        return features, manifest_path, source, []
+
+    scan_path = Path(model_input_from)
+    scan_table = pl.read_parquet(scan_path)
+    candidates = select_scan_ab_features(scan_table)
+    if not candidates:
+        raise ValueError(
+            f"{scan_path}에서 등급 A·B, universe={SCAN_PRIMARY_UNIVERSE} 후보가 없습니다"
+        )
+
+    if "price_ge_5" not in labels_dev.columns:
+        raise KeyError(
+            "라벨 데이터셋에 price_ge_5 컬럼이 없습니다 — --model-input-from의 상관 "
+            "중복 제거를 할 수 없습니다"
+        )
+    candidate_cols = [c.feature for c in candidates]
+    missing_cols = sorted(set(candidate_cols) - set(features_dev.columns))
+    if missing_cols:
+        raise KeyError(
+            f"{scan_path}의 후보 피쳐가 --features-dataset에 없습니다: {missing_cols}"
+        )
+
+    core = (
+        features_dev.select("date", "symbol", *candidate_cols)
+        .join(
+            labels_dev.select("date", "symbol", "price_ge_5"),
+            on=["date", "symbol"],
+            how="inner",
+        )
+        .filter(pl.col("price_ge_5"))
+        .with_columns(pl.col("date").rank(method="dense").cast(pl.Int64).alias("month_idx"))
+    )
+    kept, dropped = dedup_correlated_candidates(candidates, core)
+    if not kept:
+        raise ValueError(f"{scan_path}: 상관 중복 제거 뒤 남은 모델 입력이 없습니다")
+
+    source = (
+        f"{scan_path} grade in {{A,B}}, universe={SCAN_PRIMARY_UNIVERSE}, "
+        f"|rho|<={DEDUP_RHO_THRESHOLD} dedup (scan_long2)"
+    )
+    return kept, scan_path, source, dropped
+
+
 # --- 2. 입력 조립 --------------------------------------------------------------
 
 
@@ -122,6 +332,16 @@ class M4Inputs:
     labels_content_hash: str | None
     features_row_count: int
     labels_row_count: int
+    #: 입력 선택(us4) — 지정하지 않으면 전부 기본값이라 기존 필드만 쓰는
+    #: 호출부·테스트는 안 바뀐다. ``features_dataset``·``labels_dataset``은
+    #: 실제로 읽은 데이터셋 이름(``write_run``의 ``input_datasets`` 키가 된다),
+    #: ``model_input_source``는 ``resolve_model_input_features``가 돌려준
+    #: 출처 설명, ``dedup_dropped``는 ``--model-input-from``의 상관 기반
+    #: 중복 제거로 뺀 피쳐 목록(기본 경로는 항상 빈 리스트).
+    features_dataset: str = DEFAULT_FEATURES_DATASET
+    labels_dataset: str = labels_dataset_name(DEFAULT_LABELS_VERSION)
+    model_input_source: str = ""
+    dedup_dropped: list[dict] = field(default_factory=list)
 
 
 def _dataset_manifest_field(root: DataRoot, name: str, field_name: str):
@@ -130,13 +350,50 @@ def _dataset_manifest_field(root: DataRoot, name: str, field_name: str):
     return manifest.get(field_name)
 
 
-def build_m4_inputs(root: DataRoot) -> M4Inputs:
-    model_features, m3_manifest_path = load_m3_model_input_features(root)
+def build_m4_inputs(
+    root: DataRoot,
+    *,
+    features_dataset: str = DEFAULT_FEATURES_DATASET,
+    labels_dataset: str = labels_dataset_name(DEFAULT_LABELS_VERSION),
+    model_input_from: Path | str | None = None,
+) -> M4Inputs:
+    """M4(그리고 이를 재사용하는 M5·M6·M7)의 입력 프레임을 조립한다.
 
-    features_dev = load_dev_frame(root, "us_features_v1")
-    labels_dev = load_dev_frame(root, "us_labels_v1")
+    ``features_dataset``·``labels_dataset``·``model_input_from``을 전부
+    지정하지 않으면(기본값 그대로 호출) **지금과 완전히 같다** — 이 세
+    인자는 us4 입력 선택(``--features-dataset``·``--labels-version``·
+    ``--model-input-from``)이 그대로 통과하는 자리일 뿐, 그 뒤(순위 변환·
+    조인·holdout 벽)는 한 글자도 안 바뀐다.
+    """
+    features_dev = load_dev_frame(root, features_dataset)
+    labels_dev = load_dev_frame(root, labels_dataset)
     assert_dev_window(features_dev)
     assert_dev_window(labels_dev)
+
+    model_input_from_path = Path(model_input_from) if model_input_from is not None else None
+    model_features, source_path, model_input_source, dedup_dropped = resolve_model_input_features(
+        root,
+        features_dev=features_dev,
+        labels_dev=labels_dev,
+        model_input_from=model_input_from_path,
+    )
+
+    # OLS-3(GKX null model)은 등급·family와 무관한 사전등록 셋이다 — 고른
+    # --features-dataset에 그 세 컬럼이 없으면(예: us_features_flow_v1은
+    # F17~F19만 갖고 있다) 항상 DEFAULT_FEATURES_DATASET에서 따로 조인해
+    # 붙인다. features_dataset이 그 데이터셋 자신이면(지금 동작) 아무 일도
+    # 안 한다.
+    if not set(OLS3_FEATURES).issubset(features_dev.columns):
+        if features_dataset == DEFAULT_FEATURES_DATASET:
+            raise KeyError(
+                f"{DEFAULT_FEATURES_DATASET}에 OLS3_FEATURES{OLS3_FEATURES}가 없습니다"
+            )
+        baseline_dev = load_dev_frame(root, DEFAULT_FEATURES_DATASET)
+        assert_dev_window(baseline_dev)
+        ols3_cols = [*OLS3_FEATURES, *(f"{c}_isna" for c in OLS3_FEATURES)]
+        features_dev = features_dev.join(
+            baseline_dev.select("date", "symbol", *ols3_cols), on=["date", "symbol"], how="inner"
+        )
 
     needed = sorted(set(model_features) | set(OLS3_FEATURES))
     isna_cols = [f"{c}_isna" for c in needed]
@@ -158,11 +415,15 @@ def build_m4_inputs(root: DataRoot) -> M4Inputs:
         core=core,
         dates=dates,
         model_features=model_features,
-        m3_manifest_path=m3_manifest_path,
-        features_content_hash=_dataset_manifest_field(root, "us_features_v1", "content_hash"),
-        labels_content_hash=_dataset_manifest_field(root, "us_labels_v1", "content_hash"),
+        m3_manifest_path=source_path,
+        features_content_hash=_dataset_manifest_field(root, features_dataset, "content_hash"),
+        labels_content_hash=_dataset_manifest_field(root, labels_dataset, "content_hash"),
         features_row_count=features_dev.height,
         labels_row_count=labels_dev.height,
+        features_dataset=features_dataset,
+        labels_dataset=labels_dataset,
+        model_input_source=model_input_source,
+        dedup_dropped=dedup_dropped,
     )
 
 
@@ -583,6 +844,14 @@ def _fold_records(folds: list[WfFold], core: pl.DataFrame) -> list[dict]:
     return records
 
 
+def model_runs_dir(root: DataRoot, *, run_tag: str | None = None) -> Path:
+    """``output/model_runs``(또는 ``--run-tag``가 있으면
+    ``output/model_runs/<태그>``) — M4·M5·M6·M7이 다 이 자리를 쓴다.
+    ``run_tag``가 없으면(기본) 지금과 완전히 같다."""
+    base = root.output / "model_runs"
+    return base / run_tag if run_tag else base
+
+
 def write_run(
     root: DataRoot,
     result: ModelRunResult,
@@ -591,9 +860,10 @@ def write_run(
     folds: list[WfFold],
     snapshot_date: str,
     modeler_git_commit: str,
+    run_tag: str | None = None,
 ) -> Path:
     run_id = f"{result.model_id}_{snapshot_date.replace('-', '')}"
-    out_dir = root.output / "model_runs" / run_id
+    out_dir = model_runs_dir(root, run_tag=run_tag) / run_id
     pred_dir = out_dir / "predictions"
     pred_dir.mkdir(parents=True, exist_ok=True)
 
@@ -603,6 +873,7 @@ def write_run(
 
     config = {
         "run_id": run_id,
+        "run_tag": run_tag,
         "model_id": result.model_id,
         "target_col": result.target_col,
         "feature_cols": result.feature_cols,
@@ -619,13 +890,14 @@ def write_run(
         "dev_start": DEV_START.isoformat(),
         "dev_end": DEV_END.isoformat(),
         "m3_manifest_path": str(inputs.m3_manifest_path),
-        "model_input_features_source": "us_features_v1 manifest.model_input_features.all (M3)",
+        "model_input_features_source": inputs.model_input_source,
+        "model_input_dedup_dropped": inputs.dedup_dropped,
         "input_datasets": {
-            "us_features_v1": {
+            inputs.features_dataset: {
                 "content_hash": inputs.features_content_hash,
                 "row_count": inputs.features_row_count,
             },
-            "us_labels_v1": {
+            inputs.labels_dataset: {
                 "content_hash": inputs.labels_content_hash,
                 "row_count": inputs.labels_row_count,
             },
@@ -653,18 +925,56 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="run_id 접미사로 쓸 날짜 (기본: 오늘 날짜)",
     )
+    parser.add_argument(
+        "--features-dataset",
+        default=DEFAULT_FEATURES_DATASET,
+        help=f"피쳐를 읽을 데이터셋 이름 (기본: {DEFAULT_FEATURES_DATASET} = 지금 동작)."
+        " OLS-3 세 컬럼(mcap_rank·bm·mom_12_1)은 이 값과 무관하게 항상"
+        f" {DEFAULT_FEATURES_DATASET}에서 읽는다",
+    )
+    parser.add_argument(
+        "--labels-version",
+        default=DEFAULT_LABELS_VERSION,
+        choices=("v1", "v2"),
+        help=f"라벨 데이터셋 판 — us_labels_<판> (기본: {DEFAULT_LABELS_VERSION} = 지금 동작)",
+    )
+    parser.add_argument(
+        "--model-input-from",
+        default=None,
+        type=Path,
+        help="모델 입력 피쳐를 M3 manifest 대신 이 scan_long2 산출물"
+        "(feature_scan_long2.parquet)에서 읽는다 — 등급 A·B, price_ge_5 유니버스만"
+        " 보고 |rho|>0.8 상관 중복을 뺀다. 지정하지 않으면 지금과 같이 M3 manifest를 읽는다",
+    )
+    parser.add_argument(
+        "--run-tag",
+        default=None,
+        help="산출물 디렉터리에 끼워 넣을 태그 — output/model_runs/<태그>/... 형태가 된다."
+        " 지정하지 않으면 지금과 같다",
+    )
     args = parser.parse_args(argv)
     snapshot_date = args.snapshot_date or date.today().isoformat()
+    labels_dataset = labels_dataset_name(args.labels_version)
 
     t_start = time.monotonic()
     root = DataRoot.resolve(market="us")
     modeler_repo = Path(__file__).resolve().parents[3]
     modeler_git_commit = _git_commit(modeler_repo)
 
-    inputs = build_m4_inputs(root)
+    inputs = build_m4_inputs(
+        root,
+        features_dataset=args.features_dataset,
+        labels_dataset=labels_dataset,
+        model_input_from=args.model_input_from,
+    )
     folds = build_wf_folds(inputs.dates, dev_end=DEV_END)
 
-    print(f"모델 입력: {inputs.model_features}  (M3: {inputs.m3_manifest_path})")
+    print(
+        f"모델 입력 {len(inputs.model_features)}개: {inputs.model_features} "
+        f"(출처: {inputs.model_input_source})"
+    )
+    if inputs.dedup_dropped:
+        print(f"  상관 중복 제거로 뺀 피쳐: {inputs.dedup_dropped}")
     for record in _fold_records(folds, inputs.core):
         print(
             f"  fold{record['fold_id']} split_k={record['split_k']} "
@@ -703,6 +1013,7 @@ def main(argv: list[str] | None = None) -> int:
             folds=folds,
             snapshot_date=snapshot_date,
             modeler_git_commit=modeler_git_commit,
+            run_tag=args.run_tag,
         )
         fold_ic_str = [f"{v:.4f}" for v in result.fold_ics]
         print(
