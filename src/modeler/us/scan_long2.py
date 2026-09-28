@@ -187,7 +187,9 @@ F18_FEATURE_REGISTRY: tuple[scan.FeatureSpec, ...] = (
 
 #: F19 기관보유(13F, 조건부) — ``00_draft.md`` §5.3. 셋 다 부호 등록(전부 +).
 F19_FEATURE_REGISTRY: tuple[scan.FeatureSpec, ...] = (
-    scan.FeatureSpec("inst_n_log", "F19", "+"),
+    # 수준(level)은 방향 근거가 갈린다 — 기관 보유가 많으면 가격이 효율적이고
+    # 규모와 상관이 높다(Nagel 2005). 변화 둘만 (+)를 등록한다 (us4 초안 U-Q3 재검토).
+    scan.FeatureSpec("inst_n_log", "F19", None),
     scan.FeatureSpec("inst_breadth_chg", "F19", "+"),
     scan.FeatureSpec("inst_shares_chg", "F19", "+"),
 )

@@ -963,14 +963,15 @@ def test_f18_registry_has_four_unregistered_features() -> None:
     assert all(spec.expected_sign is None for spec in F18_FEATURE_REGISTRY)
 
 
-def test_f19_registry_has_three_registered_positive_features() -> None:
+def test_f19_registry_registers_changes_positive_and_level_unsigned() -> None:
     assert {spec.feature for spec in F19_FEATURE_REGISTRY} == {
         "inst_n_log",
         "inst_breadth_chg",
         "inst_shares_chg",
     }
     assert all(spec.family == "F19" for spec in F19_FEATURE_REGISTRY)
-    assert all(spec.expected_sign == "+" for spec in F19_FEATURE_REGISTRY)
+    signs = {spec.feature: spec.expected_sign for spec in F19_FEATURE_REGISTRY}
+    assert signs == {"inst_n_log": None, "inst_breadth_chg": "+", "inst_shares_chg": "+"}
 
 
 def test_new_feature_registry_is_exactly_the_ten_new_features() -> None:
