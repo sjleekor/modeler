@@ -37,9 +37,10 @@ def lake(tmp_path: Path) -> UsLake:
 # --- US_TABLES / ASOF_AXIS ---------------------------------------------------
 
 
-def test_us_tables_has_18_unique_entries() -> None:
-    assert len(US_TABLES) == 18
-    assert len(set(US_TABLES)) == 18
+def test_us_tables_has_19_unique_entries() -> None:
+    # 18(``01_data_readiness.md`` §1) + ``ftd_fails``(us4 F17, 2026-09-27).
+    assert len(US_TABLES) == 19
+    assert len(set(US_TABLES)) == 19
 
 
 def test_asof_axis_covers_every_table_exactly() -> None:
@@ -213,7 +214,7 @@ def test_scan_passthrough_for_table_without_cleaner(tmp_path: Path, lake: UsLake
 # --- snapshot_manifest --------------------------------------------------------
 
 
-def test_snapshot_manifest_returns_all_18_tables_with_their_own_dates(
+def test_snapshot_manifest_returns_all_19_tables_with_their_own_dates(
     tmp_path: Path, lake: UsLake
 ) -> None:
     frame = pl.DataFrame({"date": [date(2020, 1, 1)]})
