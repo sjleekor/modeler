@@ -742,6 +742,26 @@ def test_load_features_and_labels_respects_default_dev_end(tmp_path: Path) -> No
     assert labels63["date"].max() == scan_long2.DEV_END
 
 
+def test_load_features_and_labels_joins_universe_flag_for_flow_dataset(tmp_path: Path) -> None:
+    """us4 U-D3: ``us_features_flow_v1``은 키와 피쳐만 담아 ``price_ge_5``가 없다.
+    그 플래그는 동결 피쳐셋(``us_features_<version>``)에서 키로 붙어야 한다."""
+    root = DataRoot(base=tmp_path)
+    dates = [date(2020, 1, 2), date(2020, 2, 3)]
+    _write_synthetic_datasets(root, dates=dates, n_symbols=3)
+    flow_rows = [
+        {"date": d, "symbol": f"S{s:02d}", "ftd_share_20": float(s)} for d in dates for s in range(3)
+    ]
+    write_dataset(pl.DataFrame(flow_rows), root, "us_features_flow_v1", manifest={})
+
+    features, _, _ = load_features_and_labels(root, features_dataset="us_features_flow_v1")
+
+    assert "price_ge_5" in features.columns
+    assert features["price_ge_5"].null_count() == 0
+    assert features["price_ge_5"].all()
+    assert "ftd_share_20" in features.columns
+    assert features.height == len(flow_rows)
+
+
 def test_load_features_and_labels_respects_custom_dev_end(tmp_path: Path) -> None:
     """``--dev-end``로 기본값보다 훨씬 이른 날짜를 주면 그 뒤 행은 어느
     데이터셋에서도 읽히지 않아야 한다 — N2가 2026-06-30으로 넓힐 때 쓸

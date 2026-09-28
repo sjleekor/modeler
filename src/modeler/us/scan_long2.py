@@ -806,6 +806,14 @@ def load_features_and_labels(
     default_features, labels21, labels63 = dataset_names(version)
     features_name = features_dataset if features_dataset is not None else default_features
     features_dev = scan.load_dev_frame(root, features_name, dev_end=dev_end)
+    if PRIMARY_UNIVERSE not in features_dev.columns:
+        # us4 U-D3: ``us_features_flow_v1``은 (date, symbol) 키와 피쳐만 담는다 —
+        # 유니버스 플래그(``price_ge_5``)는 동결 피쳐셋(``us_features_<version>``)
+        # 에서 키로 붙인다. 입력 연결일 뿐 판정 사양은 안 바뀐다.
+        universe_flag = scan.load_dev_frame(root, default_features, dev_end=dev_end).select(
+            "date", "symbol", PRIMARY_UNIVERSE
+        )
+        features_dev = features_dev.join(universe_flag, on=["date", "symbol"], how="left")
     labels_dev = scan.load_dev_frame(root, labels21, dev_end=dev_end)
     labels63_dev = scan.load_dev_frame(root, labels63, dev_end=dev_end)
     return features_dev, labels_dev, labels63_dev
