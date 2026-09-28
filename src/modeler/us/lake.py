@@ -1,4 +1,4 @@
-"""미국 18표 parquet 레이크 리더.
+"""미국 parquet 레이크 리더 (``US_TABLES`` 참고 — 표 개수는 그때그때 늘어난다).
 
 레이크 구조 (2026-09-20 실측, ``01_data_readiness.md`` §1)::
 
@@ -27,16 +27,23 @@ import polars as pl
 from modeler.etl.config import DataRoot
 
 #: 18표(``01_data_readiness.md`` §1 실측) + ``ftd_fails``(us4 F17, 2026-09-27
-#: 추가 — 알파벳 순 그대로 끼워 넣는다). 알파벳 순.
+#: 추가) + ``cusip_symbol_pit``·``inst_holdings_q``·``thirteenf_submissions``
+#: (us4 F19, 2026-09-28 추가 — ``institutional.py``가 CUSIP↔심볼 다리
+#: (``cusip_symbol_pit``)와 보유 집계(``inst_holdings_q``)를 읽는다.
+#: ``thirteenf_submissions``는 이 family의 원천 표라 같이 등록해 두지만,
+#: F19 피쳐 계산 자체는 이미 집계된 ``inst_holdings_q``만으로 끝난다 —
+#: institutional.py 모듈독스트링 참고) — 알파벳 순 그대로 끼워 넣는다.
 US_TABLES: tuple[str, ...] = (
     "company_meta",
     "corp_actions",
+    "cusip_symbol_pit",
     "earnings_calendar",
     "filings_index",
     "filings_sub",
     "ftd_fails",
     "fundamentals",
     "index_constituents",
+    "inst_holdings_q",
     "insider_owners",
     "insider_trans",
     "listing_snapshots",
@@ -45,6 +52,7 @@ US_TABLES: tuple[str, ...] = (
     "prices_daily",
     "short_interest",
     "short_volume",
+    "thirteenf_submissions",
     "trading_calendar",
     "universe_daily",
     "volatility_daily",
@@ -53,7 +61,7 @@ US_TABLES: tuple[str, ...] = (
 #: 표 -> as-of 축 컬럼명 (``01_data_readiness.md`` §2 표 그대로).
 #:
 #: 모델 코드는 이 컬럼 하나만 보고 시점을 잘라야 한다 — 다른 날짜 컬럼으로
-#: 자르면 미래를 본다. 축이 ``None``인 표 셋은 이유가 각각 다르다:
+#: 자르면 미래를 본다. 축이 ``None``인 표 넷은 이유가 각각 다르다:
 #:
 #: - ``company_meta``: CIK 현재값 스냅샷 1컷이다. 과거 시점 업종·필터에 쓰면
 #:   안 된다 (현재 필터에만 쓴다).
@@ -61,15 +69,27 @@ US_TABLES: tuple[str, ...] = (
 #:   ``insider_trans``에 join해 그 표의 ``filing_date``를 빌려 쓴다.
 #: - ``trading_calendar``: (date, exchange) 자체가 거래일 참조표라 as-of
 #:   개념이 없다.
+#: - ``cusip_symbol_pit``: 단일 날짜로 자르는 표가 아니라 ``(cusip, symbol)``
+#:   쌍마다 ``first_seen``\~``last_seen`` **관측 구간**을 갖는 참조표다(us4
+#:   F19, 2026-09-28 추가) — 쓰는 쪽(``institutional.py``)이 기준일로 그
+#:   구간을 직접 맞춘다.
+#:
+#: ``ftd_fails``·``inst_holdings_q``처럼 축이 있는 표라도, 그 축에 공표 지연이
+#: 더해져야 실제로 알 수 있던 날짜가 되는 경우는 ``ASOF_LAG_TRADING_DAYS``(거래일
+#: 지연만 지원)로 못 담아 해당 피쳐 모듈(``ftd.py``·``institutional.py``)이
+#: 달력일 상수를 직접 더해 ``join_asof``로 시점을 지킨다 — 이 축 자체는 "그
+#: 표에서 사건이 일어난 날"만 가리킨다.
 ASOF_AXIS: dict[str, str | None] = {
     "company_meta": None,
     "corp_actions": "ex_date",
+    "cusip_symbol_pit": None,
     "earnings_calendar": "date",
     "filings_index": "acceptance_datetime",
     "filings_sub": "filed",
     "ftd_fails": "settlement_date",
     "fundamentals": "filed",
     "index_constituents": "as_of",
+    "inst_holdings_q": "period_of_report",
     "insider_owners": None,
     "insider_trans": "filing_date",
     "listing_snapshots": "as_of",
@@ -78,6 +98,7 @@ ASOF_AXIS: dict[str, str | None] = {
     "prices_daily": "date",
     "short_interest": "settlement_date",
     "short_volume": "date",
+    "thirteenf_submissions": "filing_date",
     "trading_calendar": None,
     "universe_daily": "date",
     "volatility_daily": "date",
@@ -108,7 +129,9 @@ _EASTERN_TZ = "America/New_York"
 
 def _require_known_table(table: str) -> None:
     if table not in US_TABLES:
-        raise KeyError(f"모르는 미국 표입니다: {table!r}. US_TABLES 18개 중 하나여야 합니다.")
+        raise KeyError(
+            f"모르는 미국 표입니다: {table!r}. US_TABLES {len(US_TABLES)}개 중 하나여야 합니다."
+        )
 
 
 def acceptance_datetime_to_et(expr: pl.Expr) -> pl.Expr:

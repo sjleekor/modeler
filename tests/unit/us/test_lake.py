@@ -37,10 +37,12 @@ def lake(tmp_path: Path) -> UsLake:
 # --- US_TABLES / ASOF_AXIS ---------------------------------------------------
 
 
-def test_us_tables_has_19_unique_entries() -> None:
-    # 18(``01_data_readiness.md`` §1) + ``ftd_fails``(us4 F17, 2026-09-27).
-    assert len(US_TABLES) == 19
-    assert len(set(US_TABLES)) == 19
+def test_us_tables_has_22_unique_entries() -> None:
+    # 18(``01_data_readiness.md`` §1) + ``ftd_fails``(us4 F17, 2026-09-27) +
+    # ``cusip_symbol_pit``·``inst_holdings_q``·``thirteenf_submissions``
+    # (us4 F19, 2026-09-28).
+    assert len(US_TABLES) == 22
+    assert len(set(US_TABLES)) == 22
 
 
 def test_asof_axis_covers_every_table_exactly() -> None:
@@ -60,9 +62,11 @@ def test_asof_lag_keys_are_known_tables_with_an_axis() -> None:
 
 def test_asof_axis_none_only_for_tables_without_own_date_column() -> None:
     # company_meta(현재값 스냅샷) · insider_owners(join으로 빌려 씀) ·
-    # trading_calendar(참조표)만 축이 없다. 01_data_readiness.md §2 그대로.
+    # trading_calendar(참조표) · cusip_symbol_pit(구간 참조표, us4 F19)만
+    # 축이 없다. 01_data_readiness.md §2 + institutional.py 모듈독스트링.
     assert {t for t, axis in ASOF_AXIS.items() if axis is None} == {
         "company_meta",
+        "cusip_symbol_pit",
         "insider_owners",
         "trading_calendar",
     }
@@ -214,7 +218,7 @@ def test_scan_passthrough_for_table_without_cleaner(tmp_path: Path, lake: UsLake
 # --- snapshot_manifest --------------------------------------------------------
 
 
-def test_snapshot_manifest_returns_all_19_tables_with_their_own_dates(
+def test_snapshot_manifest_returns_all_22_tables_with_their_own_dates(
     tmp_path: Path, lake: UsLake
 ) -> None:
     frame = pl.DataFrame({"date": [date(2020, 1, 1)]})

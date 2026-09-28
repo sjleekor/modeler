@@ -1,17 +1,25 @@
-"""``us_features_flow_v1`` 데이터셋을 만든다 — F17(FTD)·F18(주문흐름)만.
+"""``us_features_flow_v1`` 데이터셋을 만든다 — F17(FTD)·F18(주문흐름)·F19(기관보유).
 
     uv run python -m modeler.us.build_flow_features
 
 ``us4_flow_features/00_draft.md`` U-D3 그대로다: **``us_panel_v2``의 키(``date``,
-``symbol``)만 읽어** 새 family 둘을 붙인다. ``build_panel()``을 다시 불러 패널을
+``symbol``)만 읽어** 새 family 셋을 붙인다. ``build_panel()``을 다시 불러 패널을
 새로 짓지 않는다 — 레이크가 그새 바뀌었으면 동결된 ``us_features_v2``(44개)와
 키 집합이 달라질 수 있어, 이미 만들어 둔 동결 패널의 키를 그대로 재사용해야
 44개·새 family가 같은 (date, symbol) 축 위에 있다고 보장할 수 있다.
 
 ``build_features.py``의 관례(더러운 트리 거부, ``git_commit``·``write_dataset``
 manifest)를 그대로 따르되, 둘 더 넣는다 — **출력 디렉터리가 이미 있으면 멈춘다**
-(``us_features_v2`` 같은 기존 데이터셋을 실수로 덮지 않는다) · 지연 상수 둘을
+(``us_features_v2`` 같은 기존 데이터셋을 실수로 덮지 않는다) · 지연 상수 셋을
 manifest에 적는다(``02_lag_constants.md``).
+
+**F19는 조건부다(U-D8).** 그래도 이 스크립트는 F19가 레이크에 없다고 조용히
+건너뛰지 않는다 — ``FAMILY_ORDER``에 그대로 셋째로 올라 있고,
+``inst_holdings_q``·``cusip_symbol_pit``(혹은 ``prices_daily``) 표가
+``$STOCK_DATA_ROOT``에 없으면 ``add_institutional``이 ``FileNotFoundError``를
+던져 그 자리에서 멈춘다. U-D8의 "10/11까지 표가 안 굳으면 뺀다"는 판단은
+**사람이 그 시점에 이 튜플에서 F19 행을 지우는 방식**으로 하는 것이지, 코드가
+표 유무를 보고 스스로 빼지 않는다(조용한 실패를 피하려는 이 저장소의 관례).
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from modeler.etl.config import DataRoot
 from modeler.us.build_features import _missing_rate
 from modeler.us.dataset import git_commit, write_dataset
 from modeler.us.features.ftd import LAG_FTD_DAYS, add_ftd
+from modeler.us.features.institutional import LAG_13F_DAYS, add_institutional
 from modeler.us.features.order_flow import (
     MIDAS_AVAILABLE_FROM,
     MIDAS_FALLBACK_LAG_DAYS,
@@ -37,11 +46,12 @@ from modeler.us.lake import UsLake
 DATASET_NAME = "us_features_flow_v1"
 SOURCE_PANEL_NAME = "us_panel_v2"
 
-#: (family 이름, add_<family> 함수) — F17·F18 둘뿐이다. F19(13F)는 조건부라
-#: 이 스크립트에 없다(U-D8) — 붙을 때 여기 셋째로 더한다.
+#: (family 이름, add_<family> 함수) — F17·F18·F19. F19는 조건부(U-D8)라도
+#: 표가 없으면 에러로 멈추게 그대로 둔다(모듈독스트링 참고) — 조용히 빼지 않는다.
 FAMILY_ORDER: tuple[tuple[str, object], ...] = (
     ("F17_ftd", add_ftd),
     ("F18_order_flow", add_order_flow),
+    ("F19_institutional", add_institutional),
 )
 
 
@@ -74,6 +84,7 @@ def _lag_constants_manifest() -> dict[str, object]:
             for (year, quarter), available_from in sorted(MIDAS_AVAILABLE_FROM.items())
         },
         "MIDAS_FALLBACK_LAG_DAYS": MIDAS_FALLBACK_LAG_DAYS,
+        "LAG_13F_DAYS": LAG_13F_DAYS,
     }
 
 
