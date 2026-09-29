@@ -1,0 +1,16 @@
+{
+  "e": 0.008136627915012924,
+  "e_prime": 0.0070094230030329574,
+  "i": -0.02490977003297281,
+  "s": -0.027791771969850807,
+  "d": -0.497298969707191,
+  "d_longest_rebalances": 14,
+  "n_rebalances_e": 14,
+  "n_rebalances_i": 14,
+  "turnover_base": 0.7615384615384616,
+  "turnover_tradable": 0.7707692307692308,
+  "n_obs_base": 642270,
+  "n_obs_tradable": 597519,
+  "verdict": "B",
+  "verdict_reason": "E=0.008137 > 0 \uc774\uc9c0\ub9cc I=-0.024910, S=-0.027792 \uc911 \ud558\ub098\uac00 0 \uc774\ud558"
+}
