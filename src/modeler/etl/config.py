@@ -50,6 +50,7 @@ REMOTE_SOURCE = "sj2_remote"
 RAW_TABLES: tuple[str, ...] = (
     "daily_ohlcv",
     "daily_market_cap",
+    "krx_index_daily",  # KRX Open API 지수 일별 (collector v0.15.13, 2026-09-29)
     "krx_security_flow_raw",
     "dart_xbrl_fact_raw",
     "dart_financial_statement_raw",
