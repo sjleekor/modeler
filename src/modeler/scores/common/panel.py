@@ -8,13 +8,18 @@
 개장 30분 전이 결정 시각이므로 여유가 크게 남는다. 스냅샷의 ``observed_at``(수집 시각)은
 과거 백필 때문에 PIT 근거가 못 된다 — 쓰지 않는다.
 
+KR 지수는 다르다. KRX Open API가 T+1로 공표하므로(당일 행이 23:00 KST에도 없다, 2026-09-29
+실측) ``build_asset_panel(available_at_fn=..., available_at_basis=...)``로 세션별 가용 시각을
+받는다(``common/kr_inputs.py``). 기본 동작(위 60분 규칙)은 그대로다.
+
 t 세션에 가격이 없으면(``dq_price_missing_at_t``) 마지막으로 관측된 세션의 값을 그대로
 들고 오되(as-of), ``last_price_session``이 t보다 앞선다. 라벨은 그런 이동을 하지 않는다.
 """
 
 from __future__ import annotations
 
-from datetime import timedelta
+from collections.abc import Callable
+from datetime import date, datetime, timedelta
 
 import polars as pl
 
@@ -58,11 +63,15 @@ def build_asset_panel(
     path: pl.DataFrame,
     *,
     horizon: int = HORIZON_SESSIONS,
+    available_at_fn: Callable[[date], datetime] | None = None,
+    available_at_basis: str = AVAILABLE_AT_BASIS,
 ) -> pl.DataFrame:
     """한 자산의 패널.
 
     ``path``: ``compute_total_return_path`` 출력(``session, px_raw, px_adj, tr_index, ...``).
     행 범위는 첫 관측 세션 ~ 마지막 관측 세션이다(그 뒤에는 입력 가격이 없다).
+
+    ``available_at_fn``: 가격 세션 -> 그 가격을 알 수 있는 시각(tz-aware). 없으면 폐장 + 60분.
     """
     if path.height == 0:
         raise ValueError(f"{asset_id}: 가격 경로가 비었습니다")
@@ -99,15 +108,29 @@ def build_asset_panel(
         pl.col("tr_index").forward_fill().alias("tr_index_t"),
     )
     t = t.filter((pl.col("session") >= first) & (pl.col("session") <= last))
-    t = t.join(
-        tab.select(
-            pl.col("session").alias("last_price_session"), pl.col("close_at").alias("_lp_close")
-        ),
-        on="last_price_session",
-        how="left",
-    ).with_columns(
-        (pl.col("_lp_close") + PRICE_AVAILABILITY_BUFFER).cast(UTC_TS).alias("price_available_at")
-    )
+    if available_at_fn is None:
+        t = t.join(
+            tab.select(
+                pl.col("session").alias("last_price_session"),
+                pl.col("close_at").alias("_lp_close"),
+            ),
+            on="last_price_session",
+            how="left",
+        ).with_columns(
+            (pl.col("_lp_close") + PRICE_AVAILABILITY_BUFFER)
+            .cast(UTC_TS)
+            .alias("price_available_at")
+        )
+    else:
+        sess = t["last_price_session"].drop_nulls().unique().sort().to_list()
+        avail = pl.DataFrame(
+            {
+                "last_price_session": sess,
+                "price_available_at": pl.Series([available_at_fn(d) for d in sess], dtype=UTC_TS),
+            },
+            schema={"last_price_session": pl.Date, "price_available_at": UTC_TS},
+        )
+        t = t.join(avail, on="last_price_session", how="left")
     out = t.select(
         pl.lit(asset_id).alias("asset_id"),
         "session",
@@ -118,7 +141,7 @@ def build_asset_panel(
         "exit_at",
         "last_price_session",
         "price_available_at",
-        pl.lit(AVAILABLE_AT_BASIS).alias("available_at_basis"),
+        pl.lit(available_at_basis).alias("available_at_basis"),
         "px_raw_t",
         "px_adj_t",
         "tr_index_t",

@@ -9,8 +9,13 @@
   그 날짜 이후에만 그 값이 존재한 것으로 본다. tz-aware라 KR 08:30 KST 결정에도 그대로 쓴다.
   각 결정 시각마다 ``available_at <= decision_at``인 행 중 **관측일이 가장 늦은** 값
   (같은 관측일이면 최신 vintage)을 쓴다. 나이가 ``macro_staleness_days``를 넘으면 null.
-* KR 입력은 아직 맥에 없다. KR 실행은 ``KrNotSyncedError``로 멈춘다(0으로 채우지 않는다).
-  KR 피쳐 함수는 일반 long 프레임(``date, value, available_at``)을 받아 sync 뒤 바로 쓴다.
+* KR: 가격 피쳐는 같은 함수, 거시는 US 일별 계열(위와 같은 규칙)에 KR 전용 둘을 더한다.
+  ``usdkrw_ret_60``(``fx_usdkrw_ecos``)와 ``kr_foreign_net_20_over_trdval``
+  (``foreign_net_kospi_ecos`` / ``trdval_kospi_ecos``, KOSPI 시장 수급을 KR 자산 전부에 쓴다)는
+  ``common/kr_inputs.py``의
+  ``KrMacro``(``date, value, available_at``)로 받는다. ``available_at``은 가용일 08:30 KST다.
+  ``kr_macro``가 없으면 ``KrNotSyncedError``로 멈춘다(0으로 채우지 않는다). 피쳐 수식은 US와
+  같은 파일의 같은 함수다.
 
 **경고.** ``macro_series``에서 일부 계열은 초기 ``realtime_start``가 백필 시점이다
 (BAA10Y 2014-01-27, WTI 2011-04-06, VIX 2010-11-22 ...). strict PIT 규칙대로 그 전 결정일에는
@@ -33,8 +38,8 @@ import polars as pl
 
 from modeler.scores.common.assets import Asset, get_asset
 from modeler.scores.common.calendar import UTC_TS
+from modeler.scores.common.kr_inputs import KrMacro, KrNotSyncedError
 from modeler.scores.common.panel import assert_pit
-from modeler.scores.market_sector.build_panel import KrNotSyncedError
 from modeler.scores.market_sector.config import MsConfig
 
 __all__ = [
@@ -508,28 +513,44 @@ def build_features(
     cfg: MsConfig,
     *,
     market: str,
+    kr_macro: KrMacro | None = None,
 ) -> pl.DataFrame:
-    """패널 -> 피쳐 프레임 (asset_id, session 한 행). US만 지원, KR은 ``KrNotSyncedError``."""
-    if market.upper() == "KR":
+    """패널 -> 피쳐 프레임 (asset_id, session 한 행).
+
+    US: ``macro_rows``(US 거시). KR: ``macro_rows``(같은 US 거시, 08:30 KST 결정에 그대로 쓴다)와
+    ``kr_macro``. KR에서 ``kr_macro``가 없으면 ``KrNotSyncedError``.
+    """
+    is_kr = market.upper() == "KR"
+    if is_kr and kr_macro is None:
         raise KrNotSyncedError(
-            "KR 입력(USD/KRW·외국인 순매수·거래대금·KR 지수 패널)이 아직 맥에 sync되지 않았습니다. "
-            "collector 백필 후 `collector db sync-remote`로 받은 뒤 KR 로더를 붙이십시오. "
+            "KR 입력(USD/KRW·외국인 순매수·거래대금)이 없습니다. collector 백필과 "
+            "`collector db sync-remote` 뒤 `load_kr_macro`로 받은 KrMacro를 넘기십시오. "
             "0으로 채우지 않고 여기서 멈춥니다."
         )
     if macro_rows is None:
-        raise ValueError("US 피쳐에는 macro_rows가 필요합니다")
+        raise ValueError("피쳐에는 macro_rows(US 거시)가 필요합니다")
     pf = compute_price_features(panel, cfg)
     ats = sorted(pf["decision_at"].unique().to_list())
     mf = macro_features(macro_rows, ats, cfg)
     f = pf.join(mf, on="decision_at", how="left")
     asset_ids = sorted(f["asset_id"].unique().to_list())
+    avail_cols = ["price_available_at", "macro_available_at_max"]
+    if is_kr:
+        assert kr_macro is not None
+        fx = usdkrw_ret_60(kr_macro.fx, ats)
+        fl = kr_foreign_net_20_over_trdval(kr_macro.foreign_net, kr_macro.trdval, ats)
+        f = f.join(fx, on="decision_at", how="left").join(fl, on="decision_at", how="left")
+        avail_cols += ["usdkrw_available_at", "kr_flow_available_at"]
+        kr_cols = [pl.lit(1, dtype=pl.Int8).alias("market_is_kr")]
+    else:
+        kr_cols = [
+            pl.lit(0.0).alias("usdkrw_ret_60"),
+            pl.lit(0.0).alias("kr_foreign_net_20_over_trdval"),
+            pl.lit(0, dtype=pl.Int8).alias("market_is_kr"),
+        ]
     f = f.with_columns(
-        pl.lit(0.0).alias("usdkrw_ret_60"),
-        pl.lit(0.0).alias("kr_foreign_net_20_over_trdval"),
-        pl.lit(0, dtype=pl.Int8).alias("market_is_kr"),
-        pl.max_horizontal("price_available_at", "macro_available_at_max").alias(
-            "feature_available_at"
-        ),
+        *kr_cols,
+        pl.max_horizontal(*avail_cols).alias("feature_available_at"),
         *[(pl.col("asset_id") == a).cast(pl.Int8).alias(f"asset_{a}") for a in asset_ids],
     )
     f = f.sort(["asset_id", "session"])

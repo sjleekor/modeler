@@ -17,7 +17,8 @@ import json
 import logging
 import platform
 import shutil
-from datetime import date
+from collections.abc import Callable
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +29,13 @@ from modeler.etl.config import REPO_ROOT, DataRoot
 from modeler.scores.common.assets import (
     ASSET_REGISTRY_VERSION,
     Asset,
+    activate_kr_sectors,
+    active_kr_sector_ids,
     assets_for_market,
     get_asset,
+    kr_index_key,
     registry_hash,
+    registry_version,
 )
 from modeler.scores.common.calendar import HORIZON_SESSIONS, SessionCalendar
 from modeler.scores.common.cash import (
@@ -41,6 +46,16 @@ from modeler.scores.common.cash import (
     load_us_rates,
 )
 from modeler.scores.common.inputs import PinnedScopedLake, sha256_file
+from modeler.scores.common.kr_inputs import (
+    KR_TABLES_USED,
+    KRX_AVAILABLE_AT_BASIS,
+    KrLake,
+    KrNotSyncedError,
+    kr_session_calendar,
+    krx_index_available_at,
+    load_kr_index_paths,
+    load_kr_rates,
+)
 from modeler.scores.common.panel import (
     AVAILABLE_AT_BASIS,
     PRICE_AVAILABILITY_BUFFER,
@@ -57,8 +72,7 @@ US_TABLES_USED = ("prices_daily", "corp_actions", "macro_series", "trading_calen
 DEFAULT_CASH_SERIES = {"us": "DGS3MO", "kr": "rate_kr_cd91"}
 
 
-class KrNotSyncedError(RuntimeError):
-    """KR 지수·CD91 데이터가 아직 맥에 sync되지 않았다."""
+__all__ = ["KrNotSyncedError", "assemble", "build_kr", "build_us", "main"]
 
 
 def _select_assets(market: str, ids: list[str] | None) -> list[Asset]:
@@ -76,12 +90,27 @@ def assemble(
     cash: CashAccount | None,
     *,
     horizon: int = HORIZON_SESSIONS,
+    available_at_fn: Callable[[date], datetime] | None = None,
+    available_at_basis: str = AVAILABLE_AT_BASIS,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """순수 조립: 경로 -> (panel, labels). 부모 경로는 ``paths``에 있어야 한다."""
+    """순수 조립: 경로 -> (panel, labels). 부모 경로는 ``paths``에 있어야 한다.
+
+    ``available_at_fn``·``available_at_basis``: 가격 가용 시각 규칙(기본: 폐장 + 60분).
+    KR 지수는 T+1 규칙을 넘긴다(``common/kr_inputs.py``).
+    """
     panels, labels = [], []
     for a in assets:
         path = paths[a.asset_id]
-        panels.append(build_asset_panel(a.asset_id, cal, path, horizon=horizon))
+        panels.append(
+            build_asset_panel(
+                a.asset_id,
+                cal,
+                path,
+                horizon=horizon,
+                available_at_fn=available_at_fn,
+                available_at_basis=available_at_basis,
+            )
+        )
         parent = paths[a.parent_benchmark] if a.parent_benchmark else None
         labels.append(
             compute_labels(
@@ -334,10 +363,160 @@ def build_us(args: argparse.Namespace) -> Path:
 
 
 def build_kr(args: argparse.Namespace) -> Path:
-    raise KrNotSyncedError(
-        "KR 지수(KRX 지수 일별)·CD91일(ECOS) 데이터가 아직 맥에 sync되지 않았습니다. "
-        "collector 백필 후 `collector db sync-remote`로 받은 뒤 로더를 붙이십시오."
+    """KR 패널·라벨. 입력은 로컬 KR raw parquet(``KrLake``), 가격은 ``price_only``다.
+
+    출력 ``stock_data/kr/datasets/market_sector/<version>/`` (US와 같은 파일 구성).
+    표가 없으면 ``KrNotSyncedError``.
+    """
+    if args.kr_sectors:
+        activate_kr_sectors(args.kr_sectors)
+    root = DataRoot.resolve("kr")
+    lake = _resolve_kr_lake(root, args.snapshot_date)
+    out_dir = root.datasets / "market_sector" / args.version
+    if out_dir.exists() and not args.overwrite:
+        raise FileExistsError(
+            f"{out_dir} 가 이미 있습니다. 새 버전 이름을 쓰거나 --overwrite 를 주십시오."
+        )
+
+    selected = _select_assets("kr", args.assets)
+    needed = {a.asset_id: a for a in selected}
+    for a in selected:
+        if a.parent_benchmark:
+            needed.setdefault(a.parent_benchmark, get_asset(a.parent_benchmark))
+    keys = {aid: kr_index_key(aid) for aid in needed}
+
+    # 세션 후보는 코스피 지수의 날짜(대표지수, 백필 전 구간)다. 달력이 이 범위를 정한다.
+    probe = load_kr_index_paths(lake, {"_probe": kr_index_key("kr_kospi")})[0]["_probe"]
+    cal = kr_session_calendar(probe["session"].to_list())
+    paths, diags = load_kr_index_paths(lake, keys, sessions=frozenset(cal.sessions))
+
+    rates = load_kr_rates(lake, args.cash_series, cal.sessions)
+    cash = (
+        build_cash_account(
+            rates, cal.sessions, series_id=args.cash_series, staleness_days=args.staleness_days
+        )
+        if rates is not None
+        else None
     )
+    if cash is None:
+        logger.warning(
+            "현금 시리즈 %s 가 레이크에 없다 — 현금 대비 라벨은 null(cash_series_missing)",
+            args.cash_series,
+        )
+
+    panel, labels = assemble(
+        selected,
+        paths,
+        cal,
+        cash,
+        available_at_fn=krx_index_available_at,
+        available_at_basis=KRX_AVAILABLE_AT_BASIS,
+    )
+    tmp = out_dir.with_name(out_dir.name + ".tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    out_hashes = write_outputs(panel, labels, tmp)
+
+    inputs = {}
+    for t, files in lake.input_files(KR_TABLES_USED).items():
+        inputs[t] = {
+            "snapshot_date": lake.snapshot_date,
+            "source": lake.source,
+            "files": {f.name: {"sha256": sha256_file(f), "bytes": f.stat().st_size} for f in files},
+        }
+    readiness = readiness_table(selected, paths, diags, labels, cal)
+    manifest = {
+        "dataset": args.version,
+        "market": "KR",
+        "layer": "market_sector_layer1_panel_labels",
+        "modeler_git_commit": git_commit(REPO_ROOT, allow_dirty=args.allow_dirty),
+        "asset_registry_version": registry_version(),
+        "asset_registry_base_version": ASSET_REGISTRY_VERSION,
+        "asset_registry_hash": registry_hash(),
+        "kr_sectors_activated": list(active_kr_sector_ids()),
+        "assets": [
+            {
+                "asset_id": a.asset_id,
+                "proxy": a.proxy,
+                "index_group": keys[a.asset_id][0],
+                "asset_type": a.asset_type,
+                "parent_benchmark": a.parent_benchmark,
+                "definition_version": a.definition_version,
+                "history_type": a.history_type,
+                "return_basis": paths[a.asset_id]["return_basis"][0],
+                "diagnostics": {
+                    k: diags[a.asset_id][k]
+                    for k in (
+                        "price_rows",
+                        "duplicate_price_dates",
+                        "null_or_nonpositive_close_rows",
+                        "prices_off_calendar",
+                        "prices_off_calendar_dates",
+                    )
+                },
+            }
+            for a in needed.values()
+        ],
+        "inputs": inputs,
+        "cash": {
+            "cash_basis": CASH_BASIS,
+            "series_id": args.cash_series,
+            "series_present_in_lake": rates is not None,
+            "staleness_days": args.staleness_days,
+        },
+        "calendar": {
+            "calendar_id": cal.calendar_id,
+            "calendar_basis": cal.calendar_basis,
+            "first_session": cal.sessions[0],
+            "last_session": cal.sessions[-1],
+            "decision_rule": "next session open - 30 minutes",
+        },
+        "time_contract": {
+            "price_available_at_basis": KRX_AVAILABLE_AT_BASIS,
+            "price_available_at_rule": (
+                "08:30 KST on the next calendar day after bas_dd "
+                "(KRX Open API publishes T+1); asserted available_at <= decision_at "
+                "(equality allowed)"
+            ),
+            "return_basis": "price_only",
+            "entry": "close of t+1",
+            "exit": f"close of entry + {HORIZON_SESSIONS} sessions",
+        },
+        "labels": {"horizon_sessions": HORIZON_SESSIONS, "loss_threshold": LOSS_THRESHOLD},
+        "outputs": {
+            **out_hashes,
+            "panel_content_hash": content_hash(panel),
+            "labels_content_hash": content_hash(labels),
+            "panel_rows": panel.height,
+            "labels_rows": labels.height,
+        },
+        "env": {"polars": pl.__version__, "python": platform.python_version()},
+    }
+    (tmp / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True, default=_json_default)
+        + "\n"
+    )
+    (tmp / "readiness.json").write_text(
+        json.dumps(readiness, indent=2, ensure_ascii=False, sort_keys=True, default=_json_default)
+        + "\n"
+    )
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    tmp.rename(out_dir)
+
+    print(format_readiness(readiness))
+    print(f"\n출력: {out_dir}")
+    return out_dir
+
+
+def _resolve_kr_lake(root: DataRoot, snapshot_date: str | None) -> KrLake:
+    """``--snapshot-date``가 완전하면 그것, 아니면 최신 완전 스냅샷(US와 같은 규칙)."""
+    if snapshot_date:
+        try:
+            return KrLake.resolve(root, snapshot_date=snapshot_date)
+        except KrNotSyncedError:
+            logger.warning("스냅샷 %s 가 완전하지 않다 — 최신 완전 스냅샷을 씁니다", snapshot_date)
+    return KrLake.resolve(root)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -356,6 +535,12 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-dirty", action="store_true", help="커밋 안 된 트리 허용(manifest에 -dirty 표시)"
     )
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument(
+        "--kr-sectors",
+        nargs="*",
+        default=None,
+        help="(KR 전용) 승인된 KR 섹터 후보 id를 이 실행에서 켠다. 예: kr_fin kr_hlth",
+    )
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     if args.cash_series is None:

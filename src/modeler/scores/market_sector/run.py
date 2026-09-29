@@ -6,7 +6,12 @@
 * ``--smoke``: 실제 데이터·모든 fold를 돌리되 ``output/market_sector/smoke_<ts>/``에만 쓴다.
 * 산출물: ``stock_data/us/output/market_sector/<run_id>/{oof_predictions.parquet,
   scores.parquet, metrics.json, report.md, latest_scores.{json,csv}, models/, manifest.json}``.
-* KR은 입력이 아직 맥에 없어 ``KrNotSyncedError``로 멈춘다.
+* ``--market kr``: 입력은 ``build_panel --market kr``이 만든 KR 패널
+  (``stock_data/kr/datasets/market_sector/<panel-version>/``)과 KR raw parquet
+  (``USD/KRW``·외국인 순매수·거래대금)다. 거시는 US 일별 계열을 그대로 쓴다(US 레이크의 최신
+  ``macro_series``, 08:30 KST 결정에 ``available_at``이 tz-aware라 그대로 맞는다).
+  패널이나 KR 표가 없으면 ``KrNotSyncedError``로 멈춘다. 패널 manifest의
+  ``kr_sectors_activated``를 다시 켠다.
 * ``raw/``·``derived/``에는 쓰지 않는다. 같은 입력·설정·시드는 같은 parquet 바이트를 낸다.
 
 ``run_pipeline``은 IO 없는 순수 함수라 합성 데이터로 테스트한다.
@@ -32,10 +37,11 @@ import scipy
 import sklearn
 
 from modeler.etl.config import REPO_ROOT, DataRoot
+from modeler.scores.common.assets import activate_kr_sectors
 from modeler.scores.common.cash import CASH_BASIS
 from modeler.scores.common.inputs import PinnedScopedLake, sha256_file
+from modeler.scores.common.kr_inputs import KrLake, KrNotSyncedError, load_kr_macro
 from modeler.scores.market_sector import baselines as bl
-from modeler.scores.market_sector.build_panel import KrNotSyncedError
 from modeler.scores.market_sector.config import MsConfig
 from modeler.scores.market_sector.evaluate import evaluate_all, render_report
 from modeler.scores.market_sector.features import (
@@ -521,6 +527,7 @@ def _load_or_build_features(
     allow_dirty_commit: str,
     build_only: bool,
     smoke: bool = False,
+    market: str = "US",
 ) -> tuple[pl.DataFrame, dict[str, Any], Path]:
     fdir = root.datasets / "market_sector" / feature_version
     if fdir.is_dir() and (fdir / "features.parquet").is_file():
@@ -532,10 +539,33 @@ def _load_or_build_features(
         if man["panel_manifest_sha256"] != panel_manifest["_sha256"]:
             raise RuntimeError(f"{fdir} 는 다른 패널로 만든 것입니다. 새 버전 이름을 쓰십시오.")
         return pl.read_parquet(fdir / "features.parquet"), man, fdir
-    snap = panel_manifest["inputs"]["macro_series"]["snapshot_date"]
-    lake = PinnedScopedLake(root=root, snapshots={"macro_series": snap}, symbols=())
-    macro = load_us_macro(lake)
-    f = build_features(panel, macro, cfg, market="US")
+    market = market.upper()
+    extra_inputs: dict[str, Any] = {}
+    kr_macro = None
+    if market == "KR":
+        kr_snap = panel_manifest["inputs"]["common_feature_observation_raw"]["snapshot_date"]
+        kr_lake = KrLake.resolve(root, snapshot_date=kr_snap)
+        kr_macro = load_kr_macro(kr_lake, sorted(panel["session"].unique().to_list()))
+        us_lake = PinnedScopedLake(root=DataRoot.resolve("us"), snapshots={}, symbols=())
+        snap = us_lake.latest_snapshot("macro_series").isoformat()
+        us_lake = PinnedScopedLake(root=us_lake.root, snapshots={"macro_series": snap}, symbols=())
+        macro = load_us_macro(us_lake)
+        extra_inputs = {
+            "kr_raw_snapshot_date": kr_snap,
+            "kr_raw_files": panel_manifest["inputs"]["common_feature_observation_raw"]["files"],
+            "kr_macro_series": ["fx_usdkrw_ecos", "foreign_net_kospi_ecos", "trdval_kospi_ecos"],
+            "kr_available_at_basis": "available_from_date_0830_kst",
+            "price_available_at_basis": "krx_openapi_t_plus_1_0830_kst",
+        }
+        macro_files = {
+            f.name: sha256_file(f) for f in us_lake.input_files(("macro_series",))["macro_series"]
+        }
+    else:
+        snap = panel_manifest["inputs"]["macro_series"]["snapshot_date"]
+        lake = PinnedScopedLake(root=root, snapshots={"macro_series": snap}, symbols=())
+        macro = load_us_macro(lake)
+        macro_files = panel_manifest["inputs"]["macro_series"]["files"]
+    f = build_features(panel, macro, cfg, market=market, kr_macro=kr_macro)
     asset_ids = sorted(f["asset_id"].unique().to_list())
     man = feature_manifest(
         f,
@@ -543,15 +573,16 @@ def _load_or_build_features(
         asset_ids=asset_ids,
         extra={
             "dataset": feature_version,
-            "market": "US",
+            "market": market,
             "panel_version": panel_manifest["dataset"],
             "panel_manifest_sha256": panel_manifest["_sha256"],
             "panel_content_hash": panel_manifest["outputs"]["panel_content_hash"],
             "macro_series_snapshot_date": snap,
-            "macro_series_files": panel_manifest["inputs"]["macro_series"]["files"],
+            "macro_series_files": macro_files,
             "macro_series_ids": sorted(macro["series_id"].unique().to_list()),
             "modeler_git_commit": allow_dirty_commit,
             "available_at_rule": "feature_available_at <= decision_at < entry_at asserted",
+            **extra_inputs,
         },
     )
     # smoke는 데이터셋 디렉터리를 만들지 않고 run 안에 둔다
@@ -573,16 +604,24 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     t0 = time.time()
-    if args.market == "kr":
-        raise KrNotSyncedError(
-            "KR 입력(KR 지수 패널·CD91·USD/KRW·외국인 순매수)이 아직 맥에 sync되지 않았습니다. "
-            "collector 백필과 `collector db sync-remote` 뒤에 KR 로더를 붙이십시오."
-        )
+    market = args.market.upper()
+    try:
+        root = DataRoot.resolve(args.market)
+    except RuntimeError as exc:
+        if market == "KR":
+            raise KrNotSyncedError(str(exc)) from exc
+        raise
     cfg = MsConfig()
-    market = "US"
-    root = DataRoot.resolve("us")
     pdir = root.datasets / "market_sector" / args.panel_version
+    if market == "KR" and not (pdir / "manifest.json").is_file():
+        raise KrNotSyncedError(
+            f"KR 패널이 없습니다 ({pdir}). 먼저 "
+            "`python -m modeler.scores.market_sector.build_panel --market kr ...`를 돌리십시오 "
+            "(KR raw parquet가 sync돼 있어야 합니다)."
+        )
     panel_manifest = json.loads((pdir / "manifest.json").read_text())
+    if market == "KR" and panel_manifest.get("kr_sectors_activated"):
+        activate_kr_sectors(panel_manifest["kr_sectors_activated"])
     panel_manifest["_sha256"] = sha256_file(pdir / "manifest.json")
     for fn in ("panel.parquet", "labels.parquet"):
         if sha256_file(pdir / fn) != panel_manifest["outputs"][fn]:
@@ -590,7 +629,7 @@ def main(argv: list[str] | None = None) -> int:
     panel = pl.read_parquet(pdir / "panel.parquet")
     labels = pl.read_parquet(pdir / "labels.parquet")
     stamp = datetime.now().strftime("%Y%m%d%H%M")
-    run_id = args.run_id or (f"smoke_{stamp}" if args.smoke else f"ms_us_{stamp}")
+    run_id = args.run_id or (f"smoke_{stamp}" if args.smoke else f"ms_{args.market}_{stamp}")
     if args.smoke and not run_id.startswith("smoke_"):
         run_id = f"smoke_{run_id}"
     out_dir = root.output / "market_sector" / run_id
@@ -606,6 +645,7 @@ def main(argv: list[str] | None = None) -> int:
             run_dir=None,
             allow_dirty_commit=commit,
             build_only=True,
+            market=market,
         )
         print(f"features: {fdir}  rows={fman['rows']} ready={fman['feature_ready_rows']}")
         return 0
@@ -623,6 +663,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_dirty_commit=commit,
         build_only=False,
         smoke=args.smoke,
+        market=market,
     )
     t_feat = time.time()
     lab_cols = [
