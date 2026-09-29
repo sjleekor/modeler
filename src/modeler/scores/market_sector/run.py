@@ -10,8 +10,7 @@
   (``stock_data/kr/datasets/market_sector/<panel-version>/``)과 KR raw parquet
   (``USD/KRW``·외국인 순매수·거래대금)다. 거시는 US 일별 계열을 그대로 쓴다(US 레이크의 최신
   ``macro_series``, 08:30 KST 결정에 ``available_at``이 tz-aware라 그대로 맞는다).
-  패널이나 KR 표가 없으면 ``KrNotSyncedError``로 멈춘다. 패널 manifest의
-  ``kr_sectors_activated``를 다시 켠다.
+  패널이나 KR 표가 없으면 ``KrNotSyncedError``로 멈춘다.
 * ``raw/``·``derived/``에는 쓰지 않는다. 같은 입력·설정·시드는 같은 parquet 바이트를 낸다.
 
 ``run_pipeline``은 IO 없는 순수 함수라 합성 데이터로 테스트한다.
@@ -37,7 +36,6 @@ import scipy
 import sklearn
 
 from modeler.etl.config import REPO_ROOT, DataRoot
-from modeler.scores.common.assets import activate_kr_sectors
 from modeler.scores.common.cash import CASH_BASIS
 from modeler.scores.common.inputs import PinnedScopedLake, sha256_file
 from modeler.scores.common.kr_inputs import KrLake, KrNotSyncedError, load_kr_macro
@@ -555,7 +553,7 @@ def _load_or_build_features(
             "kr_raw_files": panel_manifest["inputs"]["common_feature_observation_raw"]["files"],
             "kr_macro_series": ["fx_usdkrw_ecos", "foreign_net_kospi_ecos", "trdval_kospi_ecos"],
             "kr_available_at_basis": "available_from_date_0830_kst",
-            "price_available_at_basis": "krx_openapi_t_plus_1_0830_kst",
+            "price_available_at_basis": "session_close_plus_60min",
         }
         macro_files = {
             f.name: sha256_file(f) for f in us_lake.input_files(("macro_series",))["macro_series"]
@@ -620,8 +618,6 @@ def main(argv: list[str] | None = None) -> int:
             "(KR raw parquet가 sync돼 있어야 합니다)."
         )
     panel_manifest = json.loads((pdir / "manifest.json").read_text())
-    if market == "KR" and panel_manifest.get("kr_sectors_activated"):
-        activate_kr_sectors(panel_manifest["kr_sectors_activated"])
     panel_manifest["_sha256"] = sha256_file(pdir / "manifest.json")
     for fn in ("panel.parquet", "labels.parquet"):
         if sha256_file(pdir / fn) != panel_manifest["outputs"][fn]:

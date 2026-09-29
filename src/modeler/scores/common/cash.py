@@ -26,7 +26,7 @@ import numpy as np
 import polars as pl
 
 CASH_BASIS = "synthetic_short_rate_act365"
-DEFAULT_STALENESS_DAYS = 7
+DEFAULT_STALENESS_DAYS = 14
 
 STATUS_OK = "ok"
 STATUS_STALE = "stale"

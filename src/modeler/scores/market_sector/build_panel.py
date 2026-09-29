@@ -29,8 +29,6 @@ from modeler.etl.config import REPO_ROOT, DataRoot
 from modeler.scores.common.assets import (
     ASSET_REGISTRY_VERSION,
     Asset,
-    activate_kr_sectors,
-    active_kr_sector_ids,
     assets_for_market,
     get_asset,
     kr_index_key,
@@ -52,7 +50,6 @@ from modeler.scores.common.kr_inputs import (
     KrLake,
     KrNotSyncedError,
     kr_session_calendar,
-    krx_index_available_at,
     load_kr_index_paths,
     load_kr_rates,
 )
@@ -96,7 +93,7 @@ def assemble(
     """순수 조립: 경로 -> (panel, labels). 부모 경로는 ``paths``에 있어야 한다.
 
     ``available_at_fn``·``available_at_basis``: 가격 가용 시각 규칙(기본: 폐장 + 60분).
-    KR 지수는 T+1 규칙을 넘긴다(``common/kr_inputs.py``).
+    KR 지수도 기본(폐장 + 60분, XKRX 달력의 실제 폐장)을 쓴다(``common/kr_inputs.py``).
     """
     panels, labels = [], []
     for a in assets:
@@ -368,8 +365,6 @@ def build_kr(args: argparse.Namespace) -> Path:
     출력 ``stock_data/kr/datasets/market_sector/<version>/`` (US와 같은 파일 구성).
     표가 없으면 ``KrNotSyncedError``.
     """
-    if args.kr_sectors:
-        activate_kr_sectors(args.kr_sectors)
     root = DataRoot.resolve("kr")
     lake = _resolve_kr_lake(root, args.snapshot_date)
     out_dir = root.datasets / "market_sector" / args.version
@@ -404,14 +399,8 @@ def build_kr(args: argparse.Namespace) -> Path:
             args.cash_series,
         )
 
-    panel, labels = assemble(
-        selected,
-        paths,
-        cal,
-        cash,
-        available_at_fn=krx_index_available_at,
-        available_at_basis=KRX_AVAILABLE_AT_BASIS,
-    )
+    # 가격 가용 시각은 US와 같은 기본 규칙(폐장 + 60분)이다. ``krx_index_available_at``과 동치.
+    panel, labels = assemble(selected, paths, cal, cash)
     tmp = out_dir.with_name(out_dir.name + ".tmp")
     if tmp.exists():
         shutil.rmtree(tmp)
@@ -431,9 +420,7 @@ def build_kr(args: argparse.Namespace) -> Path:
         "layer": "market_sector_layer1_panel_labels",
         "modeler_git_commit": git_commit(REPO_ROOT, allow_dirty=args.allow_dirty),
         "asset_registry_version": registry_version(),
-        "asset_registry_base_version": ASSET_REGISTRY_VERSION,
         "asset_registry_hash": registry_hash(),
-        "kr_sectors_activated": list(active_kr_sector_ids()),
         "assets": [
             {
                 "asset_id": a.asset_id,
@@ -474,9 +461,9 @@ def build_kr(args: argparse.Namespace) -> Path:
         "time_contract": {
             "price_available_at_basis": KRX_AVAILABLE_AT_BASIS,
             "price_available_at_rule": (
-                "08:30 KST on the next calendar day after bas_dd "
-                "(KRX Open API publishes T+1); asserted available_at <= decision_at "
-                "(equality allowed)"
+                "session close (XKRX calendar) + 60 minutes, same as US; the KRX Open API "
+                "T+1 publication is an operations matter (MS5), not a point-in-time matter; "
+                "asserted available_at <= decision_at"
             ),
             "return_basis": "price_only",
             "entry": "close of t+1",
@@ -535,12 +522,6 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-dirty", action="store_true", help="커밋 안 된 트리 허용(manifest에 -dirty 표시)"
     )
     ap.add_argument("--overwrite", action="store_true")
-    ap.add_argument(
-        "--kr-sectors",
-        nargs="*",
-        default=None,
-        help="(KR 전용) 승인된 KR 섹터 후보 id를 이 실행에서 켠다. 예: kr_fin kr_hlth",
-    )
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     if args.cash_series is None:

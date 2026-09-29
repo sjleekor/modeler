@@ -8,9 +8,9 @@
 개장 30분 전이 결정 시각이므로 여유가 크게 남는다. 스냅샷의 ``observed_at``(수집 시각)은
 과거 백필 때문에 PIT 근거가 못 된다 — 쓰지 않는다.
 
-KR 지수는 다르다. KRX Open API가 T+1로 공표하므로(당일 행이 23:00 KST에도 없다, 2026-09-29
-실측) ``build_asset_panel(available_at_fn=..., available_at_basis=...)``로 세션별 가용 시각을
-받는다(``common/kr_inputs.py``). 기본 동작(위 60분 규칙)은 그대로다.
+KR 지수도 같은 규칙이다(폐장은 XKRX 달력의 실제 값, ``common/kr_inputs.py``). KRX Open API의
+T+1 공표는 운영 문제(MS5)이지 PIT 문제가 아니다. ``available_at_fn``으로 다른 규칙을 넘길 수는
+있다(옛 T+1 규칙 실험용).
 
 t 세션에 가격이 없으면(``dq_price_missing_at_t``) 마지막으로 관측된 세션의 값을 그대로
 들고 오되(as-of), ``last_price_session``이 t보다 앞선다. 라벨은 그런 이동을 하지 않는다.

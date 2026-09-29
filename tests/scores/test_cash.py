@@ -48,8 +48,8 @@ def test_daily_compounding_of_steps():
 
 def test_stale_rate_makes_interval_null():
     d = [date(2024, 1, 1), date(2024, 1, 8), date(2024, 1, 15), date(2024, 1, 22)]
-    # 금리는 1/1 관측 한 번뿐. staleness 7일 -> 1/1->1/8 step은 나이 0 ok, 1/8->1/15는 나이 7 ok,
-    # 1/15->1/22는 나이 14 -> stale
+    # 금리는 1/1 관측 한 번뿐. staleness 7일(명시) -> 1/1->1/8 step은 나이 0 ok, 1/8->1/15는
+    # 나이 7 ok, 1/15->1/22는 나이 14 -> stale
     acct = build_cash_account(_rates([(d[0], d[0], 5.0)]), d, series_id="T", staleness_days=7)
     assert acct.frame["step_status"].to_list() == ["ok", "ok", "stale", "no_rate_yet"][:3] + [
         "ok" if acct.frame["step_status"][3] == "ok" else "stale"
@@ -83,3 +83,10 @@ def test_revision_of_older_date_does_not_replace_latest_observation():
     a = rate_available_at(r, [date(2024, 1, 5), date(2024, 1, 11)])
     assert a["rate_pct"].to_list() == [4.1, 4.1]
     assert a["rate_obs_date"].to_list() == [date(2024, 1, 3)] * 2
+
+
+def test_default_staleness_is_14_days():
+    from modeler.scores.common.cash import DEFAULT_STALENESS_DAYS
+    from modeler.scores.market_sector.config import MsConfig
+
+    assert DEFAULT_STALENESS_DAYS == 14 and MsConfig().cash_staleness_days == 14

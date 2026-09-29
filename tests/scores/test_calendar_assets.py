@@ -19,10 +19,10 @@ def test_registry_us_and_kr_entries():
     assert us["us_spx"].parent_benchmark is None and us["us_spx"].proxy == "SPY"
     assert all(a.calendar == "XNYS" and a.currency == "USD" for a in us.values())
     kr = {a.asset_id: a for a in assets_for_market("KR")}
-    assert set(kr) == {"kr_kospi", "kr_kosdaq"}
+    assert set(kr) == {"kr_kospi", "kr_kosdaq", "kr_fin", "kr_hlth", "kr_ind", "kr_enrg", "kr_tech"}
     assert kr["kr_kospi"].proxy == "코스피" and kr["kr_kospi"].fallback_proxy == "market_kospi_ecos"
     assert get_asset("kr_kosdaq").source == "kr_krx_index_daily"
-    assert len(registry_hash()) == 64 and len(ASSETS) == 9
+    assert len(registry_hash()) == 64 and len(ASSETS) == 14 and len(us) + len(kr) == 14
     with pytest.raises(KeyError):
         get_asset("nope")
 

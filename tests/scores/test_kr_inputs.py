@@ -10,15 +10,11 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from modeler.scores.common import assets as assets_mod
 from modeler.scores.common.assets import (
     ASSET_REGISTRY_VERSION,
     ASSETS,
-    KR_SECTOR_CANDIDATES,
-    activate_kr_sectors,
-    active_kr_sector_ids,
+    KR_SECTOR_REJECTED_KRX300,
     assets_for_market,
-    deactivate_kr_sectors,
     get_asset,
     kr_index_key,
     registry_hash,
@@ -28,10 +24,12 @@ from modeler.scores.common.calendar import UTC_TS, SessionCalendar
 from modeler.scores.common.cash import build_cash_account
 from modeler.scores.common.kr_inputs import (
     KRX_AVAILABLE_AT_BASIS,
+    KRX_COLLECTION_TIME_BASIS,
     KrLake,
     KrNotSyncedError,
     kr_session_calendar,
     krx_index_available_at,
+    krx_index_available_at_collection_time,
     load_kr_index_paths,
     load_kr_macro,
     load_kr_rates,
@@ -77,7 +75,11 @@ def _index_rows(sessions: list[date]) -> pl.DataFrame:
     specs = [
         ("kospi", "KOSPI", "코스피", 2000.0, 1.0),
         ("kosdaq", "KOSDAQ", "코스닥", 800.0, 0.5),
-        ("krx", "KRX", "KRX 300 금융", 500.0, 0.3),
+        ("krx", "KRX", "KRX 은행", 500.0, 0.3),
+        ("krx", "KRX", "KRX 헬스케어", 510.0, 0.31),
+        ("krx", "KRX", "KRX 기계장비", 520.0, 0.32),
+        ("krx", "KRX", "KRX 에너지화학", 530.0, 0.33),
+        ("krx", "KRX", "KRX 반도체", 540.0, 0.34),
         # 같은 이름이 두 그룹에 있다 — 그룹으로 구분해야 한다
         ("kospi", "KOSPI", "건설", 100.0, 9.0),
         ("kosdaq", "KOSDAQ", "건설", 200.0, 7.0),
@@ -152,8 +154,7 @@ def kr_root(tmp_path, monkeypatch):
     _write(tmp_path, "krx_index_daily", _index_rows(ss))
     _write(tmp_path, "common_feature_observation_raw", _obs_rows(ss))
     _marker(tmp_path, ["krx_index_daily", "common_feature_observation_raw"])
-    yield tmp_path
-    deactivate_kr_sectors()
+    return tmp_path
 
 
 def _lake(root: Path) -> KrLake:
@@ -260,13 +261,22 @@ def test_off_calendar_rows_are_dropped_and_counted(kr_root):
 
 
 # --------------------------------------------------------------------------- available_at·PIT
-def test_krx_available_at_is_next_calendar_day_0830_kst():
-    a = krx_index_available_at(date(2024, 1, 3))  # 수
+def test_krx_available_at_is_session_close_plus_60min():
+    cal = SessionCalendar.from_exchange_calendars("XKRX", date(2015, 1, 1), date(2017, 12, 31))
+    assert cal is not None
+    # 2016-08-01 전 폐장 15:00 KST(06:00 UTC), 후 15:30 KST(06:30 UTC) — 상수가 아니라 달력 값
+    assert krx_index_available_at(date(2015, 1, 5), cal) == datetime(2015, 1, 5, 7, 0, tzinfo=UTC)
+    assert krx_index_available_at(date(2017, 1, 5), cal) == datetime(2017, 1, 5, 7, 30, tzinfo=UTC)
+    assert KRX_AVAILABLE_AT_BASIS == "session_close_plus_60min"
+
+
+def test_collection_time_rule_kept_but_not_default():
+    a = krx_index_available_at_collection_time(date(2024, 1, 3))  # 수
     assert a == datetime(2024, 1, 3, 23, 30, tzinfo=UTC)  # 목 08:30 KST
-    assert krx_index_available_at(FRI) == datetime(2024, 1, 5, 23, 30, tzinfo=UTC)  # 토 08:30 KST
+    assert KRX_COLLECTION_TIME_BASIS == "krx_openapi_t_plus_1_0830_kst"
 
 
-def test_panel_pit_holds_on_xkrx_sessions_with_equality(kr_root):
+def test_panel_pit_holds_strictly_before_decision(kr_root):
     lake = _lake(kr_root)
     keys = {"kr_kospi": ("kospi", "코스피"), "kr_kosdaq": ("kosdaq", "코스닥")}
     cal = kr_session_calendar(_sessions())
@@ -277,19 +287,19 @@ def test_panel_pit_holds_on_xkrx_sessions_with_equality(kr_root):
         paths,
         cal,
         None,
-        available_at_fn=krx_index_available_at,
-        available_at_basis=KRX_AVAILABLE_AT_BASIS,
     )
     assert panel.height > 0 and labels.height == panel.height
-    assert (panel["price_available_at"] <= panel["decision_at"]).all()
-    # 연속한 평일 세션에서는 등호가 성립한다(08:30 KST == 08:30 KST)
-    assert (panel["price_available_at"] == panel["decision_at"]).sum() > 0
+    # 폐장 + 60분 < 다음 세션 개장 - 30분: 엄격히 앞선다
+    assert (panel["price_available_at"] < panel["decision_at"]).all()
+    # 기본 규칙은 krx_index_available_at과 같은 값이다
+    exp = [krx_index_available_at(d, cal) for d in panel["last_price_session"].to_list()]
+    assert panel["price_available_at"].to_list() == exp
     assert set(panel["available_at_basis"]) == {KRX_AVAILABLE_AT_BASIS}
     assert set(panel["return_basis"]) == {RETURN_BASIS_PRICE}
     assert panel["price_available_at"].dtype == UTC_TS
     assert_pit(panel, ["price_available_at"])
-    # 한 시간 늦추면 위반이다 — 검사가 실제로 작동한다
-    late = panel.with_columns(pl.col("price_available_at") + pl.duration(hours=1))
+    # 하루 늦추면 위반이다 — 검사가 실제로 작동한다
+    late = panel.with_columns(pl.col("price_available_at") + pl.duration(days=1))
     with pytest.raises(AssertionError):
         assert_pit(late, ["price_available_at"])
 
@@ -397,48 +407,32 @@ def test_non_monotone_availability_is_raised_to_running_max(tmp_path, monkeypatc
 
 
 # --------------------------------------------------------------------------- 등록부
-def test_kr_sector_candidates_are_not_active():
-    assert len(KR_SECTOR_CANDIDATES) == 5
-    active_ids = {a.asset_id for a in ASSETS}
-    assert not active_ids & {c.asset_id for c in KR_SECTOR_CANDIDATES}
-    assert ASSET_REGISTRY_VERSION == "ms_assets_v1"
+def test_kr_sectors_are_active_in_v2():
+    assert ASSET_REGISTRY_VERSION == "ms_assets_v2"
     assert registry_version() == ASSET_REGISTRY_VERSION
-    assert {a.asset_id for a in assets_for_market("KR")} == {"kr_kospi", "kr_kosdaq"}
+    assert len(KR_SECTOR_REJECTED_KRX300) == 4
+    kr = {a.asset_id: a for a in assets_for_market("KR")}
+    assert set(kr) == {"kr_kospi", "kr_kosdaq", "kr_fin", "kr_hlth", "kr_ind", "kr_enrg", "kr_tech"}
+    assert all(
+        kr[i].asset_type == "sector" and kr[i].parent_benchmark == "kr_kospi"
+        for i in ("kr_fin", "kr_hlth", "kr_ind", "kr_enrg", "kr_tech")
+    )
     assert kr_index_key("kr_kospi") == ("kospi", "코스피")
-    assert kr_index_key("kr_fin") == ("krx", "KRX 300 금융")
-    with pytest.raises(KeyError):
-        get_asset("kr_fin")
+    assert kr_index_key("kr_fin") == ("krx", "KRX 은행")
+    assert kr_index_key("kr_hlth") == ("krx", "KRX 헬스케어")
+    assert kr_index_key("kr_ind") == ("krx", "KRX 기계장비")
+    assert kr_index_key("kr_enrg") == ("krx", "KRX 에너지화학")
+    assert kr_index_key("kr_tech") == ("krx", "KRX 반도체")
+    assert not any("KRX 300" in a.proxy for a in ASSETS)
+    assert len(ASSETS) == 14 and len(registry_hash()) == 64
     with pytest.raises(KeyError):
         kr_index_key("us_spx")
-
-
-def test_activate_kr_sectors_changes_version_and_hash():
-    base = registry_hash()
-    try:
-        got = activate_kr_sectors(["kr_fin", "kr_tech"])
-        assert [a.asset_id for a in got] == ["kr_fin", "kr_tech"]
-        assert get_asset("kr_fin").parent_benchmark == "kr_kospi"
-        assert get_asset("kr_fin").asset_type == "sector"
-        assert registry_version() == "ms_assets_v1+kr_sectors"
-        assert registry_hash() != base
-        assert active_kr_sector_ids() == ("kr_fin", "kr_tech")
-        assert {a.asset_id for a in assets_for_market("KR")} >= {"kr_fin", "kr_tech"}
-        activate_kr_sectors(["kr_fin"])  # 멱등
-        assert active_kr_sector_ids() == ("kr_fin", "kr_tech")
-        with pytest.raises(KeyError):
-            activate_kr_sectors(["kr_bank"])
-    finally:
-        deactivate_kr_sectors()
-    assert registry_hash() == base and registry_version() == "ms_assets_v1"
-    assert assets_mod.active_assets() == ASSETS
 
 
 # --------------------------------------------------------------------------- 엔드투엔드
 def test_build_kr_end_to_end_and_features(kr_root, monkeypatch):
     monkeypatch.setattr(bp, "git_commit", lambda *a, **k: "test-commit")
-    rc = bp.main(
-        ["--market", "kr", "--version", "ms_kr_test", "--kr-sectors", "kr_fin", "--allow-dirty"]
-    )
+    rc = bp.main(["--market", "kr", "--version", "ms_kr_test", "--allow-dirty"])
     assert rc == 0
     out = kr_root / "kr" / "datasets" / "market_sector" / "ms_kr_test"
     assert {p.name for p in out.iterdir()} == {
@@ -449,8 +443,7 @@ def test_build_kr_end_to_end_and_features(kr_root, monkeypatch):
     }
     man = json.loads((out / "manifest.json").read_text())
     assert man["market"] == "KR"
-    assert man["kr_sectors_activated"] == ["kr_fin"]
-    assert man["asset_registry_version"] == "ms_assets_v1+kr_sectors"
+    assert man["asset_registry_version"] == "ms_assets_v2"
     assert man["time_contract"]["price_available_at_basis"] == KRX_AVAILABLE_AT_BASIS
     assert man["time_contract"]["return_basis"] == "price_only"
     assert man["cash"]["series_present_in_lake"] is True
@@ -458,8 +451,9 @@ def test_build_kr_end_to_end_and_features(kr_root, monkeypatch):
     assert man["inputs"]["krx_index_daily"]["snapshot_date"] == SNAP
     panel = pl.read_parquet(out / "panel.parquet")
     labels = pl.read_parquet(out / "labels.parquet")
-    assert set(panel["asset_id"]) == {"kr_kospi", "kr_kosdaq", "kr_fin"}
-    assert (panel["price_available_at"] <= panel["decision_at"]).all()
+    assert set(panel["asset_id"]) == {a.asset_id for a in assets_for_market("KR")}
+    assert set(panel["available_at_basis"]) == {"session_close_plus_60min"}
+    assert (panel["price_available_at"] < panel["decision_at"]).all()
     assert set(panel["calendar_basis"]).pop().startswith("exchange_calendars")
     # 현금 라벨이 KR 금리로 채워진다
     assert labels.filter(pl.col("asset_id") == "kr_kospi")[
@@ -467,7 +461,7 @@ def test_build_kr_end_to_end_and_features(kr_root, monkeypatch):
     ].null_count() < (labels.filter(pl.col("asset_id") == "kr_kospi").height)
     # 이미 있는 버전은 덮지 않는다
     with pytest.raises(FileExistsError):
-        bp.main(["--market", "kr", "--version", "ms_kr_test", "--kr-sectors", "kr_fin"])
+        bp.main(["--market", "kr", "--version", "ms_kr_test"])
 
     # 피쳐: KR 전용 둘이 채워지고 PIT가 지켜진다
     lake = _lake(kr_root)

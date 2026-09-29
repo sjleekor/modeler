@@ -18,13 +18,14 @@
     않다(``건설`` 등 20개가 kospi·kosdaq에 모두 있다) — 항상 그룹과 같이 찾는다.
 
 가용 시각 (PIT)
-    KRX Open API는 **T+1로 공표한다.** ``bas_dd`` 당일 행은 23:00 KST에도 없다(2026-09-29 실측).
-    그래서 ``bas_dd`` 행의 ``available_at``은 **다음 달력일 08:30 KST**
-    (``available_at_basis="krx_openapi_t_plus_1_0830_kst"``)다. 결정 시각은 다음 세션 개장 30분
-    전 = 개장일 08:30 KST이고 다음 세션은 빨라야 다음 달력일이므로, 연속한 평일에서는
-    ``available_at == decision_at``이 된다. 검사가 ``<=``라 통과한다(등호 허용). 08:30 정각에 이미
-    공표됐다고 가정하는 셈이라 여유가 없다 — 실제 공표가 08:30보다 늦어질 수 있으면 이 상수를
-    늦추고 새 basis 이름을 쓴다.
+    KRX 지수 행의 ``available_at``은 US와 같은 규칙이다: **그 세션의 폐장 시각 + 60분**
+    (``available_at_basis="session_close_plus_60min"``). 폐장 시각은 XKRX 달력의 실제 값이다
+    (2016-08-01 전 15:00 KST, 이후 15:30 KST). 상수로 쓰지 않는다.
+    근거: 지수 종가는 폐장 시점에 공개된 정보다. KRX Open API가 T+1로 공표하는 것(``bas_dd`` 당일
+    행이 23:00 KST에도 없다, 2026-09-29 실측)은 운영 문제(MS5: 매일 결정 시각에 그날 종가를 받는
+    경로)이지 시점 정합성(PIT) 문제가 아니다. 옛 T+1 규칙(다음 달력일 08:30 KST,
+    ``krx_openapi_t_plus_1_0830_kst``)은 ``krx_index_available_at_collection_time``에 남겨 두었고
+    기본으로는 쓰지 않는다.
 
     ECOS 계열(USD/KRW·외국인 순매수·거래대금·CD91)은 행의 ``available_from_date``(없으면 관측일
     다음 XKRX 세션)의 **08:30 KST**를 가용 시각으로 쓴다. ``available_from_date``가 관측일 이하이면
@@ -53,6 +54,7 @@ import polars as pl
 from modeler.etl.config import REMOTE_SOURCE, DataRoot, LakeConfig
 from modeler.etl.snapshot import resolve_snapshot
 from modeler.scores.common.calendar import UTC_TS, SessionCalendar
+from modeler.scores.common.panel import AVAILABLE_AT_BASIS, PRICE_AVAILABILITY_BUFFER
 from modeler.scores.common.total_return import compute_total_return_path, dividend_coverage
 
 logger = logging.getLogger(__name__)
@@ -61,8 +63,10 @@ KRX_INDEX_TABLE = "krx_index_daily"
 COMMON_OBS_TABLE = "common_feature_observation_raw"
 KR_TABLES_USED = (KRX_INDEX_TABLE, COMMON_OBS_TABLE)
 
-#: KRX 지수 행의 가용 시각 기준 이름. 패널 ``available_at_basis`` 열에 들어간다.
-KRX_AVAILABLE_AT_BASIS = "krx_openapi_t_plus_1_0830_kst"
+#: KRX 지수 행의 가용 시각 기준 이름. 패널 ``available_at_basis`` 열에 들어간다(US와 같다).
+KRX_AVAILABLE_AT_BASIS = AVAILABLE_AT_BASIS
+#: 옛 규칙(수집 시각 기준 T+1 08:30 KST)의 기준 이름. 기본으로 쓰지 않는다.
+KRX_COLLECTION_TIME_BASIS = "krx_openapi_t_plus_1_0830_kst"
 #: ECOS 계열 가용 시각 기준 이름(피쳐 manifest용).
 ECOS_AVAILABLE_AT_BASIS = "available_from_date_0830_kst"
 AVAILABILITY_TIME_KST = time(8, 30)
@@ -86,8 +90,21 @@ def kr_available_at(d: date) -> datetime:
     return datetime.combine(d, AVAILABILITY_TIME_KST, tzinfo=_KST).astimezone(UTC)
 
 
-def krx_index_available_at(session: date) -> datetime:
-    """``bas_dd``가 ``session``인 KRX 지수 행의 가용 시각: 다음 달력일 08:30 KST (T+1)."""
+def krx_index_available_at(session: date, cal: SessionCalendar) -> datetime:
+    """``bas_dd``가 ``session``인 KRX 지수 행의 가용 시각: 그 세션 폐장 + 60분 (tz-aware UTC).
+
+    US와 같은 규칙이다(``panel.AVAILABLE_AT_BASIS``). 폐장 시각은 ``cal``(XKRX)의 실제 값이라
+    2016-08-01 전(15:00 KST)과 후(15:30 KST)가 다르다. 지수 종가는 폐장 때 공개된 정보다.
+    KRX Open API의 T+1 공표는 운영 문제(MS5)이지 PIT 문제가 아니다.
+    """
+    return cal.close_at(session) + PRICE_AVAILABILITY_BUFFER
+
+
+def krx_index_available_at_collection_time(session: date) -> datetime:
+    """옛 규칙: 다음 달력일 08:30 KST (KRX Open API T+1 공표 기준). **기본으로 쓰지 않는다.**
+
+    ``available_at_basis``는 ``KRX_COLLECTION_TIME_BASIS``를 쓴다.
+    """
     return kr_available_at(session + timedelta(days=1))
 
 

@@ -60,7 +60,9 @@ class MsConfig:
     # baseline
     baseline_smoothing_k: int = 60
     # 현금
-    cash_staleness_days: int = 7
+    # 14일: CD91 available_from_date가 추석 2017에 11일, 추석 2025에 8일 늦어 7일에서는
+    # KR 현금 라벨 840개가 null이었다
+    cash_staleness_days: int = 14
     # 점수 변환
     opportunity_reference_min_oof: int = 250
     # 가중치: 날짜마다 시장별 총 가중치 1, 시장 안에서는 자산 균등
