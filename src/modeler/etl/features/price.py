@@ -23,8 +23,12 @@ from __future__ import annotations
 import duckdb
 
 from modeler.etl.config import LakeConfig
-from modeler.etl.mart import materialize, register_mart_view
-from modeler.etl.trading_panel import build_market_model_sql, build_valid_session_sql
+from modeler.etl.mart import MartPlan, materialize, register_mart_view
+from modeler.etl.trading_panel import (
+    MARKET_SEMANTICS_V1,
+    build_market_model_sql,
+    build_valid_session_sql,
+)
 
 PRICE_TABLE = "feat_price"
 
@@ -33,11 +37,16 @@ def build_price_sql(
     price_view: str = "daily_ohlcv",
     *,
     quality_view: str | None = None,
+    market_semantics: str = MARKET_SEMANTICS_V1,
 ) -> str:
     """SQL producing ``feat_price`` from a daily OHLCV view.
 
     ``price_view`` must already be registered on the connection. Log returns use
     ``ln(close_t / close_{t-n})``; momentum/vol use day-over-day log returns.
+
+    ``market_semantics="v2"`` sums the market return in a fixed order (see
+    :func:`~modeler.etl.trading_panel.build_market_model_sql`); the default is the
+    text every frozen mart was written under.
     """
     quality_join = (
         f"LEFT JOIN {quality_view} q USING (trade_date, ticker, market)"
@@ -62,7 +71,7 @@ def build_price_sql(
             SELECT v.*, {ca_event} AS ca_event
             FROM valid v {quality_join}
         ),
-        {build_market_model_sql("valid_q")},
+        {build_market_model_sql("valid_q", market_semantics)},
         features AS (
             SELECT
                 trade_date, ticker, market, valid_session_idx,
@@ -220,16 +229,24 @@ def materialize_price(
     price_view: str = "daily_ohlcv",
     quality_view: str | None = None,
     force: bool = False,
+    semantics: str = MARKET_SEMANTICS_V1,
 ) -> str:
     """Build + register ``feat_price`` mart view. Returns the view name.
 
     Requires ``price_view`` registered on ``con``.
+
+    ``semantics="v2"`` is a different meaning (a fixed-order market return, so the
+    market-model columns are reproducible), hence its ``sql_hash`` differs from ``v1``'s
+    and the metadata also records ``semantics_version``; ``v1`` writes exactly the
+    metadata it always did.
     """
-    materialize(
-        con,
-        config,
-        PRICE_TABLE,
-        build_price_sql(price_view, quality_view=quality_view),
-        force=force,
+    sql = build_price_sql(
+        price_view, quality_view=quality_view, market_semantics=semantics
     )
+    plan = (
+        None
+        if semantics == MARKET_SEMANTICS_V1
+        else MartPlan(plan_id="single", final_sql=sql, semantics_version=semantics)
+    )
+    materialize(con, config, PRICE_TABLE, sql, force=force, plan=plan)
     return register_mart_view(con, config, PRICE_TABLE)

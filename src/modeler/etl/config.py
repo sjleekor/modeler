@@ -81,12 +81,15 @@ class EngineOptions:
 
     ``threads`` defaults to DuckDB's own default when None. ``memory_limit``
     (e.g. ``"2GB"``) caps RAM; DuckDB spills the 2.2GB flow dedup to disk under
-    a tight limit (etl_02 §3.1). ``temp_directory`` is where spill files land.
+    a tight limit (etl_02 §3.1). ``temp_directory`` is where spill files land and
+    ``max_temp_directory_size`` (e.g. ``"30GB"``) caps what DuckDB may spill
+    there; None leaves DuckDB's own default (90% of the disk) in place.
     """
 
     threads: int | None = None
     memory_limit: str | None = None
     temp_directory: str | None = None
+    max_temp_directory_size: str | None = None
 
     def as_pragmas(self) -> dict[str, str]:
         pragmas: dict[str, str] = {}
@@ -96,6 +99,8 @@ class EngineOptions:
             pragmas["memory_limit"] = self.memory_limit
         if self.temp_directory is not None:
             pragmas["temp_directory"] = self.temp_directory
+        if self.max_temp_directory_size is not None:
+            pragmas["max_temp_directory_size"] = self.max_temp_directory_size
         return pragmas
 
 

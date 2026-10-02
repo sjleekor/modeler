@@ -121,21 +121,50 @@ def build_metric_intervals_cte(
     """
 
 
-def build_metric_join(metric_code: str, basis: str) -> str:
-    """One ``LEFT JOIN metric_intervals`` restricted to the current interval."""
+#: Execution plans for the per-metric interval join. Both return the same rows;
+#: they differ only in how DuckDB can plan the upper-bound predicate.
+JOIN_PLAN_OR = "or"
+JOIN_PLAN_COALESCE = "coalesce_join"
+JOIN_PLANS: tuple[str, ...] = (JOIN_PLAN_OR, JOIN_PLAN_COALESCE)
+
+
+def build_metric_join(metric_code: str, basis: str, plan: str = JOIN_PLAN_OR) -> str:
+    """One ``LEFT JOIN metric_intervals`` restricted to the current interval.
+
+    ``plan="or"`` is the text every frozen mart was written under (and its
+    ``sql_hash``). ``plan="coalesce_join"`` states the same upper bound as
+    ``trade_date < COALESCE(next_available_from, DATE '9999-12-31')``: an open
+    interval (``next_available_from IS NULL``) is exactly an interval that never
+    ends, so the rows are identical. The difference is only for the planner. With
+    the ``OR`` the ``ticker`` equality is not extracted as a hash key and DuckDB
+    falls back to a block-wise nested-loop join for each of the 18 joins (7.28M
+    sessions x 1.2M intervals, hours of CPU); with the ``COALESCE`` it is a hash
+    join on ``ticker`` and the range predicates are filters on top of it.
+    """
     alias = f"m_{metric_code}_{basis.lower()}"
+    if plan == JOIN_PLAN_COALESCE:
+        upper = f"""
+         AND panel.trade_date < COALESCE({alias}.next_available_from, DATE '9999-12-31')"""
+    elif plan == JOIN_PLAN_OR:
+        upper = f"""
+         AND ({alias}.next_available_from IS NULL
+              OR panel.trade_date < {alias}.next_available_from)"""
+    else:
+        raise ValueError(f"unknown interval join plan {plan!r}; expected one of {JOIN_PLANS}")
     return f"""
         LEFT JOIN metric_intervals {alias}
           ON {alias}.ticker = panel.ticker
          AND {alias}.metric_code = '{metric_code}' AND {alias}.fs_basis = '{basis}'
-         AND {alias}.daily_available_from <= panel.trade_date
-         AND ({alias}.next_available_from IS NULL
-              OR panel.trade_date < {alias}.next_available_from)"""
+         AND {alias}.daily_available_from <= panel.trade_date{upper}"""
 
 
-def build_metric_joins(metrics: Sequence[str], bases: Sequence[str] = FS_BASES) -> str:
+def build_metric_joins(
+    metrics: Sequence[str], bases: Sequence[str] = FS_BASES, plan: str = JOIN_PLAN_OR
+) -> str:
     """Every ``(metric, basis)`` join, metric-major — the order fin_scan uses."""
-    return "\n".join(build_metric_join(metric, basis) for metric in metrics for basis in bases)
+    return "\n".join(
+        build_metric_join(metric, basis, plan) for metric in metrics for basis in bases
+    )
 
 
 def build_wide_intervals_cte(

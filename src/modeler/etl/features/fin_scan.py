@@ -21,18 +21,33 @@ independently-chosen bases that happen to collide.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import duckdb
 
 from modeler.etl.config import LakeConfig
 from modeler.etl.features.fin_vintage import (
     BASE_OK_SQL,
     FS_BASES,
+    JOIN_PLAN_OR,
     build_metric_intervals_cte,
     build_metric_joins,
 )
-from modeler.etl.mart import materialize, register_mart_view
+from modeler.etl.mart import MartPlan, materialize, register_mart_view
 
 FIN_SCAN_TABLE = "feat_fin_scan_daily"
+
+SEMANTICS_V1 = "v1"
+SEMANTICS_V2 = "v2"
+SEMANTICS_VERSIONS = (SEMANTICS_V1, SEMANTICS_V2)
+#: ``v2`` takes each cross-sectional mean and standard deviation over the whole
+#: ``(trade_date, market)`` partition in ``ticker`` order. The frame is unchanged
+#: (all rows, so the value is the same mean), only the order of the float additions is
+#: fixed. Without it the additions follow the partition's arrival order, which varies
+#: from run to run and moves ``fin_value_z`` by about 1e-14.
+_ORDERED_WHOLE_PARTITION = (
+    "ORDER BY ticker ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"
+)
 
 #: N2-9 diagnostic table name. A separate mart, never a replacement: the
 #: industry variant is not PIT, so both have to exist side by side to be
@@ -88,6 +103,26 @@ _METRICS = (
 #: ``test_fin_risk.py::test_the_fin_scan_sql_is_byte_identical`` pins.
 _BASES = FS_BASES
 
+#: Key columns of the mart, in output order.
+FIN_SCAN_KEY_COLUMNS = ("trade_date", "ticker", "market")
+
+#: ``fin_log_mcap`` is defined here once. The full mart and the column projection below
+#: both embed this text (``base_ok`` is :data:`BASE_OK_SQL`), so the two cannot disagree.
+FIN_LOG_MCAP_SQL = "CASE WHEN base_ok THEN ln(market_cap_pit) END"
+
+#: Columns the projection can produce, in the full mart's output order, with their
+#: expressions over the ``scored`` relation. A column without an entry is not supported:
+#: the projection fails instead of dropping it.
+PROJECTION_EXPRESSIONS: dict[str, str] = {"fin_log_mcap": FIN_LOG_MCAP_SQL}
+
+PLAN_PROJECTION = "projection"
+
+
+def _panel_source(pit_view: str, quality_view: str) -> str:
+    """The ``FROM`` of the ``panel`` CTE (before the optional industry join)."""
+    return f"""FROM {pit_view} pit
+        LEFT JOIN {quality_view} q USING (trade_date, ticker, market)"""
+
 
 def build_fin_scan_daily_sql(
     *,
@@ -95,6 +130,8 @@ def build_fin_scan_daily_sql(
     quality_view: str = "dim_price_quality_daily",
     vintage_view: str = "fin_quarterly_metric_vintage",
     industry_view: str | None = None,
+    join_plan: str = JOIN_PLAN_OR,
+    semantics: str = SEMANTICS_V1,
 ) -> str:
     """SQL producing ``feat_fin_scan_daily`` from B-3's quarterly vintage mart.
 
@@ -110,11 +147,28 @@ def build_fin_scan_daily_sql(
             backwards — so it belongs beside the existing path, never in place
             of it. Left ``None`` the emitted SQL is unchanged, which is what
             keeps the frozen parity tests meaningful.
+        join_plan: How the 18 interval joins state their upper bound
+            (:func:`~modeler.etl.features.fin_vintage.build_metric_join`). The
+            default is the text every frozen mart was written under; the other
+            plan returns the same rows with a different text, so it is a
+            ``MartPlan`` and never the cache contract.
+        semantics: ``"v2"`` fixes the float summation order of the cross-sectional
+            z-scores (see :data:`_ORDERED_WHOLE_PARTITION`). It is a different meaning
+            (``fin_value_z`` moves in the last digits), hence a different ``sql_hash``.
     """
-    joins = build_metric_joins(_METRICS, _BASES)
+    if semantics not in SEMANTICS_VERSIONS:
+        raise ValueError(
+            f"unknown fin_scan semantics {semantics!r}; expected {SEMANTICS_VERSIONS}"
+        )
+    joins = build_metric_joins(_METRICS, _BASES, join_plan)
+
     # One string, used by every winsorize percentile and every z-score, so the
     # variant cannot end up neutralising some components and not others.
     cross_section = "trade_date, market" if industry_view is None else CROSS_SECTION_WITH_INDUSTRY
+    # The window of every mean and standard deviation. v1 states only the partition.
+    moments = f"PARTITION BY {cross_section}" + (
+        f" {_ORDERED_WHOLE_PARTITION}" if semantics == SEMANTICS_V2 else ""
+    )
     industry_join = (
         "" if industry_view is None else f"\n        LEFT JOIN {industry_view} ind USING (ticker)"
     )
@@ -129,8 +183,7 @@ def build_fin_scan_daily_sql(
             pit.market_cap_pit, pit.issued_shares_pit,
             pit.shares_is_available, pit.shares_invalid_flag, pit.shares_available_from,
             q.is_halted, q.valid_session_idx{industry_column}
-        FROM {pit_view} pit
-        LEFT JOIN {quality_view} q USING (trade_date, ticker, market){industry_join}
+        {_panel_source(pit_view, quality_view)}{industry_join}
     ),
     joined AS (
         SELECT panel.*,
@@ -209,7 +262,7 @@ def build_fin_scan_daily_sql(
             trade_date, ticker, market{industry_passthrough}, fs_basis_used, negative_equity,
             gross_profit_source, value_available_from, profitability_available_from,
             asset_growth_available_from, accruals_available_from,
-            CASE WHEN base_ok THEN ln(market_cap_pit) END AS fin_log_mcap,
+            {FIN_LOG_MCAP_SQL} AS fin_log_mcap,
             CASE WHEN base_ok AND total_equity_selected > 0
                  THEN total_equity_selected / market_cap_pit END AS fin_book_to_market,
             CASE WHEN base_ok THEN controlling_net_income_selected / market_cap_pit
@@ -278,14 +331,14 @@ def build_fin_scan_daily_sql(
     zscored AS (
         SELECT
             *,
-            (w_bm - AVG(w_bm) OVER (PARTITION BY {cross_section}))
-                / NULLIF(STDDEV_SAMP(w_bm) OVER (PARTITION BY {cross_section}), 0) AS z_bm,
-            (w_ep - AVG(w_ep) OVER (PARTITION BY {cross_section}))
-                / NULLIF(STDDEV_SAMP(w_ep) OVER (PARTITION BY {cross_section}), 0) AS z_ep,
-            (w_cfop - AVG(w_cfop) OVER (PARTITION BY {cross_section}))
-                / NULLIF(STDDEV_SAMP(w_cfop) OVER (PARTITION BY {cross_section}), 0) AS z_cfop,
-            (w_sp - AVG(w_sp) OVER (PARTITION BY {cross_section}))
-                / NULLIF(STDDEV_SAMP(w_sp) OVER (PARTITION BY {cross_section}), 0) AS z_sp
+            (w_bm - AVG(w_bm) OVER ({moments}))
+                / NULLIF(STDDEV_SAMP(w_bm) OVER ({moments}), 0) AS z_bm,
+            (w_ep - AVG(w_ep) OVER ({moments}))
+                / NULLIF(STDDEV_SAMP(w_ep) OVER ({moments}), 0) AS z_ep,
+            (w_cfop - AVG(w_cfop) OVER ({moments}))
+                / NULLIF(STDDEV_SAMP(w_cfop) OVER ({moments}), 0) AS z_cfop,
+            (w_sp - AVG(w_sp) OVER ({moments}))
+                / NULLIF(STDDEV_SAMP(w_sp) OVER ({moments}), 0) AS z_sp
         FROM winsorized
     ),
     value_combined AS (
@@ -338,6 +391,61 @@ def build_fin_scan_daily_sql(
         accruals_available_from,
         (trade_date - accruals_available_from) AS accruals_fin_age_days
     FROM final
+    """
+
+
+def check_projection_columns(columns: Sequence[str]) -> tuple[str, ...]:
+    """The requested non-key columns in the mart's output order; unsupported ones fail.
+
+    Raises:
+        ValueError: A column has no projection support, or nothing is requested.
+    """
+    wanted = {column for column in columns if column not in FIN_SCAN_KEY_COLUMNS}
+    unsupported = sorted(wanted - set(PROJECTION_EXPRESSIONS))
+    if unsupported:
+        raise ValueError(
+            f"feat_fin_scan_daily projection does not support {unsupported}; "
+            f"supported: {list(PROJECTION_EXPRESSIONS)}. Build the full mart instead."
+        )
+    if not wanted:
+        raise ValueError("feat_fin_scan_daily projection needs at least one column")
+    return tuple(name for name in PROJECTION_EXPRESSIONS if name in wanted)
+
+
+def build_fin_scan_projection_sql(
+    columns: Sequence[str],
+    *,
+    pit_view: str = "dim_stock_pit_daily",
+    quality_view: str = "dim_price_quality_daily",
+) -> str:
+    """The key columns plus ``columns``, with the full mart's definitions and none of its cost.
+
+    Same grain and rows as :func:`build_fin_scan_daily_sql` (one per PIT row), the same
+    ``panel`` source and ``base_ok``, and the same expression for each column. It reads
+    neither the quarterly vintage mart nor any interval join.
+    """
+    names = check_projection_columns(columns)
+    selects = ",\n        ".join(
+        f"{PROJECTION_EXPRESSIONS[name]} AS {name}" for name in names
+    )
+    return f"""
+    WITH panel AS (
+        SELECT
+            pit.trade_date, pit.ticker, pit.market,
+            pit.market_cap_pit, pit.shares_is_available, pit.shares_invalid_flag,
+            q.is_halted, q.valid_session_idx
+        {_panel_source(pit_view, quality_view)}
+    ),
+    scored AS (
+        SELECT
+            *,
+            {BASE_OK_SQL} AS base_ok
+        FROM panel
+    )
+    SELECT
+        trade_date, ticker, market,
+        {selects}
+    FROM scored
     """
 
 
@@ -415,19 +523,59 @@ def materialize_fin_scan_daily(
     quality_view: str = "dim_price_quality_daily",
     vintage_view: str = "fin_quarterly_metric_vintage",
     force: bool = False,
+    join_plan: str = JOIN_PLAN_OR,
+    semantics: str = SEMANTICS_V1,
+    columns: Sequence[str] | None = None,
 ) -> str:
     """Build + register ``feat_fin_scan_daily`` as a cached parquet mart.
 
     Requires ``pit_view``, ``quality_view`` (A0) and ``vintage_view`` (B-3)
     already registered on ``con``.
+
+    ``join_plan="coalesce_join"`` writes the mart from the hash-joinable text
+    (Mac, 2026-09-29 snapshot: about 23 s against about 50 min). The cache
+    contract stays the default text, so ``sql_hash`` is unchanged; the metadata
+    additionally carries ``plan`` and ``plan_hash`` and the mart is only reused
+    by a caller that asks for the same plan.
+
+    ``semantics="v2"`` is a different meaning (a fixed summation order for the
+    z-scores), so the contract text, and with it ``sql_hash``, is the v2 text and
+    the metadata also records ``semantics_version``. It combines with any join plan.
+
+    ``columns`` builds the projection instead (:func:`build_fin_scan_projection_sql`): the
+    keys plus those columns only, which makes it a different mart. Its contract text is the
+    projection statement, so ``sql_hash`` and ``schema_hash`` describe what is on disk, and
+    the metadata records ``plan="projection"`` and the ``projected_columns``. Neither a
+    full mart is reused for it nor it for a full-mart caller. There is no join plan or
+    z-score semantics to choose, so a non-default value is an error.
     """
+    if columns is not None:
+        if join_plan != JOIN_PLAN_OR or semantics != SEMANTICS_V1:
+            raise ValueError("a feat_fin_scan_daily projection takes no join_plan or semantics")
+        projected = check_projection_columns(columns)
+        sql = build_fin_scan_projection_sql(
+            projected, pit_view=pit_view, quality_view=quality_view)
+        materialize(
+            con, config, FIN_SCAN_TABLE, sql, force=force,
+            plan=MartPlan(
+                plan_id=PLAN_PROJECTION, final_sql=sql,
+                metadata=(("projected_columns", list(projected)),)),
+        )
+        return register_mart_view(con, config, FIN_SCAN_TABLE)
+    kwargs = dict(pit_view=pit_view, quality_view=quality_view, vintage_view=vintage_view)
+    plan = None
+    if join_plan != JOIN_PLAN_OR or semantics != SEMANTICS_V1:
+        plan = MartPlan(
+            plan_id=join_plan if join_plan != JOIN_PLAN_OR else "single",
+            final_sql=build_fin_scan_daily_sql(**kwargs, join_plan=join_plan, semantics=semantics),
+            semantics_version=semantics,
+        )
     materialize(
         con,
         config,
         FIN_SCAN_TABLE,
-        build_fin_scan_daily_sql(
-            pit_view=pit_view, quality_view=quality_view, vintage_view=vintage_view
-        ),
+        build_fin_scan_daily_sql(**kwargs, semantics=semantics),
         force=force,
+        plan=plan,
     )
     return register_mart_view(con, config, FIN_SCAN_TABLE)

@@ -17,18 +17,26 @@ See ``docs/target/01_20_access_return_rank/etl_01_parquet_data_flow_plan.md`` §
 
 from __future__ import annotations
 
+import json
 import shutil
 from collections.abc import Iterable
+from pathlib import Path
 
 import duckdb
 
 from modeler.etl.config import CONFIG_TABLES, RAW_TABLES, LakeConfig
 
+DERIVED_PLAN_FILE = "_plan.json"
+
 
 def connect(config: LakeConfig) -> duckdb.DuckDBPyConnection:
     """Open an in-memory DuckDB connection with the configured engine pragmas."""
     con = duckdb.connect()
-    for key, value in config.engine.as_pragmas().items():
+    pragmas = config.engine.as_pragmas()
+    if "temp_directory" in pragmas:
+        # DuckDB creates the leaf lazily and fails on a missing parent.
+        Path(pragmas["temp_directory"]).mkdir(parents=True, exist_ok=True)
+    for key, value in pragmas.items():
         # Identifiers (key) are from a fixed allowlist; value is quoted.
         con.execute(f"SET {key} = '{value}'")
     return con
@@ -100,6 +108,8 @@ def register_derived_marts(
     which: Iterable[str] = ("stock_metric_fact", "common_feature_daily_fact"),
     persist: bool = False,
     force: bool = False,
+    metric_fact_plan: str = "single",
+    metric_rules_version: str | None = None,
 ) -> list[str]:
     """Recompute the derived facts from the raw lake and register them as views.
 
@@ -115,6 +125,13 @@ def register_derived_marts(
     in-memory for unit tests and smoke checks that should not write repository
     artifacts.
 
+    ``metric_fact_plan`` picks the execution plan of ``stock_metric_fact`` (same rows, a
+    different text; see ``metrics_normalize.PLANS``). A persisted mart built by a
+    non-default plan carries a ``_plan.json`` and is only reused by the same plan.
+    ``metric_rules_version`` picks the collector metric rule set (``None`` = current); a
+    mart built under other rules records the version and rule hash in its ``_plan.json``
+    and is only reused under the same rules.
+
     Returns the view names created.
     """
     # Imported here (not at module top) to avoid a circular import: the marts
@@ -122,15 +139,28 @@ def register_derived_marts(
     from modeler.etl.marts.common_build import (
         register_common_feature_daily_fact_view,
     )
-    from modeler.etl.marts.metrics_normalize import register_stock_metric_fact_view
+    from modeler.etl.marts.metrics_normalize import (
+        is_default_stock_metric_fact,
+        register_stock_metric_fact_view,
+        stock_metric_fact_plan_record,
+    )
 
     requested = set(which)
     created: list[str] = []
 
     if "stock_metric_fact" in requested:
-        view = register_stock_metric_fact_view(con)
+        view = register_stock_metric_fact_view(
+            con, plan=metric_fact_plan, rules_version=metric_rules_version)
         if persist:
-            _persist_derived_mart(con, config, view, force=force)
+            _persist_derived_mart(
+                con, config, view, force=force,
+                plan_record=(
+                    None
+                    if is_default_stock_metric_fact(metric_fact_plan, metric_rules_version)
+                    else stock_metric_fact_plan_record(
+                        metric_fact_plan, rules_version=metric_rules_version)
+                ),
+            )
         created.append(view)
 
     if "common_feature_daily_fact" in requested:
@@ -150,25 +180,64 @@ def _persist_derived_mart(
     name: str,
     *,
     force: bool = False,
+    plan_record: dict | None = None,
 ) -> None:
-    """Write one derived canonical-compatible view to the derived mart lake."""
+    """Write one derived canonical-compatible view to the derived mart lake.
+
+    ``plan_record`` (a non-default execution plan) is stored beside the parquet as
+    ``_plan.json``; reusing existing files requires the same record. A caller without one
+    (the default definition) reuses legacy files without a sidecar, and refuses a mart whose
+    sidecar says it was built by another plan or rule set.
+    """
+    from modeler.etl.mart import StaleMartContract
+
     table_dir = config.derived_mart_root / name
     if table_dir.exists() and force:
         shutil.rmtree(table_dir)
     glob_path = str(table_dir / "**" / "*.parquet")
     has_files = table_dir.exists() and _glob_has_files(con, glob_path)
+    sidecar = table_dir / DERIVED_PLAN_FILE
+    if has_files and plan_record is not None:
+        try:
+            stored = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            stored = None
+        if stored != plan_record:
+            raise StaleMartContract(
+                f"persisted derived mart {name!r} was not written by plan "
+                f"{plan_record.get('plan')!r}; use force=True to rebuild"
+            )
+    if has_files and plan_record is None and sidecar.is_file():
+        raise StaleMartContract(
+            f"persisted derived mart {name!r} was written by a non-default plan or rule set "
+            f"({sidecar.read_text(encoding='utf-8').strip()}); use force=True to rebuild"
+        )
     if not has_files:
         if table_dir.exists():
             shutil.rmtree(table_dir)
         table_dir.mkdir(parents=True, exist_ok=True)
         target = _sql_str_literal(str(table_dir / "part-000000.parquet"))
         con.execute(f"COPY (SELECT * FROM {name}) TO {target} (FORMAT PARQUET, COMPRESSION ZSTD)")
+        if plan_record is not None:
+            sidecar.write_text(json.dumps(plan_record, sort_keys=True) + "\n", encoding="utf-8")
 
     glob = _sql_str_literal(glob_path)
     con.execute(
         f"CREATE OR REPLACE VIEW {name} AS "
         f"SELECT * FROM read_parquet({glob}, hive_partitioning=false)"
     )
+
+
+def read_derived_plan_record(config: LakeConfig, name: str) -> dict:
+    """semantics / plan / plan hash a persisted derived mart was written under.
+
+    A mart persisted by the default plan has no ``_plan.json``; it reports the legacy
+    statement (``v1`` / ``single`` / no plan hash), like a feature mart without plan keys.
+    """
+    sidecar = config.derived_mart_root / name / DERIVED_PLAN_FILE
+    if not sidecar.is_file():
+        return {"semantics_version": "v1", "plan": "single", "plan_hash": None}
+    return json.loads(sidecar.read_text(encoding="utf-8"))
 
 
 def register_persisted_derived_mart(

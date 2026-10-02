@@ -46,7 +46,12 @@ def build_full_panel_sql(price_view: str = "daily_ohlcv") -> str:
     """
 
 
-def build_market_model_sql(source_cte: str) -> str:
+MARKET_SEMANTICS_V1 = "v1"
+MARKET_SEMANTICS_V2 = "v2"
+MARKET_SEMANTICS_VERSIONS = (MARKET_SEMANTICS_V1, MARKET_SEMANTICS_V2)
+
+
+def build_market_model_sql(source_cte: str, semantics: str = MARKET_SEMANTICS_V1) -> str:
     """The ``market``/``modeled``/``residuals`` CTE trio, over ``source_cte``.
 
     One market-model definition, shared by every mart that needs a residual
@@ -60,11 +65,36 @@ def build_market_model_sql(source_cte: str) -> str:
     are all statements about the same ``resid_ret``, and A0's input lineage is
     keyed on ``feat_price``'s SQL text (``mart._sql_hash``), so this returns
     that text verbatim rather than a tidied-up equivalent.
+
+    ``semantics="v2"`` changes only how ``market_ret`` is summed. ``v1`` averages with a
+    window aggregate whose input order depends on how the engine happens to partition the
+    rows, so the float sum (and everything fitted on it: beta, alpha, ``resid_ret``) can
+    move in the last bits from run to run. ``v2`` averages inside a ``GROUP BY`` with
+    ``ORDER BY ticker``, a total order within (date, market) because ``(date, ticker,
+    market)`` is the primary key, so the sum is taken in one fixed order. The value is the
+    same mean up to rounding (it differs from ``v1`` at the 1e-16 relative level), which is
+    why this is a semantics version and not a plan.
     """
-    return f"""market AS (
+    if semantics not in MARKET_SEMANTICS_VERSIONS:
+        raise ValueError(
+            f"unknown market model semantics {semantics!r}; expected {MARKET_SEMANTICS_VERSIONS}"
+        )
+    if semantics == MARKET_SEMANTICS_V2:
+        market_cte = f"""market AS (
+            SELECT s.*, m.market_ret
+            FROM {source_cte} s
+            LEFT JOIN (
+                SELECT trade_date, market, AVG(log_ret ORDER BY ticker) AS market_ret
+                FROM {source_cte}
+                GROUP BY trade_date, market
+            ) m USING (trade_date, market)
+        ),"""
+    else:
+        market_cte = f"""market AS (
             SELECT *, AVG(log_ret) OVER (PARTITION BY trade_date, market) AS market_ret
             FROM {source_cte}
-        ),
+        ),"""
+    return f"""{market_cte}
         modeled AS (
             SELECT *,
                 REGR_SLOPE(log_ret, market_ret) OVER (

@@ -39,9 +39,19 @@ from __future__ import annotations
 import duckdb
 
 from modeler.etl.config import LakeConfig
-from modeler.etl.mart import materialize, register_mart_view
+from modeler.etl.mart import MartPlan, materialize, register_mart_view
 
 FQMV_TABLE = "fin_quarterly_metric_vintage"
+
+SEMANTICS_V1 = "v1"
+SEMANTICS_V2 = "v2"
+SEMANTICS_VERSIONS = (SEMANTICS_V1, SEMANTICS_V2)
+#: ``v2`` propagates an unknown availability. ``greatest()`` skips NULL, so under ``v1``
+#: a derived ``available_from`` (differenced quarter, weighted share, TTM) silently ignores a
+#: contributing vintage whose own ``available_from`` is NULL (``receipt_beyond_calendar`` in
+#: ``stock_metric_vintage_fact`` v2) and is dated earlier than that vintage is knowable.
+#: ``v2`` returns NULL instead; ``fin_vintage`` drops rows with a NULL availability.
+#: With no NULL ``available_from`` upstream the two versions emit identical rows.
 
 DIRECT_INTERIM_METRICS = frozenset(
     {
@@ -103,12 +113,56 @@ def _in_list(codes: frozenset[str]) -> str:
     return "(" + ", ".join(f"'{c}'" for c in sorted(codes)) + ")"
 
 
+def _derived_available(
+    semantics: str, own: str, others: tuple[tuple[str, str], ...] = ()
+) -> str:
+    """``available_from`` of a quarter derived from ``own`` and the ``others`` vintages.
+
+    ``others`` are ``(available_from, rcept_no)`` column pairs of the contributing vintages
+    (``rcept_no`` tells a missing vintage, which does not contribute, from a present one with
+    an unknown availability). ``v1`` is the legacy ``greatest()``.
+    """
+    avails = ", ".join([own, *(avail for avail, _ in others)])
+    if semantics == SEMANTICS_V1:
+        return f"greatest({avails})"
+    unknown = " OR ".join([
+        f"{own} IS NULL",
+        *(f"({rcept} IS NOT NULL AND {avail} IS NULL)" for avail, rcept in others),
+    ])
+    return f"CASE WHEN {unknown} THEN NULL ELSE greatest({avails}) END"
+
+
 def build_fin_quarterly_metric_vintage_sql(
     *,
     vintage_view: str = "stock_metric_vintage_fact",
     pairing_tolerance: float = 0.0,
+    semantics: str = SEMANTICS_V1,
 ) -> str:
-    """SQL producing ``fin_quarterly_metric_vintage`` from B-2's vintage fact."""
+    """SQL producing ``fin_quarterly_metric_vintage`` from B-2's vintage fact.
+
+    ``semantics="v2"`` makes every derived ``available_from`` NULL when a contributing
+    vintage's is NULL (see :data:`SEMANTICS_V2`); the default is the legacy text.
+    """
+    if semantics not in SEMANTICS_VERSIONS:
+        raise ValueError(
+            f"unknown fin_quarterly_metric_vintage semantics {semantics!r}; "
+            f"expected {SEMANTICS_VERSIONS}"
+        )
+    q2_avail = _derived_available(semantics, "q2_avail", (("q1_avail", "q1_rcept"),))
+    q3_avail = _derived_available(semantics, "q3_avail", (("q2_avail", "q2_rcept"),))
+    q4_direct_avail = _derived_available(
+        semantics, "q4_avail",
+        (("q1_avail", "q1_rcept"), ("q2_avail", "q2_rcept"), ("q3_avail", "q3_rcept")))
+    q4_avail = _derived_available(semantics, "q4_avail", (("q3_avail", "q3_rcept"),))
+    if semantics == SEMANTICS_V1:
+        ttm_avail = "greatest(available_from, neighbor1_avail, neighbor2_avail, neighbor3_avail)"
+    else:
+        ttm_avail = (
+            "CASE WHEN available_from IS NULL OR neighbor1_avail IS NULL\n"
+            "                  OR neighbor2_avail IS NULL OR neighbor3_avail IS NULL THEN NULL\n"
+            "                 ELSE greatest(available_from, neighbor1_avail, neighbor2_avail,"
+            " neighbor3_avail) END"
+        )
     metrics_list = _in_list(_ALL_QUARTERED_METRICS)
     direct_list = _in_list(DIRECT_INTERIM_METRICS)
     cumulative_list = _in_list(CUMULATIVE_REPORTED_METRICS)
@@ -183,7 +237,7 @@ def build_fin_quarterly_metric_vintage_sql(
             ticker, market, corp_code, metric_code, fs_basis, bsns_year,
             2, q2_pe, q2_rcept,
             CASE WHEN metric_code IN {direct_list} THEN q2_avail
-                 ELSE greatest(q2_avail, q1_avail) END,
+                 ELSE {q2_avail} END,
             -- §3.7: a direct/cumulative-derived conflict excludes the value
             -- from official output (NULL), keeping only the diagnostic flag.
             CASE
@@ -211,7 +265,7 @@ def build_fin_quarterly_metric_vintage_sql(
             ticker, market, corp_code, metric_code, fs_basis, bsns_year,
             3, q3_pe, q3_rcept,
             CASE WHEN metric_code IN {direct_list} THEN q3_avail
-                 ELSE greatest(q3_avail, q2_avail) END,
+                 ELSE {q3_avail} END,
             CASE
                 WHEN metric_code IN {direct_list} THEN
                     CASE WHEN q3_cumulative_reported IS NOT NULL
@@ -237,8 +291,8 @@ def build_fin_quarterly_metric_vintage_sql(
             ticker, market, corp_code, metric_code, fs_basis, bsns_year,
             4, q4_pe, q4_rcept,
             CASE WHEN metric_code IN {direct_list}
-                 THEN greatest(q4_avail, q1_avail, q2_avail, q3_avail)
-                 ELSE greatest(q4_avail, q3_avail) END,
+                 THEN {q4_direct_avail}
+                 ELSE {q4_avail} END,
             CASE
                 WHEN metric_code IN {direct_list} THEN q4_value - (q1_value + q2_value + q3_value)
                 WHEN metric_code IN {cumulative_list} THEN q4_value - q3_value
@@ -338,7 +392,7 @@ def build_fin_quarterly_metric_vintage_sql(
             WHEN metric_kind IN ('direct_interim', 'cumulative_reported')
              AND standalone_value IS NOT NULL AND neighbor1_value IS NOT NULL
              AND neighbor2_value IS NOT NULL AND neighbor3_value IS NOT NULL
-            THEN greatest(available_from, neighbor1_avail, neighbor2_avail, neighbor3_avail)
+            THEN {ttm_avail}
         END AS ttm_available_from
     FROM with_neighbors
     """
@@ -350,10 +404,11 @@ def register_fin_quarterly_metric_vintage_view(
     view_name: str = FQMV_TABLE,
     vintage_view: str = "stock_metric_vintage_fact",
     pairing_tolerance: float = 0.0,
+    semantics: str = SEMANTICS_V1,
 ) -> str:
     """Register a DuckDB view over the SQL above (no parquet — tests/parity)."""
     sql = build_fin_quarterly_metric_vintage_sql(
-        vintage_view=vintage_view, pairing_tolerance=pairing_tolerance
+        vintage_view=vintage_view, pairing_tolerance=pairing_tolerance, semantics=semantics
     )
     con.execute(f"CREATE OR REPLACE VIEW {view_name} AS {sql}")
     return view_name
@@ -366,19 +421,23 @@ def materialize_fin_quarterly_metric_vintage(
     vintage_view: str = "stock_metric_vintage_fact",
     pairing_tolerance: float = 0.0,
     force: bool = False,
+    semantics: str = SEMANTICS_V1,
 ) -> str:
     """Build + register ``fin_quarterly_metric_vintage`` as a cached parquet mart.
 
     Requires ``vintage_view`` (B-2's ``stock_metric_vintage_fact``) already
     registered on ``con``.
+
+    ``semantics="v2"`` is a different meaning (unknown availability propagates), so the
+    contract text, and with it ``sql_hash``, is the v2 text and the metadata also records
+    ``semantics_version``. The default keeps the legacy text, hash and metadata.
     """
-    materialize(
-        con,
-        config,
-        FQMV_TABLE,
-        build_fin_quarterly_metric_vintage_sql(
-            vintage_view=vintage_view, pairing_tolerance=pairing_tolerance
-        ),
-        force=force,
+    sql = build_fin_quarterly_metric_vintage_sql(
+        vintage_view=vintage_view, pairing_tolerance=pairing_tolerance, semantics=semantics
     )
+    plan = (
+        None if semantics == SEMANTICS_V1
+        else MartPlan(plan_id="single", final_sql=sql, semantics_version=semantics)
+    )
+    materialize(con, config, FQMV_TABLE, sql, force=force, plan=plan)
     return register_mart_view(con, config, FQMV_TABLE)

@@ -31,7 +31,8 @@ from __future__ import annotations
 import duckdb
 
 from modeler.etl.config import LakeConfig
-from modeler.etl.mart import materialize, register_mart_view
+from modeler.etl.mart import MartPlan, materialize, register_mart_view
+from modeler.etl.marts.metric_vintages import first_report_order_sql
 
 FIN_TABLE = "feat_fin_pit"
 
@@ -53,14 +54,37 @@ _PIVOT_METRICS = (
 ANNUAL_LAG_DAYS = 90
 QUARTERLY_LAG_DAYS = 45
 
+#: ``v1`` is the definition every frozen run used. ``v2`` only changes which of
+#: several rows wins when they are tied on ``period_end`` (see below); it is the
+#: version the serving builder selects.
+SEMANTICS_V1 = "v1"
+SEMANTICS_V2 = "v2"
+SEMANTICS_VERSIONS = (SEMANTICS_V1, SEMANTICS_V2)
 
-def build_available_sql(smf_view: str = "stock_metric_fact") -> str:
+
+def build_available_sql(smf_view: str = "stock_metric_fact", semantics: str = SEMANTICS_V1) -> str:
     """CTE-body SQL adding ``available_from`` and deduping to latest period_end.
 
     ``available_from`` = period_end + (90d annual / 45d quarterly). For a given
     (ticker, metric_code, available_from) the latest period_end wins (handles
     restatements landing on the same disclosure lag).
+
+    ``semantics="v2"`` breaks the remaining tie. Two reports can carry the same
+    ``period_end`` for a metric: a later report printing a comparative-period
+    figure (or an XBRL fallback attaching one) next to the report that first
+    published that period. ``v1`` leaves their order to the execution plan
+    (807 value-differing groups on the 2026-09-29 snapshot). ``v2`` lets the
+    report that first published the period win: ``bsns_year`` then report order
+    (Q1, half, Q3, annual) ascending. No raw id is used, because it would make
+    the value depend on load order.
     """
+    if semantics not in SEMANTICS_VERSIONS:
+        raise ValueError(f"unknown fin_pit semantics {semantics!r}; expected {SEMANTICS_VERSIONS}")
+    tie = (
+        ""
+        if semantics == SEMANTICS_V1
+        else f",\n            bsns_year ASC, {first_report_order_sql('reprt_code')} ASC"
+    )
     lag = (
         f"CASE WHEN period_type = 'annual' THEN period_end + INTERVAL '{ANNUAL_LAG_DAYS} days' "
         f"ELSE period_end + INTERVAL '{QUARTERLY_LAG_DAYS} days' END"
@@ -72,7 +96,7 @@ def build_available_sql(smf_view: str = "stock_metric_fact") -> str:
         FROM {smf_view}
         QUALIFY ROW_NUMBER() OVER (
             PARTITION BY ticker, metric_code, {lag}
-            ORDER BY period_end DESC
+            ORDER BY period_end DESC{tie}
         ) = 1
     """
 
@@ -85,6 +109,7 @@ def _pivot_expr() -> str:
 def build_fin_pit_sql(
     universe_view: str = "dim_universe_daily",
     smf_view: str = "stock_metric_fact",
+    semantics: str = SEMANTICS_V1,
 ) -> str:
     """SQL producing ``feat_fin_pit`` at (trade_date, ticker, market) grain.
 
@@ -92,7 +117,7 @@ def build_fin_pit_sql(
     wide-pivots the metrics, and derives ratios. ``universe_view`` and
     ``smf_view`` must already be registered on the connection.
     """
-    avail = build_available_sql(smf_view)
+    avail = build_available_sql(smf_view, semantics)
     return f"""
         WITH avail AS (
             {avail}
@@ -147,17 +172,32 @@ def materialize_fin_pit(
     universe_view: str = "dim_universe_daily",
     smf_view: str = "stock_metric_fact",
     force: bool = False,
+    semantics: str = SEMANTICS_V1,
 ) -> str:
     """Build + register ``feat_fin_pit`` mart view. Returns the view name.
 
     Requires ``universe_view`` and ``smf_view`` registered on ``con`` (the latter
     from the canonical lake).
+
+    ``semantics="v2"`` is a different meaning, so its ``sql_hash`` differs from
+    ``v1``'s and the metadata also records ``semantics_version``; ``v1`` writes
+    exactly the metadata it always did.
     """
+    plan = (
+        None
+        if semantics == SEMANTICS_V1
+        else MartPlan(
+            plan_id="single",
+            final_sql=build_fin_pit_sql(universe_view, smf_view, semantics),
+            semantics_version=semantics,
+        )
+    )
     materialize(
         con,
         config,
         FIN_TABLE,
-        build_fin_pit_sql(universe_view, smf_view),
+        build_fin_pit_sql(universe_view, smf_view, semantics),
         force=force,
+        plan=plan,
     )
     return register_mart_view(con, config, FIN_TABLE)

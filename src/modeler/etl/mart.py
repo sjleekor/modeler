@@ -18,6 +18,7 @@ import hashlib
 import json
 import shutil
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 import duckdb
@@ -41,6 +42,59 @@ class StaleMartContract(RuntimeError):
     this meant a Phase B run could not start on a snapshot whose marts were
     pre-built by ``compute-all`` (which does not stamp ``analysis_config_hash``).
     """
+
+
+class MartPlanCheckFailed(RuntimeError):
+    """A staged plan's own consistency check failed; no mart is written."""
+
+
+@dataclass(frozen=True)
+class MartPlan:
+    """A non-default way to compute a mart: a different meaning, a different plan, or both.
+
+    Two axes are recorded and they must not be confused. ``semantics_version`` is
+    what the mart *means* — a ``v2`` may legitimately differ in value from ``v1``.
+    ``plan_id`` is *how* it is computed — plans of the same semantics must produce
+    the same rows, only faster. The cache's ``sql_hash`` stays the hash of the
+    single-statement contract SQL of the chosen semantics, so a ``v1`` mart keeps
+    exactly the hash it has always had whichever plan built it.
+
+    Args:
+        plan_id: Name of the execution plan (``"staged"``, ``"coalesce_join"``...).
+        final_sql: The statement written to the mart. For a staged plan it reads
+            the stage views, so it is not the contract SQL.
+        semantics_version: Meaning of the mart (``"v1"`` is today's SQL).
+        stages: ``(view_name, sql)`` pairs run in order. Each is written to a
+            parquet file in the stage directory and re-registered as a view named
+            ``view_name`` over ``read_parquet``, so the planner sees real row
+            counts instead of guessing through a chain of CTEs. The SQL text must
+            not contain paths, because it is part of :attr:`plan_hash`.
+        checks: ``(name, sql)`` pairs; each query must return one row whose first
+            value is true. They run after the last stage and before the final write.
+        metadata: ``(key, json_value)`` pairs stored in the cache metadata besides the
+            plan keys, and part of :attr:`plan_hash`. A mart that is not the full statement
+            (a column projection) states here what it contains, so a reader cannot take it
+            for the full mart and a cache hit needs the same statement.
+    """
+
+    plan_id: str
+    final_sql: str
+    semantics_version: str = "v1"
+    stages: tuple[tuple[str, str], ...] = ()
+    checks: tuple[tuple[str, str], ...] = ()
+    metadata: tuple[tuple[str, object], ...] = ()
+
+    @property
+    def plan_hash(self) -> str:
+        """Hash over the plan id, every stage SQL and the final SQL."""
+        body = {
+            "plan": self.plan_id,
+            "stages": [[name, sql] for name, sql in self.stages],
+            "final": self.final_sql,
+        }
+        if self.metadata:
+            body["metadata"] = [[key, value] for key, value in self.metadata]
+        return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
 def mart_root(config: LakeConfig) -> Path:
@@ -97,13 +151,31 @@ def sql_contract_hash(select_sql: str) -> str:
 
 
 def _expected_metadata(
-    con: duckdb.DuckDBPyConnection, config: LakeConfig, select_sql: str
+    con: duckdb.DuckDBPyConnection,
+    config: LakeConfig,
+    select_sql: str,
+    plan: MartPlan | None = None,
 ) -> dict[str, str | None]:
-    return {
+    """The contract a mart is (or must have been) written under.
+
+    ``semantics_version`` / ``plan`` / ``plan_hash`` are added only when a
+    ``MartPlan`` is given. A legacy caller therefore keeps the metadata it always
+    had, and a mart built by a plan can never be reused by a caller that did not
+    ask for that plan (the dicts differ), nor the other way round.
+    """
+    expected: dict[str, object] = {
         "analysis_config_hash": config.analysis_config_hash,
         "schema_hash": _schema_hash(con, select_sql),
         "sql_hash": _sql_hash(select_sql),
     }
+    if plan is not None:
+        expected["semantics_version"] = plan.semantics_version
+        expected["plan"] = plan.plan_id
+        expected["plan_hash"] = plan.plan_hash
+        for key, value in plan.metadata:
+            # Round-trip through JSON so a tuple compares equal to the list read back.
+            expected[key] = json.loads(json.dumps(value))
+    return expected
 
 
 def _cache_contract_matches(actual: dict[str, object], expected: dict[str, str | None]) -> bool:
@@ -128,15 +200,27 @@ def materialize(
     *,
     force: bool = False,
     partition_by: list[str] | None = None,
+    plan: MartPlan | None = None,
+    stage_dir: Path | None = None,
 ) -> Path:
     """Write ``select_sql`` to ``feature_mart/.../<name>/`` as parquet.
 
     Idempotent: returns early (skips the write) when the table already exists
     and ``force`` is False. With ``force`` the existing directory is removed and
     rebuilt. Returns the table directory.
+
+    ``select_sql`` is always the *contract* statement: the cache keys are taken
+    from it. With ``plan`` the mart is written by ``plan`` instead (see
+    :class:`MartPlan`) and the metadata additionally records the semantics
+    version, plan id and plan hash; a reused mart must match all of them.
+    ``stage_dir`` is where the plan's stage parquet files go. Pass a directory
+    that belongs to one run (the serving builder uses its per-run temp dir) so
+    stages are never reused across runs; ``<stage_dir>/<name>`` is wiped first
+    and removed after a successful write. A failed plan removes the mart
+    directory, so no mart without metadata is left behind.
     """
     table_dir = mart_table_dir(config, name)
-    expected = _expected_metadata(con, config, select_sql)
+    expected = _expected_metadata(con, config, select_sql, plan)
     if is_materialized(config, name) and not force:
         metadata_path = _metadata_path(config, name)
         if not metadata_path.is_file():
@@ -169,11 +253,60 @@ def materialize(
     else:
         target = _sql_str_literal(str(table_dir / "part-000000.parquet"))
 
-    con.execute(f"COPY ({select_sql}) TO {target} ({', '.join(copy_opts)})")
+    if plan is None:
+        con.execute(f"COPY ({select_sql}) TO {target} ({', '.join(copy_opts)})")
+    else:
+        try:
+            _write_with_plan(
+                con, plan, name, target, copy_opts, None if stage_dir is None else stage_dir / name
+            )
+        except BaseException:
+            shutil.rmtree(table_dir, ignore_errors=True)
+            raise
     _metadata_path(config, name).write_text(
         json.dumps(expected, sort_keys=True) + "\n", encoding="utf-8"
     )
     return table_dir
+
+
+def _write_with_plan(
+    con: duckdb.DuckDBPyConnection,
+    plan: MartPlan,
+    name: str,
+    target: str,
+    copy_opts: list[str],
+    stage_dir: Path | None,
+) -> None:
+    """Run ``plan``'s stages, then write its final statement to ``target``.
+
+    Stage files are plain parquet (default compression: they live for one run).
+    On success they and their views are removed; on failure the files stay for
+    inspection (they sit in the run's temp dir) but the views are dropped.
+    """
+    if plan.stages and stage_dir is None:
+        raise ValueError(f"mart {name!r}: a staged plan needs an explicit stage_dir")
+    views: list[str] = []
+    try:
+        if stage_dir is not None and plan.stages:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            stage_dir.mkdir(parents=True, exist_ok=False)
+        for stage_name, stage_sql in plan.stages:
+            path = _sql_str_literal(str(stage_dir / f"{stage_name}.parquet"))
+            con.execute(f"COPY ({stage_sql}) TO {path} (FORMAT PARQUET)")
+            con.execute(
+                f"CREATE OR REPLACE VIEW {stage_name} AS SELECT * FROM read_parquet({path})"
+            )
+            views.append(stage_name)
+        for check_name, check_sql in plan.checks:
+            row = con.execute(check_sql).fetchone()
+            if not row or row[0] is not True:
+                raise MartPlanCheckFailed(f"mart {name!r}: plan check {check_name!r} failed")
+        con.execute(f"COPY ({plan.final_sql}) TO {target} ({', '.join(copy_opts)})")
+    finally:
+        for view in views:
+            con.execute(f"DROP VIEW IF EXISTS {view}")
+    if stage_dir is not None and plan.stages:
+        shutil.rmtree(stage_dir, ignore_errors=True)
 
 
 def materialize_in_parts(

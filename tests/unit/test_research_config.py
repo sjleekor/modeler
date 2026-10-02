@@ -100,3 +100,8 @@ def test_engine_options_pragmas() -> None:
         "memory_limit": "2GB",
         "temp_directory": "/tmp/x",
     }
+    capped = EngineOptions(temp_directory="/tmp/x", max_temp_directory_size="30GB")
+    assert capped.as_pragmas() == {
+        "temp_directory": "/tmp/x",
+        "max_temp_directory_size": "30GB",
+    }

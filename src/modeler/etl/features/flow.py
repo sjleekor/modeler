@@ -33,10 +33,20 @@ from __future__ import annotations
 import duckdb
 
 from modeler.etl.config import LakeConfig
-from modeler.etl.mart import materialize, register_mart_view
+from modeler.etl.mart import MartPlan, materialize, register_mart_view
 from modeler.etl.quality import short_regime_sql
 
 FLOW_TABLE = "feat_flow"
+
+#: Default: KRX-first ``ROW_NUMBER`` dedup over every raw row, then a conditional-aggregation
+#: pivot. This is the text every frozen mart was written under.
+PIVOT_PLAN_WINDOW = "window_dedup"
+#: Same rows from one ``GROUP BY`` with ``arg_min_null`` per metric code. It skips the
+#: window sort of the ~78M-row dedup. ``arg_min_null`` (not ``arg_min``) is required: the
+#: window version keeps a KRX row whose value is NULL, and ``arg_min`` would skip it and
+#: fall through to the PYKRX value.
+PIVOT_PLAN_ARGMIN = "argmin_pivot"
+PIVOT_PLANS = (PIVOT_PLAN_WINDOW, PIVOT_PLAN_ARGMIN)
 
 # The 7 metric_codes carried by krx_security_flow_raw (verified on the lake).
 METRIC_CODES: tuple[str, ...] = (
@@ -75,17 +85,36 @@ def _pivot_expr() -> str:
     return ",\n            ".join(cols)
 
 
+def _argmin_pivot_expr() -> str:
+    """KRX-first value per metric code, picked inside the ``GROUP BY`` (no dedup pass)."""
+    cols = []
+    for code in METRIC_CODES:
+        cols.append(
+            "arg_min_null(CAST(value AS DOUBLE), CASE source WHEN 'KRX' THEN 0 ELSE 1 END) "
+            f"FILTER (WHERE metric_code = '{code}') AS {code}"
+        )
+    return ",\n                ".join(cols)
+
+
 def build_flow_sql(
     flow_view: str = "krx_security_flow_raw",
     *,
     price_view: str | None = None,
     pit_view: str | None = None,
     quality_view: str | None = None,
+    pivot_plan: str = PIVOT_PLAN_WINDOW,
 ) -> str:
     """SQL producing ``feat_flow`` (dedup -> wide pivot -> derived features).
 
     ``flow_view`` must already be registered on the connection (hive=false).
+
+    ``pivot_plan`` only changes how the wide table is reached. ``window_dedup`` (the
+    default) is the original text; ``argmin_pivot`` returns the same rows with a
+    different text, so it is a :class:`~modeler.etl.mart.MartPlan`, never the cache
+    contract.
     """
+    if pivot_plan not in PIVOT_PLANS:
+        raise ValueError(f"unknown feat_flow pivot plan {pivot_plan!r}; expected {PIVOT_PLANS}")
     dedup = build_dedup_sql(flow_view)
     if price_view is None:
         # Degraded path (no price/quality data available): keep every flow
@@ -152,8 +181,17 @@ def build_flow_sql(
         f"LAG({c}) OVER (PARTITION BY ticker, market ORDER BY trade_date) AS {c}_lag1"
         for c in ratio_columns.replace(" ", "").split(",")
     )
-    return f"""
-        WITH dedup AS (
+    if pivot_plan == PIVOT_PLAN_ARGMIN:
+        wide_ctes = f"""wide AS (
+            -- one hash aggregation: the KRX-first value per (key, metric_code), no window sort
+            SELECT
+                trade_date, ticker, market,
+                {_argmin_pivot_expr()}
+            FROM {flow_view}
+            GROUP BY trade_date, ticker, market
+        )"""
+    else:
+        wide_ctes = f"""dedup AS (
             {dedup}
         ),
         wide AS (
@@ -162,7 +200,9 @@ def build_flow_sql(
                 {_pivot_expr()}
             FROM dedup
             GROUP BY trade_date, ticker, market
-        ),
+        )"""
+    return f"""
+        WITH {wide_ctes},
         {session_cte},
         flow_base AS (
             SELECT sessioned.*,
@@ -318,22 +358,33 @@ def materialize_flow(
     pit_view: str | None = None,
     quality_view: str | None = None,
     force: bool = False,
+    pivot_plan: str = PIVOT_PLAN_WINDOW,
 ) -> str:
     """Build + register ``feat_flow`` mart view. Returns the view name.
 
     Requires ``flow_view`` registered on ``con`` (hive=false — the lake reader
     enforces this so the KRX-first dedup is not neutralized, etl_01 §4.2).
+
+    ``pivot_plan="argmin_pivot"`` writes the mart from the single-aggregation text. The
+    cache contract stays the default text (``sql_hash`` unchanged); the metadata also
+    carries ``plan`` / ``plan_hash`` and the mart is only reused by a caller asking for
+    the same plan.
     """
+    kwargs = dict(
+        price_view=price_view, pit_view=pit_view, quality_view=quality_view,
+    )
+    plan = None
+    if pivot_plan != PIVOT_PLAN_WINDOW:
+        plan = MartPlan(
+            plan_id=pivot_plan,
+            final_sql=build_flow_sql(flow_view, **kwargs, pivot_plan=pivot_plan),
+        )
     materialize(
         con,
         config,
         FLOW_TABLE,
-        build_flow_sql(
-            flow_view,
-            price_view=price_view,
-            pit_view=pit_view,
-            quality_view=quality_view,
-        ),
+        build_flow_sql(flow_view, **kwargs),
         force=force,
+        plan=plan,
     )
     return register_mart_view(con, config, FLOW_TABLE)

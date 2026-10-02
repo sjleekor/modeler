@@ -24,14 +24,28 @@ from __future__ import annotations
 
 import duckdb
 from collector.kr.shared import (
+    CURRENT_METRIC_RULES_VERSION,
     MetricMappingRule,
     default_metric_catalog,
     default_metric_mapping_rules,
+    metric_rules_content_hash,
+    resolve_metric_rules_version,
 )
 
 from modeler.etl.lake import _sql_str_literal
+from modeler.etl.mart import MartPlan
 
 SMF_VIEW = "stock_metric_fact"
+
+#: Default: one join per source against the whole rule table with ``(col = '' OR ...)``
+#: wildcards, then ``QUALIFY ROW_NUMBER`` over every candidate. The text every frozen
+#: mart was written under.
+PLAN_SINGLE = "single"
+#: Same rows: each source joins its equality rules and its wildcard rules separately (so
+#: the equality branch is a hash join), and the winner is ``arg_min`` of a ``GROUP BY``
+#: instead of a window over all candidates.
+PLAN_SPLIT_ARGMIN = "split_argmin"
+PLANS = (PLAN_SINGLE, PLAN_SPLIT_ARGMIN)
 
 # reprt_code -> period_type / period_end, matching definitions.metric_rules.
 _PERIOD_TYPE_SQL = (
@@ -129,10 +143,30 @@ def build_stock_metric_fact_sql(
     shareholder_return_view: str = "dart_shareholder_return_raw",
     xbrl_view: str = "dart_xbrl_fact_raw",
     corp_view: str = "dart_corp_master",
+    plan: str = PLAN_SINGLE,
+    rules_version: str | None = None,
 ) -> str:
-    """SQL producing ``stock_metric_fact`` rows from the raw lake views."""
-    rules = default_metric_mapping_rules()
-    unit_by_code = {entry.metric_code: entry.unit for entry in default_metric_catalog()}
+    """SQL producing ``stock_metric_fact`` rows from the raw lake views.
+
+    ``rules_version`` picks the collector metric rule set (``None`` = current, the text every
+    caller got before versions existed; ``"mrv1_20260818"`` = the set the KR model was
+    trained under). It changes which rows exist, not how they are chosen.
+
+    ``plan`` picks how the same rows are reached; the default text is unchanged. The one
+    place the plans may differ is a tie on the whole winner key ``(priority,
+    candidate_rank, source_key)`` for a ``(ticker, metric_code, bsns_year, reprt_code)``
+    group, where both pick an arbitrary candidate.
+    """
+    if plan not in PLANS:
+        raise ValueError(f"unknown stock_metric_fact plan {plan!r}; expected {PLANS}")
+    split = plan == PLAN_SPLIT_ARGMIN
+    # No argument for the default so a caller that substitutes the rule list keeps working.
+    if rules_version is None:
+        rules, catalog = default_metric_mapping_rules(), default_metric_catalog()
+    else:
+        rules = default_metric_mapping_rules(rules_version)
+        catalog = default_metric_catalog(rules_version)
+    unit_by_code = {entry.metric_code: entry.unit for entry in catalog}
     rules_rel = _rules_relation_sql(rules, unit_by_code)
 
     period_type_fin = _period_type_expr("f.reprt_code")
@@ -149,17 +183,8 @@ def build_stock_metric_fact_sql(
         f"{_infer_period_end_expr('x.reprt_code', 'x.bsns_year')})"
     )
 
-    return f"""
-    WITH corp AS (
-        SELECT ticker, market, corp_code
-        FROM {corp_view}
-        WHERE is_active = TRUE
-          AND ticker IS NOT NULL AND ticker <> ''
-          AND market IS NOT NULL
-    ),
-    rule_rel AS (SELECT * FROM {rules_rel}),
-    candidates AS (
-        -- dart_financial_statement_raw (value_selector is always thstrm_amount)
+    def fin_block(rule_rel: str, lead: str) -> str:
+        return f"""-- dart_financial_statement_raw (value_selector is always thstrm_amount)
         SELECT
             c.ticker, c.market, c.corp_code,
             r.metric_code,
@@ -177,16 +202,16 @@ def build_stock_metric_fact_sql(
             0 AS candidate_rank
         FROM {financial_view} f
         JOIN corp c ON c.ticker = f.ticker
-        JOIN rule_rel r
-          ON r.source_table = 'dart_financial_statement_raw'
+        JOIN {rule_rel} r
+          ON {lead}r.source_table = 'dart_financial_statement_raw'
          AND (r.fs_div = '' OR f.fs_div = r.fs_div)
          AND (r.sj_div = '' OR f.sj_div = r.sj_div)
          AND (r.account_id = '' OR f.account_id = r.account_id)
          AND (r.account_nm = '' OR f.account_nm = r.account_nm)
-        WHERE f.thstrm_amount IS NOT NULL
+        WHERE f.thstrm_amount IS NOT NULL"""
 
-        UNION ALL
-        -- dart_share_count_raw (BIGINT selectors -> no-decimal value_text)
+    def share_block(rule_rel: str, lead: str) -> str:
+        return f"""-- dart_share_count_raw (BIGINT selectors -> no-decimal value_text)
         SELECT
             c.ticker, c.market, c.corp_code,
             r.metric_code,
@@ -214,16 +239,16 @@ def build_stock_metric_fact_sql(
             0 AS candidate_rank
         FROM {share_count_view} s
         JOIN corp c ON c.ticker = s.ticker
-        JOIN rule_rel r
-          ON r.source_table = 'dart_share_count_raw'
+        JOIN {rule_rel} r
+          ON {lead}r.source_table = 'dart_share_count_raw'
          AND (r.row_name = '' OR s.se = r.row_name)
         WHERE CASE r.value_selector
                   WHEN 'istc_totqy' THEN s.istc_totqy
                   WHEN 'tesstk_co' THEN s.tesstk_co
-              END IS NOT NULL
+              END IS NOT NULL"""
 
-        UNION ALL
-        -- dart_shareholder_return_raw
+    def return_block(rule_rel: str, lead: str) -> str:
+        return f"""-- dart_shareholder_return_raw
         SELECT
             c.ticker, c.market, c.corp_code,
             r.metric_code,
@@ -245,8 +270,8 @@ def build_stock_metric_fact_sql(
             0 AS candidate_rank
         FROM {shareholder_return_view} sr
         JOIN corp c ON c.ticker = sr.ticker
-        JOIN rule_rel r
-          ON r.source_table = 'dart_shareholder_return_raw'
+        JOIN {rule_rel} r
+          ON {lead}r.source_table = 'dart_shareholder_return_raw'
          AND (r.statement_type = '' OR sr.statement_type = r.statement_type)
          AND (r.row_name = '' OR sr.row_name = r.row_name)
          AND (r.stock_knd = '' OR sr.stock_knd = r.stock_knd)
@@ -254,10 +279,10 @@ def build_stock_metric_fact_sql(
          AND (r.dim2 = '' OR sr.dim2 = r.dim2)
          AND (r.dim3 = '' OR sr.dim3 = r.dim3)
          AND (r.metric_code_match = '' OR sr.metric_code = r.metric_code_match)
-        WHERE sr.value_numeric IS NOT NULL
+        WHERE sr.value_numeric IS NOT NULL"""
 
-        UNION ALL
-        -- dart_xbrl_fact_raw (candidate_rank from dimensions)
+    def xbrl_block(rule_rel: str, lead: str) -> str:
+        return f"""-- dart_xbrl_fact_raw (candidate_rank from dimensions)
         SELECT
             c.ticker, c.market, c.corp_code,
             r.metric_code,
@@ -275,15 +300,58 @@ def build_stock_metric_fact_sql(
             {_XBRL_RANK_SQL} AS candidate_rank
         FROM {xbrl_view} x
         JOIN corp c ON c.ticker = x.ticker
-        JOIN rule_rel r
-          ON r.source_table = 'dart_xbrl_fact_raw'
+        JOIN {rule_rel} r
+          ON {lead}r.source_table = 'dart_xbrl_fact_raw'
          AND (r.account_id = '' OR x.concept_id = r.account_id)
          AND (r.account_nm = ''
               OR x.label_ko = r.account_nm
               OR x.concept_name = r.account_nm)
-        WHERE x.value_numeric IS NOT NULL
-    )
-    SELECT
+        WHERE x.value_numeric IS NOT NULL"""
+
+    if split:
+        blocks = [
+            fin_block("rule_rel_eq_account_id", "r.account_id = f.account_id\n         AND "),
+            fin_block("rule_rel_wild_account_id", ""),
+            share_block("rule_rel_eq_row_name", "r.row_name = s.se\n         AND "),
+            share_block("rule_rel_wild_row_name", ""),
+            return_block("rule_rel_eq_row_name", "r.row_name = sr.row_name\n         AND "),
+            return_block("rule_rel_wild_row_name", ""),
+            xbrl_block("rule_rel_eq_account_id", "r.account_id = x.concept_id\n         AND "),
+            xbrl_block("rule_rel_wild_account_id", ""),
+        ]
+        rule_splits = """,
+    rule_rel_eq_account_id AS (SELECT * FROM rule_rel WHERE account_id <> ''),
+    rule_rel_wild_account_id AS (SELECT * FROM rule_rel WHERE account_id = ''),
+    rule_rel_eq_row_name AS (SELECT * FROM rule_rel WHERE row_name <> ''),
+    rule_rel_wild_row_name AS (SELECT * FROM rule_rel WHERE row_name = '')"""
+        winner = """SELECT
+        ticker, w.market, w.corp_code, metric_code, w.period_type, w.period_end,
+        bsns_year, reprt_code, w.fs_div, w.value_numeric, w.value_text, w.unit,
+        w.source_table, w.source_key, w.mapping_rule_code
+    FROM (
+        SELECT
+            ticker, metric_code, bsns_year, reprt_code,
+            arg_min(
+                struct_pack(market := market, corp_code := corp_code,
+                            period_type := period_type, period_end := period_end,
+                            fs_div := fs_div, value_numeric := value_numeric,
+                            value_text := value_text, unit := unit,
+                            source_table := source_table, source_key := source_key,
+                            mapping_rule_code := mapping_rule_code),
+                struct_pack(p := priority, r := candidate_rank, k := source_key)
+            ) AS w
+        FROM candidates
+        GROUP BY ticker, metric_code, bsns_year, reprt_code
+    )"""
+    else:
+        blocks = [
+            fin_block("rule_rel", ""),
+            share_block("rule_rel", ""),
+            return_block("rule_rel", ""),
+            xbrl_block("rule_rel", ""),
+        ]
+        rule_splits = ""
+        winner = """SELECT
         ticker, market, corp_code, metric_code, period_type, period_end,
         bsns_year, reprt_code, fs_div, value_numeric, value_text, unit,
         source_table, source_key, mapping_rule_code
@@ -291,14 +359,64 @@ def build_stock_metric_fact_sql(
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY ticker, metric_code, bsns_year, reprt_code
         ORDER BY priority ASC, candidate_rank ASC, source_key ASC
-    ) = 1
+    ) = 1"""
+    candidates = "\n\n        UNION ALL\n        ".join(blocks)
+
+    return f"""
+    WITH corp AS (
+        SELECT ticker, market, corp_code
+        FROM {corp_view}
+        WHERE is_active = TRUE
+          AND ticker IS NOT NULL AND ticker <> ''
+          AND market IS NOT NULL
+    ),
+    rule_rel AS (SELECT * FROM {rules_rel}){rule_splits},
+    candidates AS (
+        {candidates}
+    )
+    {winner}
     """
+
+
+def is_default_stock_metric_fact(plan: str, rules_version: str | None) -> bool:
+    """True for the definition every frozen research mart was written under."""
+    return plan == PLAN_SINGLE and (
+        rules_version is None
+        or resolve_metric_rules_version(rules_version) == CURRENT_METRIC_RULES_VERSION
+    )
+
+
+def stock_metric_fact_plan_record(
+    plan: str = PLAN_SINGLE, *, rules_version: str | None = None, **views: str
+) -> dict[str, str | None]:
+    """What a manifest records about how ``stock_metric_fact`` was computed.
+
+    ``stock_metric_fact`` lives in the derived-mart lake, not the feature mart, so it has
+    no ``_cache_metadata.json``. The default plan with the current rules records
+    ``plan_hash = None`` like every other legacy-text mart and carries no rules keys.
+    Anything else also records ``rules_version`` and ``rules_hash`` (sha256 of the rule and
+    catalog contents), so a mart built under other rules can never be mistaken for it.
+    """
+    record: dict[str, str | None] = {
+        "semantics_version": "v1", "plan": plan, "plan_hash": None,
+    }
+    if plan != PLAN_SINGLE:
+        record["plan_hash"] = MartPlan(
+            plan_id=plan,
+            final_sql=build_stock_metric_fact_sql(**views, plan=plan, rules_version=rules_version),
+        ).plan_hash
+    if not is_default_stock_metric_fact(plan, rules_version):
+        record["rules_version"] = resolve_metric_rules_version(rules_version)
+        record["rules_hash"] = metric_rules_content_hash(rules_version)
+    return record
 
 
 def register_stock_metric_fact_view(
     con: duckdb.DuckDBPyConnection,
     *,
     view_name: str = SMF_VIEW,
+    plan: str = PLAN_SINGLE,
+    rules_version: str | None = None,
     **views: str,
 ) -> str:
     """Register a DuckDB view computing ``stock_metric_fact`` from raw views.
@@ -306,6 +424,6 @@ def register_stock_metric_fact_view(
     Lightweight path (no parquet) for parity checks and direct consumers; the
     orchestrated pipeline materializes instead (heavy QUALIFY once per snapshot).
     """
-    sql = build_stock_metric_fact_sql(**views)
+    sql = build_stock_metric_fact_sql(**views, plan=plan, rules_version=rules_version)
     con.execute(f"CREATE OR REPLACE VIEW {view_name} AS {sql}")
     return view_name
