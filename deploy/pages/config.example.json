@@ -1,0 +1,9 @@
+{
+  "repository_confirmed": false,
+  "checkout_dir": "/srv/market-briefing-checkout",
+  "projection_dir": "/srv/market-briefing-output/public_projection",
+  "remote_name": "origin",
+  "expected_remote_url": "git@github.com:sjleekor/market-briefing.git",
+  "branch": "site",
+  "base_path": "/market-briefing/"
+}

@@ -1,0 +1,7 @@
+{
+  "schema_version": "us-expected-source.v1",
+  "reviewed_status": "unreviewed",
+  "source_reference": null,
+  "market_lag_limit_sessions": null,
+  "expected_session_by_report_date": {}
+}

@@ -1,0 +1,19 @@
+{
+  "schema_version": "daily-briefing-runtime.v1",
+  "python": "3.12.3",
+  "implementation": "CPython",
+  "system": "Linux",
+  "machine": "x86_64",
+  "packages": {
+    "numpy": "2.5.3",
+    "scipy": "1.18.1",
+    "pandas": "2.3.3",
+    "polars": "1.44.2",
+    "pyarrow": "25.0.1",
+    "scikit-learn": "1.9.1",
+    "lightgbm": "4.7.0",
+    "joblib": "1.6.0",
+    "duckdb": "1.5.5"
+  },
+  "evidence": "sj2 isolated venv used for golden and fixture verification on 2026-09-30"
+}

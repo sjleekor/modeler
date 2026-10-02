@@ -1,0 +1,44 @@
+{
+  "schema_version": "daily-briefing-release.v1",
+  "frozen": true,
+  "synthetic_fixture": false,
+  "release_root": null,
+  "jobs": [
+    {
+      "market": "KR",
+      "model_id": "kr_daily_h20_v1",
+      "model_version": null,
+      "entrypoint": "modeler.serving.adapters:infer_kr_daily",
+      "bundle_path": null,
+      "bundle_sha256": null,
+      "code_path": "src/modeler/serving/adapters.py",
+      "code_path_sha256": null,
+      "code_files": [],
+      "code_sha256": null
+    },
+    {
+      "market": "US",
+      "model_id": "us_exploratory_20260929_r1_lightgbm",
+      "model_version": null,
+      "entrypoint": "modeler.serving.adapters:infer_us_model",
+      "bundle_path": null,
+      "bundle_sha256": null,
+      "code_path": "src/modeler/serving/adapters.py",
+      "code_path_sha256": null,
+      "code_files": [],
+      "code_sha256": null
+    },
+    {
+      "market": "US",
+      "model_id": "us_exploratory_20260929_r1_ridge",
+      "model_version": null,
+      "entrypoint": "modeler.serving.adapters:infer_us_model",
+      "bundle_path": null,
+      "bundle_sha256": null,
+      "code_path": "src/modeler/serving/adapters.py",
+      "code_path_sha256": null,
+      "code_files": [],
+      "code_sha256": null
+    }
+  ]
+}

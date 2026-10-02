@@ -1,0 +1,83 @@
+name: Validate and deploy public site
+
+on:
+  push:
+    branches: [site]
+    paths: [public/**]
+  workflow_dispatch:
+    inputs:
+      allow_synthetic:
+        description: Allow public deployment of a clearly labeled synthetic fixture
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout site branch
+        uses: actions/checkout@REPLACE_WITH_REVIEWED_40_HEX_COMMIT_SHA
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Checkout reviewed validator source
+        uses: actions/checkout@REPLACE_WITH_REVIEWED_40_HEX_COMMIT_SHA
+        with:
+          ref: main
+          path: _validator
+      - name: Validate public projection and retained history
+        shell: bash
+        env:
+          ALLOW_SYNTHETIC: ${{ inputs.allow_synthetic }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_PATH: ${{ vars.PAGES_BASE_PATH }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${BASE_PATH:-}" ]]; then
+            echo "Repository variable PAGES_BASE_PATH must be configured" >&2
+            exit 1
+          fi
+          args=(--root public --base-path "${BASE_PATH}")
+          if [[ "${ALLOW_SYNTHETIC:-false}" == "true" ]]; then
+            args+=(--allow-synthetic)
+          fi
+          if [[ -n "${BEFORE_SHA:-}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            prior="${RUNNER_TEMP}/prior-public"
+            mkdir -p "${prior}"
+            git archive "${BEFORE_SHA}" public | tar -x -C "${prior}"
+            args+=(--compare-to "${prior}/public")
+          fi
+          python _validator/deploy/pages/validate_public_site.py "${args[@]}"
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout site branch
+        uses: actions/checkout@REPLACE_WITH_REVIEWED_40_HEX_COMMIT_SHA
+        with:
+          ref: ${{ github.sha }}
+      - name: Configure Pages
+        uses: actions/configure-pages@REPLACE_WITH_REVIEWED_40_HEX_COMMIT_SHA
+      - name: Upload static artifact
+        uses: actions/upload-pages-artifact@REPLACE_WITH_REVIEWED_40_HEX_COMMIT_SHA
+        with:
+          path: public
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@REPLACE_WITH_REVIEWED_40_HEX_COMMIT_SHA
