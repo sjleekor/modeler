@@ -13,6 +13,7 @@ from __future__ import annotations
 import polars as pl
 
 from modeler.us.features.fundamentals_ttm import (
+    RULE_LEGACY,
     REVENUE_TAGS,
     flow_ttm,
     instant_latest,
@@ -21,27 +22,29 @@ from modeler.us.features.fundamentals_ttm import (
 from modeler.us.lake import UsLake
 
 
-def add_profitability(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
+def add_profitability(
+    panel: pl.DataFrame, lake: UsLake, selection_rule: str = RULE_LEGACY
+) -> pl.DataFrame:
     """F6 피쳐 4개(``roa_ttm · roe_ttm · gpa · opm_ttm``) + ``_isna`` 4개를 붙인다."""
-    assets = instant_latest(panel, lake, "Assets").select(
+    assets = instant_latest(panel, lake, "Assets", selection_rule).select(
         "date", "symbol", pl.col("value").alias("assets")
     )
-    equity = instant_latest(panel, lake, "StockholdersEquity").select(
+    equity = instant_latest(panel, lake, "StockholdersEquity", selection_rule).select(
         "date", "symbol", pl.col("value").alias("equity")
     )
-    ni_ttm = flow_ttm(panel, lake, ["NetIncomeLoss"]).select(
+    ni_ttm = flow_ttm(panel, lake, ["NetIncomeLoss"], selection_rule).select(
         "date", "symbol", pl.col("value").alias("ni_ttm")
     )
-    revenue_ttm = flow_ttm(panel, lake, list(REVENUE_TAGS)).select(
+    revenue_ttm = flow_ttm(panel, lake, list(REVENUE_TAGS), selection_rule).select(
         "date", "symbol", pl.col("value").alias("revenue_ttm")
     )
-    gross_profit_ttm = flow_ttm(panel, lake, ["GrossProfit"]).select(
+    gross_profit_ttm = flow_ttm(panel, lake, ["GrossProfit"], selection_rule).select(
         "date", "symbol", pl.col("value").alias("gross_profit_ttm")
     )
-    cost_of_revenue_ttm = flow_ttm(panel, lake, ["CostOfRevenue"]).select(
+    cost_of_revenue_ttm = flow_ttm(panel, lake, ["CostOfRevenue"], selection_rule).select(
         "date", "symbol", pl.col("value").alias("cost_of_revenue_ttm")
     )
-    operating_income_ttm = flow_ttm(panel, lake, ["OperatingIncomeLoss"]).select(
+    operating_income_ttm = flow_ttm(panel, lake, ["OperatingIncomeLoss"], selection_rule).select(
         "date", "symbol", pl.col("value").alias("operating_income_ttm")
     )
 

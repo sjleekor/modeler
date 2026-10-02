@@ -15,6 +15,7 @@ from __future__ import annotations
 import polars as pl
 
 from modeler.us.features.fundamentals_ttm import (
+    RULE_LEGACY,
     REVENUE_TAGS,
     flow_ttm,
     instant_latest,
@@ -24,23 +25,25 @@ from modeler.us.features.fundamentals_ttm import (
 from modeler.us.lake import UsLake
 
 
-def add_valuation(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
+def add_valuation(
+    panel: pl.DataFrame, lake: UsLake, selection_rule: str = RULE_LEGACY
+) -> pl.DataFrame:
     """``panel``의 (date, symbol)을 그대로 두고 F5 피쳐 4개 + ``_isna`` 4개를 붙인다.
 
     ``bm · ep_ttm · cfp_ttm · sp_ttm``.
     """
-    mcap = market_cap(panel, lake).select("date", "symbol", "mcap")
+    mcap = market_cap(panel, lake, selection_rule).select("date", "symbol", "mcap")
 
-    equity = instant_latest(panel, lake, "StockholdersEquity").select(
+    equity = instant_latest(panel, lake, "StockholdersEquity", selection_rule).select(
         "date", "symbol", pl.col("value").alias("equity")
     )
-    ni_ttm = flow_ttm(panel, lake, ["NetIncomeLoss"]).select(
+    ni_ttm = flow_ttm(panel, lake, ["NetIncomeLoss"], selection_rule).select(
         "date", "symbol", pl.col("value").alias("ni_ttm")
     )
-    ocf_ttm = flow_ttm(panel, lake, ["NetCashProvidedByUsedInOperatingActivities"]).select(
+    ocf_ttm = flow_ttm(panel, lake, ["NetCashProvidedByUsedInOperatingActivities"], selection_rule).select(
         "date", "symbol", pl.col("value").alias("ocf_ttm")
     )
-    revenue_ttm = flow_ttm(panel, lake, list(REVENUE_TAGS)).select(
+    revenue_ttm = flow_ttm(panel, lake, list(REVENUE_TAGS), selection_rule).select(
         "date", "symbol", pl.col("value").alias("revenue_ttm")
     )
 

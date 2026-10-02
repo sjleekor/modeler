@@ -84,6 +84,35 @@ _QUARTER_SPAN_DAYS: dict[str, tuple[int, int, int]] = {
 #: 빠진 분기가 있다는 뜻이라 TTM을 내지 않는다.
 _TTM_SPAN_DAYS = (200, 420)
 
+#: 선택 규칙. ``legacy``는 기존 동작(같은 ``filed`` 행과 q_end 동률을 입력 순서가 정한다)이고
+#: 연구 경로의 기본값이다. ``det_a``는 서빙용 결정적 규칙 A다
+#: (``us_fundamental_determinism_design.md`` 2장):
+#:
+#: * 같은 ``filed``의 행은 ``(accn, 정정본 여부, unit이 USD·shares인지, val)`` 오름차순의
+#:   마지막 행을 고른다.
+#: * q_end 동률은 ``start`` 내림차순, ``q_val`` 오름차순으로 정하고 ``head(4)``는 그대로다.
+#: * unit은 거르지 않는다(비USD 행도 기존처럼 들어간다).
+RULE_LEGACY = "legacy"
+RULE_DET_A = "det_a"
+SELECTION_RULES: tuple[str, ...] = (RULE_LEGACY, RULE_DET_A)
+
+_AMENDMENT_FORMS = ["10-K/A", "10-Q/A"]
+_UNIT_PREFERRED = ["USD", "shares"]
+
+
+def check_rule(rule: str) -> str:
+    if rule not in SELECTION_RULES:
+        raise ValueError(f"지원하지 않는 재무 선택 규칙입니다: {rule!r}")
+    return rule
+
+
+def _order_columns() -> list[pl.Expr]:
+    """det_a가 같은 ``filed`` 안에서 행을 전순서로 만드는 보조 열."""
+    return [
+        pl.col("form").is_in(_AMENDMENT_FORMS).cast(pl.Int8).alias("_frank"),
+        pl.col("unit").is_in(_UNIT_PREFERRED).cast(pl.Int8).alias("_upref"),
+    ]
+
 
 def _qseq_expr() -> pl.Expr:
     span = (pl.col("end") - pl.col("start")).dt.total_days()
@@ -109,7 +138,7 @@ def _dates_cik(panel: pl.DataFrame) -> pl.DataFrame:
     return panel.select("date", "cik").filter(pl.col("cik").is_not_null()).unique()
 
 
-def _quarter_facts(lake: UsLake, tags: Sequence[str]) -> pl.DataFrame:
+def _quarter_facts(lake: UsLake, tags: Sequence[str], rule: str = RULE_LEGACY) -> pl.DataFrame:
     """분기 판정을 마친 (cik, start, end, qseq, filed, val) 후보.
 
     ``tags``는 폴백 우선순위(앞이 우선)다 — 매출의 ``Revenues`` ∪
@@ -120,17 +149,20 @@ def _quarter_facts(lake: UsLake, tags: Sequence[str]) -> pl.DataFrame:
     (정정본) — 여기서는 지우지 않는다. "이 시점에 무엇이 보였나"는 호출자가
     ``t``별로 고른다(``_asof_latest``).
     """
+    det = rule == RULE_DET_A
     lf = lake.scan("fundamentals").filter(
         pl.col("tag").is_in(list(tags)) & pl.col("start").is_not_null()
     )
-    df = (
-        lf.select("cik", "tag", "fp", "start", "end", "val", "filed")
-        .with_columns(_qseq_expr())
-        .filter(pl.col("qseq").is_not_null())
-        .collect()
-    )
+    cols = ["cik", "tag", "fp", "start", "end", "val", "filed"]
+    keep = ["cik", "start", "end", "qseq", "filed", "val"]
+    if det:
+        cols += ["accn", "form", "unit"]
+        keep += ["accn", "_frank", "_upref"]
+    df = lf.select(*cols).with_columns(_qseq_expr()).filter(pl.col("qseq").is_not_null()).collect()
+    if det:
+        df = df.with_columns(_order_columns())
     if df.is_empty():
-        return df.select("cik", "start", "end", "qseq", "filed", "val")
+        return df.select(*keep)
 
     tag_rank = {tag: rank for rank, tag in enumerate(tags)}
     df = df.with_columns(
@@ -142,10 +174,15 @@ def _quarter_facts(lake: UsLake, tags: Sequence[str]) -> pl.DataFrame:
     df = df.join(best_rank, on=["cik", "start", "end", "qseq"], how="left").filter(
         pl.col("_tag_rank") == pl.col("_best_rank")
     )
-    return df.select("cik", "start", "end", "qseq", "filed", "val")
+    return df.select(*keep)
 
 
-def _asof_latest(dates_cik: pl.DataFrame, facts: pl.DataFrame, key_cols: list[str]) -> pl.DataFrame:
+def _asof_latest(
+    dates_cik: pl.DataFrame,
+    facts: pl.DataFrame,
+    key_cols: list[str],
+    rule: str = RULE_LEGACY,
+) -> pl.DataFrame:
     """``dates_cik``(date, cik)마다, ``key_cols``로 식별되는 슬롯별로
     ``filed <= date``인 것 중 ``filed``가 최신인 행을 고른다.
 
@@ -159,7 +196,12 @@ def _asof_latest(dates_cik: pl.DataFrame, facts: pl.DataFrame, key_cols: list[st
     candidates = dates_cik.join(facts, on="cik", how="inner").filter(
         pl.col("filed") <= pl.col("date")
     )
-    candidates = candidates.sort(["date", "cik", *key_cols, "filed"])
+    if rule == RULE_DET_A:
+        candidates = candidates.sort(
+            ["date", "cik", *key_cols, "filed", "accn", "_frank", "_upref", "val"]
+        )
+    else:
+        candidates = candidates.sort(["date", "cik", *key_cols, "filed"])
     return candidates.group_by(["date", "cik", *key_cols], maintain_order=True).last()
 
 
@@ -169,7 +211,9 @@ def _empty_result() -> pl.DataFrame:
     )
 
 
-def flow_ttm(panel: pl.DataFrame, lake: UsLake, tags: Sequence[str]) -> pl.DataFrame:
+def flow_ttm(
+    panel: pl.DataFrame, lake: UsLake, tags: Sequence[str], rule: str = RULE_LEGACY
+) -> pl.DataFrame:
     """(date, symbol)별 trailing-4-quarter 합.
 
     ``tags``는 폴백 우선순위 리스트(앞이 우선) — 매출처럼 태그가 갈리는
@@ -178,9 +222,10 @@ def flow_ttm(panel: pl.DataFrame, lake: UsLake, tags: Sequence[str]) -> pl.DataF
     반환: ``date, symbol, value, isna``. ``value``는 4분기가 인접하게
     갖춰지지 않으면(워밍업·결측·중간에 빈 분기) null이고 ``isna``가 True다.
     """
+    check_rule(rule)
     dates_cik = _dates_cik(panel)
-    facts = _quarter_facts(lake, tags)
-    best = _asof_latest(dates_cik, facts, ["start", "end", "qseq"])
+    facts = _quarter_facts(lake, tags, rule)
+    best = _asof_latest(dates_cik, facts, ["start", "end", "qseq"], rule)
     if not best.is_empty():
         # 드물게 같은 (date, cik, start, qseq)에 end가 다른 두 슬롯이 남을 수
         # 있다(예: 회계연도 끝이 며칠 밀린 변칙 신고) — pivot이 셀당 값 하나를
@@ -234,10 +279,15 @@ def flow_ttm(panel: pl.DataFrame, lake: UsLake, tags: Sequence[str]) -> pl.DataF
         (pl.col("fy_val") - pl.col("q3cum")).alias("q4"),
     )
 
+    det = rule == RULE_DET_A
     long = pl.concat(
         [
             combined.select(
-                "date", "cik", pl.col(end_col).alias("q_end"), pl.col(val_col).alias("q_val")
+                "date",
+                "cik",
+                *(["start"] if det else []),
+                pl.col(end_col).alias("q_end"),
+                pl.col(val_col).alias("q_val"),
             )
             for val_col, end_col in [("q1", "end1"), ("q2", "end2"), ("q3", "end3"), ("q4", "end4")]
         ]
@@ -246,7 +296,14 @@ def flow_ttm(panel: pl.DataFrame, lake: UsLake, tags: Sequence[str]) -> pl.DataF
     if long.is_empty():
         ttm = pl.DataFrame(schema={"date": pl.Date, "cik": pl.Int64, "value": pl.Float64})
     else:
-        long = long.sort(["date", "cik", "q_end"], descending=[False, False, True])
+        if det:
+            # q_end 동률은 start 내림차순, q_val 오름차순으로 정해 입력 순서와 무관하게 한다.
+            long = long.sort(
+                ["date", "cik", "q_end", "start", "q_val"],
+                descending=[False, False, True, True, False],
+            )
+        else:
+            long = long.sort(["date", "cik", "q_end"], descending=[False, False, True])
         top4 = long.group_by(["date", "cik"], maintain_order=True).head(4)
         agg = top4.group_by(["date", "cik"]).agg(
             pl.col("q_val").sum().alias("value"),
@@ -271,20 +328,32 @@ def flow_ttm(panel: pl.DataFrame, lake: UsLake, tags: Sequence[str]) -> pl.DataF
     )
 
 
-def _instant_facts(lake: UsLake, tag: str) -> pl.DataFrame:
-    """(cik, end, filed, val) — 잔액표(순간값) 태그. ``start``가 null인 행만이다."""
+def _instant_facts(lake: UsLake, tag: str, rule: str = RULE_LEGACY) -> pl.DataFrame:
+    """(cik, end, filed, val) — 잔액표(순간값) 태그. ``start``가 null인 행만이다.
+
+    ``det_a``는 같은 ``filed`` 안의 전순서를 만들 ``accn``과 보조 열을 더 싣는다."""
     lf = lake.scan("fundamentals").filter((pl.col("tag") == tag) & pl.col("start").is_null())
+    if rule == RULE_DET_A:
+        return (
+            lf.select("cik", "end", "val", "filed", "accn", "form", "unit")
+            .with_columns(_order_columns())
+            .select("cik", "end", "val", "filed", "accn", "_frank", "_upref")
+            .collect()
+        )
     return lf.select("cik", "end", "val", "filed").collect()
 
 
-def instant_latest(panel: pl.DataFrame, lake: UsLake, tag: str) -> pl.DataFrame:
+def instant_latest(
+    panel: pl.DataFrame, lake: UsLake, tag: str, rule: str = RULE_LEGACY
+) -> pl.DataFrame:
     """(date, symbol)별 t 시점에 알려진 가장 최근 보고기간의 잔액표 값.
 
     반환: ``date, symbol, value, isna``.
     """
+    check_rule(rule)
     dates_cik = _dates_cik(panel)
-    facts = _instant_facts(lake, tag)
-    best = _asof_latest(dates_cik, facts, ["end"])
+    facts = _instant_facts(lake, tag, rule)
+    best = _asof_latest(dates_cik, facts, ["end"], rule)
     if best.is_empty():
         latest = pl.DataFrame(schema={"date": pl.Date, "cik": pl.Int64, "value": pl.Float64})
     else:
@@ -300,7 +369,9 @@ def instant_latest(panel: pl.DataFrame, lake: UsLake, tag: str) -> pl.DataFrame:
     )
 
 
-def instant_yoy_pair(panel: pl.DataFrame, lake: UsLake, tag: str) -> pl.DataFrame:
+def instant_yoy_pair(
+    panel: pl.DataFrame, lake: UsLake, tag: str, rule: str = RULE_LEGACY
+) -> pl.DataFrame:
     """(date, symbol)별 최신 잔액표 값과 그 약 1년 전 값.
 
     "1년 전"은 달력 365일이 아니라, 최신 보고기간(``end``)보다 300\\~430일
@@ -310,9 +381,10 @@ def instant_yoy_pair(panel: pl.DataFrame, lake: UsLake, tag: str) -> pl.DataFram
     반환: ``date, symbol, cur_val, prior_val`` — 성장률·변화율은 호출자가
     계산한다(분모가 0이거나 음수인 경우의 처리가 피쳐마다 다를 수 있어서다).
     """
+    check_rule(rule)
     dates_cik = _dates_cik(panel)
-    facts = _instant_facts(lake, tag)
-    best = _asof_latest(dates_cik, facts, ["end"])
+    facts = _instant_facts(lake, tag, rule)
+    best = _asof_latest(dates_cik, facts, ["end"], rule)
     if best.is_empty():
         current = pl.DataFrame(
             schema={"date": pl.Date, "cik": pl.Int64, "cur_end": pl.Date, "cur_val": pl.Float64}
@@ -339,14 +411,14 @@ def instant_yoy_pair(panel: pl.DataFrame, lake: UsLake, tag: str) -> pl.DataFram
     return result.select("date", "symbol", "cur_val", "prior_val")
 
 
-def market_cap(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
+def market_cap(panel: pl.DataFrame, lake: UsLake, rule: str = RULE_LEGACY) -> pl.DataFrame:
     """(date, symbol)별 시총 근사 — ``EntityCommonStockSharesOutstanding``(최신
     ``filed <= t``) × 그날 원시 종가(``panel.close``). 분기 계단이 있으므로
     (``07_risks.md`` Y6) 절대값 피쳐로 쓰지 않는다 — 순위화는 호출자 몫이다.
 
     반환: ``date, symbol, mcap, isna``.
     """
-    shares = instant_latest(panel, lake, "EntityCommonStockSharesOutstanding")
+    shares = instant_latest(panel, lake, "EntityCommonStockSharesOutstanding", rule)
     out = panel.select("date", "symbol", "close").join(
         shares.select("date", "symbol", "value"), on=["date", "symbol"], how="left"
     )

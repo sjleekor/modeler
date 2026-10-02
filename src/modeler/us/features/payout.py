@@ -16,7 +16,14 @@ from datetime import timedelta
 
 import polars as pl
 
-from modeler.us.features.fundamentals_ttm import flow_ttm, market_cap, safe_ratio
+from modeler.us.features.fundamentals_ttm import (
+    RULE_DET_A,
+    RULE_LEGACY,
+    check_rule,
+    flow_ttm,
+    market_cap,
+    safe_ratio,
+)
 from modeler.us.lake import UsLake
 
 #: 지난 12개월 창. 달력 365일 — corp_actions의 ex_date는 공표일 자체라
@@ -24,7 +31,9 @@ from modeler.us.lake import UsLake
 _TRAILING_DAYS = 365
 
 
-def _dividend_ttm(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
+def _dividend_ttm(
+    panel: pl.DataFrame, lake: UsLake, selection_rule: str = RULE_LEGACY
+) -> pl.DataFrame:
     """(date, symbol)별 지난 12개월(``ex_date <= t`` ∧ ``ex_date > t - 365일``) 배당 합."""
     dividends = (
         lake.scan("corp_actions")
@@ -40,6 +49,10 @@ def _dividend_ttm(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
         (pl.col("ex_date") <= pl.col("date"))
         & (pl.col("ex_date") > pl.col("date") - timedelta(days=_TRAILING_DAYS))
     )
+    if selection_rule == RULE_DET_A:
+        # 부동소수점 합은 더하는 순서에 따라 마지막 비트가 달라진다. 서빙 규칙은 입력 행 순서·
+        # join 순서와 무관하게 같은 값이 나오도록 명시 key로 정렬한 뒤 합한다.
+        candidates = candidates.sort(["date", "symbol", "ex_date", "amount"])
     summed = candidates.group_by(["date", "symbol"]).agg(pl.col("amount").sum().alias("div_sum"))
 
     out = panel.select("date", "symbol").join(summed, on=["date", "symbol"], how="left")
@@ -47,11 +60,14 @@ def _dividend_ttm(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
     return out.with_columns(pl.col("div_sum").fill_null(0.0))
 
 
-def add_payout(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
+def add_payout(
+    panel: pl.DataFrame, lake: UsLake, selection_rule: str = RULE_LEGACY
+) -> pl.DataFrame:
     """F8 피쳐 2개(``div_yield · buyback_yield``) + ``_isna`` 2개를 붙인다."""
-    div_sum = _dividend_ttm(panel, lake)
-    mcap = market_cap(panel, lake).select("date", "symbol", "mcap")
-    buyback_ttm = flow_ttm(panel, lake, ["PaymentsForRepurchaseOfCommonStock"]).select(
+    check_rule(selection_rule)
+    div_sum = _dividend_ttm(panel, lake, selection_rule)
+    mcap = market_cap(panel, lake, selection_rule).select("date", "symbol", "mcap")
+    buyback_ttm = flow_ttm(panel, lake, ["PaymentsForRepurchaseOfCommonStock"], selection_rule).select(
         "date", "symbol", pl.col("value").alias("buyback_ttm")
     )
 

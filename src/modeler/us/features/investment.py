@@ -11,6 +11,7 @@ from __future__ import annotations
 import polars as pl
 
 from modeler.us.features.fundamentals_ttm import (
+    RULE_LEGACY,
     flow_ttm,
     instant_latest,
     instant_yoy_pair,
@@ -19,27 +20,29 @@ from modeler.us.features.fundamentals_ttm import (
 from modeler.us.lake import UsLake
 
 
-def add_investment(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
+def add_investment(
+    panel: pl.DataFrame, lake: UsLake, selection_rule: str = RULE_LEGACY
+) -> pl.DataFrame:
     """F7 피쳐 3개(``asset_growth · accruals · net_issuance``) + ``_isna`` 3개를 붙인다."""
-    assets_pair = instant_yoy_pair(panel, lake, "Assets").select(
+    assets_pair = instant_yoy_pair(panel, lake, "Assets", selection_rule).select(
         "date",
         "symbol",
         pl.col("cur_val").alias("assets_cur"),
         pl.col("prior_val").alias("assets_prior"),
     )
-    assets_latest = instant_latest(panel, lake, "Assets").select(
+    assets_latest = instant_latest(panel, lake, "Assets", selection_rule).select(
         "date", "symbol", pl.col("value").alias("assets")
     )
-    shares_pair = instant_yoy_pair(panel, lake, "EntityCommonStockSharesOutstanding").select(
+    shares_pair = instant_yoy_pair(panel, lake, "EntityCommonStockSharesOutstanding", selection_rule).select(
         "date",
         "symbol",
         pl.col("cur_val").alias("shares_cur"),
         pl.col("prior_val").alias("shares_prior"),
     )
-    ni_ttm = flow_ttm(panel, lake, ["NetIncomeLoss"]).select(
+    ni_ttm = flow_ttm(panel, lake, ["NetIncomeLoss"], selection_rule).select(
         "date", "symbol", pl.col("value").alias("ni_ttm")
     )
-    ocf_ttm = flow_ttm(panel, lake, ["NetCashProvidedByUsedInOperatingActivities"]).select(
+    ocf_ttm = flow_ttm(panel, lake, ["NetCashProvidedByUsedInOperatingActivities"], selection_rule).select(
         "date", "symbol", pl.col("value").alias("ocf_ttm")
     )
 
