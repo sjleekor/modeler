@@ -63,6 +63,11 @@ SERVING_MARTS = REQUIRED_PREP_MARTS
 # server disk once. Callers may raise or lower it, never remove it.
 DEFAULT_MAX_TEMP_SIZE = "30GB"
 TEMP_PARENT_NAME = "_duckdb_tmp"
+# Raw export marker policies (collector bin/raw-parquet-export-all.sh). The exported-snapshot
+# policy (collector v0.15.17 --consistent-snapshot) reads every table from one PostgreSQL
+# snapshot, so each table manifest must name the marker's snapshot id.
+RAW_POLICY_PER_CHUNK = "read_committed_per_chunk"
+RAW_POLICY_EXPORTED_SNAPSHOT = "repeatable_read_exported_snapshot"
 # Which version of each shared mart the serving builder selects. The research and frozen
 # paths keep their own defaults (v1 / single / or-join): these are not defaults anywhere else.
 # A "plan" computes the same rows faster; a "semantics" version changes what the mart means.
@@ -261,7 +266,13 @@ def verify_raw(config: LakeConfig, *, cutoff: datetime, feature_asof_date: str) 
     expected = set(RAW_TABLES) | set(CONFIG_TABLES)
     if set(body.get("tables", {})) != expected:
         raise ValueError("KR raw export table set is incomplete or unexpected")
-    if body.get("snapshot_policy") != "read_committed_per_chunk":
+    policy = body.get("snapshot_policy")
+    pg_snapshot_id = None
+    if policy == RAW_POLICY_EXPORTED_SNAPSHOT:
+        pg_snapshot_id = body.get("pg_snapshot_id")
+        if not pg_snapshot_id:
+            raise ValueError("KR raw export marker has no pg_snapshot_id")
+    elif policy != RAW_POLICY_PER_CHUNK:
         raise ValueError("KR raw export snapshot policy differs from the collector contract")
     for name, entry in body["tables"].items():
         expected_path = config.raw_root / "_manifests" / "table_manifests" / f"{name}.json"
@@ -276,6 +287,10 @@ def verify_raw(config: LakeConfig, *, cutoff: datetime, feature_asof_date: str) 
                 or table.get("name") != name or entry.get("rows_exported") != table.get("rows_exported")
                 or entry.get("schema_hash") != (table.get("schema") or {}).get("hash")):
             raise ValueError(f"KR raw export table manifest does not match snapshot/source: {name}")
+        if pg_snapshot_id is not None and (
+                source.get("snapshot_policy") != RAW_POLICY_EXPORTED_SNAPSHOT
+                or source.get("pg_snapshot_id") != pg_snapshot_id):
+            raise ValueError(f"KR raw export table was not read from the marker's snapshot: {name}")
     stamp = datetime.fromisoformat(body.get("finished_at", "").replace("Z", "+00:00"))
     if stamp.tzinfo is None or stamp.utcoffset() is None or stamp > cutoff:
         raise ValueError("KR raw export has no verified completion by input cutoff")

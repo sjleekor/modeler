@@ -39,24 +39,60 @@ def test_packaged_holiday_calendar_is_read_when_present() -> None:
     assert record["name"] == live.HOLIDAY_CALENDAR_NAME and record["row_count"] > 0
 
 
-def _raw_marker(config: LakeConfig, *, tables: set[str] | None = None, route: str = "remote") -> Path:
+def _raw_marker(
+    config: LakeConfig, *, tables: set[str] | None = None, route: str = "remote",
+    pg_snapshot_id: str | None = None,
+) -> Path:
     path = config.raw_root / "_manifests" / "_SUCCESS.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     selected = tables if tables is not None else set(RAW_TABLES) | set(CONFIG_TABLES)
     entries = {}
+    source = {"name": REMOTE_SOURCE, "snapshot_date": config.snapshot_date}
+    if pg_snapshot_id is not None:
+        source |= {"snapshot_policy": live.RAW_POLICY_EXPORTED_SNAPSHOT,
+                   "pg_snapshot_id": pg_snapshot_id}
     for name in selected:
         detail_path = path.parent / "table_manifests" / f"{name}.json"
         detail_path.parent.mkdir(parents=True, exist_ok=True)
         detail_path.write_text(json.dumps({
-            "source": {"name": REMOTE_SOURCE, "snapshot_date": config.snapshot_date},
+            "source": source,
             "table": {"name": name, "rows_exported": 1, "schema": {"hash": "fixture"}},
         }))
         entries[name] = {"manifest_path": str(detail_path), "rows_exported": 1, "schema_hash": "fixture"}
-    path.write_text(json.dumps({
+    body = {
         "route": route, "finished_at": "2026-09-30T00:30:00+09:00",
-        "snapshot_policy": "read_committed_per_chunk", "tables": entries,
-    }))
+        "snapshot_policy": live.RAW_POLICY_PER_CHUNK, "tables": entries,
+    }
+    if pg_snapshot_id is not None:
+        body |= {"snapshot_policy": live.RAW_POLICY_EXPORTED_SNAPSHOT,
+                 "pg_snapshot_id": pg_snapshot_id}
+    path.write_text(json.dumps(body))
     return path
+
+
+def test_raw_capture_accepts_one_exported_snapshot_for_every_table(tmp_path: Path) -> None:
+    from datetime import datetime
+
+    config = LakeConfig(DataRoot(tmp_path / "kr"), "2026-09-30", REMOTE_SOURCE)
+    cutoff = datetime.fromisoformat("2026-10-01T09:30:00+09:00")
+    marker = _raw_marker(config, pg_snapshot_id="00000003-0000002A-1")
+    digest = live.verify_raw(config, cutoff=cutoff, feature_asof_date="2026-09-30")
+    assert digest == live._sha256(marker)
+    detail = config.raw_root / "_manifests" / "table_manifests" / "daily_ohlcv.json"
+    changed = json.loads(detail.read_text())
+    changed["source"]["pg_snapshot_id"] = "00000003-0000002B-1"
+    detail.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="marker's snapshot"):
+        live.verify_raw(config, cutoff=cutoff, feature_asof_date="2026-09-30")
+    body = json.loads(marker.read_text())
+    body.pop("pg_snapshot_id")
+    marker.write_text(json.dumps(body))
+    with pytest.raises(ValueError, match="no pg_snapshot_id"):
+        live.verify_raw(config, cutoff=cutoff, feature_asof_date="2026-09-30")
+    body["snapshot_policy"] = "something_else"
+    marker.write_text(json.dumps(body))
+    with pytest.raises(ValueError, match="snapshot policy"):
+        live.verify_raw(config, cutoff=cutoff, feature_asof_date="2026-09-30")
 
 
 def test_raw_capture_requires_full_remote_completed_table_set(tmp_path: Path) -> None:
