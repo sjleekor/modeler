@@ -60,8 +60,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 result = monitor_stage(config, day, attempt=args.attempt)
                 states = {"monitor": result["status"]}
-                failed = result["status"] not in {"verified", "verified_withheld", "publication_withheld",
-                                                   "holiday_skipped"}
+                failed = result["status"] not in {"verified", "publication_withheld", "holiday_skipped"}
         print(json.dumps({"report_date": day.isoformat(), "stages": states}, sort_keys=True))
         return int(failed)
     except Exception as exc:

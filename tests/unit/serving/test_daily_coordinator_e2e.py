@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from modeler.serving.orchestration import code_inventory_sha256
+from modeler.serving.runtime_contract import PROBE
 
 D = date(2026, 9, 29)
 PROJECT = Path(__file__).resolve().parents[3]
@@ -27,7 +29,7 @@ MODULES = (
     "modeler/serving/daily_opening.py",
     "modeler/serving/opening_prepare.py",
     "modeler/serving/runtime_contract.py", "modeler/reporting/__init__.py",
-    "modeler/reporting/site.py",
+    "modeler/reporting/site.py", "modeler/reporting/markdown.py",
 )
 ADAPTER = '''from modeler.serving.schema import report_template
 
@@ -81,6 +83,28 @@ def _native(prepared: Path, market: str) -> None:
         "features_sha256": _sha(feature), "native_prepare_manifest_sha256": _sha(native)})
 
 
+def _runtime_manifest(target: Path) -> None:
+    """Write the frozen runtime contract these synthetic releases pin.
+
+    The checked-in manifest records the sj2 venv (Linux x86_64).  On the same OS and CPU it is
+    copied as is, so version drift in that venv still fails here.  On another platform (a Mac) the
+    interpreter identity can never match it, which used to fail every coordinator test before the
+    flow under test even ran.  There the contract is taken from the running interpreter instead.
+    DAILY_E2E_PROBE_RUNTIME=1 forces that on any platform.
+    """
+    pinned = PROJECT / "deploy" / "prod" / "runtime-verified-sj2-20260930.json"
+    recorded = json.loads(pinned.read_text(encoding="utf-8"))
+    same_platform = (recorded["system"], recorded["machine"]) == (
+        platform.system(), platform.machine())
+    if same_platform and os.environ.get("DAILY_E2E_PROBE_RUNTIME") != "1":
+        shutil.copy2(pinned, target)
+        return
+    probe = subprocess.run([sys.executable, "-c", PROBE], capture_output=True, text=True,
+                           check=True)
+    body = {"schema_version": "daily-briefing-runtime.v1", **json.loads(probe.stdout)}
+    target.write_text(json.dumps(body, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def _setup(tmp_path: Path) -> tuple[Path, Path]:
     release = tmp_path / "frozen-release"
     source = release / "src"
@@ -91,8 +115,7 @@ def _setup(tmp_path: Path) -> tuple[Path, Path]:
     adapter = source / "modeler" / "serving" / "adapters.py"
     adapter.write_text(ADAPTER)
     shutil.copy2(PROJECT / "uv.lock", release / "uv.lock")
-    shutil.copy2(PROJECT / "deploy" / "prod" / "runtime-verified-sj2-20260930.json",
-                 release / "runtime.json")
+    _runtime_manifest(release / "runtime.json")
     cards = _write(release / "model-cards.json", {
         model_id: {"title": model_id, "summary": "Synthetic fixture model card."}
         for model_id in ("kr_daily_h20_v1", "us_exploratory_20260929_r1_lightgbm",
@@ -126,18 +149,17 @@ def _setup(tmp_path: Path) -> tuple[Path, Path]:
         "market_lag_limit_sessions": 1})
     config = _write(tmp_path / "ops.json", {"schema_version": "daily-briefing-ops.v1",
         "prepared_root": str(prepared), "selection_root": str(prepared / "selections"),
-        "run_root": str(tmp_path / "runs"), "projection_root": str(tmp_path / "site"),
-        "previous_projection_dir": None, "release_manifest": str(release_manifest),
+        "run_root": str(tmp_path / "runs"), "release_manifest": str(release_manifest),
         "python": sys.executable, "python_sha256": _sha(Path(sys.executable)),
         "runtime_lock": str(release / "uv.lock"), "runtime_lock_sha256": _sha(release / "uv.lock"),
         "runtime_manifest": str(release / "runtime.json"), "runtime_manifest_sha256": _sha(release / "runtime.json"),
         "model_cards_path": str(cards), "model_cards_sha256": _sha(cards),
         "kr_calendar": str(kr_calendar), "us_calendar": str(us_calendar),
         "us_expected_source": str(expected), "opening_artifact": None,
-        "base_path": "/market-briefing/", "publisher_enabled": False,
-        "external_verification_enabled": False, "publisher_script": None,
-        "publisher_script_sha256": None, "publisher_config": None, "site_checkout": None,
-        "actions_repository": None, "actions_workflow": None, "public_manifest_url": None})
+        "publisher_enabled": False, "external_verification_enabled": False,
+        "reports_publisher": None, "reports_publisher_sha256": None, "reports_checkout": None,
+        "reports_remote_url": None, "reports_repository": None, "reports_audience": None,
+        "reports_branch": None, "reports_top_n": 100})
     return release, config
 
 
@@ -151,7 +173,16 @@ def _cli(release: Path, config: Path, stage: str, *, fixture_now: str = "2026-09
     return json.loads(result.stdout)
 
 
-def test_three_model_synthetic_coordinator_cli_and_private_site(tmp_path: Path) -> None:
+def _unit_context(tmp_path: Path, day: date = D):
+    """Render context of the saved report: what the publisher's local step renders as markdown."""
+    from modeler.reporting import markdown
+
+    saved = tmp_path / "runs" / day.isoformat() / f"report-{day}.json"
+    return markdown.build_context(tmp_path / "no-reports-checkout", saved.read_bytes(), None,
+                                  "frozen-release", None, 100, lambda message: None)
+
+
+def test_three_model_synthetic_coordinator_cli_and_withheld_publication(tmp_path: Path) -> None:
     release, config = _setup(tmp_path)
     assert _cli(release, config, "select", fixture_now="2026-09-29T09:30:00+09:00")["status"] == "selected"
     assert _cli(release, config, "infer")["status"] == "inferred"
@@ -160,9 +191,17 @@ def test_three_model_synthetic_coordinator_cli_and_private_site(tmp_path: Path) 
     report = json.loads((tmp_path / "runs" / D.isoformat() / f"report-{D}.json").read_text())
     assert len(report["markets"]) == 3
     assert report["synthetic_fixture"] is True
-    manifest = json.loads((tmp_path / "site" / D.isoformat() / "site-manifest.json").read_text())
-    assert manifest["latest_report_date"] == D.isoformat()
-    assert manifest["synthetic_fixture"] is True
+    run_dir = tmp_path / "runs" / D.isoformat()
+    render = json.loads((run_dir / "coordinator-render.json").read_text())
+    inference = json.loads((run_dir / "coordinator-inference.json").read_text())
+    assert render["invocation_id"] == inference["invocation_id"]
+    assert render["report_sha256"] == inference["report_sha256"]
+    assert render["synthetic_fixture"] is True
+    assert not any(key in render for key in ("projection_dir", "site_manifest_sha256"))
+    assert not (tmp_path / "site").exists()  # the public Pages projection is gone
+    publication = json.loads((run_dir / "coordinator-publication.json").read_text())
+    assert publication["reason"] == "publisher_disabled"
+    assert not (run_dir / "markdown").exists()  # a disabled publisher renders nothing
 
 
 def test_missing_us_policy_keeps_kr_cli_inference(tmp_path: Path) -> None:
@@ -175,10 +214,10 @@ def test_missing_us_policy_keeps_kr_cli_inference(tmp_path: Path) -> None:
     report = json.loads((tmp_path / "runs" / D.isoformat() / f"report-{D}.json").read_text())
     assert [row["market"] for row in report["markets"]] == ["KR"]
     assert len(report["failures"]) == 2
-    public = json.loads((tmp_path / "site" / D.isoformat() / "reports" / D.isoformat() /
-                         "report.json").read_text())
-    assert len(public["markets"]) == 3
-    assert [row["status"] for row in public["markets"] if row["market"] == "US"] == ["unavailable"] * 2
+    ctx = _unit_context(tmp_path)
+    assert ctx["kr"]["status"] == "partial"
+    assert [m["status"] for m in ctx["us"]["models"]] == ["failed", "failed"]
+    assert [m["internal"] for m in ctx["us"]["models"]] == ["failed", "failed"]
 
 
 def test_no_native_jobs_still_renders_three_unavailable_sections(tmp_path: Path) -> None:
@@ -196,10 +235,9 @@ def test_no_native_jobs_still_renders_three_unavailable_sections(tmp_path: Path)
     assert result.returncode == 1
     assert json.loads(result.stdout)["status"] == "inference_failed"
     assert _cli(release, config, "render")["status"] == "rendered"
-    public = json.loads((tmp_path / "site" / D.isoformat() / "reports" / D.isoformat() /
-                         "report.json").read_text())
-    assert len(public["markets"]) == 3
-    assert all(row["status"] == "unavailable" for row in public["markets"])
+    ctx = _unit_context(tmp_path)
+    assert ctx["status"] == "failed"
+    assert [m["status"] for m in ctx["kr"]["models"] + ctx["us"]["models"]] == ["failed"] * 3
 
 
 def test_failed_second_invocation_does_not_reuse_old_report(tmp_path: Path, monkeypatch) -> None:
@@ -235,27 +273,39 @@ def test_wrapper_renders_status_page_when_no_models_run(tmp_path: Path) -> None:
     assert json.loads(executed.stdout)["stages"] == {
         "opening": "not_configured", "inference": "inference_failed",
         "render": "rendered", "publication": "publication_withheld"}
-    public = json.loads((tmp_path / "site" / D.isoformat() / "reports" / D.isoformat() /
-                         "report.json").read_text())
-    assert len(public["markets"]) == 3
+    assert _unit_context(tmp_path)["status"] == "failed"
 
 
-def test_publish_rejects_base_config_with_projection_before_running_publisher(tmp_path: Path) -> None:
+def test_enabled_publisher_requires_confirmed_reports_settings(tmp_path: Path) -> None:
     from modeler.serving import daily_coordinator
 
     release, config_path = _setup(tmp_path)
-    assert _cli(release, config_path, "select", fixture_now="2026-09-29T09:30:00+09:00")["status"] == "selected"
-    assert _cli(release, config_path, "infer")["status"] == "inferred"
-    assert _cli(release, config_path, "render")["status"] == "rendered"
-    config = daily_coordinator._config(config_path)
-    wrong = _write(tmp_path / "publisher.json", {
-        "projection_dir": str(tmp_path / "site" / "2026-09-28"),
-        "checkout_dir": str(tmp_path / "site-checkout"), "base_path": "/market-briefing/"})
-    config.update({"publisher_enabled": True, "publisher_config": str(wrong),
-                   "site_checkout": str(tmp_path / "site-checkout")})
-    with pytest.raises(ValueError, match="must not set projection_dir"):
-        daily_coordinator.publish_stage(config, D)
-    assert not (tmp_path / "runs" / D.isoformat() / "coordinator-publication.json").exists()
+    checkout = tmp_path / "reports-checkout"
+    checkout.mkdir()
+    script = tmp_path / "publish_reports.py"
+    script.write_text("raise SystemExit(0)\n")
+    good = {**json.loads(config_path.read_text()), "publisher_enabled": True,
+            "reports_publisher": str(script), "reports_publisher_sha256": _sha(script),
+            "reports_checkout": str(checkout),
+            "reports_remote_url": "git@github.com:sjleekor/stock_reports.git",
+            "reports_repository": "sjleekor/stock_reports", "reports_audience": "owner_only",
+            "reports_branch": "main", "reports_top_n": 100}
+    accepted = daily_coordinator._config(_write(tmp_path / "good.json", good))
+    assert accepted["publisher_enabled"] is True
+    for key, value, message in (
+            ("reports_repository", "sjleekor/market-briefing", "stock_reports"),
+            ("reports_audience", "public", "owner_only"),
+            ("reports_audience", None, "owner_only"),
+            ("reports_branch", "site", "main"),
+            ("reports_remote_url", "", "remote URL"),
+            ("reports_publisher_sha256", "0" * 64, "SHA-256"),
+            ("reports_top_n", 0, "reports_top_n"),
+            ("reports_checkout", str(tmp_path / "missing"), "reports_checkout"),
+            ("reports_checkout", None, "reports_checkout")):
+        with pytest.raises(ValueError, match=message):
+            daily_coordinator._config(_write(tmp_path / "bad.json", {**good, key: value}))
+    # A disabled publisher needs none of these settings.
+    assert daily_coordinator._config(config_path)["publisher_enabled"] is False
 
 
 def test_monitor_keeps_rights_and_transport_status_separate(tmp_path: Path) -> None:
@@ -268,8 +318,8 @@ def test_monitor_keeps_rights_and_transport_status_separate(tmp_path: Path) -> N
     state = json.loads((tmp_path / "runs" / D.isoformat() / "monitor-0.json").read_text())
     assert state["axes"]["rights"] == "withheld"
     assert state["axes"]["publisher"] == "publication_withheld"
-    assert state["axes"]["actions"] == "unknown"
-    assert state["axes"]["public_url"] == "unknown"
+    assert state["axes"]["remote"] == "unknown"
+    assert set(state["axes"]) == {"input", "inference", "rights", "publisher", "remote"}
 
 
 def test_holiday_monitor_skips_without_retry(tmp_path: Path) -> None:

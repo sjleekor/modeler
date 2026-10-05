@@ -1,5 +1,4 @@
-"""Static public report projection and site generation."""
+"""Report rendering: markdown units for ``stock_reports`` and the owner-only private HTML view.
 
-from .site import SiteBuilder, public_projection
-
-__all__ = ["SiteBuilder", "public_projection"]
+``markdown`` uses only the standard library, so importing this package stays light.
+"""

@@ -1,10 +1,10 @@
 # 일일 브리핑 운영 초안
 
-이 디렉터리는 실행 인터페이스와 **비활성** Cronicle 제안입니다. `config.example.json`과 `release.example.json`의 필수 경로·hash는 아직 비어 있으므로 그대로 실행할 수 없습니다. 실제 KR/US 입력, 공개 권한, Pages 저장소가 확인되지 않아 production 일정이나 게시를 시작하지 않았습니다.
+이 디렉터리는 실행 인터페이스와 **비활성** Cronicle 제안입니다. `config.example.json`과 `release.example.json`의 필수 경로·hash는 아직 비어 있으므로 그대로 실행할 수 없습니다. 실제 KR/US 입력과 `stock_reports` 저장소 설정(Private, 협업자 없음)을 확인하기 전에는 production 일정이나 게시를 시작하지 않습니다.
 
 ## 고정 release와 경로
 
-검토한 소스 파일만 별도 release 디렉터리에 복사하고 hash를 고정합니다. 가변 `source/` checkout이나 전체 repository를 runtime에 직접 연결하지 않습니다. Release manifest는 세 모델의 entrypoint, bundle manifest, code inventory와 hash를 묶습니다. frozen release에는 `collector` Python package도 포함해야 합니다. `runtime-verified-sj2-20260930.json`은 sj2 **격리 시험 venv**에서 확인한 Python·패키지 버전입니다. 운영 image가 같은 구성이라는 증거는 아닙니다. `model-cards.json`의 최종 SHA-256은 `f45f4326adcdbeb6e2c8799de3c69b3e9c0c37935d1b76a2d90c5f598d09e385`이며, 운영 config의 `model_cards_path`와 `model_cards_sha256`은 이 파일의 고정 release 사본을 가리켜야 합니다. 카드의 `publication.allowed`는 자체 작성 설명문에만 적용됩니다. 순위·시세의 공개 상태는 별도 gate가 정합니다.
+검토한 소스 파일만 별도 release 디렉터리에 복사하고 hash를 고정합니다. 가변 `source/` checkout이나 전체 repository를 runtime에 직접 연결하지 않습니다. Release manifest는 세 모델의 entrypoint, bundle manifest, code inventory와 hash를 묶습니다. frozen release에는 `collector` Python package도 포함해야 합니다. `runtime-verified-sj2-20260930.json`은 sj2 **격리 시험 venv**에서 확인한 Python·패키지 버전입니다. 운영 image가 같은 구성이라는 증거는 아닙니다. `model-cards.json`의 최종 SHA-256은 `f45f4326adcdbeb6e2c8799de3c69b3e9c0c37935d1b76a2d90c5f598d09e385`이며, 운영 config의 `model_cards_path`와 `model_cards_sha256`은 이 파일의 고정 release 사본을 가리켜야 합니다. 카드의 `publication.allowed`는 자체 작성 설명문에만 적용됩니다. report의 `publication` 필드는 지우지 않았지만, private 저장소에 본인만 보는 게시는 이 gate와 별개의 경로입니다(아래 `stock_reports` 절).
 
 Serving data root 아래 `prepared/kr`, `prepared/us`에는 읽기 전용 native 산출물, `prepared/selections`에는 D별 불변 selection, `runs/`에는 report·coordinator state, `private-projections/`에는 내부 렌더 결과를 둡니다. `selection_root`는 `prepared_root` 아래에 있어야 합니다. 모델 프로세스는 collector raw 테이블을 바꾸거나 holdout label을 읽지 않습니다. 학습과 일일 추론은 분리합니다.
 
@@ -20,17 +20,17 @@ python -m modeler.serving.daily_wrapper monitor --config CONFIG --attempt 0
 
 `select`는 D 09:30에 KR 이전 완료 세션 K와 US U/E/A를 확인하고 native completion·달력·source policy를 고정합니다. 원천 E는 실제 A에서 역으로 추정하지 않습니다. US E/lag 정책이 없으면 US를 unavailable로 닫고 KR은 독립적으로 선택할 수 있습니다. KR 휴장일에는 skip 상태를 남기고 report를 만들지 않습니다. Native 완료 marker, hash, cutoff 증거가 없거나 늦으면 해당 모델을 선택하지 않습니다.
 
-`run`은 D 10:00 이후에 저장된 selection을 확인하고 infer → render → publish 순서로 실행합니다. 세 모델 모두 unavailable이어도 해당 D의 상태 페이지를 만들고 입력 실패를 exit code 1로 알립니다. 순위 공개 권한이 `unresolved`이면 내부 report와 projection은 생성할 수 있지만 공개 단계는 `publication_withheld`입니다. KIS 개장 관측은 `modeler.serving.opening_prepare`의 별도 불변 artifact를 씁니다. 원천 시각이 확인되지 않은 관측은 장중 확인으로 올리지 않습니다.
+`run`은 D 10:00 이후에 저장된 selection을 확인하고 infer → render → publish 순서로 실행합니다. 세 모델 모두 unavailable이어도 해당 D의 단위를 만들고 입력 실패를 exit code 1로 알립니다. `publisher_enabled=false`이면 내부 report와 비공개 화면(`private_projection_root`)은 만들지만 게시 단계는 `publication_withheld`(이유 `publisher_disabled`)입니다. KIS 개장 관측은 `modeler.serving.opening_prepare`의 별도 불변 artifact를 씁니다. 원천 시각이 확인되지 않은 관측은 장중 확인으로 올리지 않습니다.
 
 `opening_snapshot_root`, `opening_output_root`, `opening_max_age_seconds`가 모두 설정돼 있으면 `run`이 이미 캡처한 `report_date=D/slot-*.json` 중 수신 시각이 D 10:00 이하인 snapshot만 mapper에 전달합니다. subprocess는 인자를 분리해 `shell=False`로 실행하고 timeout은 90초입니다. slot이 없거나 mapper가 실패하면 opening만 `unavailable`로 두고 KR·US 추론은 계속합니다. 예시 config에서는 이 세 값을 비워 둡니다. 실제 캡처·원천 시각·공개 권한 검증이 끝났다는 뜻은 아닙니다.
 
-`monitor --attempt 0`, `1`, `2`, `3`은 각각 10:15, 10:17, 10:22, 10:32 KST 제안입니다. 저장된 D report와 publisher journal을 확인하고, 실패한 게시만 같은 commit으로 재시도합니다. 추론을 다시 하지 않습니다. Actions 성공과 공개 URL의 정확한 site manifest 일치가 확인돼야 `verified`입니다. 외부 HTTPS 확인은 대상 URL과 운영 네트워크 경로가 정해질 때까지 비활성입니다. HTTP client는 운영 환경의 proxy 설정을 그대로 따라야 합니다.
+`monitor --attempt 0`, `1`, `2`, `3`은 각각 10:15, 10:17, 10:22, 10:32 KST 제안입니다. 저장된 D report와 publisher journal을 확인하고, 실패한 게시는 **동기화 단계만** 다시 돕니다. 추론도 렌더도 다시 하지 않습니다. `external_verification_enabled=true`이면 `git ls-remote`로 원격 `main`이 publisher가 push한 커밋을 포함하는지 보고, 포함해야 `verified`입니다. 꺼져 있으면 `remote_pending`으로 남습니다. 자세한 상태는 아래 `stock_reports` 절에 있습니다.
 
-`cronicle-events.disabled.json`의 이벤트는 전부 `enabled=false`이며 `config_path=null`입니다. 실제 Cronicle category·target·plugin·wrapper 경로는 운영 설정에서 별도 확인해야 합니다. 이 파일은 기존 이벤트를 바꾸지 않습니다. `publisher_enabled=false`, `external_verification_enabled=false`인 예시 config도 실제 Pages 게시를 허가하지 않습니다. Actions 전체 commit SHA, 저장소·branch·Pages 설정·쓰기 권한과 공개 데이터 권리가 확인돼야 게시 경로를 열 수 있습니다.
+`cronicle-events.disabled.json`의 이벤트는 전부 `enabled=false`이며 `config_path=null`입니다. 실제 Cronicle category·target·plugin·wrapper 경로는 운영 설정에서 별도 확인해야 합니다. 이 파일은 기존 이벤트를 바꾸지 않습니다. `publisher_enabled=false`, `external_verification_enabled=false`인 예시 config도 실제 게시를 허가하지 않습니다. deploy key(쓰기 권한), 저장소 설정(Private, 협업자 없음), checkout이 확인돼야 게시 경로를 열 수 있습니다.
 
 ## 격리 검증 범위
 
-최종 모델 설명 카드가 들어간 격리 evidence는 `ops_real_adapter_e2e_20260930_final_cards/evidence.json`입니다. 실제 세 bundle을 **synthetic feature·fixture clock**으로 호출했고 세 모델 결과, 실패 0건, 전체 `partial`을 확인했습니다. `select`, `infer`, `render`가 성공했고 `publish`는 `publication_withheld`였습니다. Site도 `synthetic_fixture=true`입니다. 이 결과는 실제 최신 거래일 추론, 공개 Pages 게시, Cronicle 활성화 또는 5일 전진 운영의 증거가 아닙니다.
+최종 모델 설명 카드가 들어간 격리 evidence는 `ops_real_adapter_e2e_20260930_final_cards/evidence.json`입니다. 실제 세 bundle을 **synthetic feature·fixture clock**으로 호출했고 세 모델 결과, 실패 0건, 전체 `partial`을 확인했습니다. `select`, `infer`, `render`가 성공했고 `publish`는 `publication_withheld`였습니다. 당시 공개 projection도 `synthetic_fixture=true`였습니다(그 경로는 지금 없습니다). 이 결과는 실제 최신 거래일 추론, 공개 Pages 게시, Cronicle 활성화 또는 5일 전진 운영의 증거가 아닙니다.
 
 Cronicle API key는 별도 관리자 절차로 교체했습니다. 비밀 없는 독립 검증에서 이전 key 비활성, 새 key 작동·같은 권한, secret 파일 일치와 mode `0600`을 확인했습니다. 검증 때 조회한 일정은 22행이며 변경 요청은 0건입니다. 이전 응답에서 `api_key` 필드가 보였던 21건과 일정 22행은 다른 집계입니다. 이 검증으로 전후 일정 내용 전체가 같다고 주장하지 않습니다.
 
@@ -65,23 +65,107 @@ synthetic 입력으로 실제 세 bundle을 호출한 `release_nav` E2E입니다
 
 패키지 데이터는 allowlist(`holidays_krx.csv`)만 복사하고 `release.json`의 `data_files`에 경로와 sha를 적습니다. `_release_jobs`는 `data_files`가 있으면 release root 안 상대경로, symlink 아님, 파일 존재, sha256 일치, 경로 중복 없음을 검증합니다. 키가 없는 기존 fixture release는 그대로 통과합니다.
 
-## 날짜별 게시 설정과 이전 projection
+## `stock_reports` 게시 (reports publisher)
 
-둘째 날부터 게시가 멈추지 않도록 coordinator가 날짜마다 두 값을 정합니다.
+Pages 공개 경로는 없앴습니다. `publish` 단계는 private 저장소 `sjleekor/stock_reports`의 `main`에 markdown 단위를 push합니다. 올리는 내용과 범위는 [`02_publish_to_stock_reports.md`](../../../my/milestones/common/20261005_daily_briefing_reports/00_candidate_plan/02_publish_to_stock_reports.md)가 정합니다. 올리는 것은 모델별 상위 N(기본 100)의 순위·코드·이름과 순위용 점수(소수 4자리), KR 품질 사유, 기준일, 신선도, 실패 사유, release·sha256입니다. 전체 순위, 원시 피쳐, 서버 경로, 비밀값은 올리지 않습니다. **이 경로는 저장소를 본인만 본다는 전제입니다.** 협업자를 추가하거나 공개로 바꾸면 올린 내용의 판단이 무효이므로, publisher 설정의 `audience`는 `owner_only`가 아니면 멈춥니다.
 
-- `publisher_config`는 **base 설정**입니다. `projection_dir`가 없거나 null이어야 하고, 값이 있으면 publish가 멈춥니다. `publish` 단계가 `run_root/<D>/pages-publisher-config.json`을 원자적으로 쓰고(base 내용 + 그날 render의 `projection_dir`), publisher는 이 파일로 부릅니다. monitor 재시도도 같은 파일을 씁니다. 경로와 sha256은 `coordinator-publication.json`에 남습니다.
-- `previous_projection_dir`는 운영에서 **null**로 둡니다. null이면 `render`가 `projection_root` 아래에서 이름이 `YYYY-MM-DD`이고 D보다 앞선 디렉터리 중, `site-manifest.json`의 `latest_report_date`가 이름과 같은 가장 최근 것을 고릅니다. symlink면 멈춥니다. 고른 projection의 `synthetic_fixture`가 이번 실행과 다르면 멈춥니다. 없으면(첫날) 이전 없이 render합니다. 경로를 직접 적으면 그 경로를 씁니다(시험·이관용).
-- 사용한 이전 경로와 그 `site-manifest.json`의 sha256(없으면 null)은 `coordinator-render.json`의 `previous_projection_dir`, `previous_site_manifest_sha256`에 남습니다.
+### 구성 요소
+
+| 구성 요소 | 위치 | 하는 일 |
+|---|---|---|
+| 렌더러 | `src/modeler/reporting/markdown.py` (release 안) | report를 단위 폴더(`README.md`·`market-sector.md`·`kr-stocks.md`·`us-stocks.md`·`data-status.md`)로 렌더하고, 인덱스 자동 구간을 다시 쓰고, 트리를 검증합니다. 표준 라이브러리만 쓰고, 템플릿은 `.py` 문자열이라 release `DATA_FILES`를 늘리지 않습니다. **release 검토 목록(`SOURCE_MANIFEST`)에 이 파일을 넣어야 release 빌드가 통과합니다.** |
+| publisher | `deploy/reports/publish_reports.py` (release 밖, `serving/publisher/`로 복사, sha256 고정) | 로컬 단계와 동기화 단계 |
+| 검증기 | `deploy/reports/validate_reports.py` (같은 곳) | 경로 allowlist, front matter, 크기, 상대 링크, 과거 단위 보호, 서버 경로·비밀값, symlink |
+
+coordinator가 publisher를 `PYTHONPATH=<release>/src`로 부르므로 렌더와 검증은 고정된 release 코드가 합니다.
+
+### 두 단계
+
+`publish` 단계는 `publish_reports.py run`을 한 번 부릅니다. 이 안에서 로컬 단계가 먼저 끝나므로 GitHub에 닿지 않는 날에도 단위와 journal이 남습니다.
+
+| 단계 | 하는 일 | 실패하면 |
+|---|---|---|
+| L1 | `runs/D/report-D.json`의 sha256과 `run-state.json`의 invocation id가 이번 실행의 것인지 확인합니다 | `rejected` |
+| L2 | `runs/D/markdown/unit/`에 단위 파일 다섯 개를 렌더합니다. 같은 입력을 다시 돌려 내용이 같으면 파일을 그대로 둡니다(`generated_at` 고정) | `rejected` |
+| L3 | 단위 수준 검증(front matter, 1MB, 단위 안 링크, 서버 경로·호스트명·키 모양 문자열) | `rejected`, `markdown/rejected.json` |
+| L4 | journal에 "동기화 대기"를 적습니다 | |
+| S1 | flock으로 동시 실행을 막습니다 | 바로 종료(`locked`) |
+| S2 | checkout을 확인합니다. 깨끗함, branch `main`, remote URL 정확 일치, checkout 자체의 작성자 설정(`user.name`·`user.email`, 전역 설정에 기대지 않음) | 멈춤. journal 그대로 |
+| S3 | fetch합니다 | 연결 실패면 `sync_pending`으로 끝. journal 그대로 |
+| S4 | 커밋은 했지만 push하지 못한 단위가 있으면 먼저 처리합니다. 원격이 앞서 나갔으면 로컬 커밋을 버리고(`reset --hard origin/main`) 단위를 "동기화 대기"로 되돌려 다시 얹습니다. journal에 없는 로컬 커밋이 있으면 멈춥니다 | `failed` |
+| S5 | 밀린 날짜부터 차례로 원격 최신 위에 단위를 얹습니다. 원격에 같은 단위가 있고 `generated_at`·`revision`·정정 줄을 뺀 내용이 같으면 **새 커밋만 만들지 않습니다**(그래도 push 대기 커밋은 계속 처리합니다) | |
+| S6 | 인덱스(루트·종류·월 README의 자동 구간)를 다시 만들고, 없는 모델 카드만 만들고, 이번 커밋이 바꾸는 파일을 검증합니다 | `rejected`. 작업 트리를 되돌림 |
+| S7 | 파일을 하나씩 지정해 `git add`하고 커밋합니다. 메시지는 `daily-briefing 2026-10-07` | |
+| S8 | force 없이 push합니다. non-fast-forward면 S3부터 다시, 최대 3회 | `push_pending`. 로컬 커밋과 journal이 남음 |
+
+monitor의 재시도는 로컬 단계가 이미 끝났다면 `publish_reports.py sync`만 돕니다(끝나지 않았으면 `run`을 다시 돕니다). 그래도 안 되면 밀린 단위는 다음 날 실행이 날짜 순서대로 먼저 올립니다.
+
+### 정정과 과거 단위
+
+- 같은 D를 다시 돌려 내용이 같으면 커밋하지 않습니다(`unchanged`).
+- 내용이 다르면 `correction_required`(종료 코드 30)로 멈추고 아무것도 올리지 않습니다. 고치려면 사람이 `sync --correct <단위> --reason <사유>`를 돌립니다. `revision`을 하나 올리고, 요약 맨 위에 정정 줄(사유, 이전 판 커밋)을 넣고, 커밋 메시지는 `daily-briefing 2026-10-07 r2: <사유>`입니다. 이전 판은 git 이력에 남습니다.
+- 이미 올린 단위를 바꾸거나 지우는 커밋은 검증기가 거부합니다(`--correct`한 그 단위만 예외). 루트 README의 자동 구간 밖을 고치는 것, `CONVENTIONS.md`·`reference/glossary.md`를 고치는 것, 남의 모델 카드를 만들거나 바꾸는 것도 거부합니다.
+
+```sh
+# 이미 올린 2026-10-07 단위를 고칩니다(local 단계로 새 판이 journal에 대기 중이어야 합니다).
+python publish_reports.py sync --config runs/2026-10-07/reports-publisher-config.json \
+    --correct 2026-10-07 --reason "KR 점수 재계산"
+```
+
+### 종료 코드와 상태
+
+| 종료 코드 | 결과 `status` | 뜻 |
+|---|---|---|
+| 0 | `published` · `unchanged` · `nothing_to_do` · `local_ready` | 원격 `main`에 단위가 있습니다(또는 할 일이 없습니다) |
+| 1 | `failed` | checkout·설정·journal 오류. journal은 그대로입니다 |
+| 10 | `rejected` | 검증 실패. 단위는 `runs/D/markdown/`에 있고 journal에 사유가 있습니다 |
+| 20 | `sync_pending` | fetch가 안 됨(원격에 닿지 않음). 단위와 journal이 남았습니다 |
+| 21 | `push_pending` | 커밋은 했지만 push하지 못함. 같은 내용으로 다시 돌리면 같은 커밋을 push합니다 |
+| 30 | `correction_required` | 원격에 같은 단위가 다른 내용으로 있음 |
+| 75 | `locked` | 다른 publisher 실행이 잠금을 쥐고 있음 |
+
+결과는 stdout에 JSON 한 줄로 나옵니다. coordinator는 종료 코드 0이면 `coordinator-publication.json`의 `status`를 `published`로, 아니면 `publisher_failed`로 적고 `publisher_status`·`publisher_exit_code`·`local_done`을 같이 남깁니다. 성공하면 `reports_commit`(원격 `main`의 커밋)도 적습니다.
+
+### ops 설정 키
+
+Pages용 `base_path`·`projection_root`·`previous_projection_dir`·`publisher_script(_sha256)`·`publisher_config`·`site_checkout`·`actions_repository`·`actions_workflow`·`public_manifest_url`은 없앴습니다. `publisher_enabled`가 `true`일 때 아래 키를 모두 검증합니다. `false`이면 검증하지 않고 `publish`는 `publication_withheld`로 끝납니다.
+
+| 키 | 값 |
+|---|---|
+| `publisher_enabled` | 게시를 켤지. 명시해야 합니다 |
+| `external_verification_enabled` | monitor가 `git ls-remote`로 원격을 볼지 |
+| `reports_repository` | `sjleekor/stock_reports`(다르면 멈춤) |
+| `reports_audience` | `owner_only`(다르면 멈춤) |
+| `reports_branch` | `main` |
+| `reports_remote_url` | `git@github.com:sjleekor/stock_reports.git`. publisher가 checkout의 remote URL과 정확히 같은지 봅니다 |
+| `reports_checkout` | 깨끗한 checkout 경로. 예: `/home/whi/apps/market-briefing/reports-checkout`. 작성자는 이 checkout의 git 설정(`stock-reports-bot`)입니다 |
+| `reports_publisher`, `reports_publisher_sha256` | `serving/publisher/publish_reports.py`와 그 sha256 |
+| `reports_top_n` | 모델별로 올릴 상위 개수(1\~500, 기본 100) |
+
+checkout 옆(같은 부모 디렉터리)에 숨김 파일 둘이 생깁니다. `.reports-checkout.reports-publish.lock`(flock)과 `.reports-checkout.reports-publish-journal.json`(0600, 처리할 단위가 없으면 지움)입니다. journal은 단위별로 `sync_pending`·`push_pending`·`rejected`·`correction_required`와 단위 해시, 커밋 sha를 적습니다. checkout 안에는 아무것도 만들지 않습니다.
+
+날짜별 입력은 coordinator가 `run_root/<D>/reports-publisher-config.json`에 원자적으로 씁니다(저장소·checkout·release id·report sha256·invocation id·모델 카드 경로·top_n). 비공개 화면 경로는 여기 넣지 않습니다. 합성 fixture release에서만 `--allow-synthetic`을 붙입니다.
+
+### monitor 상태
+
+| `status` | 뜻 |
+|---|---|
+| `verified` | 원격 `main`이 publisher가 push한 커밋을 포함합니다. 그 뒤에 사용자가 직접 커밋을 올려 head가 달라졌어도, 그 커밋이 새 head의 조상이면 포함으로 봅니다 |
+| `remote_missing_commit` | 원격 `main`에 그 커밋이 없습니다(되돌려졌거나 push가 사라짐) |
+| `remote_pending` | 검증을 끄고 있거나(`external_verification_enabled=false`) 원격에 닿지 않아 확인하지 못했습니다 |
+| `publisher_failed` | 게시가 아직 안 됐습니다. 10:15 이후 시도마다 동기화 단계만 다시 돕니다 |
+
+axes는 `input`, `inference`, `rights`(참고용), `publisher`, `remote`입니다. 사용자의 후속 커밋 확인은 개인 ref `refs/monitor/main`으로 받아 publisher가 쓰는 `refs/remotes/origin/main`을 건드리지 않습니다.
 
 ## 비공개 리포트 보기
 
-순위·점수·개장 관측 값은 공개 Pages에 싣지 않습니다. 본인만 보는 비공개 화면은 설정 키 `private_projection_root`(선택, null이면 만들지 않음)에 만듭니다.
+서버에서 본인만 보는 HTML 화면입니다. 설정 키 `private_projection_root`(선택, null이면 만들지 않음)에 만듭니다. `stock_reports`에 올라가는 markdown 단위와 별개이고, **이 디렉터리 자체는 어떤 저장소에도 복사하지 않습니다.**
 
-- `render` 단계가 공개 projection을 쓴 다음 `private_projection_root/<D>`에 비공개 화면을 씁니다. 이 경로가 `projection_root`나 `site_checkout`과 같거나 서로 안쪽이면 설정 검증에서 멈춥니다.
+- `render` 단계가 `private_projection_root/<D>`에 비공개 화면을 씁니다. 이 경로가 `run_root`나 `reports_checkout`과 같거나 서로 안쪽이면 설정 검증에서 멈춥니다.
 - 출력은 `index.html`(최근 날짜), `archive/index.html`(날짜별 목록), `reports/<날짜>/index.html`, `assets/private.css`, `private-manifest.json`(`private: true`), `PRIVATE_DO_NOT_PUBLISH.txt`입니다. 링크가 모두 상대 경로라 어느 디렉터리에서 열어도 됩니다.
 - 모델별 상위 100개(전체 개수 표시)와 점수가 나옵니다. 점수는 순위용이고 확률이 아닙니다. 모든 페이지 맨 위에 "비공개 — 게시 금지"와 `noindex` 메타가 있습니다.
 - `coordinator-render.json`의 `private_projection_dir`, `private_manifest_sha256`에 출력 경로와 manifest hash가 남습니다.
-- `publish` 단계는 이 출력을 publisher에 넘기지 않습니다. 공개 검증기는 이 출력을 허용 목록 밖 파일로 보고 거부합니다. 이 디렉터리를 `site_checkout`이나 Pages 저장소에 복사하지 마십시오.
+- `publish` 단계는 이 출력을 publisher에 넘기지 않습니다. 검증기는 이 출력(HTML, 마커, 매니페스트)을 허용 경로 밖 파일로 보고 거부합니다. 이 디렉터리를 `reports_checkout`에 복사하지 마십시오. 마커 파일(`PRIVATE_DO_NOT_PUBLISH.txt`)이 이 금지를 적고 있습니다.
 
 보는 방법은 SSH 터널입니다. sj2에서 해당 날짜 디렉터리를 loopback으로만 서빙합니다.
 
@@ -159,8 +243,7 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
   --us-expected-sha256 54450ffd0ea135fd93f58ca420e47425818a198ef90fda276067df29c26ddf91 \
   --parity-evidence $B/us_parity_det_a_20260930/parity_det_a_v2_20260930.json \
   --parity-evidence-sha256 5d434c4e1f670d2ef88361c90549df912673ee593dcef7f20597b5aa3cb301c8 \
-  --pages-config /home/whi/apps/market-briefing/config/pages-config.base.json \
-  --site-checkout /home/whi/apps/market-briefing/site-checkout \
+  --reports-checkout /home/whi/apps/market-briefing/reports-checkout \
   --us-lake /home/whi/data/stock_data/us
 ```
 
@@ -171,19 +254,19 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
 | `venv/` | 검증된 venv의 `cp -a` 사본 (이미 있으면 python·패키지 버전만 검증) | 복사 그대로 |
 | `releases/<id>/` | `release_build`로 만든 non-synthetic release. 만든 뒤 읽기 전용 | 디렉터리 0550, 파일 0440 |
 | `config/` | `ops.json`(0640), `pins.json`, E 표, parity evidence, `calendars/`(KR 2026, US 2026\~2027) | 디렉터리 0750, 나머지 0440 |
-| `publisher/` | `publish_site.py`, `validate_public_site.py` 사본 (검토한 manifest의 sha와 같아야 함) | 0750, 파일 0440 |
+| `publisher/` | `publish_reports.py`, `validate_reports.py` 사본 (검토한 manifest의 sha와 같아야 함) | 0750, 파일 0440 |
 | `stock_data/us/raw`, `derived` | 운영 lake로 가는 symlink (읽기만) | |
 | `stock_data/us/output/` | 실제 디렉터리. prepare가 쓰는 유일한 곳 | 0750 |
 | `prepared/kr/` | 빈 디렉터리 (KR 입력이 없으면 selector가 `unavailable`로 닫음) | 0750 |
 | `prepared/us` | `stock_data/us/output/us_scoring_daily_v1/prepared`로 가는 symlink | |
 | `prepared/selections/` | D 선택 결과. prepared root 안에 있어야 함 | 0750 |
 | `runs/`, `locks/` | coordinator 상태 | 0700 |
-| `projection/`, `logs/` | 공개 projection, 로그 | 0750 |
+| `logs/` | 로그 | 0750 |
 | `private-projection/` | 비공개 리포트. 게시하지 않음 | 0700 |
 
 권한은 모두 소유자 전용입니다. Cronicle이 같은 사용자로 돌고, 비공개 리포트와 실행 상태를 다른 계정에 열 이유가 없기 때문입니다. release를 읽기 전용으로 둔 것은 frozen 코드를 실수로 고치지 못하게 하려는 것입니다. 지우거나 바꿔야 하면 `chmod -R u+w`를 먼저 하십시오. `ops.json`만 0640이라 나중에 publisher를 켤 때 고칠 수 있습니다.
 
-`ops.json`은 `publisher_enabled=false`, `external_verification_enabled=false`로 만듭니다. `opening_*`는 null, `private_projection_root`는 `private-projection`, `base_path`는 `/market-briefing/`입니다. `publisher_config`와 `site_checkout`은 Pages 기본 설정과 checkout을 그대로 가리키고 복사하지 않습니다. `actions_repository=sjleekor/market-briefing`, `actions_workflow=pages.yml`, `public_manifest_url=https://sjleekor.github.io/market-briefing/site-manifest.json`입니다. `pins.json`에 E 표, evidence, publisher 스크립트의 sha를 남깁니다. KR 달력은 2026-12-31까지라 2027년 전에 휴장일 CSV와 달력을 갱신해야 합니다.
+`ops.json`은 `publisher_enabled=false`, `external_verification_enabled=false`로 만듭니다. `opening_*`는 null, `private_projection_root`는 `private-projection`입니다. `reports_*` 키는 채우되(`reports_repository=sjleekor/stock_reports`, `reports_audience=owner_only`, `reports_branch=main`, `reports_remote_url`은 SSH URL, `reports_checkout`은 `--reports-checkout` 값, `reports_publisher(_sha256)`은 `serving/publisher/publish_reports.py`) 게시는 켜지 않습니다. `--reports-checkout`은 아직 없어도 되지만 serving root 안에 있으면 안 됩니다. `pins.json`에 E 표, evidence, publisher 스크립트의 sha를 남깁니다. KR 달력은 2026-12-31까지라 2027년 전에 휴장일 CSV와 달력을 갱신해야 합니다.
 
 ### wrapper 둘
 
@@ -194,4 +277,4 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
 
 1. 10-01 17:30 `us-prepare.sh`: A는 2026-09-30입니다. 16:30 `sdc_daily_us_universe_incremental`이 끝난 뒤여야 합니다. 2026-09-30 실측에서 운영 lake의 `universe_daily`는 2026-09-22 snapshot(최대 날짜 09-18)이고 incremental 완료 marker가 없어, prepare가 `US universe_daily requires a completed incremental membership snapshot`으로 멈춥니다. incremental이 먼저 한 번 돌아야 합니다.
 2. 10-02 09:30 `briefing-stage.sh select`: D 선택이 잠깁니다. 이 시각 전에는 실행하지 마십시오.
-3. 10-02 10:00 `briefing-stage.sh run`. 이어서 10:15·10:17·10:22·10:32에 `monitor`(`--attempt` 0\~3)입니다. publisher가 꺼져 있어 `publication_withheld`로 끝나는 것이 정상입니다.
+3. 10-02 10:00 `briefing-stage.sh run`. 이어서 10:15·10:17·10:22·10:32에 `monitor`(`--attempt` 0\~3)입니다. publisher를 켜기 전에는 `publication_withheld`로 끝나는 것이 정상입니다.
