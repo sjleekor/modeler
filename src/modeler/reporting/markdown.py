@@ -552,6 +552,199 @@ def _safe_str(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
+# ---------------------------------------------------------------------------
+# 증권 종류 (06 문서 R0 발견 F1·F2, 1안)
+#
+# 이름으로 판정해 순위 표에 표시만 합니다. 순위·점수는 바꾸지 않습니다.
+# 판정 규칙과 알려진 오탐·미탐은 06 문서 "1안 결과"에 있습니다. 규칙을 바꾸면 거기도 고칩니다.
+# ---------------------------------------------------------------------------
+SECURITY_NAMES_SCHEMA = "security-names.v1"
+KIND_COMMON = "보통주"
+KIND_UNKNOWN = "확인 안 됨"
+KIND_ORDER = ("채권형", "우선주", "SPAC", "리츠", "펀드")
+
+# US: listing_snapshots.security_name. 위에서부터 먼저 걸리는 규칙이 이깁니다.
+US_BOND_RE = re.compile(
+    r"\bnotes?\b|\bdebentures?\b|\bsubordinated\b|\bcapital obligation\b|\betns?\b", re.I
+)
+US_PREF_RE = re.compile(r"\b(?:pfd|prd|preferred|preference)\b", re.I)
+# BNS "Bank Nova Scotia Halifax Pfd 3 Ordinary Shares"는 보통주입니다.
+US_COMMON_RE = re.compile(r"\bcommon stock\b|\bordinary shares?\b", re.I)
+US_SPAC_RE = re.compile(r"\bacquisition\b|\bspac\b|\bblank check\b", re.I)
+# 시리즈 SPAC: "Churchill Capital Corp XI - Class A Ordinary Shares", "Cantor Equity Partners I"
+US_SPAC_SERIES_RE = re.compile(
+    r"\b[ivx]{1,4}\b,?(?: (?:inc|ltd|corp|co)\.?)?\s*-?\s*class a ordinary shares?\b", re.I
+)
+US_FUND_RE = re.compile(r"\bfunds?\b|\bclosed[- ]end\b|\bbusiness development compan|\bbdc\b", re.I)
+# REIT·은행·로열티 신탁은 Trust·Beneficial Interest를 써도 펀드로 잡지 않습니다.
+US_NOT_FUND_RE = re.compile(
+    r"\breit\b|\brealty\b|\bpropert(?:y|ies)\b|\breal estate\b|\bre finance\b|\bmortgage\b"
+    r"|\blodging\b|\bhotels?\b|\bhospitality\b|\bresidential\b|\bindustrial\b"
+    r"|\bself storage\b|\bnet lease\b|\bhomes\b|\boffice\b"
+    r"|\bban(?:k|corp|cshares)\b|\btrust (?:company|corporation)\b|\broyalty\b",
+    re.I,
+)
+US_MUNI_RE = re.compile(r"\bmunicipals?\b|\bportfolio\b", re.I)
+US_TRUSTISH_RE = re.compile(r"\btrust\b|\bbeneficial interests?\b|\bsbi\b", re.I)
+US_CEF_WORD_RE = re.compile(
+    r"\bincome\b|\bdividend\b|\bequity\b|\bterm\b|\bopportunit|\bresources\b|\bsciences\b"
+    r"|\btechnology\b|\butility\b|\binfrastructure\b|\bmicro-cap\b|\bsmall-cap\b|\bgold\b"
+    r"|\bcredit\b|\byield\b|\bfloating\b|\bduration\b|\ballocation\b|\bstrateg|\bpremium\b"
+    r"|\benhanced\b|\binvestors\b|\btotal return\b|\bmulti-sector\b|\bconvertible\b",
+    re.I,
+)
+# 이름 맨 앞이 폐쇄형 펀드 운용사이고 투자상품 단어가 있으면 펀드입니다(ETO, EIC).
+# BlackRock, Inc.·Invesco Ltd. 같은 운용사 자신은 투자상품 단어가 없어 보통주로 남습니다.
+US_CEF_SPONSOR_RE = re.compile(
+    r"^(?:blackrock|nuveen|eaton vance|pimco|gabelli|gamco|calamos|abrdn|aberdeen|royce"
+    r"|western asset|cohen & steers|doubleline|virtus|john hancock|templeton|neuberger|dws"
+    r"|allspring|invesco|liberty all-star|kayne anderson|guggenheim|nyli|pgim|saba|rivernorth"
+    r"|thornburg|xai|reaves|duff & phelps|cornerstone|highland|bny mellon|lmp"
+    r"|columbia seligman|eagle point)\b",
+    re.I,
+)
+
+# KR: stock_master 종목명과 단축코드.
+KR_SPAC_RE = re.compile(r"스팩|기업인수목적|SPAC", re.I)
+KR_REIT_RE = re.compile(r"리츠|REIT", re.I)  # 메리츠(Meritz)는 지운 뒤 봅니다
+# 사회기반시설 투융자회사. 이름만으로는 바이오인프라(보통주)와 가를 수 없어 이름을 적어 둡니다.
+KR_FUND_NAMES = frozenset({"맥쿼리인프라", "KB발해인프라"})
+KR_FUND_RE = re.compile(r"투융자|선박투자")
+KR_PREF_NAME_RE = re.compile(r"\d?우[A-Z]?(?:\(전환\))?$")
+
+
+def classify_us(symbol: str, security_name: str | None) -> str:
+    """US 종류. 이름이 없으면 `확인 안 됨`입니다. 다만 심볼에 `$`가 있으면 우선주로 봅니다."""
+    name = (security_name or "").strip()
+    if not name:
+        return "우선주" if "$" in symbol else KIND_UNKNOWN
+    if US_BOND_RE.search(name):
+        return "채권형"
+    if "$" in symbol:
+        return "우선주"  # NYSE 우선주 표기. 채권형이 아니면 우선주로 봅니다(NLY$F "6.95% Series F")
+    if US_PREF_RE.search(name) and not US_COMMON_RE.search(name):
+        return "우선주"
+    if US_SPAC_RE.search(name) or US_SPAC_SERIES_RE.search(name):
+        return "SPAC"
+    if US_FUND_RE.search(name):
+        return "펀드"
+    if US_NOT_FUND_RE.search(name):
+        return KIND_COMMON
+    if US_MUNI_RE.search(name):
+        return "펀드"
+    if US_CEF_WORD_RE.search(name) and (
+        US_TRUSTISH_RE.search(name) or US_CEF_SPONSOR_RE.search(name)
+    ):
+        return "펀드"
+    return KIND_COMMON
+
+
+def classify_kr(symbol: str, name: str | None) -> str:
+    """KR 종류. 이름이 없거나 코드와 같으면 `확인 안 됨`입니다."""
+    text = (name or "").strip()
+    if not text or text == symbol:
+        return KIND_UNKNOWN
+    if KR_SPAC_RE.search(text):
+        return "SPAC"
+    if KR_REIT_RE.search(text.replace("메리츠", "")):
+        return "리츠"
+    if text in KR_FUND_NAMES or KR_FUND_RE.search(text):
+        return "펀드"
+    # 우선주: 단축코드 끝자리가 0이 아니고 이름이 우·2우B·우(전환) 꼴로 끝납니다(성우는 보통주).
+    if symbol[-1:] not in ("", "0") and KR_PREF_NAME_RE.search(text.replace(" ", "")):
+        return "우선주"
+    return KIND_COMMON
+
+
+def load_security_names(raw: bytes | None) -> dict:
+    """`security-names.v1` 입력을 {시장: {"source", "basis", "symbols"}}로 읽습니다.
+
+    `symbols`는 {코드: {"name": str|None, "current": bool}}입니다. `current`가 false면
+    그 갈래의 마지막 상장 목록에 없던 심볼이라 이름이 낡았을 수 있어 종류를 판정하지 않습니다.
+    """
+    if raw is None:
+        return {}
+    data = load_json_bytes(raw, "증권 이름 입력")
+    if data.get("schema") != SECURITY_NAMES_SCHEMA:
+        raise InputError(f"증권 이름 입력의 schema가 {SECURITY_NAMES_SCHEMA}가 아닙니다.")
+    markets = data.get("markets")
+    if not isinstance(markets, dict):
+        raise InputError("증권 이름 입력에 markets 객체가 없습니다.")
+    out = {}
+    for market in ("KR", "US"):
+        block = markets.get(market)
+        if block is None:
+            continue
+        if not isinstance(block, dict) or not isinstance(block.get("symbols"), dict):
+            raise InputError(f"증권 이름 입력의 {market}.symbols가 객체가 아닙니다.")
+        symbols = {}
+        for sym, info in block["symbols"].items():
+            if not isinstance(sym, str) or not isinstance(info, dict):
+                raise InputError(f"증권 이름 입력의 {market} 항목 형식이 맞지 않습니다.")
+            symbols[sym] = {
+                "name": info["name"] if isinstance(info.get("name"), str) else None,
+                "current": info.get("current") is not False,
+            }
+        out[market] = {
+            "source": _safe_str(block.get("source")),
+            "basis": _safe_str(block.get("basis")),
+            "symbols": symbols,
+        }
+    return out
+
+
+def row_kind(market: str, row: dict, names: dict) -> str:
+    """순위 행 하나의 종류. KR은 행의 이름을 먼저 쓰고, 없으면 이름 입력을 씁니다."""
+    symbol = row["symbol"]
+    info = (names.get(market) or {}).get("symbols", {}).get(symbol)
+    if market == "KR":
+        name = row.get("name") if row.get("name") not in (None, "", symbol) else None
+        if name is None and info and info["current"]:
+            name = info["name"]
+        return classify_kr(symbol, name)
+    if not info or not info["current"]:
+        return classify_us(symbol, None)  # 이름이 없거나 낡았습니다
+    return classify_us(symbol, info["name"])
+
+
+def attach_kinds(sec: dict, market: str, names: dict) -> None:
+    """모델마다 `kinds`(표시 행과 같은 순서)를 붙이고, 종류 열을 보일지 정합니다.
+
+    이름 원천이 전혀 없어 모든 행이 `확인 안 됨`이면 열을 생략합니다(R2 publisher가 이름을
+    넘기기 전의 운영 단위). 이때 표 위에 생략한 이유를 적습니다.
+    """
+    for m in sec["models"]:
+        m["kinds"] = [row_kind(market, row, names) for row in m["rows"]]
+    sec["show_kind"] = any(k != KIND_UNKNOWN for m in sec["models"] for k in m["kinds"])
+    sec["names"] = names.get(market)
+
+
+def kinds_of(m: dict) -> list:
+    """표시 행의 종류 목록. `attach_kinds`를 거치지 않은 입력이면 전부 `확인 안 됨`입니다."""
+    kinds = m.get("kinds")
+    return kinds if isinstance(kinds, list) else [KIND_UNKNOWN] * len(m["rows"])
+
+
+def kind_count_line(kinds: list) -> str:
+    """표 위에 넣는 한 줄. 예: 보통주가 아닌 종목 11개 포함 (채권형 4 · 우선주 4 · 펀드 3)."""
+    counts = Counter(kinds)
+    others = [k for k in counts if k not in KIND_ORDER + (KIND_COMMON, KIND_UNKNOWN)]
+    parts = [f"{k} {counts[k]}" for k in list(KIND_ORDER) + sorted(others) if counts.get(k)]
+    total = sum(counts[k] for k in counts if k not in (KIND_COMMON, KIND_UNKNOWN))
+    line = f"보통주가 아닌 종목 {total}개 포함"
+    line += f" ({' · '.join(parts)})." if parts else "."
+    if counts.get(KIND_UNKNOWN):
+        line += f" 종류를 확인하지 못한 종목 {counts[KIND_UNKNOWN]}개."
+    return line
+
+
+KIND_NOTE = (
+    "`종류`는 이름으로 판정한 표시입니다. 순위와 점수는 그대로입니다. "
+    "판정 기준은 [데이터 상태](data-status.md#증권-종류)에 있습니다."
+)
+KIND_OMITTED = "종류를 판정할 이름 원천이 이 단위에 없어 `종류` 열을 생략했습니다."
+
+
 def build_model_entry(
     market: str, model_id: str, report: dict | None, failures: list, top_n: int
 ) -> dict:
@@ -958,8 +1151,9 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
         if not rows:
             lines += ["이번 판에 순위가 없습니다 (전체 0개).", ""]
         else:
+            show_kind = sec.get("show_kind", False)
             held, reasons, body = 0, Counter(), []
-            for row in rows:
+            for row, kind in zip(rows, kinds_of(m)):
                 reason_codes = row.get("quality_reasons")
                 review = row.get("quality_review")
                 texts = (
@@ -978,13 +1172,9 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
                 else:
                     quality = "품질 정보 없음"
                 body.append(
-                    [
-                        str(row["rank"]),
-                        c(row["symbol"]),
-                        c(row["name"]),
-                        "{:.4f}".format(row["score"]),
-                        quality,
-                    ]
+                    [str(row["rank"]), c(row["symbol"]), c(row["name"])]
+                    + ([c(kind)] if show_kind else [])
+                    + ["{:.4f}".format(row["score"]), quality]
                 )
             lines.append(
                 f"전체 {m['total']}개 중 상위 {len(rows)}개입니다. 그 밖의 순위는 올리지 않습니다."
@@ -1006,11 +1196,16 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
                     right=(1,),
                 )
             lines += ["", f"## 상위 {len(rows)}", ""]
-            lines += md_table(
-                ["순위", "코드", "이름", "점수 (순위용 점수 — 확률 아님)", "품질"],
-                body,
-                right=(0, 3),
+            if show_kind:
+                lines += [kind_count_line(kinds_of(m)) + " " + KIND_NOTE, ""]
+            else:
+                lines += [KIND_OMITTED, ""]
+            headers = (
+                ["순위", "코드", "이름"]
+                + (["종류"] if show_kind else [])
+                + ["점수 (순위용 점수 — 확률 아님)", "품질"]
             )
+            lines += md_table(headers, body, right=(0, len(headers) - 2))
             lines.append("")
     lines += [DISCLAIMER, ""]
     meta_extra = {
@@ -1020,7 +1215,7 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
     return lines, meta_extra
 
 
-def render_us_model(ctx: dict, m: dict, show_name: bool) -> list:
+def render_us_model(ctx: dict, m: dict, show_name: bool, show_kind: bool = False) -> list:
     short = US_SHORT.get(m["model_id"], m["model_id"])
     lines = [f"## {c(short)}", ""]
     lines.append("- 상태: " + status_with_internal(m["status"], m["internal"]))
@@ -1069,15 +1264,22 @@ def render_us_model(ctx: dict, m: dict, show_name: bool) -> list:
         f"전체 {m['total']}개 중 상위 {len(rows)}개입니다. 그 밖의 순위는 올리지 않습니다."
     )
     lines.append("")
+    if show_kind:
+        lines += [kind_count_line(kinds_of(m)), ""]
     headers = (
-        ["순위", "코드"] + (["이름"] if show_name else []) + ["점수 (순위용 점수 — 확률 아님)"]
+        ["순위", "코드"]
+        + (["이름"] if show_name else [])
+        + (["종류"] if show_kind else [])
+        + ["점수 (순위용 점수 — 확률 아님)"]
     )
     right = (0, len(headers) - 1)
     body = []
-    for row in rows:
+    for row, kind in zip(rows, kinds_of(m)):
         cells = [str(row["rank"]), c(row["symbol"])]
         if show_name:
             cells.append(c(row["name"]))
+        if show_kind:
+            cells.append(c(kind))
         cells.append("{:.4f}".format(row["score"]))
         body.append(cells)
     lines += md_table(headers, body, right=right)
@@ -1123,8 +1325,10 @@ def render_us(ctx: dict) -> tuple[list, dict]:
             "생략했습니다.",
             "",
         ]
+    if shown_rows:
+        lines += [KIND_NOTE if sec.get("show_kind") else KIND_OMITTED, ""]
     for m in sec["models"]:
-        lines += render_us_model(ctx, m, show_name)
+        lines += render_us_model(ctx, m, show_name, sec.get("show_kind", False))
     lines += ["LightGBM과 Ridge의 점수는 서로 합치거나 비교하지 않습니다.", "", DISCLAIMER, ""]
     meta_extra = {
         "data_asof": {"us_features": asofs[0]} if asofs else {},
@@ -1408,6 +1612,54 @@ def internal_cell(sec: dict) -> str:
     )
 
 
+KR_KIND_RULES = (
+    "SPAC: 이름에 `스팩`. 리츠: 이름에 `리츠`(`메리츠`는 빼고 봄). "
+    "펀드: 인프라 투융자회사(`맥쿼리인프라`·`KB발해인프라`). "
+    "우선주: 코드 끝자리가 0이 아니고 이름이 `우`·`2우B`·`우(전환)` 꼴로 끝남. 나머지는 보통주"
+)
+US_KIND_RULES = (
+    "채권형: Notes·Debentures·Subordinated·Capital Obligation·ETN. "
+    "우선주: 코드에 `$`, 또는 Pfd·Prd·Preferred·Preference(Common Stock·Ordinary Shares와 "
+    "같이 쓰이면 제외). SPAC: Acquisition·SPAC·Blank Check, 또는 로마 숫자 시리즈 뒤 "
+    "Class A Ordinary Shares. "
+    "펀드: Fund·Closed End·BDC·Municipal·Portfolio, 또는 Trust·Beneficial Interest·운용사 "
+    "이름에 Income·Dividend 같은 투자상품 단어가 같이 있을 때. "
+    "REIT·은행·로열티 신탁 이름은 펀드로 보지 않음. 나머지는 보통주"
+)
+
+
+def kind_status_lines(ctx: dict) -> list:
+    """데이터 상태의 `증권 종류` 절. 이름 원천과 판정 기준을 적습니다."""
+    rows = []
+    for sec, market, rules in (
+        (ctx["kr"], "KR", KR_KIND_RULES),
+        (ctx["us"], "US", US_KIND_RULES),
+    ):
+        names = sec.get("names")
+        if not sec.get("show_kind"):
+            rows.append([market, "없음", "-", "이름 원천이 없어 `종류` 열을 생략했습니다"])
+            continue
+        if names:
+            source, basis = c(names["source"] or "증권 이름 입력"), c(names["basis"] or "-")
+        else:
+            source, basis = "envelope 순위 행의 이름", "-"
+        if market == "KR" and names:
+            source = "envelope 순위 행의 이름, 없으면 " + source
+        rows.append([market, source, basis, rules])
+    return (
+        [
+            "## 증권 종류",
+            "",
+            "순위 표의 `종류`는 이름으로 판정한 표시입니다. 순위와 점수는 바꾸지 않습니다. "
+            "이름만 보므로 틀릴 수 있습니다. 예를 들어 이름에 펀드 표시가 없는 폐쇄형 펀드는 "
+            "`보통주`로 남고, 이름 원천에 없는 종목은 `확인 안 됨`입니다.",
+            "",
+        ]
+        + md_table(["시장", "이름 원천", "기준", "판정"], rows)
+        + [""]
+    )
+
+
 def render_status(ctx: dict) -> tuple[list, dict]:
     title = title_for(ctx, "데이터 상태")
     lines = head_lines(ctx, title)
@@ -1534,8 +1786,11 @@ def render_status(ctx: dict) -> tuple[list, dict]:
             "private 저장소를 본인만 보는 경로와는 별개인 값입니다.",
         ]
     lines += ["", "KIS 장중 관측(opening)은 이 리포트 범위 밖입니다.", ""]
+    lines += kind_status_lines(ctx)
     lines += ["## 출처", ""]
     prov_rows = [["release", code(ctx["release"])], ["내부 report sha256", code(ctx["sha"])]]
+    if ctx.get("names_sha"):
+        prov_rows.append(["증권 이름 입력 sha256", code(ctx["names_sha"])])
     for sec in (kr, us):
         for m in sec["models"]:
             if m["report"] is None:
@@ -1674,18 +1929,19 @@ def render_summary(ctx: dict) -> tuple[list, dict]:
     else:
         lines += ["대표지수 상태를 내지 못했습니다.", ""]
     lines += ["## KR 상위 10", ""]
-    lines += top10_lines(kr_m, with_name=True)
+    lines += top10_lines(kr_m, with_name=True, show_kind=kr.get("show_kind", False))
     lines += ["## US 상위 10", ""]
     for m in us["models"]:
         lines += ["### " + c(US_SHORT.get(m["model_id"], m["model_id"])), ""]
-        lines += top10_lines(m, with_name=False)
+        lines += top10_lines(m, with_name=False, show_kind=us.get("show_kind", False))
     lines += [
         f"상위 10개만 적었습니다. 상위 {ctx['top_n']}개와 점수(순위용 점수 — 확률 아님)는 "
         "각 섹션 파일에 있습니다.",
         "",
-        DISCLAIMER,
-        "",
     ]
+    if kr.get("show_kind") or us.get("show_kind"):
+        lines += [KIND_NOTE, ""]
+    lines += [DISCLAIMER, ""]
     meta_extra = {
         "data_asof": all_data_asof(ctx),
         "models": list(
@@ -1699,7 +1955,7 @@ def render_summary(ctx: dict) -> tuple[list, dict]:
     return lines, meta_extra
 
 
-def top10_lines(m: dict, with_name: bool) -> list:
+def top10_lines(m: dict, with_name: bool, show_kind: bool = False) -> list:
     if m["status"] == "failed":
         return ["순위를 내지 못했습니다.", ""]
     if m["suppressed"]:
@@ -1707,10 +1963,17 @@ def top10_lines(m: dict, with_name: bool) -> list:
     rows = m["rows"][:10]
     if not rows:
         return ["이번 판에 순위가 없습니다.", ""]
+    kinds = kinds_of(m)[:10]
     show_name = with_name or any(r["name"] != r["symbol"] for r in rows)
-    headers = ["순위", "코드"] + (["이름"] if show_name else [])
-    body = [[str(r["rank"]), c(r["symbol"])] + ([c(r["name"])] if show_name else []) for r in rows]
-    return md_table(headers, body, right=(0,)) + [""]
+    headers = ["순위", "코드"] + (["이름"] if show_name else []) + (["종류"] if show_kind else [])
+    body = [
+        [str(r["rank"]), c(r["symbol"])]
+        + ([c(r["name"])] if show_name else [])
+        + ([c(k)] if show_kind else [])
+        for r, k in zip(rows, kinds)
+    ]
+    head = [kind_count_line(kinds), ""] if show_kind else []
+    return head + md_table(headers, body, right=(0,)) + [""]
 
 
 SECTION_RENDERERS = (
@@ -1837,10 +2100,13 @@ def build_context(
     generated_at: str | None,
     top_n: int,
     log,
+    security_names: bytes | None = None,
 ) -> dict:
     """envelope(JSON 바이트)와 시장·섹터 입력으로 렌더 입력(ctx)을 만듭니다. 파일은 쓰지 않습니다.
 
     `repo`는 "마지막 정상 단위" 링크를 찾으려고 읽기만 합니다. 없는 디렉터리여도 됩니다.
+    `security_names`는 `security-names.v1` JSON 바이트입니다. 없으면 KR은 순위 행의 이름으로
+    종류를 판정하고, 이름이 없는 시장은 종류 열을 생략합니다.
     """
     env = load_json_bytes(env_bytes, "envelope")
     unit, decision = parse_envelope(env)
@@ -1880,6 +2146,9 @@ def build_context(
             "envelope 값을 따릅니다."
         )
     kr, us = build_market_sections(env, reports, failures, top_n)
+    names = load_security_names(security_names)
+    attach_kinds(kr, "KR", names)
+    attach_kinds(us, "US", names)
     ms_sec = build_ms_section(ms, unit)
     stamp = generated_at
     if stamp:
@@ -1898,6 +2167,7 @@ def build_context(
         "revision": 1,
         "release": release,
         "sha": sha256_bytes(env_bytes),
+        "names_sha": sha256_bytes(security_names) if security_names is not None else None,
         "replay": replay,
         "replay_info": env.get("replay"),
         "synthetic": env.get("synthetic_fixture") is True,
@@ -1964,6 +2234,7 @@ def generate(
     previous_commit: str | None,
     overwrite: bool,
     log,
+    names_path: Path | None = None,
 ) -> str:
     """단위 하나를 저장소 트리에 쓰고 인덱스를 다시 만듭니다. 수동·시험용입니다.
 
@@ -1973,7 +2244,10 @@ def generate(
         raise InputError("--repo 디렉터리가 없습니다. 먼저 --init으로 만드십시오.")
     env_bytes = read_bytes(env_path, "envelope")
     ms_bytes = read_bytes(ms_path, "시장·섹터 입력") if ms_path else None
-    ctx = build_context(repo, env_bytes, ms_bytes, release, generated_at, top_n, log)
+    names_bytes = read_bytes(names_path, "증권 이름 입력") if names_path else None
+    ctx = build_context(
+        repo, env_bytes, ms_bytes, release, generated_at, top_n, log, security_names=names_bytes
+    )
     unit = ctx["unit"]
     udir = unit_dir(repo, unit)
     existing = read_existing(udir)
@@ -2880,6 +3154,11 @@ def main(argv: list | None = None) -> int:
     parser.add_argument(
         "--market-sector", type=Path, help="시장·섹터 JSON (없으면 섹션을 failed로 씁니다)"
     )
+    parser.add_argument(
+        "--security-names",
+        type=Path,
+        help="security-names.v1 JSON (순위 표 종류 열의 이름 원천. 없으면 KR 행 이름만 씀)",
+    )
     parser.add_argument("--release", help="서빙 release id")
     parser.add_argument("--generated-at", help="ISO 시각(시간대 포함). 없으면 지금")
     parser.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
@@ -2934,6 +3213,7 @@ def main(argv: list | None = None) -> int:
                     args.previous_commit,
                     args.overwrite,
                     log,
+                    names_path=args.security_names,
                 )
             elif not (args.init or args.reindex):
                 raise InputError("--envelope, --init, --reindex, --validate 중 하나가 필요합니다.")
