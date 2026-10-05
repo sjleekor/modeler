@@ -1,4 +1,4 @@
-"""Contract tests for deploy/prod/bin/briefing-stage.sh and us-prepare.sh (fake python, no lake)."""
+"""Contract tests for deploy/prod/bin/briefing-stage.sh, us-prepare.sh and kr-prepare.sh (fake python, no lake)."""
 from __future__ import annotations
 
 import hashlib
@@ -14,6 +14,7 @@ import pytest
 BIN = Path(__file__).resolve().parents[3] / "deploy" / "prod" / "bin"
 STAGE = BIN / "briefing-stage.sh"
 PREPARE = BIN / "us-prepare.sh"
+KR_PREPARE = BIN / "kr-prepare.sh"
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 
@@ -26,11 +27,18 @@ if [ "$1" = -m ]; then
       [ "${FAKE_PREP_RC:-0}" -eq 0 ] || exit "$FAKE_PREP_RC"
       touch "$FAKE_STATE/prepared"; echo "prepared: /x/manifest.json"; exit 0;;
     modeler.serving.daily_wrapper) exit "${FAKE_RC:-0}";;
+    modeler.serving.kr_live_prepare) exit "${FAKE_LIVE_RC:-0}";;
+    modeler.serving.kr_prepare)
+      [ "${FAKE_KR_PREP_RC:-0}" -eq 0 ] || exit "$FAKE_KR_PREP_RC"
+      while [ $# -gt 0 ]; do [ "$1" = --output-dir ] && out=$2; shift; done
+      mkdir -p "$out" && touch "$out/completion.json"; exit 0;;
   esac
 elif [ "$1" = -c ]; then
   case "$3" in
     prepared-ok) if [ -n "${FAKE_ALREADY:-}" ] || [ -f "$FAKE_STATE/prepared" ]; then echo /x/manifest.json; exit 0; fi; exit 1;;
     data-ready) echo "  prices_daily: fake" >&2; exit "${FAKE_DATA_RC:-0}";;
+    kr-dates) [ "${FAKE_CAL_RC:-0}" -eq 0 ] || exit "$FAKE_CAL_RC"
+      echo "${FAKE_KR_SESSION:-session}"; echo "${FAKE_K:-2026-10-02}"; exit 0;;
   esac
 fi
 exit 99
@@ -52,7 +60,8 @@ def serving(tmp_path: Path) -> dict:
     fake.write_text(FAKE_PYTHON)
     fake.chmod(0o755)
     for name, body in (("timeout", 'echo "timeout $1" >> "$FAKE_LOG"; shift; exec "$@"'),
-                       ("taskset", 'echo "taskset $1 $2" >> "$FAKE_LOG"; shift 2; exec "$@"')):
+                       ("taskset", 'echo "taskset $1 $2" >> "$FAKE_LOG"; shift 2; exec "$@"'),
+                       ("nice", 'echo "nice $1 $2" >> "$FAKE_LOG"; shift 2; exec "$@"')):
         shim = tmp_path / "shims" / name
         shim.parent.mkdir(exist_ok=True)
         shim.write_text("#!/usr/bin/env bash\n" + body + "\n")
@@ -61,8 +70,11 @@ def serving(tmp_path: Path) -> dict:
     config.mkdir()
     evidence = config / "evidence.json"
     evidence.write_text('{"status": "score_equivalent"}')
+    calendar = config / "calendar-KR.json"
+    calendar.write_text("{}")
     (config / "ops.json").write_text(json.dumps({"release_manifest": str(release / "release.json"),
-                                                 "python": str(fake)}))
+                                                 "python": str(fake), "kr_calendar": str(calendar),
+                                                 "prepared_root": str(root / "prepared")}))
     (config / "pins.json").write_text(json.dumps(
         {"parity_evidence": {"path": str(evidence), "sha256": _sha(evidence)}}))
     state = tmp_path / "state"
@@ -162,3 +174,107 @@ def test_prepare_failure_code_passes_through(serving):
 def test_prepare_bad_args(serving):
     assert _run(PREPARE, ["--run-date", "tomorrow"], serving["env"]).returncode == 2
     assert _run(PREPARE, ["x"], serving["env"]).returncode == 2
+
+
+FAKE_SDC = {
+    "kr-export-wait-ready.sh": 'echo "gate $*" >> "$FAKE_LOG"; exit "${FAKE_GATE_RC:-0}"',
+    "kr-raw-parquet-export.sh": (
+        'echo "export $*" >> "$FAKE_LOG"; [ "${FAKE_EXPORT_RC:-0}" -eq 0 ] || exit "$FAKE_EXPORT_RC"\n'
+        'm="$KR_STOCK_DATA_ROOT/kr/raw/raw_postgres/snapshot_date=$2/source=sj2_remote/_manifests"\n'
+        'mkdir -p "$m" && touch "$m/_SUCCESS.json"'),
+}
+
+
+@pytest.fixture()
+def kr(serving, tmp_path: Path) -> dict:
+    sdc = tmp_path / "sdc_bin"
+    sdc.mkdir()
+    for name, body in FAKE_SDC.items():
+        (sdc / name).write_text("#!/usr/bin/env bash\n" + body + "\n")
+        (sdc / name).chmod(0o755)
+    lake = tmp_path / "lake"
+    env = {**serving["env"], "SDC_BIN": str(sdc), "KR_STOCK_DATA_ROOT": str(lake),
+           "KR_PREPARE_GATE_UNTIL": "23:59"}
+    out = serving["root"] / "prepared" / "kr" / "score_date=2026-10-02" / "prep_id=2026-10-05"
+    return {**serving, "env": env, "lake": lake, "out": out}
+
+
+def _marker(lake: Path, kind: str, snap: str = "2026-10-05") -> Path:
+    sub = {"raw": "raw/raw_postgres", "feature": "derived/feature"}[kind]
+    path = lake / "kr" / sub / f"snapshot_date={snap}" / "source=sj2_remote" / "_manifests" / "_SUCCESS.json"
+    path.parent.mkdir(parents=True)
+    path.touch()
+    return path
+
+
+def test_kr_prepare_happy_path(kr):
+    done = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"])
+    assert done.returncode == 0, done.stderr
+    calls = _calls(kr)
+    (gate,) = [c for c in calls if c.startswith("gate ")]
+    assert gate.startswith("gate --feature-asof-date 2026-10-02 --deadline-seconds ")
+    assert "export --snapshot-date 2026-10-05 --consistent-snapshot" in calls
+    cutoff = "--input-cutoff 2026-10-05T09:30:00+09:00"
+    (live,) = [c for c in calls if "kr_live_prepare" in c]
+    assert (f"argv=-m modeler.serving.kr_live_prepare --snapshot-date 2026-10-05 --feature-asof-date 2026-10-02 "
+            f"{cutoff} --stock-data-root {kr['lake']} --profile full --max-temp-size 30GB|") in live
+    (prep,) = [c for c in calls if "modeler.serving.kr_prepare" in c]
+    assert f"--output-dir {kr['out']} --stock-data-root {kr['lake']}|" in prep
+    assert f"PYTHONPATH={kr['release']}/src" in prep and "DONTWRITE=1" in prep
+    assert "/logs/kr-prepare/D=2026-10-05" in prep
+    assert "timeout 5400" in calls and "timeout 3600" in calls and "timeout 1800" in calls
+    assert "taskset -c 0,1" in calls and "nice -n 10" in calls
+    assert (kr["out"] / "completion.json").is_file()
+
+
+def test_kr_prepare_closed_day_skips(kr):
+    done = _run(KR_PREPARE, ["--report-date", "2026-10-04"], kr["env"], {"FAKE_KR_SESSION": "closed"})
+    assert done.returncode == 0 and "not a KR session" in done.stdout
+    assert not [c for c in _calls(kr) if c.startswith(("gate ", "export ")) or "argv=-m" in c]
+
+
+def test_kr_prepare_already_prepared_skips(kr):
+    kr["out"].mkdir(parents=True)
+    (kr["out"] / "completion.json").touch()
+    done = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"])
+    assert done.returncode == 0 and "already prepared" in done.stdout
+    assert not [c for c in _calls(kr) if c.startswith(("gate ", "export ")) or "argv=-m" in c]
+
+
+def test_kr_prepare_resumes_after_sealed_steps(kr):
+    _marker(kr["lake"], "raw")
+    _marker(kr["lake"], "feature")
+    done = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"])
+    assert done.returncode == 0, done.stderr
+    calls = _calls(kr)
+    assert not [c for c in calls if c.startswith(("gate ", "export ")) or "kr_live_prepare" in c]
+    assert [c for c in calls if "modeler.serving.kr_prepare" in c]
+
+
+@pytest.mark.parametrize("gate_rc,code", [(75, 30), (1, 31), (5, 5)])
+def test_kr_prepare_gate_failure_stops_before_export(kr, gate_rc, code):
+    done = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"], {"FAKE_GATE_RC": str(gate_rc)})
+    assert done.returncode == code
+    assert not [c for c in _calls(kr) if c.startswith("export ") or "argv=-m" in c]
+
+
+def test_kr_prepare_consistent_snapshot_can_be_turned_off(kr):
+    done = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"], {"KR_PREPARE_CONSISTENT_SNAPSHOT": "0"})
+    assert done.returncode == 0, done.stderr
+    assert "export --snapshot-date 2026-10-05" in _calls(kr)
+
+
+@pytest.mark.parametrize("extra,code", [({"FAKE_EXPORT_RC": "3"}, 3), ({"FAKE_LIVE_RC": "124"}, 124),
+                                        ({"FAKE_KR_PREP_RC": "1"}, 1)])
+def test_kr_prepare_step_failure_code_passes_through(kr, extra, code):
+    assert _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"], extra).returncode == code
+
+
+def test_kr_prepare_calendar_gap_is_12(kr):
+    assert _run(KR_PREPARE, ["--report-date", "2027-01-04"], kr["env"], {"FAKE_CAL_RC": "3"}).returncode == 12
+
+
+def test_kr_prepare_bad_args(kr):
+    assert _run(KR_PREPARE, ["--report-date", "today"], kr["env"]).returncode == 2
+    assert _run(KR_PREPARE, ["x"], kr["env"]).returncode == 2
+    assert _run(KR_PREPARE, [], kr["env"], {"KR_PREPARE_CONSISTENT_SNAPSHOT": "yes"}).returncode == 2
