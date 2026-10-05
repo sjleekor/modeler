@@ -278,3 +278,176 @@ def test_kr_prepare_bad_args(kr):
     assert _run(KR_PREPARE, ["--report-date", "today"], kr["env"]).returncode == 2
     assert _run(KR_PREPARE, ["x"], kr["env"]).returncode == 2
     assert _run(KR_PREPARE, [], kr["env"], {"KR_PREPARE_CONSISTENT_SNAPSHOT": "yes"}).returncode == 2
+
+
+# ---- step 5: retention ----
+
+def _snap(lake: Path, kind: str, snap: str, *, files: bool = True) -> Path:
+    """An old snapshot: sealed manifests plus a parquet file."""
+    sub = {"raw": "raw/raw_postgres", "feature": "derived/feature"}[kind]
+    base = lake / "kr" / sub / f"snapshot_date={snap}" / "source=sj2_remote"
+    (base / "_manifests" / "table_manifests").mkdir(parents=True)
+    (base / "_manifests" / "_SUCCESS.json").write_text(f'{{"snap": "{snap}"}}')
+    (base / "_manifests" / "table_manifests" / "t.json").write_text("{}")
+    if files:
+        (base / "daily_ohlcv").mkdir()
+        (base / "daily_ohlcv" / "part-0.parquet").write_text("x" * 100)
+    return base.parent
+
+
+def _archive(lake: Path, kind: str, snap: str) -> Path:
+    sub = {"raw": "raw/_manifest_archive", "feature": "derived/_manifest_archive/feature"}[kind]
+    return lake / "kr" / sub / f"snapshot_date={snap}" / "source=sj2_remote" / "_manifests"
+
+
+def _kr_run(kr, extra: dict | None = None):
+    return _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"], extra)
+
+
+def test_retention_deletes_older_and_archives_manifests(kr):
+    lake = kr["lake"]
+    old = {k: _snap(lake, k, "2026-10-01") for k in ("raw", "feature")}
+    cur = {k: _snap(lake, k, "2026-10-05") for k in ("raw", "feature")}
+    newer = {k: _snap(lake, k, "2026-10-06") for k in ("raw", "feature")}
+    done = _kr_run(kr)
+    assert done.returncode == 0, done.stderr
+    for kind in ("raw", "feature"):
+        assert not old[kind].exists()
+        assert cur[kind].is_dir() and newer[kind].is_dir()
+        arch = _archive(lake, kind, "2026-10-01")
+        assert (arch / "_SUCCESS.json").read_text() == '{"snap": "2026-10-01"}'
+        assert (arch / "table_manifests" / "t.json").is_file()
+        assert not _archive(lake, kind, "2026-10-05").parent.parent.exists()
+    assert done.stdout.count("retention: deleted") == 2 and "archived ->" in done.stdout
+    assert (kr["out"] / "completion.json").is_file()
+
+
+def test_retention_deletes_older_metric_snapshots(kr):
+    metric = kr["lake"] / "kr" / "derived" / "metric"
+    for snap in ("2026-10-01", "2026-10-05"):
+        fact = metric / f"snapshot_date={snap}" / "source=sj2_remote" / "stock_metric_fact"
+        fact.mkdir(parents=True)
+        (fact / "part-000000.parquet").write_text("x")
+        (fact / "_plan.json").write_text("{}")
+    done = _kr_run(kr)
+    assert done.returncode == 0, done.stderr
+    assert not (metric / "snapshot_date=2026-10-01").exists()
+    assert (metric / "snapshot_date=2026-10-05" / "source=sj2_remote" / "stock_metric_fact" / "_plan.json").is_file()
+    assert "retention: deleted metric snapshot_date=2026-10-01" in done.stdout
+    assert "WARNING" not in done.stderr
+
+
+def test_retention_keep_two_keeps_one_older(kr):
+    lake = kr["lake"]
+    for snap in ("2026-09-29", "2026-10-01"):
+        _snap(lake, "raw", snap)
+    done = _kr_run(kr, {"KR_PREPARE_KEEP_SNAPSHOTS": "2"})
+    assert done.returncode == 0, done.stderr
+    raw = lake / "kr" / "raw" / "raw_postgres"
+    assert not (raw / "snapshot_date=2026-09-29").exists()
+    assert (raw / "snapshot_date=2026-10-01").is_dir() and (raw / "snapshot_date=2026-10-05").is_dir()
+    assert _archive(lake, "raw", "2026-09-29").is_dir() and not _archive(lake, "raw", "2026-10-01").exists()
+
+
+def test_retention_disabled_keeps_everything(kr):
+    old = _snap(kr["lake"], "raw", "2026-10-01")
+    done = _kr_run(kr, {"KR_PREPARE_RETENTION": "0"})
+    assert done.returncode == 0 and old.is_dir() and "retention disabled" in done.stdout
+    assert not (kr["lake"] / "kr" / "raw" / "_manifest_archive").exists()
+
+
+@pytest.mark.parametrize("extra", [{"KR_PREPARE_KEEP_SNAPSHOTS": "0"}, {"KR_PREPARE_KEEP_SNAPSHOTS": "x"},
+                                   {"KR_PREPARE_KEEP_SNAPSHOTS": "-1"}, {"KR_PREPARE_RETENTION": "2"}])
+def test_retention_invalid_knob_is_2(kr, extra):
+    assert _kr_run(kr, extra).returncode == 2
+    assert _calls(kr) == []
+
+
+def test_retention_skipped_when_step4_fails(kr):
+    old = _snap(kr["lake"], "raw", "2026-10-01")
+    assert _kr_run(kr, {"FAKE_KR_PREP_RC": "1"}).returncode == 1
+    assert old.is_dir() and not (kr["lake"] / "kr" / "raw" / "_manifest_archive").exists()
+
+
+def test_retention_runs_when_already_prepared(kr):
+    old = _snap(kr["lake"], "feature", "2026-10-01")
+    _snap(kr["lake"], "feature", "2026-10-05")  # with no SNAP dir the older one is the newest and stays
+    kr["out"].mkdir(parents=True)
+    (kr["out"] / "completion.json").touch()
+    done = _kr_run(kr)
+    assert done.returncode == 0 and "already prepared" in done.stdout
+    assert not old.exists() and _archive(kr["lake"], "feature", "2026-10-01").is_dir()
+    assert not [c for c in _calls(kr) if c.startswith(("gate ", "export ")) or "argv=-m" in c]
+    again = _kr_run(kr)  # a second rerun changes nothing
+    assert again.returncode == 0 and "retention: deleted" not in again.stdout
+
+
+def test_retention_ignores_other_names(kr):
+    raw = kr["lake"] / "kr" / "raw" / "raw_postgres"
+    for name in ("snapshot_date=2026-10-01.bak", "snapshot_date=latest", "other"):
+        (raw / name).mkdir(parents=True)
+    _kr_run(kr)
+    assert all((raw / n).is_dir() for n in ("snapshot_date=2026-10-01.bak", "snapshot_date=latest", "other"))
+
+
+def test_retention_failure_warns_and_exits_0(kr):
+    old = _snap(kr["lake"], "raw", "2026-10-01")
+    fine = _snap(kr["lake"], "feature", "2026-10-01")
+    _snap(kr["lake"], "feature", "2026-10-05")
+    locked = old / "source=sj2_remote" / "daily_ohlcv"
+    locked.chmod(0o555)  # non-writable dir: its parquet cannot be unlinked
+    try:
+        if os.access(locked, os.W_OK):
+            pytest.skip("running as a user that ignores directory permissions")
+        done = _kr_run(kr)
+        assert done.returncode == 0, done.stderr
+        assert "WARNING retention incomplete" in done.stderr and "snapshot_date=2026-10-01" in done.stderr
+        assert (kr["out"] / "completion.json").is_file()
+        assert not fine.exists()  # the other parent is still cleaned
+        # manifests went first: no leftover _SUCCESS.json for parquet that remains
+        assert not list(old.rglob("_SUCCESS.json"))
+        assert _archive(kr["lake"], "raw", "2026-10-01").is_dir()
+    finally:
+        locked.chmod(0o755)
+
+
+def test_retention_refuses_symlinked_target(kr, tmp_path):
+    raw = kr["lake"] / "kr" / "raw" / "raw_postgres"
+    real = _snap(tmp_path / "elsewhere", "raw", "2026-09-01")
+    raw.mkdir(parents=True)
+    (raw / "snapshot_date=2026-10-01").symlink_to(real)
+    done = _kr_run(kr)
+    assert done.returncode == 0 and "symlink" in done.stderr
+    assert real.is_dir() and (real / "source=sj2_remote" / "daily_ohlcv" / "part-0.parquet").is_file()
+
+
+def test_retention_refuses_symlinked_parent(kr, tmp_path):
+    real = _snap(tmp_path / "elsewhere", "raw", "2026-09-01").parent
+    (kr["lake"] / "kr" / "raw").mkdir(parents=True)
+    (kr["lake"] / "kr" / "raw" / "raw_postgres").symlink_to(real)
+    done = _kr_run(kr)
+    assert done.returncode == 0 and "symlink" in done.stderr
+    assert (real / "snapshot_date=2026-09-01").is_dir()
+
+
+def test_retention_keeps_conflicting_archive(kr):
+    old = _snap(kr["lake"], "raw", "2026-10-01")
+    arch = _archive(kr["lake"], "raw", "2026-10-01")
+    arch.mkdir(parents=True)
+    (arch / "_SUCCESS.json").write_text("different")
+    done = _kr_run(kr)
+    assert done.returncode == 0 and "not deleted" in done.stderr
+    assert old.is_dir() and (arch / "_SUCCESS.json").read_text() == "different"
+
+
+def test_retention_cleans_old_spill_dirs_only(kr):
+    tmp = kr["lake"] / "kr" / "derived" / "_duckdb_tmp"
+    old, same, odd = (tmp / "2026-10-01_20261001T041000Z_123", tmp / "2026-10-05_20261005T041000Z_9", tmp / "notes")
+    for d in (old, same, odd):
+        d.mkdir(parents=True)
+    (old / "build_profile.partial.json").write_text("{}")
+    (old / "spill.tmp").write_text("x")
+    done = _kr_run(kr)
+    assert done.returncode == 0, done.stderr
+    assert not old.exists() and same.is_dir() and odd.is_dir()
+    assert (kr["lake"] / "kr/derived/_manifest_archive/_duckdb_tmp" / old.name / "build_profile.partial.json").is_file()
