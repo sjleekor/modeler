@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -230,3 +231,161 @@ def test_direct_runner_rejects_hash_consistent_diagnostic_us(
     assert [(row["market"], row["model_id"]) for row in report["markets"]] == [
         ("KR", "kr_daily_h20_v1")]
     assert len(report["failures"]) == 2
+
+
+# ---- R3: selection modes, separate time fields, KR prepared input older than K ----
+
+def _wide_calendars(args: dict, start: str = "2026-09-14") -> None:
+    """Weekday sessions from ``start`` through D for both markets (K = 09-28)."""
+    import r3_world
+
+    for key, market in (("kr_calendar_path", "KR"), ("us_calendar_path", "US")):
+        _write(args[key], r3_world._calendar(market, date.fromisoformat(start), D))
+
+
+def test_selection_records_both_times_and_the_mode_and_no_longer_a_completed_at(tmp_path: Path) -> None:
+    args = _inputs(tmp_path)
+    result = select(**args)
+    assert result["selection_mode"] == "scheduled"
+    assert result["selected_at"] == "2026-09-29T09:30:00+09:00"
+    for market in ("kr", "us"):
+        selection = json.loads((args["output_root"] / "2026-09-29" / f"{market}-selection.json").read_text())
+        assert selection["selected_at"] == "2026-09-29T09:30:00+09:00"
+        assert selection["selection_mode"] == "scheduled"
+        assert selection["producer_completed_at"] == "2026-09-29T09:20:00+09:00"
+        assert selection["verified_available_by"] == selection["producer_completed_at"]
+        assert "completed_at" not in selection
+        assert selection["lag_sessions"] == 0
+    assert result["markets"]["KR"]["producer_completed_at"] == "2026-09-29T09:20:00+09:00"
+
+
+@pytest.mark.parametrize("mode,minute,ok", [
+    ("scheduled", (9, 30), True), ("scheduled", (10, 0), True), ("scheduled", (10, 5), False),
+    ("run_fallback", (10, 5), True), ("run_fallback", (14, 0), True), ("run_fallback", (9, 29), False),
+])
+def test_selection_time_window_depends_on_the_mode(
+        tmp_path: Path, mode: str, minute: tuple, ok: bool) -> None:
+    args = {**_inputs(tmp_path), "mode": mode,
+            "selected_at": datetime(2026, 9, 29, *minute, tzinfo=SEOUL)}
+    if ok:
+        assert select(**args)["selection_mode"] == mode
+    else:
+        with pytest.raises(ValueError, match="selection must occur"):
+            select(**args)
+
+
+def test_unknown_selection_mode_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="scheduled or run_fallback"):
+        select(**{**_inputs(tmp_path), "mode": "whenever"})
+
+
+def test_run_fallback_never_admits_an_input_that_finished_after_the_cutoff(tmp_path: Path) -> None:
+    args = {**_inputs(tmp_path), "mode": "run_fallback",
+            "selected_at": datetime(2026, 9, 29, 10, 5, tzinfo=SEOUL)}
+    marker = args["prepared_root"] / "kr" / "score_date=2026-09-28" / "prep_id=fixture" / "completion.json"
+    body = json.loads(marker.read_text())
+    body["verified_available_by"] = "2026-09-29T09:40:00+09:00"
+    _write(marker, body)
+    result = select(**args)
+    assert result["markets"]["KR"]["status"] == "unavailable" and result["markets"]["US"]["status"] == "ok"
+
+
+def test_kr_prepared_input_before_k_is_selected_as_stale_and_the_lag_is_recorded(tmp_path: Path) -> None:
+    import r3_world
+
+    args = _inputs(tmp_path)
+    shutil.rmtree(args["prepared_root"] / "kr")
+    _wide_calendars(args)
+    for asof in ("2026-09-22", "2026-09-24"):
+        r3_world.write_native(args["prepared_root"], "KR", asof, "2026-09-29T09:20:00+09:00")
+    result = select(**args)
+    assert result["markets"]["KR"] == {
+        "status": "stale", "feature_asof_date": "2026-09-24", "lag_sessions": 2,
+        "freshness_reason": "KR feature session does not match K",
+        "producer_completed_at": "2026-09-29T09:20:00+09:00"}
+    selection = json.loads((args["output_root"] / "2026-09-29" / "kr-selection.json").read_text())
+    assert selection["freshness_status"] == "stale" and selection["lag_sessions"] == 2
+    assert selection["kr_session"] == "2026-09-28"
+    assert result["status"] == "selected"  # all three jobs are pinned, KR on its older input
+
+
+def test_kr_prepared_input_newer_than_k_is_never_selected(tmp_path: Path) -> None:
+    import r3_world
+
+    args = _inputs(tmp_path)
+    shutil.rmtree(args["prepared_root"] / "kr")
+    _wide_calendars(args)
+    r3_world.write_native(args["prepared_root"], "KR", "2026-09-29", "2026-09-29T09:20:00+09:00")
+    result = select(**args)
+    assert result["markets"]["KR"]["status"] == "unavailable"
+    assert result["markets"]["KR"]["reason"] == "kr_prepared_newer_than_k"
+
+
+def test_the_newest_older_prepared_input_wins_over_an_older_one_even_when_finished_later(
+        tmp_path: Path) -> None:
+    import r3_world
+
+    args = _inputs(tmp_path)
+    shutil.rmtree(args["prepared_root"] / "kr")
+    _wide_calendars(args)
+    r3_world.write_native(args["prepared_root"], "KR", "2026-09-23", "2026-09-29T09:25:00+09:00")
+    r3_world.write_native(args["prepared_root"], "KR", "2026-09-25", "2026-09-29T08:00:00+09:00")
+    assert select(**args)["markets"]["KR"]["feature_asof_date"] == "2026-09-25"
+
+
+# ---- R3: what stays blocked on the relaxed (stale, fallback) paths ----
+
+def _stale_kr_args(tmp_path: Path) -> dict:
+    import r3_world
+
+    args = _inputs(tmp_path)
+    shutil.rmtree(args["prepared_root"] / "kr")
+    _wide_calendars(args)
+    r3_world.write_native(args["prepared_root"], "KR", "2026-09-25", "2026-09-29T09:20:00+09:00")
+    return args
+
+
+def test_stale_kr_input_still_needs_matching_hashes_and_marker(tmp_path: Path) -> None:
+    args = _stale_kr_args(tmp_path)
+    assert select(**{**args, "output_root": args["output_root"] / "ok"})["markets"]["KR"]["status"] == "stale"
+    directory = args["prepared_root"] / "kr" / "score_date=2026-09-25" / "prep_id=r3-2026-09-25"
+    # A changed feature file no longer matches the completion marker's hash.
+    (directory / "feature_panel.parquet").write_bytes(b"tampered after completion")
+    tampered = select(**{**args, "output_root": args["output_root"] / "tampered"})
+    assert tampered["markets"]["KR"]["status"] == "unavailable"
+    (directory / "feature_panel.parquet").write_bytes(b"synthetic model input KR 2026-09-25")
+    # No completion marker at all: the input does not exist for the selector.
+    (directory / "completion.json").unlink()
+    missing = select(**{**args, "output_root": args["output_root"] / "missing"})
+    assert missing["markets"]["KR"]["status"] == "unavailable"
+
+
+def test_stale_kr_input_outside_the_calendar_coverage_is_unavailable_not_guessed(
+        tmp_path: Path) -> None:
+    import r3_world
+
+    args = _inputs(tmp_path)
+    shutil.rmtree(args["prepared_root"] / "kr")
+    _wide_calendars(args, start="2026-09-24")  # the calendar starts after the prepared input's date
+    r3_world.write_native(args["prepared_root"], "KR", "2026-09-22", "2026-09-29T09:20:00+09:00")
+    result = select(**args)
+    assert result["markets"]["KR"]["status"] == "unavailable"
+    assert "KR feature session is not a session of the KR calendar" in result["markets"]["KR"]["reason"]
+
+
+def test_stale_us_input_still_goes_through_the_serving_gate(tmp_path: Path) -> None:
+    """A' (older than E) is shown as stale, but a native that fails the serving gate is not served."""
+    import r3_world
+
+    args = _inputs(tmp_path)
+    shutil.rmtree(args["prepared_root"] / "us")
+    _wide_calendars(args)
+    directory = r3_world.write_native(
+        args["prepared_root"], "US", "2026-09-23", "2026-09-29T09:20:00+09:00",
+        extra_native={"raw_feature_parity_status": "failed"})
+    served = select(**{**args, "output_root": args["output_root"] / "failed-parity"})
+    assert served["markets"]["US"]["status"] == "unavailable"
+    shutil.rmtree(directory.parent)
+    r3_world.write_native(args["prepared_root"], "US", "2026-09-23", "2026-09-29T09:20:00+09:00")
+    ok = select(**{**args, "output_root": args["output_root"] / "no-parity-claim"})
+    assert ok["markets"]["US"]["status"] == "stale" and ok["markets"]["US"]["lag_sessions"] == 3

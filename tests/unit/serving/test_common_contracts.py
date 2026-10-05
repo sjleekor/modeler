@@ -147,6 +147,44 @@ def test_kr_input_after_cutoff_is_not_eligible_for_inference():
     assert "do not infer" in result.reason
 
 
+def _kr_calendar_wide() -> SessionCalendar:
+    days = [date(2026, 9, 21), date(2026, 9, 22), date(2026, 9, 23), date(2026, 9, 24),
+            date(2026, 9, 25), date(2026, 9, 28), date(2026, 9, 29)]
+    return SessionCalendar.from_dates("KR", days, coverage_start=days[0], coverage_end=days[-1])
+
+
+def _kr_freshness(asof: date, *, calendar: SessionCalendar | None = None):
+    return assess_freshness(report_date=date(2026, 9, 29), market="KR", feature_asof_date=asof,
+        decision_at=datetime(2026, 9, 29, 10, tzinfo=SEOUL), calendar=calendar or _kr_calendar_wide(),
+        **_availability(datetime(2026, 9, 29, 9, 25, tzinfo=SEOUL)))
+
+
+def test_kr_session_before_k_is_stale_with_its_lag_in_sessions():
+    """2026-10-05 change 3: K' (earlier than K) is shown as stale; the lag counts KR sessions."""
+    assert _kr_freshness(date(2026, 9, 28)).status == "ok"
+    one = _kr_freshness(date(2026, 9, 25))
+    assert one.status == "stale" and one.delivery_lag == 1
+    assert one.reason == "KR feature session does not match K"
+    far = _kr_freshness(date(2026, 9, 21))
+    assert far.status == "stale" and far.delivery_lag == 5
+
+
+def test_kr_stale_input_still_fails_closed_on_calendar_and_cutoff_facts():
+    assert _kr_freshness(date(2026, 9, 29)).status == "failed"  # newer than K
+    outside = _kr_freshness(date(2026, 9, 18))  # before the calendar's coverage: lag unknown
+    assert outside.status == "unavailable" and outside.delivery_lag is None
+    weekend = _kr_freshness(date(2026, 9, 26))  # a date the calendar knows is not a session
+    assert weekend.status == "unavailable"
+    unconfirmed = SessionCalendar.from_dates("KR", [date(2026, 9, 25), date(2026, 9, 28), date(2026, 9, 29)],
+        coverage_start=date(2026, 9, 25), coverage_end=date(2026, 9, 29),
+        unconfirmed_dates=[date(2026, 9, 28)])
+    assert _kr_freshness(date(2026, 9, 25), calendar=unconfirmed).status == "unavailable"
+    late = assess_freshness(report_date=date(2026, 9, 29), market="KR", feature_asof_date=date(2026, 9, 25),
+        decision_at=datetime(2026, 9, 29, 10, tzinfo=SEOUL), calendar=_kr_calendar_wide(),
+        **_availability(datetime(2026, 9, 29, 9, 31, tzinfo=SEOUL)))
+    assert late.status == "unavailable" and "do not infer" in late.reason
+
+
 def _us_calendar() -> SessionCalendar:
     dates = [date(2026, 9, 23), date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 28)]
     return SessionCalendar.from_dates("US", dates, coverage_start=dates[0], coverage_end=dates[-1])
@@ -167,11 +205,26 @@ def test_us_a_newer_than_e_is_allowed_when_it_is_u_and_arrived_before_cutoff():
     assert result.market_lag == 0
 
 
-def test_us_data_one_session_behind_e_is_stale_but_two_sessions_is_unavailable():
+def test_us_lag_is_shown_not_blocked_one_session_two_sessions_and_beyond_the_old_ceiling():
+    """2026-10-05 change 4: the 2-session stop limit and the market-lag ceiling now mark stale."""
     one_late = _us_freshness(date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 28))
     two_late = _us_freshness(date(2026, 9, 23), date(2026, 9, 25), date(2026, 9, 28))
     assert one_late.status == "stale" and one_late.delivery_lag == 1
-    assert two_late.status == "unavailable" and two_late.delivery_lag == 2
+    # Two sessions behind E, three behind U (> the configured ceiling 2): stale with both lags.
+    assert two_late.status == "stale" and two_late.delivery_lag == 2 and two_late.market_lag == 3
+    assert two_late.reason == "US actual session exceeds market-lag ceiling"
+    # A looser ceiling keeps the delivery-lag reason.
+    looser = _us_freshness(date(2026, 9, 23), date(2026, 9, 25), date(2026, 9, 28), cap=9)
+    assert looser.status == "stale" and looser.reason == "US delivery lag reached the stop limit"
+
+
+def test_us_accuracy_checks_still_block_even_when_lag_is_only_displayed():
+    # Cutoff PIT, unconfirmed sessions and an A newer than U are accuracy, not freshness.
+    late = _us_freshness(date(2026, 9, 28), date(2026, 9, 28), date(2026, 9, 28),
+                         source_time=datetime(2026, 9, 29, 9, 31, tzinfo=SEOUL))
+    assert late.status == "unavailable" and "do not infer" in late.reason
+    future_a = _us_freshness(date(2026, 9, 28), date(2026, 9, 25), date(2026, 9, 25))
+    assert future_a.status == "failed"
 
 
 def test_us_a_after_u_fails_and_missing_market_lag_cap_stays_unavailable():

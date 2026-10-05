@@ -230,3 +230,155 @@ def test_run_daily_requires_fixture_or_replay_before_future_cutoff(tmp_path):
         assert "fixture_mode" in str(exc)
     else:
         raise AssertionError("future decision cutoff must require explicit fixture/replay mode")
+
+
+# ---- R3: time checks (change 5), stale KR input (3), envelope status (6), five-session cap (Q5) ----
+
+def _rewrite_manifest(job, manifest: Path, **changes) -> InferenceJob:
+    data = json.loads(manifest.read_text())
+    for key, value in changes.items():
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+    manifest.write_text(json.dumps(data))
+    return InferenceJob(**{**job.__dict__, "prepared_manifest_sha256": _hash(manifest)})
+
+
+def _metadata(job, root: Path):
+    from modeler.serving.orchestration import _prepared_metadata
+
+    return _prepared_metadata(job, root, REPORT_DATE, DECISION)
+
+
+def test_a_selection_made_after_ten_is_refused_unless_the_run_made_it_itself(tmp_path):
+    import pytest
+
+    job, _, manifest = _job(tmp_path)
+    late = "2026-09-29T10:05:00+09:00"
+    scheduled = _rewrite_manifest(job, manifest, selected_at=late, completed_at=None,
+                                  selection_mode="scheduled")
+    with pytest.raises(ValueError, match="completed after decision_at"):
+        _metadata(scheduled, tmp_path / "prepared")
+    fallback = _rewrite_manifest(job, manifest, selection_mode="run_fallback")
+    metadata = _metadata(fallback, tmp_path / "prepared")
+    assert metadata["selection_mode"] == "run_fallback" and metadata["selected_at"] == late
+    assert metadata["producer_completed_at"] == "2026-09-29T09:25:00+09:00"
+    # A legacy selection (one completed_at, no mode) still reads as a scheduled one.
+    legacy = _rewrite_manifest(job, manifest, selected_at=None, selection_mode=None,
+                               completed_at="2026-09-29T09:35:00+09:00")
+    assert _metadata(legacy, tmp_path / "prepared")["selection_mode"] == "scheduled"
+    for bad in ("sometimes", None):
+        wrong = _rewrite_manifest(job, manifest, selection_mode=bad if bad else "")
+        with pytest.raises(ValueError, match="scheduled or run_fallback"):
+            _metadata(wrong, tmp_path / "prepared")
+
+
+def test_an_input_that_finished_after_the_cutoff_is_refused_in_every_mode(tmp_path):
+    import pytest
+
+    job, _, manifest = _job(tmp_path, source_time="2026-09-29T09:31:00+09:00")
+    for mode in ("scheduled", "run_fallback"):
+        candidate = _rewrite_manifest(job, manifest, selection_mode=mode,
+                                      selected_at="2026-09-29T09:45:00+09:00", completed_at=None)
+        with pytest.raises(ValueError, match="after the 09:30 input cutoff"):
+            _metadata(candidate, tmp_path / "prepared")
+
+
+def test_a_selection_cannot_claim_another_producer_completion_time(tmp_path):
+    import pytest
+
+    job, _, manifest = _job(tmp_path)
+    forged = _rewrite_manifest(job, manifest, producer_completed_at="2026-09-29T08:00:00+09:00")
+    with pytest.raises(ValueError, match="producer_completed_at disagrees"):
+        _metadata(forged, tmp_path / "prepared")
+
+
+def test_run_daily_records_selection_fields_in_the_report_quality(tmp_path):
+    job, _, manifest = _job(tmp_path)
+    job = _rewrite_manifest(job, manifest, selection_mode="run_fallback",
+                            selected_at="2026-09-29T10:05:00+09:00", completed_at=None)
+    envelope = run_daily(report_date=REPORT_DATE, decision_at=DECISION,
+        prepared_root=tmp_path / "prepared", run_root=tmp_path / "run", jobs=[job],
+        expected_identities={("KR", "kr_daily_h20_v1")}, fixture_mode=True,
+        now=datetime(2026, 9, 29, 10, 6, tzinfo=SEOUL))
+    quality = envelope["markets"][0]["quality"]
+    assert quality["selection_mode"] == "run_fallback"
+    assert quality["selected_at"] == "2026-09-29T10:05:00+09:00"
+    assert quality["producer_completed_at"] == "2026-09-29T09:25:00+09:00"
+    assert quality["lag_sessions"] == 0 and quality["freshness_status"] == "ok"
+
+
+def _report(status, market="KR", model_id="kr_daily_h20_v1", *, rankings=0, publication="unresolved"):
+    report = report_template(market=market, report_date=REPORT_DATE.isoformat(), decision_at=DECISION,
+                             feature_asof_date="2026-09-28", model_id=model_id, model_version="1")
+    report["status"] = status
+    report["rankings"] = [{"rank": rank, "symbol": f"S{rank}", "name": "n", "score": 1.0}
+                          for rank in range(1, rankings + 1)]
+    report["publication"] = {"status": publication, "evidence": []}
+    return report
+
+
+US_IDS = ("us_exploratory_20260929_r1_lightgbm", "us_exploratory_20260929_r1_ridge")
+
+
+def _status(*reports, failures=()):
+    from modeler.serving.orchestration import combine_reports
+
+    return combine_reports(report_date=REPORT_DATE, decision_at=DECISION, reports=list(reports),
+                           failures=failures)["status"]
+
+
+def test_envelope_status_is_ok_only_when_every_section_is_ok():
+    kr = _report("ok")
+    us = [_report("ok", "US", model) for model in US_IDS]
+    # Publication is unresolved on every private-repo report: that no longer keeps the unit from ok.
+    assert _status(kr, *us) == "ok"
+    assert _status(kr, *us[:1], failures=[{"market": "US", "model_id": US_IDS[1],
+                                           "error_class": "ValueError"}]) == "partial"
+    assert _status(_report("partial"), *us) == "partial"
+    assert _status(_report("stale"), *us) == "partial"
+    assert _status(kr, _report("stale", "US", US_IDS[0]), us[1]) == "partial"
+
+
+def test_envelope_is_failed_only_when_no_section_produced_anything():
+    """The 10-05 defect: only KR succeeded and the envelope said failed."""
+    assert _status(_report("partial")) == "partial"  # KR alone, US missing -> MissingInference x2
+    assert _status() == "failed"
+    assert _status(_report("unavailable"), _report("failed", "US", US_IDS[0]),
+                   _report("withheld", "US", US_IDS[1])) == "failed"
+    assert _status(failures=[{"market": "KR", "model_id": "kr_daily_h20_v1",
+                              "error_class": "RunnerTimeout"}]) == "failed"
+
+
+def test_session_lag_reads_kr_delivery_lag_and_us_market_lag():
+    from modeler.serving.orchestration import session_lag
+
+    assert session_lag("KR", {"delivery_lag": 3, "market_lag": None}) == 3
+    assert session_lag("US", {"delivery_lag": 1, "market_lag": 4}) == 4
+    assert session_lag("US", {"market_lag": None}) is None
+    assert session_lag("KR", {"delivery_lag": True}) is None
+
+
+def test_stale_reports_keep_the_ranking_up_to_five_sessions_and_drop_it_beyond():
+    from modeler.serving.orchestration import _annotate_selection
+
+    meta = {"freshness_status": "stale", "selection_mode": "scheduled",
+            "selected_at": "2026-09-29T09:30:00+09:00",
+            "producer_completed_at": "2026-09-29T09:20:00+09:00"}
+    five = _report("partial", rankings=3)
+    _annotate_selection(five, {**meta, "freshness": {"delivery_lag": 5}}, "KR")
+    assert five["status"] == "stale" and len(five["rankings"]) == 3
+    assert five["quality"]["lag_sessions"] == 5 and five["quality"]["status_before_stale"] == "partial"
+    six = _report("partial", rankings=3)
+    _annotate_selection(six, {**meta, "freshness": {"delivery_lag": 6}}, "KR")
+    assert six["status"] == "stale" and six["rankings"] == []
+    assert six["quality"]["rankings_withheld"] == {
+        "reason": "stale_lag_exceeds_limit", "lag_sessions": 6, "limit_sessions": 5, "ranking_count": 3}
+    us = _report("stale", "US", US_IDS[0], rankings=2)
+    _annotate_selection(us, {**meta, "freshness": {"market_lag": 7, "delivery_lag": 1}}, "US")
+    assert us["rankings"] == [] and us["quality"]["lag_sessions"] == 7
+    fresh = _report("ok", rankings=2)
+    _annotate_selection(fresh, {**meta, "freshness_status": "ok", "freshness": {"delivery_lag": 0}}, "KR")
+    assert fresh["status"] == "ok" and len(fresh["rankings"]) == 2
+    assert "rankings_withheld" not in fresh["quality"]

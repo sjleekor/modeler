@@ -12,6 +12,28 @@ from modeler.serving.orchestration import InferenceContext
 from modeler.serving.schema import report_template, validate_report
 
 
+def _reference_quality(reference: Any) -> dict[str, Any]:
+    """Scalar facts of the KR reference-session check, for the data-status page."""
+    if not isinstance(reference, dict):
+        return {}
+    candidates = reference.get("candidates")
+    k_check = candidates[0] if isinstance(candidates, list) and candidates else {}
+    price = k_check.get("price", {}) if isinstance(k_check, dict) else {}
+    gate = reference.get("gate") if isinstance(reference.get("gate"), dict) else {}
+    facts = {
+        "reference_verdict": reference.get("verdict"),
+        "reference_k": reference.get("k"),
+        "reference_date": reference.get("reference_date"),
+        "reference_lag_sessions": reference.get("lag_sessions"),
+        "k_ticker_count": price.get("ticker_count"),
+        "k_ticker_ratio": price.get("ticker_ratio"),
+        "k_previous_session": price.get("previous_session"),
+        "export_gate_verdict": gate.get("verdict"),
+        "dart_chain_ended_at": gate.get("dart_chain_ended_at"),
+    }
+    return {key: value for key, value in facts.items() if value is not None}
+
+
 def infer_kr_daily(context: InferenceContext) -> dict[str, Any]:
     """Score one pinned KR panel with the bundle named by a hash-pinned manifest."""
     if (context.market, context.model_id) != ("KR", "kr_daily_h20_v1"):
@@ -36,9 +58,13 @@ def infer_kr_daily(context: InferenceContext) -> dict[str, Any]:
     )
     report["status"] = "partial"
     report["synthetic_fixture"] = context.fixture_mode
-    report["quality"] = {**report["quality"], "freshness_status": context.freshness_status}
+    report["quality"] = {**report["quality"], "freshness_status": context.freshness_status,
+                         **_reference_quality(context.native_preparation.get("reference_selection"))}
     inner = report["provenance"]
     report["provenance"] = {**inner,
+        # The completeness check that chose this session (complete_K / fallback_K_prime), with the
+        # collector gate's advisory verdict (2026-10-05 change 1); absent on older prepared inputs.
+        "reference_selection": context.native_preparation.get("reference_selection"),
         # Shared keys carry the same meaning as US: sha256 of the pinned files.
         "bundle_manifest_sha256": context.bundle_sha256,
         "prepared_manifest_sha256": context.prepared_manifest_sha256,
@@ -106,9 +132,12 @@ def infer_us_model(context: InferenceContext) -> dict[str, Any]:
                  "latest_us_session": context.freshness.get("latest_us_session"),
                  "expected_us_session": context.freshness.get("expected_us_session"),
                  "actual_us_session": context.freshness.get("actual_us_session"),
-                 "delivery_lag_sessions": context.freshness.get("delivery_lag_sessions"),
-                 "market_lag_sessions": context.freshness.get("market_lag_sessions"),
-                 "market_lag_limit_sessions": context.freshness.get("market_lag_limit_sessions")},
+                 "delivery_lag_sessions": context.freshness.get(
+                     "delivery_lag_sessions", context.freshness.get("delivery_lag")),
+                 "market_lag_sessions": context.freshness.get(
+                     "market_lag_sessions", context.freshness.get("market_lag")),
+                 "market_lag_limit_sessions": context.freshness.get(
+                     "market_lag_limit_sessions", context.selection.get("market_lag_limit_sessions"))},
         provenance={"scoring_version": us_daily.SCORING_VERSION,
                     "input_sha256": context.input_sha256,
                     "bundle_manifest_sha256": context.bundle_sha256,

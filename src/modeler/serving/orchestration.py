@@ -15,12 +15,13 @@ from typing import Any, Callable, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 from .calendars import SessionCalendar
-from .freshness import assess_freshness
+from .freshness import MAX_STALE_SESSIONS, assess_freshness
 from .opening_validation import validate_opening
 from .schema import validate_report
 
 SEOUL = ZoneInfo("Asia/Seoul")
 IDENTIFIER = re.compile(r"^[A-Za-z0-9._-]+$")
+SELECTION_MODES = frozenset({"scheduled", "run_fallback"})
 EXPECTED_MODEL_IDENTITIES = frozenset({
     ("KR", "kr_daily_h20_v1"),
     ("US", "us_exploratory_20260929_r1_lightgbm"),
@@ -173,13 +174,23 @@ def _prepared_metadata(job: InferenceJob, prepared_root: Path,
         raise ValueError("prepared manifest feature_asof_date is missing")
     date.fromisoformat(asof)
     cutoff = datetime.fromisoformat(manifest.get("input_cutoff", ""))
-    completed_at = datetime.fromisoformat(manifest.get("completed_at", ""))
-    if any(x.tzinfo is None or x.utcoffset() is None for x in (cutoff, completed_at)):
+    if cutoff.tzinfo is None or cutoff.utcoffset() is None:
         raise ValueError("prepared manifest timestamps must include timezones")
     expected_cutoff = decision_at.astimezone(SEOUL).replace(hour=9, minute=30, second=0, microsecond=0)
     if cutoff.astimezone(SEOUL) != expected_cutoff:
         raise ValueError("prepared input cutoff is not D 09:30 Asia/Seoul")
-    if completed_at > decision_at:
+    # 입력 완료 시각과 selection을 만든 시각은 다른 시각입니다(2026-10-05 변경 5). 미래 정보는
+    # **입력 완료 시각 <= cutoff**로 막고, selection을 D 10:00 뒤에 만든 것은 run이 대신 고른
+    # `run_fallback`일 때만 받아서 기록합니다. 옛 selection은 `completed_at` 하나였고 그 값이
+    # selection을 만든 시각이었습니다.
+    selected_raw = manifest.get("selected_at", manifest.get("completed_at", ""))
+    selected_at = datetime.fromisoformat(selected_raw)
+    if selected_at.tzinfo is None or selected_at.utcoffset() is None:
+        raise ValueError("prepared manifest timestamps must include timezones")
+    selection_mode = manifest.get("selection_mode", "scheduled")
+    if selection_mode not in SELECTION_MODES:
+        raise ValueError("selection_mode must be scheduled or run_fallback")
+    if selection_mode == "scheduled" and selected_at > decision_at:
         raise ValueError("selection manifest was completed after decision_at")
     calendar_raw = manifest.get("calendar")
     if not isinstance(calendar_raw, dict):
@@ -214,6 +225,12 @@ def _prepared_metadata(job: InferenceJob, prepared_root: Path,
         raise ValueError("selection lacks matching immutable prepared-feature completion evidence")
     if verified_available is None or verified_available.tzinfo is None or verified_available.utcoffset() is None:
         raise ValueError("verified_available_by must include a timezone")
+    if verified_available > cutoff:
+        # run_fallback이어도 입력 완료가 D 09:30보다 늦으면 쓰지 않습니다(PIT).
+        raise ValueError("input producer completed after the 09:30 input cutoff")
+    producer_raw = manifest.get("producer_completed_at", verified_raw)
+    if producer_raw != verified_raw:
+        raise ValueError("producer_completed_at disagrees with the verified availability time")
     first_raw = manifest.get("source_first_available_at")
     first_available = datetime.fromisoformat(first_raw) if isinstance(first_raw, str) else None
     if first_available and (first_available.tzinfo is None or first_available.utcoffset() is None):
@@ -234,10 +251,12 @@ def _prepared_metadata(job: InferenceJob, prepared_root: Path,
             source_first_available_at=first_available,
             max_us_market_lag=manifest.get("market_lag_limit_sessions"))
     else:
+        # 기준일이 K보다 이른 prepared(K')도 받습니다. 달력이 K를 다시 계산하고
+        # assess_freshness가 이른 만큼을 stale 지연 세션 수로 적습니다(2026-10-05 변경 3).
         k_raw = manifest.get("kr_session")
         k_session = date.fromisoformat(k_raw) if isinstance(k_raw, str) else None
-        if k_session != date.fromisoformat(asof):
-            raise ValueError("prepared KR feature date does not match K")
+        if k_session is None or date.fromisoformat(asof) > k_session:
+            raise ValueError("prepared KR feature date is newer than K")
         freshness = assess_freshness(report_date=report_date, market="KR",
             feature_asof_date=date.fromisoformat(asof), decision_at=decision_at,
             input_cutoff=cutoff, calendar=calendar,
@@ -248,8 +267,7 @@ def _prepared_metadata(job: InferenceJob, prepared_root: Path,
     freshness_status = freshness.status
     if manifest.get("freshness_status") != freshness_status:
         raise ValueError("selection freshness status disagrees with calendar assessment")
-    accepted = {"ok", "stale"} if job.market == "US" else {"ok"}
-    if freshness_status not in accepted:
+    if freshness_status not in {"ok", "stale"}:
         raise ValueError("prepared input freshness is unavailable for inference")
     return {"input_path": input_path, "manifest_path": manifest_path,
             "native_manifest_path": native_manifest_path,
@@ -259,6 +277,8 @@ def _prepared_metadata(job: InferenceJob, prepared_root: Path,
             "bundle_sha256": job.bundle_sha256, "code_sha256": job.code_sha256,
             "code_files": tuple((Path(path), digest) for path, digest in code_files),
             "feature_asof_date": asof, "freshness_status": freshness_status,
+            "selected_at": selected_at.isoformat(), "selection_mode": selection_mode,
+            "producer_completed_at": verified_available.isoformat(),
             "input_cutoff": cutoff.isoformat(), "verified_available_by": verified_available.isoformat(),
             "availability_evidence_type": evidence_type,
             "availability_evidence": availability_evidence,
@@ -279,6 +299,58 @@ def _job_run_id(job: InferenceJob, metadata: dict[str, Any], report_date: date,
            **{key: metadata[key] for key in ("input_sha256", "prepared_manifest_sha256", "native_manifest_sha256", "bundle_sha256", "code_sha256")}}
     raw = json.dumps(key, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(raw).hexdigest()
+
+
+#: 순위를 낸 섹션의 상태. `stale`은 오래된 입력으로 만들었어도 낸 것입니다.
+PRODUCED_STATES = frozenset({"ok", "partial", "stale"})
+
+
+def envelope_status(markets: list[dict[str, Any]], failures: list[dict[str, str]]) -> str:
+    """전 섹션이 ok면 ok, 낸 섹션이 하나도 없을 때만 failed, 나머지는 partial (2026-10-05 변경 6).
+
+    섹션은 모델 report 하나입니다. 실패한 모델(`failures`)은 낸 섹션이 아니라서 ok를 막습니다.
+    KR adapter가 늘 `partial`을 내므로(관리종목·거래정지 미확인) KR이 들어간 날은 `ok`가 안 나옵니다.
+    공개 게이트와 opening은 이 상태에 넣지 않습니다. Pages 공개가 없어졌고, 게이트는
+    `monitor`의 rights 축이 따로 봅니다.
+    """
+    if not any(item["status"] in PRODUCED_STATES for item in markets):
+        return "failed"
+    if not failures and all(item["status"] == "ok" for item in markets):
+        return "ok"
+    return "partial"
+
+
+def session_lag(market: str, freshness: dict[str, Any]) -> int | None:
+    """표시용 지연 세션 수: KR은 K와의 차이, US는 최신 완료 세션 U와의 차이입니다."""
+    value = freshness.get("delivery_lag") if market == "KR" else freshness.get("market_lag")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _annotate_selection(report: dict[str, Any], metadata: dict[str, Any], market: str) -> None:
+    """신선도와 selection 시각을 report에 적고, 5세션을 넘은 순위는 쓰지 않습니다 (Q5).
+
+    신선도는 막지 않고 표시합니다(2026-10-05). 기준일이 K·U보다 늦은 입력은 `stale`이고
+    지연 세션 수를 `quality.lag_sessions`에 적습니다. 지연이 `MAX_STALE_SESSIONS`를 넘으면
+    순위 목록을 비우고 사유만 남깁니다. 비운 순위 수는 `rankings_withheld`에 있습니다.
+    """
+    quality = dict(report["quality"])
+    quality["freshness_status"] = metadata["freshness_status"]
+    quality["selection_mode"] = metadata["selection_mode"]
+    quality["selected_at"] = metadata["selected_at"]
+    quality["producer_completed_at"] = metadata["producer_completed_at"]
+    lag = session_lag(market, metadata["freshness"])
+    if lag is not None:
+        quality["lag_sessions"] = lag
+    if metadata["freshness_status"] == "stale":
+        if report["status"] in {"ok", "partial"}:
+            quality["status_before_stale"] = report["status"]
+            report["status"] = "stale"
+        if lag is not None and lag > MAX_STALE_SESSIONS:
+            quality["rankings_withheld"] = {
+                "reason": "stale_lag_exceeds_limit", "lag_sessions": lag,
+                "limit_sessions": MAX_STALE_SESSIONS, "ranking_count": len(report["rankings"])}
+            report["rankings"] = []
+    report["quality"] = quality
 
 
 def combine_reports(*, report_date: date, decision_at: datetime,
@@ -306,19 +378,7 @@ def combine_reports(*, report_date: date, decision_at: datetime,
     if missing:
         failures.extend({"market": market, "model_id": model_id, "error_class": "MissingInference"}
                         for market, model_id in sorted(missing))
-    successful = any(item["status"] == "ok" for item in markets)
-    if not markets and not failures:
-        status = "failed"
-    elif failures or any(item["status"] in {"failed", "stale", "withheld", "unavailable"} for item in markets):
-        status = "partial" if successful else "failed"
-    elif any(item["status"] == "partial" or item["publication"]["status"] != "allowed" for item in markets):
-        status = "partial"
-    elif (opening is None or opening.get("status") != "ok" or
-          not isinstance(opening.get("publication"), dict) or
-          opening["publication"].get("status") != "allowed"):
-        status = "partial"
-    else:
-        status = "ok"
+    status = envelope_status(markets, failures)
     fixture_marks = {bool(item.get("synthetic_fixture", False)) for item in markets}
     return {"schema_version": "1.0", "report_date": report_date.isoformat(),
             "decision_at": decision_at.isoformat(), "status": status,
@@ -421,10 +481,7 @@ def run_daily(*, report_date: date, decision_at: datetime, prepared_root: Path,
                     raise ValueError("inference result identity/cutoff does not match its pinned job")
                 if report["feature_asof_date"] != metadata["feature_asof_date"]:
                     raise ValueError("inference result feature date does not match prepared input manifest")
-                if metadata["freshness_status"] == "stale":
-                    if report["status"] == "ok":
-                        report["status"] = "stale"
-                    report["quality"] = {**report["quality"], "freshness_status": "stale"}
+                _annotate_selection(report, metadata, job.market)
                 report["inference_started_at"] = started.isoformat()
                 saved = {**{key: metadata[key] for key in
                             ("input_sha256", "prepared_manifest_sha256", "native_manifest_sha256",

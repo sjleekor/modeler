@@ -11,6 +11,12 @@ from .calendars import SessionCalendar
 
 SEOUL = ZoneInfo("Asia/Seoul")
 
+#: 오래된 입력으로 만든 순위를 표시하는 상한(세션 수, 2026-10-05 Q5). 이 값을 넘으면 순위를
+#: 쓰지 않고 사유만 남깁니다. 신선도는 막지 않고 표시하지만, 상한 없이 표시하면 KR이 2주
+#: 깨졌을 때 2주 전 순위가 매일 오늘 날짜로 나갑니다. `reporting/markdown.py`의 LAG_SUPPRESS와
+#: 같은 값입니다.
+MAX_STALE_SESSIONS = 5
+
 
 @dataclass(frozen=True)
 class Freshness:
@@ -105,10 +111,6 @@ def assess_freshness(*, report_date: date, market: str, feature_asof_date: date 
             k_session = calendar.previous_session(report_date)
             if k_session is None:
                 reason = "previous Korean session is outside calendar coverage"
-            elif feature_asof_date != k_session:
-                lag = calendar.session_distance(feature_asof_date, k_session) if feature_asof_date else None
-                return _result("stale", report_date.isoformat(), asof, None, None, None, cutoff,
-                                 available, lag, None, "KR feature session does not match K")
             else:
                 k_details = calendar.session(k_session)
                 k_close = (datetime.combine(k_session, k_details.close_at, calendar.timezone)
@@ -118,8 +120,22 @@ def assess_freshness(*, report_date: date, market: str, feature_asof_date: date 
                     return _result("unavailable", report_date.isoformat(), asof, None, None, None,
                                      cutoff, available, None, None,
                                      "K is not a confirmed, completed previous KR session")
-                return _result("ok", report_date.isoformat(), asof, None, None, None, cutoff,
-                                 available, 0, 0, None)
+                if feature_asof_date == k_session:
+                    return _result("ok", report_date.isoformat(), asof, None, None, None, cutoff,
+                                     available, 0, 0, None)
+                # K보다 이른 기준일 K'(2026-10-05 변경 3): 막지 않고 stale로 표시합니다.
+                # 지연 세션 수를 셀 수 없으면(달력이 K'를 모름) 표시할 근거가 없어 fail-closed입니다.
+                lag = (calendar.session_distance(feature_asof_date, k_session)
+                       if feature_asof_date else None)
+                if lag is None or calendar.is_session(feature_asof_date) is not True:
+                    return _result("unavailable", report_date.isoformat(), asof, None, None, None,
+                                     cutoff, available, None, None,
+                                     "KR feature session is not a session of the KR calendar")
+                if lag < 0:
+                    return _result("failed", report_date.isoformat(), asof, None, None, None, cutoff,
+                                     available, lag, None, "KR feature session is newer than K")
+                return _result("stale", report_date.isoformat(), asof, None, None, None, cutoff,
+                                 available, lag, None, "KR feature session does not match K")
         return _result("unavailable", report_date.isoformat(), asof, None, None, None, cutoff,
                          available, None, None, reason)
     if market != "US":
@@ -157,15 +173,17 @@ def assess_freshness(*, report_date: date, market: str, feature_asof_date: date 
     if isinstance(max_us_market_lag, bool) or not isinstance(max_us_market_lag, int) or max_us_market_lag < 0:
         return _result("failed", report_date.isoformat(), asof, latest, expected, actual, cutoff,
                          available, delivery_lag, market_lag, "US market-lag ceiling must be a nonnegative integer")
-    if market_lag > max_us_market_lag:
-        return _result("unavailable", report_date.isoformat(), asof, latest, expected, actual, cutoff,
-                         available, delivery_lag, market_lag, "US actual session exceeds market-lag ceiling")
     if calendar.latest_completed_before(decision_at) != latest_us_session:
         return _result("failed", report_date.isoformat(), asof, latest, expected, actual, cutoff,
                          available, delivery_lag, market_lag,
                          "US U is not the latest completed session at decision_at")
+    # 2026-10-05 변경 4: 지연 한도와 중단 한도는 막지 않고 stale로 표시합니다. 순위를 낼지는
+    # MAX_STALE_SESSIONS(5세션)가 정합니다(`orchestration.run_daily`).
+    if market_lag > max_us_market_lag:
+        return _result("stale", report_date.isoformat(), asof, latest, expected, actual, cutoff,
+                         available, delivery_lag, market_lag, "US actual session exceeds market-lag ceiling")
     if delivery_lag >= max_us_delivery_lag:
-        return _result("unavailable", report_date.isoformat(), asof, latest, expected, actual, cutoff,
+        return _result("stale", report_date.isoformat(), asof, latest, expected, actual, cutoff,
                          available, delivery_lag, market_lag, "US delivery lag reached the stop limit")
     if delivery_lag == 1:
         return _result("stale", report_date.isoformat(), asof, latest, expected, actual, cutoff,

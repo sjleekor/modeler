@@ -8,6 +8,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,6 +24,7 @@ from modeler.reporting.site import PRIVATE_MANIFEST_NAME, PrivateViewBuilder, _r
 from modeler.serving.schema import report_template
 
 from .daily_inputs import select
+from .orchestration import combine_reports
 from .runtime_contract import verify_runtime
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -30,6 +33,46 @@ REPORTS_REPOSITORY = "sjleekor/stock_reports"
 REPORTS_AUDIENCE = "owner_only"
 REPORTS_BRANCH = "main"
 PUBLISHER_TIMEOUT_SECONDS = 300
+RUNNER_TIMEOUT_SECONDS = 1800
+
+
+def _stop_group(process: "subprocess.Popen[Any]", grace_seconds: float = 5.0) -> None:
+    """End the child's whole process group: TERM, then KILL after a short grace."""
+    try:
+        group = os.getpgid(process.pid)
+    except ProcessLookupError:
+        group = process.pid
+    for sig, wait in ((signal.SIGTERM, grace_seconds), (signal.SIGKILL, 30.0)):
+        try:
+            os.killpg(group, sig)
+        except ProcessLookupError:
+            break
+        try:
+            process.wait(timeout=wait)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        process.wait(timeout=30.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_group(argv: list[str], *, timeout: float, **kwargs: Any) -> "subprocess.CompletedProcess[Any]":
+    """``subprocess.run`` whose child leads its own process group.
+
+    A timeout, a TERM/INT to this process or any other exception ends the child's whole group
+    (the 2026-10-06 incident: the wrapper died when Cronicle aborted the job and the Python below
+    it kept running, outside the lock and every watch).  ``TimeoutExpired`` is re-raised after the
+    group is gone.
+    """
+    process = subprocess.Popen(argv, start_new_session=True, **kwargs)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException:
+        _stop_group(process)
+        raise
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
 def _hash(path: Path) -> str:
@@ -168,27 +211,95 @@ def _selected(config: dict[str, Any], day: date) -> dict[str, Any]:
     return state
 
 
-def select_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, Any]:
+def select_stage(config: dict[str, Any], day: date, now: datetime, *,
+                 mode: str = "scheduled") -> dict[str, Any]:
     return select(report_date=day, selected_at=now,
         prepared_root=_absolute(config, "prepared_root"),
         output_root=_absolute(config, "selection_root"),
         release_manifest=_absolute(config, "release_manifest"),
         kr_calendar_path=_absolute(config, "kr_calendar"),
         us_calendar_path=_absolute(config, "us_calendar"),
-        us_expected_path=_absolute(config, "us_expected_source"))
+        us_expected_path=_absolute(config, "us_expected_source"), mode=mode)
+
+
+def ensure_selection(config: dict[str, Any], day: date, now: datetime) -> dict[str, Any]:
+    """D의 selection을 읽고, 09:30 select가 안 돈 날은 run이 같은 규칙으로 직접 고릅니다.
+
+    selection은 불변이라 이미 있으면 그대로 돌려줍니다. 직접 고른 것은 `selection_mode`가
+    `run_fallback`이고 `selected_at`이 D 10:00 뒤일 수 있습니다. 입력 선택 규칙은 같아서
+    D 09:30 뒤에 끝난 입력은 이때도 들어가지 않습니다 (2026-10-05 변경 5).
+    """
+    path = _absolute(config, "selection_root") / day.isoformat() / "selection-state.json"
+    if not path.is_file():
+        if now.astimezone(SEOUL) < datetime.combine(day, time(10), SEOUL):
+            raise ValueError("a missing selection can only be made by the run stage after D 10:00 KST")
+        select_stage(config, day, now, mode="run_fallback")
+    return _selected(config, day)
+
+
+def _release_jobs_brief(config: dict[str, Any]) -> tuple[list[dict[str, str]], bool]:
+    release = _read(_absolute(config, "release_manifest"))
+    jobs = [{"market": job["market"], "model_id": job["model_id"]} for job in release.get("jobs", [])]
+    return jobs, release.get("synthetic_fixture") is True
+
+
+def _failed_inference(config: dict[str, Any], day: date, run_root: Path, invocation_id: str, *,
+                      stage: str, error_class: str, exit_code: int | None, timed_out: bool,
+                      fixture: bool) -> dict[str, Any]:
+    """Make this invocation's own failure report when the runner left none (변경 6).
+
+    Every model section is ``failed`` with the cause class; the unit still renders and publishes.
+    A report of an earlier invocation on the same D is never reused: it is set aside under
+    ``report-D.superseded-<sha>.json`` and replaced by this one, which carries this invocation id.
+    """
+    decision = datetime.combine(day, time(10), SEOUL)
+    jobs, _ = _release_jobs_brief(config)
+    envelope = combine_reports(report_date=day, decision_at=decision, reports=[], opening=None,
+        failures=[{**job, "error_class": error_class} for job in jobs])
+    envelope.update(historical_replay=False, synthetic_fixture=fixture, invocation_id=invocation_id,
+        failure={"stage": stage, "error_class": error_class, "runner_exit_code": exit_code,
+                 "timed_out": timed_out, "synthesized_by": "coordinator"})
+    report_path = run_root / f"report-{day.isoformat()}.json"
+    if report_path.is_file():
+        shutil.copy2(report_path, run_root / f"report-{day.isoformat()}.superseded-{_hash(report_path)[:12]}.json")
+    _atomic(report_path, envelope)
+    # The publisher accepts a unit only when run-state.json names this invocation.
+    _atomic(run_root / "run-state.json", {
+        "report_date": day.isoformat(), "invocation_id": invocation_id, "jobs": [],
+        "synthesized_by": "coordinator", "failure_stage": stage, "error_class": error_class})
+    return {"report_path": str(report_path), "report_sha256": _hash(report_path)}
 
 
 def infer_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, Any]:
     if now.astimezone(SEOUL) < datetime.combine(day, time(10), SEOUL):
         raise ValueError("inference cannot start before D 10:00 KST")
-    selected = _selected(config, day)
+    run_root = _day_dir(config, day)
+    run_root.mkdir(parents=True, exist_ok=True)
+    invocation_id = secrets.token_hex(16)
+    _, fixture = _release_jobs_brief(config)
+
+    def failed(stage: str, error_class: str, *, exit_code: int | None = None,
+               timed_out: bool = False) -> dict[str, Any]:
+        written = _failed_inference(config, day, run_root, invocation_id, stage=stage,
+            error_class=error_class, exit_code=exit_code, timed_out=timed_out, fixture=fixture)
+        state = {"report_date": day.isoformat(), "status": "inference_failed",
+                 "invocation_id": invocation_id, "runner_exit_code": exit_code,
+                 "report_path": written["report_path"], "report_sha256": written["report_sha256"],
+                 "synthetic_fixture": fixture, "successful_jobs": 0,
+                 "this_invocation_completed": False, "report_ready": True,
+                 "failure_report": True, "failure_stage": stage, "timed_out": timed_out,
+                 "error_class": error_class}
+        _atomic(run_root / "coordinator-inference.json", state)
+        return state
+
+    try:
+        selected = ensure_selection(config, day, now)
+    except Exception as exc:  # the unit is still made: every section fails with the cause class
+        return failed("select", type(exc).__name__)
     if selected.get("status") == "holiday":
         return {"status": "holiday", "report_date": day.isoformat()}
     release = _read(_absolute(config, "release_manifest"))
     release_root = Path(release["release_root"]).resolve(strict=True)
-    run_root = _day_dir(config, day)
-    run_root.mkdir(parents=True, exist_ok=True)
-    invocation_id = secrets.token_hex(16)
     argv = [str(_absolute(config, "python")), "-m", "modeler.serving.runner", "infer",
             "--report-date", day.isoformat(), "--prepared-root", str(_absolute(config, "prepared_root")),
             "--run-root", str(run_root), "--jobs-config", selected["jobs_config"],
@@ -203,34 +314,51 @@ def infer_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, A
         argv.append("--fixture-mode")
     env = os.environ.copy()
     env["PYTHONPATH"] = str(release_root / "src")
+    timed_out, spawn_error = False, None
     try:
-        completed = subprocess.run(argv, cwd=release_root, env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            check=False, timeout=1800)
+        completed = run_group(argv, cwd=release_root, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=RUNNER_TIMEOUT_SECONDS)
         exit_code = completed.returncode
     except subprocess.TimeoutExpired:
-        exit_code = 124
+        exit_code, timed_out = 124, True
+    except OSError as exc:
+        exit_code, spawn_error = 127, type(exc).__name__
     report_path = run_root / f"report-{day.isoformat()}.json"
     report = _read(report_path) if report_path.is_file() else None
+    # The report must be this invocation's own: an earlier run's file is never reused.  The runner
+    # writes report-D.json first and run-state.json (with this invocation id) last, so a report that
+    # an earlier invocation left behind is only accepted together with a run-state of this one.  The
+    # id is not written into the runner's report: its bytes (and sha256, which the rendered unit
+    # carries) must stay the same when a rerun reuses the saved results.
     report_valid = bool(report and report.get("report_date") == day.isoformat() and
                         bool(report.get("synthetic_fixture")) == selected["synthetic_fixture"])
     run_state_path = run_root / "run-state.json"
     latest_run = _read(run_state_path) if run_state_path.is_file() else {}
     this_invocation_completed = latest_run.get("invocation_id") == invocation_id
-    job_records = latest_run.get("jobs", []) if this_invocation_completed else []
+    if not (this_invocation_completed and report_valid):
+        if timed_out:
+            error_class = "RunnerTimeout"
+        elif spawn_error:
+            error_class = "RunnerSpawnError"
+        elif exit_code != 0:
+            error_class = "RunnerExitNonzero"
+        else:
+            error_class = "RunnerReportMissing"
+        return failed("infer", error_class, exit_code=exit_code, timed_out=timed_out)
+    job_records = latest_run.get("jobs", [])
     successful_jobs = sum(row.get("status") in {"ok", "reused"} for row in job_records)
-    if exit_code == 0 and this_invocation_completed and report_valid and successful_jobs:
+    if exit_code == 0 and successful_jobs and not report.get("failures"):
         inference_status = "inferred"
-    elif this_invocation_completed and report_valid and successful_jobs and report.get("markets"):
+    elif successful_jobs and report.get("markets"):
         inference_status = "inferred_partial"
     else:
         inference_status = "inference_failed"
     state = {"report_date": day.isoformat(), "status": inference_status,
              "invocation_id": invocation_id,
-             "runner_exit_code": exit_code, "report_path": str(report_path) if report_path.is_file() else None,
-             "report_sha256": _hash(report_path) if report_path.is_file() else None,
+             "runner_exit_code": exit_code, "report_path": str(report_path),
+             "report_sha256": _hash(report_path),
              "synthetic_fixture": selected["synthetic_fixture"], "successful_jobs": successful_jobs,
-             "this_invocation_completed": this_invocation_completed}
+             "this_invocation_completed": True, "report_ready": True, "failure_report": False}
     _atomic(run_root / "coordinator-inference.json", state)
     return state
 
@@ -276,21 +404,28 @@ def render_stage(config: dict[str, Any], day: date) -> dict[str, Any]:
     The markdown unit for ``stock_reports`` is rendered by the publisher's local step (publish stage),
     from the same saved report, so a failed push never blocks the report itself.
     """
-    selected = _selected(config, day)
     run_root = _day_dir(config, day)
     infer_state = _read(run_root / "coordinator-inference.json")
-    if infer_state.get("this_invocation_completed") is not True:
+    if infer_state.get("report_ready", infer_state.get("this_invocation_completed")) is not True:
         raise ValueError("render requires a report from the latest completed runner invocation")
-    run_state = _read(run_root / "run-state.json")
-    if (not isinstance(infer_state.get("invocation_id"), str) or
-            run_state.get("invocation_id") != infer_state["invocation_id"]):
+    if not isinstance(infer_state.get("invocation_id"), str):
         raise ValueError("runner invocation changed after inference")
+    synthesized = infer_state.get("failure_report") is True
+    if not synthesized:
+        # The selection (and its release pin) must still be the frozen one the runner used.
+        _selected(config, day)
+    run_state = _read(run_root / "run-state.json")
+    if run_state.get("invocation_id") != infer_state["invocation_id"]:
+        raise ValueError("runner invocation changed after inference")
+    fixture_mode = bool(infer_state.get("synthetic_fixture"))
     report_path = Path(infer_state["report_path"])
     if _hash(report_path) != infer_state["report_sha256"]:
         raise ValueError("saved report changed after inference")
     report = _read(report_path)
-    if report.get("report_date") != day.isoformat() or bool(report.get("synthetic_fixture")) != selected["synthetic_fixture"]:
+    if report.get("report_date") != day.isoformat() or bool(report.get("synthetic_fixture")) != fixture_mode:
         raise ValueError("report date or fixture mode mismatch")
+    if report.get("invocation_id", infer_state["invocation_id"]) != infer_state["invocation_id"]:
+        raise ValueError("report belongs to another invocation")
     market_reports = list(report["markets"])
     present = {(item["market"], item["model_id"]) for item in market_reports}
     release = _read(_absolute(config, "release_manifest"))
@@ -301,22 +436,22 @@ def render_stage(config: dict[str, Any], day: date) -> dict[str, Any]:
                 decision_at=datetime.fromisoformat(report["decision_at"]),
                 feature_asof_date=None, model_id=job["model_id"],
                 model_version=job["model_version"])
-            empty["synthetic_fixture"] = selected["synthetic_fixture"]
+            empty["synthetic_fixture"] = fixture_mode
             market_reports.append(empty)
     cards = _read(_absolute(config, "model_cards_path"))
     if set(cards) != {job["model_id"] for job in release["jobs"]}:
         raise ValueError("model cards must match the frozen three-model release")
     private_files = private_target = private_previous = None
     if config.get("private_projection_root") is not None:
-        private_previous, private_previous_files = _previous_private(config, day, selected["synthetic_fixture"])
-        private_builder = PrivateViewBuilder(synthetic_fixture=selected["synthetic_fixture"])
+        private_previous, private_previous_files = _previous_private(config, day, fixture_mode)
+        private_builder = PrivateViewBuilder(synthetic_fixture=fixture_mode)
         private_files = private_builder.render(report_date=day, reports=market_reports,
             opening=report["opening"], previous_files=private_previous_files)
         private_target = _absolute(config, "private_projection_root") / day.isoformat()
         private_builder.write_atomic(private_target, private_files)
     state = {"report_date": day.isoformat(), "status": "rendered", "report_sha256": _hash(report_path),
              "invocation_id": infer_state["invocation_id"],
-             "synthetic_fixture": selected["synthetic_fixture"],
+             "synthetic_fixture": fixture_mode,
              "private_projection_dir": str(private_target) if private_target else None,
              "private_manifest_sha256": (hashlib.sha256(private_files[PRIVATE_MANIFEST_NAME]).hexdigest()
                                          if private_files is not None else None),
@@ -423,8 +558,8 @@ def _run_reports_publisher(config: dict[str, Any], daily_path: Path, mode: str,
     if render["synthetic_fixture"]:
         argv.append("--allow-synthetic")
     try:
-        done = subprocess.run(argv, env=env, check=False, stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL, text=True, timeout=PUBLISHER_TIMEOUT_SECONDS)
+        done = run_group(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         text=True, timeout=PUBLISHER_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         return 124, {}
     return done.returncode, _last_json_line(done.stdout)
