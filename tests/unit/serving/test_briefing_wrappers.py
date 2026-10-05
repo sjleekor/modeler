@@ -1,12 +1,18 @@
-"""Contract tests for deploy/prod/bin/briefing-stage.sh, us-prepare.sh and kr-prepare.sh (fake python, no lake)."""
+"""Contract tests for deploy/prod/bin/briefing-stage.sh, us-prepare.sh and kr-prepare.sh (fake python, no lake).
+
+The wrappers need util-linux ``flock`` (the servers have it, a Mac does not): a shim built on
+``fcntl.flock`` stands in, locking the inherited file descriptor exactly like the real command.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -28,6 +34,16 @@ if [ "$1" = -m ]; then
       touch "$FAKE_STATE/prepared"; echo "prepared: /x/manifest.json"; exit 0;;
     modeler.serving.daily_wrapper) exit "${FAKE_RC:-0}";;
     modeler.serving.kr_live_prepare) exit "${FAKE_LIVE_RC:-0}";;
+    modeler.serving.kr_reference)
+      while [ $# -gt 0 ]; do [ "$1" = --output ] && ev=$2; [ "$1" = --k ] && k=$2; shift; done
+      if [ "${FAKE_REF_RC:-0}" -eq 32 ]; then
+        mkdir -p "$(dirname "$ev")"; echo '{"verdict": "none"}' > "$ev"; exit 32
+      fi
+      [ "${FAKE_REF_RC:-0}" -eq 0 ] || exit "$FAKE_REF_RC"
+      ref=${FAKE_REF:-$k}
+      mkdir -p "$(dirname "$ev")"
+      echo "{\"verdict\": \"complete\", \"reference_date\": \"$ref\", \"cut_required\": ${FAKE_CUT_JSON:-false}}" > "$ev"
+      echo "$ref"; echo "${FAKE_CUT:-nocut}"; exit 0;;
     modeler.serving.kr_prepare)
       [ "${FAKE_KR_PREP_RC:-0}" -eq 0 ] || exit "$FAKE_KR_PREP_RC"
       while [ $# -gt 0 ]; do [ "$1" = --output-dir ] && out=$2; shift; done
@@ -36,7 +52,8 @@ if [ "$1" = -m ]; then
 elif [ "$1" = -c ]; then
   case "$3" in
     prepared-ok) if [ -n "${FAKE_ALREADY:-}" ] || [ -f "$FAKE_STATE/prepared" ]; then echo /x/manifest.json; exit 0; fi; exit 1;;
-    data-ready) echo "  prices_daily: fake" >&2; exit "${FAKE_DATA_RC:-0}";;
+    resolve) echo "  resolve: fake" >&2; [ "${FAKE_DATA_RC:-0}" -eq 0 ] || exit "$FAKE_DATA_RC"
+      echo "${FAKE_RESOLVED:-$4}"; exit 0;;
     kr-dates) [ "${FAKE_CAL_RC:-0}" -eq 0 ] || exit "$FAKE_CAL_RC"
       echo "${FAKE_KR_SESSION:-session}"; echo "${FAKE_K:-2026-10-02}"; exit 0;;
   esac
@@ -77,6 +94,12 @@ def serving(tmp_path: Path) -> dict:
                                                  "prepared_root": str(root / "prepared")}))
     (config / "pins.json").write_text(json.dumps(
         {"parity_evidence": {"path": str(evidence), "sha256": _sha(evidence)}}))
+    flock_shim = tmp_path / "shims" / "flock"
+    flock_shim.write_text(
+        "#!/usr/bin/env bash\n"
+        '[ "$1" = -n ] || exit 2\n'
+        f'exec {sys.executable} -c "import fcntl,sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)" "$2"\n')
+    flock_shim.chmod(0o755)
     state = tmp_path / "state"
     state.mkdir()
     log = tmp_path / "calls.log"
@@ -134,6 +157,7 @@ def test_prepare_happy_path(serving):
     assert done.returncode == 0, done.stderr
     calls = _calls(serving)
     assert any("us_expected session --report-date 2026-10-01" in c for c in calls)
+    assert not any("WARNING" in line for line in done.stdout.splitlines())
     (prepare,) = [c for c in calls if "modeler.serving.us_daily" in c]
     assert (f"argv=-m modeler.serving.us_daily prepare --as-of 2026-09-29 "
             f"--raw-feature-parity-status score_equivalent "
@@ -143,11 +167,22 @@ def test_prepare_happy_path(serving):
     assert "timeout 1800" in calls and "taskset -c 0,1" in calls
 
 
-def test_prepare_data_not_ready(serving):
+def test_prepare_uses_the_newest_covered_session_when_the_lake_lacks_a(serving):
+    """2026-10-05 change 4: no more exit 20 for a missing A; A' (< A) is prepared and announced."""
+    done = _run(PREPARE, ["--run-date", "2026-09-30"], serving["env"], {"FAKE_RESOLVED": "2026-09-26"})
+    assert done.returncode == 0, done.stderr
+    assert "WARNING the lake does not cover A=2026-09-29 yet; preparing A'=2026-09-26" in done.stdout
+    (prepare,) = [c for c in _calls(serving) if "modeler.serving.us_daily" in c]
+    assert "prepare --as-of 2026-09-26 --raw-feature-parity-status score_equivalent" in prepare
+
+
+def test_prepare_exit_20_only_when_the_lake_covers_no_session_at_all(serving):
     done = _run(PREPARE, ["--run-date", "2026-09-30"], serving["env"], {"FAKE_DATA_RC": "3"})
     assert done.returncode == 20
-    assert "data not ready" in done.stderr and "A=2026-09-29" in done.stderr
+    assert "covers no completed US session" in done.stderr
     assert not [c for c in _calls(serving) if "modeler.serving.us_daily" in c]
+    unreadable = _run(PREPARE, ["--run-date", "2026-09-30"], serving["env"], {"FAKE_DATA_RC": "9"})
+    assert unreadable.returncode == 20 and "could not read the lake" in unreadable.stderr
 
 
 def test_prepare_already_prepared_skips(serving):
@@ -180,6 +215,11 @@ FAKE_SDC = {
     "kr-export-wait-ready.sh": 'echo "gate $*" >> "$FAKE_LOG"; exit "${FAKE_GATE_RC:-0}"',
     "kr-raw-parquet-export.sh": (
         'echo "export $*" >> "$FAKE_LOG"; [ "${FAKE_EXPORT_RC:-0}" -eq 0 ] || exit "$FAKE_EXPORT_RC"\n'
+        # A slow export with a grandchild (the shape of docker/collector under the wrapper).
+        'if [ -n "${FAKE_EXPORT_SLEEP:-}" ]; then\n'
+        '  sleep "$FAKE_EXPORT_SLEEP" & echo "$!" >> "$FAKE_STATE/grandchildren"\n'
+        '  echo "$$" >> "$FAKE_STATE/grandchildren"; touch "$FAKE_STATE/export-running"; wait\n'
+        'fi\n'
         'm="$KR_STOCK_DATA_ROOT/kr/raw/raw_postgres/snapshot_date=$2/source=sj2_remote/_manifests"\n'
         'mkdir -p "$m" && touch "$m/_SUCCESS.json"'),
 }
@@ -193,8 +233,7 @@ def kr(serving, tmp_path: Path) -> dict:
         (sdc / name).write_text("#!/usr/bin/env bash\n" + body + "\n")
         (sdc / name).chmod(0o755)
     lake = tmp_path / "lake"
-    env = {**serving["env"], "SDC_BIN": str(sdc), "KR_STOCK_DATA_ROOT": str(lake),
-           "KR_PREPARE_GATE_UNTIL": "23:59"}
+    env = {**serving["env"], "SDC_BIN": str(sdc), "KR_STOCK_DATA_ROOT": str(lake)}
     out = serving["root"] / "prepared" / "kr" / "score_date=2026-10-02" / "prep_id=2026-10-05"
     return {**serving, "env": env, "lake": lake, "out": out}
 
@@ -212,19 +251,55 @@ def test_kr_prepare_happy_path(kr):
     assert done.returncode == 0, done.stderr
     calls = _calls(kr)
     (gate,) = [c for c in calls if c.startswith("gate ")]
-    assert gate.startswith("gate --feature-asof-date 2026-10-02 --deadline-seconds ")
+    # One look, never a wait: the deadline is 0 seconds.
+    assert gate == "gate --feature-asof-date 2026-10-02 --deadline-seconds 0"
     assert "export --snapshot-date 2026-10-05 --consistent-snapshot" in calls
+    assert calls.index(gate) < calls.index("export --snapshot-date 2026-10-05 --consistent-snapshot")
+    evidence = kr["root"] / "logs" / "kr-prepare" / "D=2026-10-05" / "reference-selection.json"
+    (ref,) = [c for c in calls if "modeler.serving.kr_reference" in c]
+    assert (f"argv=-m modeler.serving.kr_reference --snapshot-date 2026-10-05 --report-date 2026-10-05 "
+            f"--k 2026-10-02 --calendar {kr['config'] / 'calendar-KR.json'} --stock-data-root {kr['lake']} "
+            f"--output {evidence} --gate-exit 0 --gate-evidence ") in ref
     cutoff = "--input-cutoff 2026-10-05T09:30:00+09:00"
     (live,) = [c for c in calls if "kr_live_prepare" in c]
     assert (f"argv=-m modeler.serving.kr_live_prepare --snapshot-date 2026-10-05 --feature-asof-date 2026-10-02 "
             f"{cutoff} --stock-data-root {kr['lake']} --profile full --max-temp-size 30GB|") in live
     (prep,) = [c for c in calls if "modeler.serving.kr_prepare" in c]
-    assert f"--output-dir {kr['out']} --stock-data-root {kr['lake']}|" in prep
+    assert (f"--output-dir {kr['out']} --stock-data-root {kr['lake']} --reference-evidence {evidence}|") in prep
     assert f"PYTHONPATH={kr['release']}/src" in prep and "DONTWRITE=1" in prep
     assert "/logs/kr-prepare/D=2026-10-05" in prep
     assert "timeout 5400" in calls and "timeout 3600" in calls and "timeout 1800" in calls
     assert "taskset -c 0,1" in calls and "nice -n 10" in calls
     assert (kr["out"] / "completion.json").is_file()
+
+
+def test_kr_prepare_builds_for_the_fallback_session_and_cuts_the_marts(kr):
+    """K=10-02 is incomplete in the export: K'=09-30 is prepared, the marts are cut at K'."""
+    done = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"],
+                {"FAKE_REF": "2026-09-30", "FAKE_CUT": "cut", "FAKE_CUT_JSON": "true"})
+    assert done.returncode == 0, done.stderr
+    assert "WARNING reference: fallback to K'=2026-09-30" in done.stdout
+    calls = _calls(kr)
+    (live,) = [c for c in calls if "kr_live_prepare" in c]
+    assert "--feature-asof-date 2026-09-30 " in live and "--profile full --max-temp-size 30GB --cut-to-asof|" in live
+    (prep,) = [c for c in calls if "modeler.serving.kr_prepare" in c]
+    out = kr["root"] / "prepared" / "kr" / "score_date=2026-09-30" / "prep_id=2026-10-05"
+    assert f"--feature-asof-date 2026-09-30 " in prep and f"--output-dir {out} " in prep
+    assert (out / "completion.json").is_file() and not (kr["out"] / "completion.json").exists()
+
+
+def test_kr_prepare_with_no_complete_session_exits_32_and_prepares_nothing(kr):
+    old = _snap(kr["lake"], "raw", "2026-10-01")
+    done = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"], {"FAKE_REF_RC": "32"})
+    assert done.returncode == 32
+    assert "no complete reference session" in done.stderr
+    calls = _calls(kr)
+    assert not [c for c in calls if "kr_live_prepare" in c or "modeler.serving.kr_prepare" in c]
+    assert not old.exists()  # retention still runs: the export itself succeeded
+    # A rerun on the same sealed snapshot repeats the verdict without exporting again.
+    again = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"])
+    assert again.returncode == 32
+    assert len([c for c in _calls(kr) if c.startswith("export ")]) == 1
 
 
 def test_kr_prepare_closed_day_skips(kr):
@@ -241,6 +316,16 @@ def test_kr_prepare_already_prepared_skips(kr):
     assert not [c for c in _calls(kr) if c.startswith(("gate ", "export ")) or "argv=-m" in c]
 
 
+def test_kr_prepare_a_fallback_session_counts_as_already_prepared(kr):
+    """The fallback event finds the K' unit of the chain run and ends at once (prep_id=SNAP)."""
+    earlier = kr["root"] / "prepared" / "kr" / "score_date=2026-09-30" / "prep_id=2026-10-05"
+    earlier.mkdir(parents=True)
+    (earlier / "completion.json").touch()
+    done = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"])
+    assert done.returncode == 0 and "already prepared" in done.stdout
+    assert not [c for c in _calls(kr) if c.startswith(("gate ", "export ")) or "argv=-m" in c]
+
+
 def test_kr_prepare_resumes_after_sealed_steps(kr):
     _marker(kr["lake"], "raw")
     _marker(kr["lake"], "feature")
@@ -251,11 +336,26 @@ def test_kr_prepare_resumes_after_sealed_steps(kr):
     assert [c for c in calls if "modeler.serving.kr_prepare" in c]
 
 
-@pytest.mark.parametrize("gate_rc,code", [(75, 30), (1, 31), (5, 5)])
-def test_kr_prepare_gate_failure_stops_before_export(kr, gate_rc, code):
+@pytest.mark.parametrize("gate_rc", [75, 1, 5])
+def test_kr_prepare_gate_verdict_is_advisory_and_never_stops_the_run(kr, gate_rc):
+    """Not ready, blocked and a gate error all continue: the exported snapshot decides."""
     done = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"], {"FAKE_GATE_RC": str(gate_rc)})
-    assert done.returncode == code
-    assert not [c for c in _calls(kr) if c.startswith("export ") or "argv=-m" in c]
+    assert done.returncode == 0, done.stderr
+    calls = _calls(kr)
+    assert [c for c in calls if c.startswith("export ")] and [c for c in calls if "kr_reference" in c]
+    (ref,) = [c for c in calls if "kr_reference" in c]
+    assert f"--gate-exit {gate_rc} --gate-evidence " in ref
+    assert "WARNING" in done.stdout and "export gate" in done.stdout
+    assert (kr["out"] / "completion.json").is_file()
+
+
+def test_kr_prepare_gate_can_be_switched_off(kr):
+    done = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"], {"KR_PREPARE_GATE": "off"})
+    assert done.returncode == 0, done.stderr
+    calls = _calls(kr)
+    assert not [c for c in calls if c.startswith("gate ")]
+    assert "--gate-exit" not in [c for c in calls if "kr_reference" in c][0]
+    assert _run(KR_PREPARE, [], kr["env"], {"KR_PREPARE_GATE": "wait"}).returncode == 2
 
 
 def test_kr_prepare_consistent_snapshot_can_be_turned_off(kr):
@@ -451,3 +551,125 @@ def test_retention_cleans_old_spill_dirs_only(kr):
     assert done.returncode == 0, done.stderr
     assert not old.exists() and same.is_dir() and odd.is_dir()
     assert (kr["lake"] / "kr/derived/_manifest_archive/_duckdb_tmp" / old.name / "build_profile.partial.json").is_file()
+
+
+# ---- the shared lock and signal handling (2026-10-05 change 2) ----
+
+def _hold_lock(path: Path) -> subprocess.Popen:
+    """A process that holds an exclusive flock on ``path`` until it is killed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    holder = subprocess.Popen([sys.executable, "-c", (
+        "import fcntl,sys,time\n"
+        "f=open(sys.argv[1],'a+'); fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(600)"),
+        str(path)], stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "held"
+    return holder
+
+
+def test_kr_prepare_skips_with_exit_0_when_another_run_holds_the_lock(kr):
+    holder = _hold_lock(kr["root"] / "locks" / "kr-prepare.lock")
+    try:
+        done = _kr_run(kr)
+        assert done.returncode == 0, done.stderr
+        assert "locked: another kr-prepare run holds" in done.stdout
+        assert _calls(kr) == []  # not even the calendar helper or the gate ran
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_kr_prepare_lock_is_released_when_the_holder_dies(kr):
+    holder = _hold_lock(kr["root"] / "locks" / "kr-prepare.lock")
+    holder.kill()
+    holder.wait()  # flock ends with the process: no stale lock
+    done = _kr_run(kr)
+    assert done.returncode == 0, done.stderr
+    assert "locked" not in done.stdout and (kr["out"] / "completion.json").is_file()
+
+
+def _wait_for(path: Path, run: subprocess.Popen) -> None:
+    deadline = time.time() + 20
+    while not path.exists():
+        assert time.time() < deadline and run.poll() is None, f"{path.name} never appeared"
+        time.sleep(0.05)
+
+
+def test_kr_prepare_two_overlapping_runs_only_one_proceeds(kr):
+    """The chain event and the fallback event start the same script: one exports, the other yields."""
+    env = {**os.environ, **kr["env"], "FAKE_EXPORT_SLEEP": "3"}
+    first = subprocess.Popen(["bash", str(KR_PREPARE), "--report-date", "2026-10-05"], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _wait_for(kr["log"].parent / "state" / "export-running", first)
+    second = _kr_run(kr)
+    assert second.returncode == 0 and "locked" in second.stdout
+    _, err = first.communicate(timeout=60)
+    assert first.returncode == 0, err
+    assert len([c for c in _calls(kr) if c.startswith("export ")]) == 1
+    assert (kr["out"] / "completion.json").is_file()
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _all_dead(pids: list[int]) -> bool:
+    deadline = time.time() + 10
+    while any(_alive(pid) for pid in pids) and time.time() < deadline:
+        time.sleep(0.1)
+    return not any(_alive(pid) for pid in pids)
+
+
+def test_kr_prepare_term_ends_the_whole_process_group_and_frees_the_lock(kr):
+    """Cronicle's abort (TERM) must not leave the export's descendants running (10-06 incident)."""
+    env = {**os.environ, **kr["env"], "FAKE_EXPORT_SLEEP": "120"}
+    run = subprocess.Popen(["bash", str(KR_PREPARE), "--report-date", "2026-10-05"], env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    state = kr["log"].parent / "state"
+    _wait_for(state / "export-running", run)
+    pids = [int(x) for x in (state / "grandchildren").read_text().split()]
+    assert pids and all(_alive(pid) for pid in pids)
+    run.send_signal(signal.SIGTERM)
+    out, err = run.communicate(timeout=30)
+    assert run.returncode == 143, (out, err)
+    assert "received TERM" in err
+    assert _all_dead(pids), "a descendant of the aborted step is still running"
+    # Nothing was prepared, and the lock is free again for the next run.
+    assert not (kr["out"] / "completion.json").exists()
+    again = _kr_run(kr)
+    assert again.returncode == 0 and "locked" not in again.stdout
+
+
+US_PREPARE_BRANCH = """    modeler.serving.us_daily)
+      [ "${FAKE_PREP_RC:-0}" -eq 0 ] || exit "$FAKE_PREP_RC"
+      touch "$FAKE_STATE/prepared"; echo "prepared: /x/manifest.json"; exit 0;;"""
+US_SLOW_BRANCH = """    modeler.serving.us_daily)
+      sleep 120 & echo "$!" >> "$FAKE_STATE/grandchildren"; echo "$$" >> "$FAKE_STATE/grandchildren"
+      touch "$FAKE_STATE/prepare-running"; wait;;"""
+
+
+def test_us_prepare_term_ends_the_prepare_group_and_the_lock_serializes_runs(serving, tmp_path):
+    fake = tmp_path / "fakebin" / "python"
+    assert US_PREPARE_BRANCH in FAKE_PYTHON
+    fake.write_text(FAKE_PYTHON.replace(US_PREPARE_BRANCH, US_SLOW_BRANCH))
+    env = {**os.environ, **serving["env"]}
+    run = subprocess.Popen(["bash", str(PREPARE), "--run-date", "2026-09-30"], env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    state = serving["log"].parent / "state"
+    _wait_for(state / "prepare-running", run)
+    second = _run(PREPARE, ["--run-date", "2026-09-30"], serving["env"])
+    assert second.returncode == 0 and "locked" in second.stdout
+    pids = [int(x) for x in (state / "grandchildren").read_text().split()]
+    run.send_signal(signal.SIGTERM)
+    out, err = run.communicate(timeout=30)
+    assert run.returncode == 143, (out, err)
+    assert _all_dead(pids)
+
+
+def test_briefing_stage_execs_the_python_wrapper_without_a_shell_layer():
+    """No shell stays between Cronicle and Python: TERM reaches the Python wrapper itself, which
+    ends the runner's process group (``daily_coordinator.run_group``)."""
+    assert '\nexec "$python" -m modeler.serving.daily_wrapper' in STAGE.read_text()

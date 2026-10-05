@@ -8,6 +8,11 @@
 # src/ is put on PYTHONPATH.  Output goes to stdout/stderr for Cronicle; the exit
 # code is the wrapper's (0 ok, 1 stage failed).  Exit 2 is a usage error, 10 a
 # bad serving root.
+#
+# The script ends in `exec`: no shell stays between Cronicle and the Python wrapper, so TERM, INT
+# and HUP reach the wrapper itself.  The wrapper turns them into an exit and ends the process
+# group of the runner, opening and publisher children it started (`daily_coordinator.run_group`).
+# (kr-prepare.sh and us-prepare.sh keep a shell and do the same with `set -m` and a trap.)
 set -euo pipefail
 umask 027
 
