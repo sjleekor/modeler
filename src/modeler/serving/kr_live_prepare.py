@@ -32,6 +32,7 @@ from modeler.etl.features.fin_vintage import JOIN_PLAN_COALESCE
 from modeler.etl.features.flow import PIVOT_PLAN_WINDOW, materialize_flow
 from modeler.etl.features.price import materialize_price
 from modeler.etl.lake import (
+    _sql_str_literal,
     connect,
     read_derived_plan_record,
     register_derived_marts,
@@ -127,6 +128,56 @@ RAW_INPUTS = (
     "dart_share_count_raw", "dart_shareholder_return_raw", "dart_xbrl_fact_raw",
     "dart_corp_master", "dart_filing_receipt_raw",
 )
+
+
+# How each raw input is cut when the marts must end at a reference session earlier than the
+# newest row of the export (K' fallback, see ``kr_reference``).  Same method as the replay tool that
+# produced the 2026-10-06 historical units.  Receipt dates come from the first eight digits of
+# ``rcept_no``; a row whose date cannot be read is kept, because the marts treat it through their
+# documented fallback and hiding it would change the features.
+RCEPT_DATE_SQL = "TRY_STRPTIME(NULLIF(SUBSTR(CAST(rcept_no AS VARCHAR), 1, 8), ''), '%Y%m%d')::DATE"
+CUT_TRADE_DATE_TABLES = ("daily_ohlcv", "krx_security_flow_raw")
+CUT_RCEPT_TABLES = (
+    "dart_financial_statement_raw", "dart_share_count_raw", "dart_shareholder_return_raw",
+    "dart_xbrl_fact_raw",
+)
+CUT_RECEIPT_TABLE = "dart_filing_receipt_raw"
+CUT_NONE_TABLES = ("dart_corp_master",)  # no event date: a company list as of the snapshot
+
+
+def cut_predicate(table: str, asof: str) -> str | None:
+    """SQL keeping the rows a database would have held at the close of ``asof``; None = uncut."""
+    day = f"DATE '{date.fromisoformat(asof).isoformat()}'"
+    if table in CUT_TRADE_DATE_TABLES:
+        return f"trade_date <= {day}"
+    if table in CUT_RCEPT_TABLES:
+        return f"COALESCE({RCEPT_DATE_SQL} <= {day}, TRUE)"
+    if table == CUT_RECEIPT_TABLE:
+        return f"COALESCE({RCEPT_DATE_SQL} <= {day}, TRUE) AND COALESCE(rcept_dt <= {day}, TRUE)"
+    if table in CUT_NONE_TABLES:
+        return None
+    raise ValueError(f"no cut is defined for raw table {table!r}; refusing to leave it uncut")
+
+
+def register_raw_views(con, config: LakeConfig, *, cut_asof: str | None = None) -> dict[str, str | None]:
+    """Register the raw inputs; with ``cut_asof`` every dated one only shows rows up to that day.
+
+    Returns table -> predicate (None = uncut).  Empty when no cut was asked for.
+    """
+    created = register_views(con, config, tables=RAW_INPUTS)
+    cuts: dict[str, str | None] = {}
+    if cut_asof is None:
+        return cuts
+    for table in created:
+        predicate = cut_predicate(table, cut_asof)
+        cuts[table] = predicate
+        if predicate is None:
+            continue
+        glob = _sql_str_literal(config.table_glob(table))
+        con.execute(
+            f"CREATE OR REPLACE VIEW {table} AS "
+            f"SELECT * FROM read_parquet({glob}, hive_partitioning=false) WHERE {predicate}")
+    return cuts
 
 
 def _sha256(path: Path) -> str:
@@ -316,8 +367,12 @@ def _build_marts(
     profiler: BuildProfiler | None = None, build_info: dict | None = None,
     *, profile: str = DEFAULT_BUILD_PROFILE,
     max_beyond_calendar_rows: int = DEFAULT_MAX_BEYOND_CALENDAR_ROWS,
+    cut_to_asof: bool = False,
 ) -> dict | None:
     """Topological, strict feature-only build. No best-effort skipped marts.
+
+    ``cut_to_asof`` hides every raw row dated after ``feature_asof_date``, so the marts end at
+    the reference session even when the export holds later rows (``build_info["raw_cut"]``).
 
     ``profile="full"`` builds every mart of the chain. ``profile="serving"`` builds only
     what the model reads: the vintage marts are skipped (they feed nothing but the
@@ -336,7 +391,9 @@ def _build_marts(
     profiler = profiler or NullProfiler()
     holiday_record = None
     with profiler.step("raw_views"):
-        register_views(con, config, tables=RAW_INPUTS)
+        cuts = register_raw_views(con, config, cut_asof=feature_asof_date if cut_to_asof else None)
+        if build_info is not None and cut_to_asof:
+            build_info["raw_cut"] = {"cut_asof": feature_asof_date, "predicates": cuts}
     if full:
         with profiler.step("calendar"):
             lower, upper = con.execute(
@@ -510,6 +567,7 @@ def build_live_marts(
     holidays_csv: Path | None = None, temp_dir: Path | None = None,
     max_temp_size: str = DEFAULT_MAX_TEMP_SIZE, profile: str = DEFAULT_BUILD_PROFILE,
     max_beyond_calendar_rows: int = DEFAULT_MAX_BEYOND_CALENDAR_ROWS,
+    cut_to_asof: bool = False,
 ) -> dict:
     if profile not in BUILD_PROFILES:
         raise ValueError(f"unknown KR build profile {profile!r}; expected {BUILD_PROFILES}")
@@ -548,7 +606,8 @@ def build_live_marts(
         build_info: dict = {}
         holiday_record = _build_marts(
             con, config, feature_asof_date, holidays_csv, profiler, build_info,
-            profile=profile, max_beyond_calendar_rows=max_beyond_calendar_rows)
+            profile=profile, max_beyond_calendar_rows=max_beyond_calendar_rows,
+            cut_to_asof=cut_to_asof)
         with profiler.step("verify_marts"):
             records = [_mart_record(con, config, name, feature_asof_date) for name in names]
         con.close()
@@ -565,6 +624,8 @@ def build_live_marts(
             # Receipts beyond the calendar (full profile only: the serving profile builds no
             # vintage mart, so there is nothing to count).
             "beyond_calendar": build_info.get("beyond_calendar"),
+            # None = the export was used as it is; set = rows after the reference session were hidden.
+            "raw_cut": build_info.get("raw_cut"),
             "execution_environment": _execution_environment(engine),
             "mart_versions": {
                 **{item["view"]: _version_entry(item) for item in records},
@@ -626,6 +687,9 @@ def main() -> int:
         "--max-beyond-calendar-rows", type=int, default=DEFAULT_MAX_BEYOND_CALENDAR_ROWS,
         help="fail if more stock_metric_vintage_fact rows than this have a receipt date beyond "
              "the calendar (full profile; default: %(default)s)")
+    parser.add_argument(
+        "--cut-to-asof", action="store_true",
+        help="hide raw rows dated after --feature-asof-date (K' fallback; default: use the export as is)")
     args = parser.parse_args()
     result = build_live_marts(**vars(args))
     print(json.dumps({"snapshot_date": result["snapshot_date"], "feature_asof_date": result["feature_asof_date"], "marts": len(result["marts"])}))

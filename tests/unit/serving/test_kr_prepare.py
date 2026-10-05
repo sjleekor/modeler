@@ -203,7 +203,8 @@ def test_prepare_completion_marker_is_written_after_publish_and_pins_hashes(tmp_
         _check_completion_marker(published)
 
 
-def test_native_prepare_from_synthetic_label_free_marts_seals_provenance(tmp_path: Path) -> None:
+def _synthetic_native_world(tmp_path: Path, *, stock_master: bool = False) -> dict:
+    """Raw prices, the seven marts and both markers of one snapshot (K = today in Seoul)."""
     now = datetime.now(ZoneInfo("Asia/Seoul"))
     k = now.date()
     previous = k - timedelta(days=1)
@@ -256,10 +257,24 @@ def test_native_prepare_from_synthetic_label_free_marts_seals_provenance(tmp_pat
                    "sql_hash": json.loads((config.feature_mart_root / name / "_cache_metadata.json").read_text())["sql_hash"]}
                   for name in marts],
     })
+    if stock_master:
+        names = config.raw_root / "stock_master"
+        names.mkdir(parents=True)
+        pl.DataFrame({
+            "ticker": ["000001", "000001", "999999"], "market": ["KOSPI", "KOSDAQ", "KOSPI"],
+            "name": ["Alpha Corp", "Other Market Alpha", "Not In Panel"],
+        }).write_parquet(names / "part.parquet")
+    return {"config": config, "k_text": k_text, "snapshot": snapshot, "cutoff": cutoff,
+            "needed": needed, "root": tmp_path}
+
+
+def test_native_prepare_from_synthetic_label_free_marts_seals_provenance(tmp_path: Path) -> None:
+    world = _synthetic_native_world(tmp_path)
+    k_text, needed = world["k_text"], world["needed"]
     output = tmp_path / "prepared" / k_text
     manifest = prepare_cross_section(
-        snapshot_date=snapshot, feature_asof_date=k_text,
-        input_cutoff=cutoff, output_dir=output, stock_data_root=tmp_path,
+        snapshot_date=world["snapshot"], feature_asof_date=k_text,
+        input_cutoff=world["cutoff"], output_dir=output, stock_data_root=tmp_path,
     )
     assert manifest["quality"]["eligible_rows"] == 1
     assert manifest["required_marts"] == sorted(needed.keys() | {"dim_price_quality_daily"})
@@ -447,3 +462,80 @@ def test_serving_profile_needs_a_projection_that_covers_the_requested_columns(
             tmp_path / "e", profile="serving", scan_meta=_PROJECTION, marker_projected=[]))
     with pytest.raises(ValueError, match="unknown build profile"):
         _check(_profile_marker_config(tmp_path / "f", profile="lite", scan_meta={}))
+
+
+def test_prepared_panel_carries_display_names_from_raw_stock_master(tmp_path: Path) -> None:
+    """F3: names come from the snapshot's raw stock_master, joined at (ticker, market)."""
+    world = _synthetic_native_world(tmp_path, stock_master=True)
+    output = tmp_path / "prepared" / world["k_text"]
+    manifest = prepare_cross_section(
+        snapshot_date=world["snapshot"], feature_asof_date=world["k_text"],
+        input_cutoff=world["cutoff"], output_dir=output, stock_data_root=tmp_path,
+    )
+    panel = pl.read_parquet(output / "feature_panel.parquet")
+    assert panel.row(0, named=True)["name"] == "Alpha Corp"  # not the KOSDAQ namesake
+    # Display only: not a model feature, not in the feature list the manifest pins.
+    assert "name" not in manifest["model_config"]["feature_columns"]
+    assert manifest["quality"]["display_columns"] == ["name"]
+    assert manifest["quality"]["display_name_source"] == {
+        "table": "stock_master", "snapshot_date": world["snapshot"], "rows_named": 1,
+        "rows_unnamed": 0, "model_input": False}
+    assert _check_completion_marker(output)["features_sha256"] == manifest["features_sha256"]
+
+
+def test_prepared_panel_without_stock_master_has_null_names_and_says_so(tmp_path: Path) -> None:
+    world = _synthetic_native_world(tmp_path)
+    output = tmp_path / "prepared" / world["k_text"]
+    manifest = prepare_cross_section(
+        snapshot_date=world["snapshot"], feature_asof_date=world["k_text"],
+        input_cutoff=world["cutoff"], output_dir=output, stock_data_root=tmp_path,
+    )
+    assert pl.read_parquet(output / "feature_panel.parquet")["name"].to_list() == [None]
+    assert manifest["quality"]["display_name_source"]["rows_named"] == 0
+    assert manifest["quality"]["display_name_source"]["rows_unnamed"] == 1
+
+
+def _evidence(path: Path, *, reference: str, verdict: str = "fallback_K_prime") -> Path:
+    _write_json(path, {"schema": "kr-reference-selection.v1", "verdict": verdict,
+                       "reference_date": reference, "k": "2099-01-01", "lag_sessions": 1})
+    return path
+
+
+def test_native_manifest_embeds_the_reference_evidence_and_checks_its_date(tmp_path: Path) -> None:
+    world = _synthetic_native_world(tmp_path)
+    k_text = world["k_text"]
+    evidence = _evidence(tmp_path / "evidence.json", reference=k_text)
+    manifest = prepare_cross_section(
+        snapshot_date=world["snapshot"], feature_asof_date=k_text, input_cutoff=world["cutoff"],
+        output_dir=tmp_path / "prepared" / k_text, stock_data_root=tmp_path,
+        reference_evidence=evidence)
+    assert manifest["reference_selection"]["verdict"] == "fallback_K_prime"
+    assert manifest["reference_selection"]["reference_date"] == k_text
+    wrong = _evidence(tmp_path / "wrong.json", reference="2020-01-02")
+    with pytest.raises(ValueError, match="does not name the requested feature_asof_date"):
+        prepare_cross_section(
+            snapshot_date=world["snapshot"], feature_asof_date=k_text, input_cutoff=world["cutoff"],
+            output_dir=tmp_path / "prepared" / "other", stock_data_root=tmp_path,
+            reference_evidence=wrong)
+    none = _evidence(tmp_path / "none.json", reference=k_text, verdict="none")
+    with pytest.raises(ValueError, match="does not name the requested feature_asof_date"):
+        prepare_cross_section(
+            snapshot_date=world["snapshot"], feature_asof_date=k_text, input_cutoff=world["cutoff"],
+            output_dir=tmp_path / "prepared" / "third", stock_data_root=tmp_path,
+            reference_evidence=none)
+
+
+def test_feature_marker_whose_raw_cut_ends_elsewhere_is_rejected(tmp_path: Path) -> None:
+    """A mart cut at one session must not be read as the marts of another."""
+    world = _synthetic_native_world(tmp_path)
+    config, k_text = world["config"], world["k_text"]
+    marker = config.feature_mart_root / "_manifests" / "_SUCCESS.json"
+    body = json.loads(marker.read_text())
+    body["raw_cut"] = {"cut_asof": k_text, "predicates": {"daily_ohlcv": f"trade_date <= DATE '{k_text}'"}}
+    _write_json(marker, body)
+    cutoff = world["cutoff"]
+    _check_snapshot_markers(config, input_cutoff=cutoff, feature_asof_date=k_text)  # consistent: fine
+    body["raw_cut"]["cut_asof"] = "2020-01-02"
+    _write_json(marker, body)
+    with pytest.raises(ValueError, match="raw cut does not end at feature_asof_date"):
+        _check_snapshot_markers(config, input_cutoff=cutoff, feature_asof_date=k_text)

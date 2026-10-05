@@ -174,6 +174,37 @@ def _verify_universe_contract(config: LakeConfig, spec: KrBriefingSpec) -> str:
     return expected
 
 
+def _read_reference_evidence(path: Path | None, feature_asof_date: str) -> dict | None:
+    """The reference-session evidence ``kr_reference`` wrote, checked against the requested date."""
+    if path is None:
+        return None
+    evidence = json.loads(path.read_text(encoding="utf-8"))
+    if (not isinstance(evidence, dict) or evidence.get("schema") != "kr-reference-selection.v1"
+            or evidence.get("reference_date") != feature_asof_date
+            or evidence.get("verdict") not in {"complete_K", "fallback_K_prime"}):
+        raise ValueError("KR reference evidence does not name the requested feature_asof_date")
+    return evidence
+
+
+def _stock_names(con: duckdb.DuckDBPyConnection, config: LakeConfig) -> pl.DataFrame:
+    """Display names from the raw ``stock_master`` of the same snapshot, one per (ticker, market).
+
+    Names are display only: they are joined onto the prepared panel *after* the feature columns
+    are fixed and the scorer never reads them as model input (``build_design_matrix`` selects the
+    bundle's feature columns), so the design matrix stays the one the model was trained on.
+    A snapshot without ``stock_master`` yields no names (the scorer then shows the code); the
+    manifest records ``rows_named`` so this cannot go unnoticed.
+    """
+    try:
+        register_views(con, config, tables=["stock_master"])
+    except FileNotFoundError:
+        return pl.DataFrame(schema={"ticker": pl.String, "market": pl.String, "name": pl.String})
+    frame = pl.from_arrow(con.execute(
+        "SELECT ticker, market, name FROM stock_master "
+        "WHERE name IS NOT NULL AND trim(name) <> '' ORDER BY ticker, market").arrow())
+    return frame.unique(subset=["ticker", "market"], keep="first", maintain_order=True)
+
+
 def _check_snapshot_markers(
     config: LakeConfig, *, input_cutoff: str, feature_asof_date: str
 ) -> tuple[dict[str, str], dict[str, str]]:
@@ -228,6 +259,9 @@ def _check_snapshot_markers(
                 if not metadata or not marts[name].get("sql_hash") or marts[name]["sql_hash"] != metadata.get("sql_hash"):
                     raise ValueError(f"KR {name} feature mart cache contract differs from completion marker")
             _check_profile_contract(config, body)
+            cut = body.get("raw_cut")
+            if cut is not None and (not isinstance(cut, dict) or cut.get("cut_asof") != feature_asof_date):
+                raise ValueError("KR feature snapshot raw cut does not end at feature_asof_date")
         loaded[kind] = _sha256(path)
         timestamps[
             "raw_snapshot_completed_at" if kind == "raw" else "feature_marts_completed_at"
@@ -374,8 +408,13 @@ def _query_sql(
 def prepare_cross_section(
     *, snapshot_date: str, feature_asof_date: str, output_dir: Path,
     input_cutoff: str, stock_data_root: Path | None = None, source: str = REMOTE_SOURCE,
+    reference_evidence: Path | None = None,
 ) -> dict:
-    """Read the specified ready snapshot and persist label-free K features."""
+    """Read the specified ready snapshot and persist label-free features of the reference session.
+
+    ``feature_asof_date`` is K, or an earlier K' when ``kr_reference`` found K incomplete.
+    ``reference_evidence`` (that module's JSON) is embedded in the manifest.
+    """
     if date.fromisoformat(snapshot_date).isoformat() != snapshot_date:
         raise ValueError("snapshot_date must use YYYY-MM-DD")
     if date.fromisoformat(feature_asof_date).isoformat() != feature_asof_date:
@@ -387,6 +426,7 @@ def prepare_cross_section(
     else:
         root = DataRoot(base=stock_data_root / "kr")
     config = LakeConfig(root=root, snapshot_date=snapshot_date, source=source)
+    reference = _read_reference_evidence(reference_evidence, feature_asof_date)
     marker_hashes, marker_times = _check_snapshot_markers(
         config, input_cutoff=input_cutoff, feature_asof_date=feature_asof_date
     )
@@ -420,6 +460,7 @@ def prepare_cross_section(
         _verify_universe_contract(config, spec)
         query, columns, needed = _query_sql(spec, feature_asof_date)
         panel = pl.from_arrow(con.execute(query).arrow())
+        names = _stock_names(con, config)
     finally:
         con.close()
     if panel.is_empty():
@@ -440,6 +481,10 @@ def prepare_cross_section(
             )
         panel = panel.with_columns(exprs)
     panel = panel.select([*KEY_COLS, *columns, *QUALITY_COLS]).sort(["trade_date", "ticker", "market"])
+    # Display names (F3). Added after the feature columns are fixed, never part of the model input.
+    panel = panel.join(names, on=["ticker", "market"], how="left", validate="m:1").sort(
+        ["trade_date", "ticker", "market"])
+    named_rows = int(panel.get_column("name").is_not_null().sum())
     if any(name.startswith(("y_", "raw_label", "fwd_ret_", "bench_ret_")) for name in panel.columns):
         raise AssertionError("label columns reached the KR serving feature panel")
     if any(name in panel.columns for name in ("flow_short_balance_qty", "flow_short_balance_chg_20d")):
@@ -490,7 +535,13 @@ def prepare_cross_section(
                 "trading_halt_check": "K feature mart only; does not establish D intraday tradability",
                 "price_jump_review": "not_checked",
                 "price_quality_fields": list(QUALITY_COLS),
+                "display_columns": ["name"],
+                "display_name_source": {
+                    "table": "stock_master", "snapshot_date": snapshot_date,
+                    "rows_named": named_rows, "rows_unnamed": panel.height - named_rows,
+                    "model_input": False},
             },
+            "reference_selection": reference,
             "mart_contracts": contracts,
             "feature_mart_profile": feature_mart_profile(json.loads(
                 (config.feature_mart_root / "_manifests" / "_SUCCESS.json").read_text(
@@ -520,6 +571,8 @@ def main() -> int:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--stock-data-root", type=Path)
     parser.add_argument("--source", default=REMOTE_SOURCE)
+    parser.add_argument("--reference-evidence", type=Path,
+                        help="kr_reference JSON naming the reference session; embedded in the manifest")
     args = parser.parse_args()
     manifest = prepare_cross_section(
         snapshot_date=args.snapshot_date,
@@ -528,6 +581,7 @@ def main() -> int:
         output_dir=args.output_dir,
         stock_data_root=args.stock_data_root,
         source=args.source,
+        reference_evidence=args.reference_evidence,
     )
     print(json.dumps({"rows": manifest["quality"]["eligible_rows"], "feature_asof_date": manifest["feature_asof_date"]}))
     return 0

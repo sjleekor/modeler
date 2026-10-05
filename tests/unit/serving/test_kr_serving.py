@@ -443,3 +443,35 @@ def test_scoring_rejects_same_day_feature_asof_and_label_columns() -> None:
             feature_asof_date="2026-09-28",
             prepared_manifest={"market": "KR", "feature_asof_date": "2026-09-28"},
         )
+
+
+def test_display_names_never_change_the_design_matrix_or_the_scores() -> None:
+    """F3: a ``name`` column in the prepared panel only labels rows; scores are bit-identical."""
+    base = {
+        "trade_date": [date(2026, 9, 28)] * 3,
+        "ticker": ["000001", "000002", "000003"],
+        "market": ["KOSPI"] * 3,
+        "px_ret_1d": [1.0, 2.0, 3.0],
+    }
+    prepared = {
+        "market": "KR", "snapshot_date": "2026-09-28", "feature_asof_date": "2026-09-28",
+        "model_config": {
+            "feature_set": "FS1h", "flow_variant": "lag1", "preprocess_profile": "rank",
+            "excluded_features": list(EXCLUDED_FEATURES),
+            "feature_time_contract": {"serving_applies_additional_lag": False},
+        },
+    }
+
+    def score(panel: pl.DataFrame) -> list[dict]:
+        return score_cross_section(
+            bundle=_bundle(), panel=panel, report_date="2026-09-29",
+            decision_at="2026-09-29T10:00:00+09:00", feature_asof_date="2026-09-28",
+            prepared_manifest=prepared)["rankings"]
+
+    schema = {"trade_date": pl.Date}
+    plain = score(pl.DataFrame(base, schema_overrides=schema))
+    named = score(pl.DataFrame({**base, "name": ["Alpha", "Beta", None]}, schema_overrides=schema))
+    assert [(row["symbol"], row["rank"], row["score"]) for row in plain] == [
+        (row["symbol"], row["rank"], row["score"]) for row in named]
+    assert [row["name"] for row in plain] == ["000003", "000002", "000001"]  # the code stands in
+    assert [row["name"] for row in named] == ["000003", "Beta", "Alpha"]  # a null name too

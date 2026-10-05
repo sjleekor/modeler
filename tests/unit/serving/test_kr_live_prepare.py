@@ -693,3 +693,121 @@ def test_serving_profile_fails_loudly_for_a_requested_column_it_cannot_project(
 def test_the_requested_scan_columns_come_from_the_model_features() -> None:
     assert live._scan_projection_columns() == ("fin_log_mcap",)
     assert live.requested_mart_columns()["feat_fin_scan_daily"] == ["fin_log_mcap"]
+
+
+# ---- K' fallback: cutting the raw inputs at the reference session (2026-10-05 change 1) ----
+
+def _write_raw_inputs(config: LakeConfig, *, through: date, extra_after: bool) -> None:
+    """Tiny parquet for the eight raw inputs; ``extra_after`` adds rows dated after ``through``."""
+    import duckdb
+
+    days = [date(2026, 9, 28), date(2026, 9, 29), date(2026, 9, 30)]
+    if extra_after:
+        days.append(date(2026, 10, 1))
+    days = [d for d in days if extra_after or d <= through]
+    con = duckdb.connect()
+
+    def write(table: str, rows: str) -> None:
+        directory = config.raw_root / table
+        directory.mkdir(parents=True, exist_ok=True)
+        con.execute(f"COPY ({rows}) TO '{directory / 'part.parquet'}' (FORMAT PARQUET)")
+
+    def values(items: list[str], columns: str) -> str:
+        return f"SELECT * FROM (VALUES {', '.join(items)}) AS t({columns})"
+
+    write("daily_ohlcv", values([f"(DATE '{d}', '000001', 100)" for d in days], "trade_date, ticker, close"))
+    write("krx_security_flow_raw",
+          values([f"(DATE '{d}', '000001', 5)" for d in days], "trade_date, ticker, value"))
+    receipts = [f"('{d:%Y%m%d}000123', DATE '{d}')" for d in days]
+    for table in live.CUT_RCEPT_TABLES:
+        write(table, values([*receipts, "('bad', DATE '2026-09-29')", "(NULL, DATE '2026-09-29')"],
+                            "rcept_no, other_date"))
+    odd = ["('20260929000999', DATE '2026-10-01')"] if extra_after else []  # number 09-29, dated later
+    write(live.CUT_RECEIPT_TABLE, values(
+        [f"('{d:%Y%m%d}000123', DATE '{d}')" for d in days] + odd, "rcept_no, rcept_dt"))
+    write("dart_corp_master", values(["('00000001', 'Alpha')"], "corp_code, corp_name"))
+    con.close()
+
+
+def _rows(con, table: str) -> list[tuple]:
+    return sorted(con.execute(f"SELECT * FROM {table}").fetchall(), key=repr)
+
+
+def test_cut_predicate_covers_every_raw_input_and_refuses_unknown_tables() -> None:
+    for table in live.RAW_INPUTS:
+        live.cut_predicate(table, "2026-09-30")  # raises when an input has no cut rule
+    assert live.cut_predicate("dart_corp_master", "2026-09-30") is None
+    assert live.cut_predicate("daily_ohlcv", "2026-09-30") == "trade_date <= DATE '2026-09-30'"
+    with pytest.raises(ValueError, match="refusing to leave it uncut"):
+        live.cut_predicate("daily_market_cap", "2026-09-30")
+
+
+def test_cut_views_equal_what_an_export_taken_on_the_reference_session_would_hold(
+        tmp_path: Path) -> None:
+    """The cut result is the earlier export: same rows in every input table (the K' contract)."""
+    import duckdb
+
+    through = date(2026, 9, 30)
+    later = LakeConfig(DataRoot(tmp_path / "later" / "kr"), "2026-10-05", REMOTE_SOURCE)
+    earlier = LakeConfig(DataRoot(tmp_path / "earlier" / "kr"), "2026-10-01", REMOTE_SOURCE)
+    _write_raw_inputs(later, through=through, extra_after=True)
+    _write_raw_inputs(earlier, through=through, extra_after=False)
+    cut_con, plain_con = duckdb.connect(), duckdb.connect()
+    predicates = live.register_raw_views(cut_con, later, cut_asof="2026-09-30")
+    assert live.register_raw_views(plain_con, earlier) == {}  # no cut asked: no predicates
+    assert set(predicates) == set(live.RAW_INPUTS) and predicates["dart_corp_master"] is None
+    for table in live.RAW_INPUTS:
+        assert _rows(cut_con, table) == _rows(plain_con, table), table
+    # The later export really did hold more: the cut is what hides it.
+    uncut = duckdb.connect()
+    live.register_raw_views(uncut, later)
+    assert len(_rows(uncut, "daily_ohlcv")) == len(_rows(cut_con, "daily_ohlcv")) + 1
+    # Unreadable receipt numbers stay (the marts treat them through their documented fallback).
+    kept = {row[0] for row in cut_con.execute("SELECT rcept_no FROM dart_share_count_raw").fetchall()}
+    assert {"bad", None} <= kept and "20261001000123" not in kept
+    # The receipt table is cut by both its number and its own date column.
+    receipts = {row[0] for row in cut_con.execute(f"SELECT rcept_no FROM {live.CUT_RECEIPT_TABLE}").fetchall()}
+    assert "20260929000999" not in receipts and "20260930000123" in receipts
+
+
+def test_cut_build_records_the_cut_in_the_marker_and_the_plain_build_does_not(
+        tmp_path: Path, monkeypatch) -> None:
+    config = LakeConfig(DataRoot(tmp_path / "kr"), "2026-09-30", REMOTE_SOURCE)
+    _raw_marker(config)
+    seen: dict = {}
+    _stub_build(monkeypatch, [], seen)
+    cuts: list = []
+
+    def fake_register(_con, _config, *, cut_asof=None):
+        cuts.append(cut_asof)
+        return {"daily_ohlcv": f"trade_date <= DATE '{cut_asof}'"} if cut_asof else {}
+
+    monkeypatch.setattr(live, "register_raw_views", fake_register)
+    csv_path = _holiday_csv(tmp_path / "h.csv", ["2026-01-01", "2026-12-31"])
+    cut_body = live.build_live_marts(
+        snapshot_date="2026-09-30", feature_asof_date="2026-09-30",
+        input_cutoff="2026-10-01T09:30:00+09:00", stock_data_root=tmp_path, holidays_csv=csv_path,
+        cut_to_asof=True)
+    assert cuts == ["2026-09-30"]
+    assert cut_body["raw_cut"] == {"cut_asof": "2026-09-30",
+                                   "predicates": {"daily_ohlcv": "trade_date <= DATE '2026-09-30'"}}
+    plain_config = LakeConfig(DataRoot(tmp_path / "kr"), "2026-09-29", REMOTE_SOURCE)
+    _raw_marker(plain_config)
+    plain_body = live.build_live_marts(
+        snapshot_date="2026-09-29", feature_asof_date="2026-09-29",
+        input_cutoff="2026-09-30T09:30:00+09:00", stock_data_root=tmp_path, holidays_csv=csv_path)
+    assert cuts == ["2026-09-30", None] and plain_body["raw_cut"] is None
+
+
+def test_a_cut_build_still_requires_the_sealed_raw_marker(tmp_path: Path) -> None:
+    """The K' path relaxes nothing about the snapshot: no completion marker, no marts."""
+    with pytest.raises(FileNotFoundError, match="complete sj2 raw export is missing"):
+        live.build_live_marts(
+            snapshot_date="2026-09-30", feature_asof_date="2026-09-29",
+            input_cutoff="2026-10-01T09:30:00+09:00", stock_data_root=tmp_path, cut_to_asof=True)
+    config = LakeConfig(DataRoot(tmp_path / "kr"), "2026-09-30", REMOTE_SOURCE)
+    _raw_marker(config, route="local")
+    with pytest.raises(ValueError, match="sj2 direct route"):
+        live.build_live_marts(
+            snapshot_date="2026-09-30", feature_asof_date="2026-09-29",
+            input_cutoff="2026-10-01T09:30:00+09:00", stock_data_root=tmp_path, cut_to_asof=True)
