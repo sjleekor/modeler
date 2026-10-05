@@ -53,9 +53,8 @@ def test_render_writes_private_view_and_state(tmp_path: Path, monkeypatch) -> No
     state = json.loads((tmp_path / "runs" / "2026-09-29" / "coordinator-render.json").read_text())
     assert state["private_projection_dir"] == str(private)
     assert state["private_manifest_sha256"] == hashlib.sha256((private / "private-manifest.json").read_bytes()).hexdigest()
-    public = tmp_path / "site" / "2026-09-29"
-    assert "PRIV001" not in _tree_text(public) and "0.123456" not in _tree_text(public)
-    assert not (public / "private-manifest.json").exists()
+    # The coordinator no longer builds a public projection at all.
+    assert not (tmp_path / "site").exists() and "projection_dir" not in state
 
 
 def test_private_disabled_by_default(tmp_path: Path) -> None:
@@ -68,24 +67,27 @@ def test_private_disabled_by_default(tmp_path: Path) -> None:
 
 def test_overlapping_private_root_is_rejected(tmp_path: Path, monkeypatch) -> None:
     release, config = _setup_private(tmp_path, monkeypatch)
-    mp._enable_publisher(tmp_path, config)
-    site, checkout = tmp_path / "site", tmp_path / "checkout"
+    world = mp._enable_publisher(tmp_path, config)
+    runs, checkout = tmp_path / "runs", world.checkout
     base = json.loads(config.read_text())
     assert daily_coordinator._config(config)["private_projection_root"] == str(tmp_path / "private")
-    for bad in (site, site / "x", tmp_path, checkout, checkout / "private", tmp_path / "private-link"):
+    candidates = (runs, runs / "x", tmp_path, checkout, checkout / "private",
+                  tmp_path / "private-link")
+    for bad in candidates:
         if bad.name == "private-link":
-            bad.symlink_to(site)
+            bad.symlink_to(checkout)
         body = {**base, "private_projection_root": str(bad)}
         path = e2e._write(tmp_path / "bad.json", body)
         with pytest.raises(ValueError):
             daily_coordinator._config(path)
-    mp._cli(release, e2e._write(tmp_path / "bad.json", {**base, "private_projection_root": str(site / "p")}),
-            "select", mp.D1, "2026-09-29T09:30:00+09:00", expect=1)
+    inside = e2e._write(tmp_path / "bad.json", {**base, "private_projection_root": str(checkout / "p")})
+    mp._cli(release, inside, "select", mp.D1, "2026-09-29T09:30:00+09:00", expect=1)
 
 
-def test_two_days_private_list_and_publisher_never_sees_private(tmp_path: Path, monkeypatch) -> None:
+def test_two_days_private_list_and_reports_repository_never_sees_the_private_view(
+        tmp_path: Path, monkeypatch) -> None:
     release, config = _setup_private(tmp_path, monkeypatch)
-    bare, base = mp._enable_publisher(tmp_path, config)
+    world = mp._enable_publisher(tmp_path, config)
     mp._day(release, config, mp.D1, "2026-09-29T09:30:00+09:00", "2026-09-29T10:00:00+09:00")
     assert mp._cli(release, config, "publish", mp.D1, "2026-09-29T10:00:00+09:00")["status"] == "published"
     mp._prepare_d2(tmp_path, config)
@@ -99,13 +101,15 @@ def test_two_days_private_list_and_publisher_never_sees_private(tmp_path: Path, 
     render2 = json.loads((tmp_path / "runs" / "2026-09-30" / "coordinator-render.json").read_text())
     assert render2["private_previous_projection_dir"] == str(tmp_path / "private" / "2026-09-29")
     for day in ("2026-09-29", "2026-09-30"):
-        daily = json.loads((tmp_path / "runs" / day / "pages-publisher-config.json").read_text())
-        assert daily["projection_dir"] == str(tmp_path / "site" / day)
+        daily = json.loads((tmp_path / "runs" / day / "reports-publisher-config.json").read_text())
         assert str(tmp_path / "private") not in json.dumps(daily)
-    checkout = tmp_path / "checkout"
-    text = _tree_text(checkout / "public")
-    assert "PRIV001" not in text and "PRIVATE_DO_NOT_PUBLISH" not in text and "0.123456" not in text
-    assert not list(checkout.rglob("private-manifest.json"))
+    # The repository gets the markdown unit (top N, 4-decimal scores), never the private HTML view.
+    unit = world.remote_file(f"{mp._unit(mp.D1)}/kr-stocks.md")
+    assert "PRIV001" in unit and "0.1235" in unit and "0.123456" not in unit
+    clone = world.clone_for_checks()
+    assert not list(clone.rglob("private-manifest.json")) and not list(clone.rglob("*.html"))
+    worktree = "\n".join(f.read_text(encoding="utf-8") for f in clone.rglob("*.md"))
+    assert "PRIVATE_DO_NOT_PUBLISH" not in worktree and "비공개 — 게시 금지" not in worktree
     # publish_stage source never references the private root
     import inspect
     assert "private_projection" not in inspect.getsource(daily_coordinator.publish_stage)

@@ -261,3 +261,19 @@ def test_release_without_data_files_still_passes(env):
     def mutate(release, root):
         release.pop("data_files")
     assert _release_jobs(_mutate_release(env, mutate))[1] is False
+
+
+def test_markdown_renderer_needs_no_data_file_and_must_be_in_the_reviewed_list(env):
+    # The markdown templates are Python strings, so the release data-file allowlist stays one file.
+    assert rb.DATA_FILES == (CSV,)
+    _write(env["modeler"] / "src/modeler/reporting/__init__.py", b"")
+    _write(env["modeler"] / "src/modeler/reporting/markdown.py", b"# renderer\n")
+    with pytest.raises(rb.BuildError, match="not in the reviewed"):
+        _build(env)
+    # Once the reviewed list names it, the renderer is copied with the other sources.
+    for rel in ("src/modeler/reporting/__init__.py", "src/modeler/reporting/markdown.py"):
+        env["listing"][f"modeler/{rel}"] = _sha((env["modeler"] / rel).read_bytes())
+    env["save"]()
+    summary = _build(env)
+    assert summary["python_file_count"] == 6
+    assert (env["tmp"] / "out" / "release" / "src/modeler/reporting/markdown.py").is_file()

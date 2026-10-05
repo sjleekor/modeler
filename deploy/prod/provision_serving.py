@@ -15,14 +15,13 @@ purpose; Cronicle runs as the same user and nothing else needs access):
     releases/<id>/               frozen non-synthetic release, read-only    (0550 dirs / 0440 files)
     config/                      ops.json (0640), pins.json, E table, parity evidence,
                                  calendars/ (all 0440)                      (0750)
-    publisher/                   publish_site.py, validate_public_site.py   (0750, files 0440)
+    publisher/                   publish_reports.py, validate_reports.py    (0750, files 0440)
     stock_data/us/raw|derived    read-only symlinks to the operational lake
     stock_data/us/output/        real directory, the only place prepare writes  (0750)
     prepared/kr/                 empty                                     (0750)
     prepared/us                  symlink -> stock_data/us/output/us_scoring_daily_v1/prepared
     prepared/selections/         D selections (must live inside prepared/)  (0750)
     runs/ locks/                 coordinator state                          (0700)
-    projection/                  public projection, re-creatable            (0750)
     private-projection/          private views, never published             (0700)
     logs/                        free for wrappers                          (0750)
 """
@@ -46,13 +45,15 @@ PINS_SCHEMA = "daily-briefing-serving-pins.v1"
 RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 SCORING_VERSION = "us_scoring_daily_v1"
-PUBLISHER_FILES = ("publish_site.py", "validate_public_site.py")
+PUBLISHER_FILES = ("publish_reports.py", "validate_reports.py")
+REPORTS_REPOSITORY = "sjleekor/stock_reports"
+REPORTS_REMOTE_URL = f"git@github.com:{REPORTS_REPOSITORY}.git"
 KR_CALENDAR = ("KR", date(2026, 1, 1), date(2026, 12, 31))
 US_CALENDAR = ("US", date(2026, 1, 1), date(2027, 12, 31))
 DIR_MODES = {"": 0o750, "config": 0o750, "config/calendars": 0o750, "publisher": 0o750,
              "releases": 0o750, "stock_data": 0o750, "stock_data/us": 0o750,
              "stock_data/us/output": 0o750, "prepared": 0o750, "prepared/kr": 0o750,
-             "prepared/selections": 0o750, "projection": 0o750, "logs": 0o750,
+             "prepared/selections": 0o750, "logs": 0o750,
              "runs": 0o700, "locks": 0o700, "private-projection": 0o700}
 
 
@@ -165,14 +166,22 @@ class Plan:
               "US expected source must be us-expected-source.v1 with reviewed_status=confirmed")
         self.checks["us_expected_dates"] = len(body.get("expected_session_by_report_date", {}))
         self.publisher_sources = {}
-        pages_dir = Path(a.publisher_source_dir) if a.publisher_source_dir else self.modeler / "deploy/pages"
+        reports_dir = (Path(a.publisher_source_dir) if a.publisher_source_dir
+                       else self.modeler / "deploy/reports")
         for name in PUBLISHER_FILES:
-            path = _regular(pages_dir / name, f"publisher script {name}")
+            path = _regular(reports_dir / name, f"publisher script {name}")
             key = _reviewed_key(path, self.modeler)
             _need(listed.get(key) == sha256_file(path), f"publisher script is not the reviewed one: {key}")
             self.publisher_sources[name] = path
-        self.pages_config = _regular(Path(a.pages_config), "pages base config")
-        self.site_checkout = _directory(Path(a.site_checkout), "site checkout")
+        self.reports_checkout = Path(os.path.abspath(a.reports_checkout))
+        _need(not self.reports_checkout.is_symlink(), "reports checkout cannot be a symlink")
+        _need(not self.reports_checkout.exists() or self.reports_checkout.is_dir(),
+              "reports checkout exists but is not a directory")
+        _need(self.reports_checkout != self.root and self.root not in self.reports_checkout.parents
+              and self.reports_checkout not in self.root.parents,
+              "reports checkout must not overlap the serving root")
+        _need(a.reports_remote_url == f"git@github.com:{a.reports_repository}.git",
+              "reports remote URL must be the SSH URL of the reports repository")
         self.lake = {name: _directory(Path(a.us_lake) / name, f"US lake {name}") for name in ("raw", "derived")}
         venv_python = self.venv / "bin" / "python"
         if self.venv.exists():
@@ -186,12 +195,12 @@ class Plan:
         self.checks["publisher_scripts_reviewed"] = sorted(self.publisher_sources)
 
     def planned(self) -> list[str]:
-        rel = [f"{name}/" for name in ("venv", "config", "config/calendars", "publisher", "runs", "projection",
+        rel = [f"{name}/" for name in ("venv", "config", "config/calendars", "publisher", "runs",
                                        "private-projection", "locks", "logs", "prepared/kr", "prepared/selections")]
         rel += [f"releases/{self.args.release_id}/", "config/ops.json", "config/pins.json",
                 f"config/{self.expected_target.name}", f"config/{self.evidence_target.name}",
                 "config/calendars/calendar-KR-<hash>.json", "config/calendars/calendar-US-<hash>.json",
-                "publisher/publish_site.py", "publisher/validate_public_site.py",
+                "publisher/publish_reports.py", "publisher/validate_reports.py",
                 "stock_data/us/raw -> " + str(self.lake["raw"]), "stock_data/us/derived -> " + str(self.lake["derived"]),
                 f"stock_data/us/output/{SCORING_VERSION}/prepared/",
                 "prepared/us -> stock_data/us/output/" + SCORING_VERSION + "/prepared"]
@@ -357,9 +366,8 @@ def provision(plan: Plan) -> dict[str, Any]:
     pins_sha = _write_json(plan.root / "config" / "pins.json", pins, 0o440)
     ops = {"schema_version": OPS_SCHEMA,
            "prepared_root": str(plan.prepared), "selection_root": str(plan.prepared / "selections"),
-           "run_root": str(plan.root / "runs"), "projection_root": str(plan.root / "projection"),
+           "run_root": str(plan.root / "runs"),
            "private_projection_root": str(plan.root / "private-projection"),
-           "previous_projection_dir": None,
            "release_manifest": str(release_json),
            "python": str(python), "python_sha256": sha256_file(python),
            "runtime_lock": str(release / "uv.lock"), "runtime_lock_sha256": sha256_file(release / "uv.lock"),
@@ -371,13 +379,13 @@ def provision(plan: Plan) -> dict[str, Any]:
            "us_expected_source": str(plan.expected_target),
            "opening_artifact": None, "opening_snapshot_root": None, "opening_output_root": None,
            "opening_max_age_seconds": None,
-           "base_path": "/market-briefing/",
            "publisher_enabled": False, "external_verification_enabled": False,
-           "publisher_script": publisher["publish_site.py"]["path"],
-           "publisher_script_sha256": publisher["publish_site.py"]["sha256"],
-           "publisher_config": str(plan.pages_config), "site_checkout": str(plan.site_checkout),
-           "actions_repository": a.actions_repository, "actions_workflow": a.actions_workflow,
-           "public_manifest_url": a.public_manifest_url}
+           "reports_repository": a.reports_repository, "reports_audience": "owner_only",
+           "reports_branch": "main", "reports_remote_url": a.reports_remote_url,
+           "reports_checkout": str(plan.reports_checkout),
+           "reports_publisher": publisher["publish_reports.py"]["path"],
+           "reports_publisher_sha256": publisher["publish_reports.py"]["sha256"],
+           "reports_top_n": 100}
     ops_sha = _write_json(plan.ops, ops, 0o640)
     validation = json.loads(_run([str(python), "-c", VALIDATE, str(plan.ops)], cwd=release,
                                  pythonpath=str(release / "src"), timeout=300).strip().splitlines()[-1])
@@ -408,16 +416,15 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--us-expected-sha256", required=True)
     p.add_argument("--parity-evidence", required=True)
     p.add_argument("--parity-evidence-sha256", required=True)
-    p.add_argument("--pages-config", required=True, help="publisher base config (read, not copied)")
-    p.add_argument("--site-checkout", required=True, help="Pages checkout (read, not copied)")
+    p.add_argument("--reports-checkout", required=True,
+                   help="stock_reports checkout the publisher pushes from (read, not created here)")
+    p.add_argument("--reports-repository", default=REPORTS_REPOSITORY)
+    p.add_argument("--reports-remote-url", default=REPORTS_REMOTE_URL)
     p.add_argument("--us-lake", default="/home/whi/data/stock_data/us", help="operational lake (read-only link target)")
     p.add_argument("--model-cards")
     p.add_argument("--runtime-manifest")
     p.add_argument("--uv-lock")
-    p.add_argument("--publisher-source-dir", help="default: <modeler-root>/deploy/pages")
-    p.add_argument("--actions-repository", default="sjleekor/market-briefing")
-    p.add_argument("--actions-workflow", default="pages.yml")
-    p.add_argument("--public-manifest-url", default="https://sjleekor.github.io/market-briefing/site-manifest.json")
+    p.add_argument("--publisher-source-dir", help="default: <modeler-root>/deploy/reports")
     p.add_argument("--dry-run", action="store_true", help="check inputs and list targets; write nothing")
     return p
 

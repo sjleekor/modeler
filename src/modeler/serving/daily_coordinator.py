@@ -11,16 +11,14 @@ import secrets
 import subprocess
 import sys
 import tempfile
-import urllib.error
-import urllib.request
 from contextlib import contextmanager
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
+from collections.abc import Iterator
 from zoneinfo import ZoneInfo
-from urllib.parse import urlencode
 
-from modeler.reporting.site import PRIVATE_MANIFEST_NAME, PrivateViewBuilder, SiteBuilder, _read_tree
+from modeler.reporting.site import PRIVATE_MANIFEST_NAME, PrivateViewBuilder, _read_tree
 from modeler.serving.schema import report_template
 
 from .daily_inputs import select
@@ -28,6 +26,10 @@ from .runtime_contract import verify_runtime
 
 SEOUL = ZoneInfo("Asia/Seoul")
 RETRY_MINUTES = (15, 17, 22, 32)
+REPORTS_REPOSITORY = "sjleekor/stock_reports"
+REPORTS_AUDIENCE = "owner_only"
+REPORTS_BRANCH = "main"
+PUBLISHER_TIMEOUT_SECONDS = 300
 
 
 def _hash(path: Path) -> str:
@@ -84,7 +86,7 @@ def _config(path: Path) -> dict[str, Any]:
     config = _read(path)
     if config.get("schema_version") != "daily-briefing-ops.v1":
         raise ValueError("ops config schema mismatch")
-    for key in ("prepared_root", "selection_root", "run_root", "projection_root",
+    for key in ("prepared_root", "selection_root", "run_root",
                 "release_manifest", "python", "runtime_lock", "runtime_manifest", "model_cards_path", "kr_calendar",
                 "us_calendar", "us_expected_source"):
         _absolute(config, key, exists=key in {"release_manifest", "python", "runtime_lock",
@@ -115,33 +117,38 @@ def _config(path: Path) -> dict[str, Any]:
             raise ValueError("opening max age must be 1..3600 seconds")
     if config.get("private_projection_root") is not None:
         private = _absolute(config, "private_projection_root").resolve()
-        others = [_absolute(config, "projection_root").resolve()]
-        if config.get("site_checkout") is not None:
-            others.append(_absolute(config, "site_checkout").resolve())
+        others = [_absolute(config, "run_root").resolve()]
+        if config.get("reports_checkout") is not None:
+            others.append(_absolute(config, "reports_checkout").resolve())
         for other in others:
             if private == other or private in other.parents or other in private.parents:
-                raise ValueError("private_projection_root must not overlap the public projection or site checkout")
+                raise ValueError("private_projection_root must not overlap the run root or the reports checkout")
     if not isinstance(config.get("publisher_enabled"), bool):
         raise ValueError("publisher_enabled must be explicit")
     if not isinstance(config.get("external_verification_enabled"), bool):
         raise ValueError("external_verification_enabled must be explicit")
-    base = config.get("base_path")
-    if not isinstance(base, str) or not base.startswith("/") or not base.endswith("/"):
-        raise ValueError("base_path requires a concrete Pages project path")
     if config["publisher_enabled"]:
-        for key in ("publisher_script", "publisher_config", "site_checkout", "public_manifest_url"):
-            if key == "public_manifest_url":
-                if not isinstance(config.get(key), str) or not config[key].startswith("https://"):
-                    raise ValueError("public manifest URL must be HTTPS")
-            else:
-                _absolute(config, key, exists=True)
-        if _hash(_absolute(config, "publisher_script")) != config.get("publisher_script_sha256"):
-            raise ValueError("publisher source SHA-256 changed")
-        if (config.get("actions_repository") != "sjleekor/market-briefing" or
-                not isinstance(config.get("actions_workflow"), str) or
-                not re.fullmatch(r"[A-Za-z0-9._-]+\.ya?ml", config["actions_workflow"])):
-            raise ValueError("Actions repository and workflow must be confirmed")
+        _reports_publisher_config(config)
     return config
+
+
+def _reports_publisher_config(config: dict[str, Any]) -> None:
+    """Check the stock_reports publisher settings. Only needed once the publisher is enabled."""
+    for key in ("reports_publisher", "reports_checkout"):
+        _absolute(config, key, exists=True)
+    if _hash(_absolute(config, "reports_publisher")) != config.get("reports_publisher_sha256"):
+        raise ValueError("publisher source SHA-256 changed")
+    if config.get("reports_repository") != REPORTS_REPOSITORY:
+        raise ValueError("reports repository must be confirmed as sjleekor/stock_reports")
+    if config.get("reports_audience") != REPORTS_AUDIENCE:
+        raise ValueError("reports audience must be owner_only; review the repository settings first")
+    if config.get("reports_branch") != REPORTS_BRANCH:
+        raise ValueError("reports branch must be main")
+    if not isinstance(config.get("reports_remote_url"), str) or not config["reports_remote_url"]:
+        raise ValueError("reports remote URL is required")
+    top_n = config.get("reports_top_n", 100)
+    if isinstance(top_n, bool) or not isinstance(top_n, int) or not 1 <= top_n <= 500:
+        raise ValueError("reports_top_n must be 1..500")
 
 
 def _day_dir(config: dict[str, Any], day: date) -> Path:
@@ -228,52 +235,6 @@ def infer_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, A
     return state
 
 
-def _previous_projection(config: dict[str, Any], day: date,
-                         synthetic: bool) -> tuple[Path | None, dict[str, bytes] | None]:
-    """Pick the newest strictly earlier, self-consistent projection (or the explicit override)."""
-    if config.get("previous_projection_dir"):
-        chosen: Path | None = _absolute(config, "previous_projection_dir", exists=True)
-    else:
-        chosen, newest = None, None
-        root = _absolute(config, "projection_root")
-        candidates = sorted(root.iterdir()) if root.is_dir() else []
-        for entry in candidates:
-            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", entry.name):
-                continue
-            try:
-                entry_day = date.fromisoformat(entry.name)
-            except ValueError:
-                continue
-            if entry_day >= day:
-                continue
-            if entry.is_symlink():
-                raise ValueError("previous projection candidate cannot be a symlink")
-            manifest_path = entry / "site-manifest.json"
-            if not entry.is_dir() or not manifest_path.is_file():
-                continue
-            try:
-                manifest = _read(manifest_path)
-            except (OSError, ValueError):
-                continue
-            if manifest.get("latest_report_date") != entry.name:
-                continue
-            if newest is None or entry_day > newest:
-                chosen, newest = entry, entry_day
-    if chosen is None:
-        return None, None
-    files = _read_tree(chosen)
-    manifest_bytes = files.get("site-manifest.json")
-    if manifest_bytes is not None:
-        try:
-            previous_manifest = json.loads(manifest_bytes)
-        except ValueError as exc:
-            raise ValueError("previous projection site manifest is unreadable") from exc
-        if (not isinstance(previous_manifest, dict) or
-                bool(previous_manifest.get("synthetic_fixture")) != synthetic):
-            raise ValueError("previous projection fixture mode differs from this run")
-    return chosen, files
-
-
 def _previous_private(config: dict[str, Any], day: date,
                       synthetic: bool) -> tuple[Path | None, dict[str, bytes] | None]:
     """Newest strictly earlier private view with the same fixture mode; never a public projection."""
@@ -310,6 +271,11 @@ def _previous_private(config: dict[str, Any], day: date,
 
 
 def render_stage(config: dict[str, Any], day: date) -> dict[str, Any]:
+    """Validate this invocation's report and, when configured, write the owner-only private view.
+
+    The markdown unit for ``stock_reports`` is rendered by the publisher's local step (publish stage),
+    from the same saved report, so a failed push never blocks the report itself.
+    """
     selected = _selected(config, day)
     run_root = _day_dir(config, day)
     infer_state = _read(run_root / "coordinator-inference.json")
@@ -325,9 +291,6 @@ def render_stage(config: dict[str, Any], day: date) -> dict[str, Any]:
     report = _read(report_path)
     if report.get("report_date") != day.isoformat() or bool(report.get("synthetic_fixture")) != selected["synthetic_fixture"]:
         raise ValueError("report date or fixture mode mismatch")
-    previous_dir, previous_files = _previous_projection(config, day, selected["synthetic_fixture"])
-    builder = SiteBuilder(base_path=config["base_path"],
-                          synthetic_fixture=selected["synthetic_fixture"])
     market_reports = list(report["markets"])
     present = {(item["market"], item["model_id"]) for item in market_reports}
     release = _read(_absolute(config, "release_manifest"))
@@ -343,9 +306,6 @@ def render_stage(config: dict[str, Any], day: date) -> dict[str, Any]:
     cards = _read(_absolute(config, "model_cards_path"))
     if set(cards) != {job["model_id"] for job in release["jobs"]}:
         raise ValueError("model cards must match the frozen three-model release")
-    files = builder.render(report_date=day, reports=market_reports, model_cards=cards,
-        opening=report["opening"], previous_files=previous_files,
-        inference_started_at=datetime.fromisoformat(run_state["started_at"]))
     private_files = private_target = private_previous = None
     if config.get("private_projection_root") is not None:
         private_previous, private_previous_files = _previous_private(config, day, selected["synthetic_fixture"])
@@ -353,17 +313,10 @@ def render_stage(config: dict[str, Any], day: date) -> dict[str, Any]:
         private_files = private_builder.render(report_date=day, reports=market_reports,
             opening=report["opening"], previous_files=private_previous_files)
         private_target = _absolute(config, "private_projection_root") / day.isoformat()
-    target = _absolute(config, "projection_root") / day.isoformat()
-    builder.write_atomic(target, files)
-    if private_files is not None:
         private_builder.write_atomic(private_target, private_files)
     state = {"report_date": day.isoformat(), "status": "rendered", "report_sha256": _hash(report_path),
-             "projection_dir": str(target), "site_manifest_sha256": _hash(target / "site-manifest.json"),
+             "invocation_id": infer_state["invocation_id"],
              "synthetic_fixture": selected["synthetic_fixture"],
-             "previous_projection_dir": str(previous_dir) if previous_dir else None,
-             "previous_site_manifest_sha256": (
-                 hashlib.sha256(previous_files["site-manifest.json"]).hexdigest()
-                 if previous_files and "site-manifest.json" in previous_files else None),
              "private_projection_dir": str(private_target) if private_target else None,
              "private_manifest_sha256": (hashlib.sha256(private_files[PRIVATE_MANIFEST_NAME]).hexdigest()
                                          if private_files is not None else None),
@@ -372,88 +325,145 @@ def render_stage(config: dict[str, Any], day: date) -> dict[str, Any]:
     return state
 
 
-def publish_stage(config: dict[str, Any], day: date) -> dict[str, Any]:
+def _reports_publisher_input(config: dict[str, Any], day: date, render: dict[str, Any],
+                             run_root: Path) -> dict[str, Any]:
+    """The date-scoped settings handed to the stock_reports publisher."""
+    return {
+        "audience": config["reports_audience"],
+        "checkout_dir": str(_absolute(config, "reports_checkout")),
+        "remote_name": "origin",
+        "expected_remote_url": config["reports_remote_url"],
+        "branch": config["reports_branch"],
+        "release": Path(config["release_manifest"]).parent.name,
+        "run_dir": str(run_root),
+        "report_date": day.isoformat(),
+        "report_sha256": render["report_sha256"],
+        "invocation_id": render["invocation_id"],
+        "model_cards_path": str(_absolute(config, "model_cards_path")),
+        "top_n": config.get("reports_top_n", 100),
+    }
+
+
+def _last_json_line(text: str) -> dict[str, Any]:
+    for line in reversed(text.strip().splitlines()):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def publish_stage(config: dict[str, Any], day: date, *, sync_only: bool = False) -> dict[str, Any]:
+    """Run the stock_reports publisher: local render + validation, then fetch/commit/push.
+
+    ``sync_only`` asks for the sync step alone (monitor retries).  It only applies once the local step
+    finished before; otherwise the whole publisher runs again.
+    """
     run_root = _day_dir(config, day)
     render = _read(run_root / "coordinator-render.json")
     report = run_root / f"report-{day.isoformat()}.json"
     if _hash(report) != render.get("report_sha256"):
         raise ValueError("publication retry cannot use a changed report")
+    publication_path = run_root / "coordinator-publication.json"
+    previous = _read(publication_path) if publication_path.is_file() else {}
     if not config["publisher_enabled"]:
         state = {"report_date": day.isoformat(), "status": "publication_withheld",
-                 "reason": "publisher_target_unconfirmed", "report_sha256": _hash(report)}
-        _atomic(run_root / "coordinator-publication.json", state)
+                 "reason": "publisher_disabled", "report_sha256": _hash(report)}
+        _atomic(publication_path, state)
         return state
-    base = _read(_absolute(config, "publisher_config"))
-    if base.get("projection_dir") is not None:
-        raise ValueError("publisher base config must not set projection_dir")
-    if render.get("projection_dir") != str(_absolute(config, "projection_root") / day.isoformat()):
-        raise ValueError("publisher target does not match the saved D projection")
-    if (base.get("checkout_dir") != str(_absolute(config, "site_checkout")) or
-            base.get("base_path") != config["base_path"] or
-            _hash(Path(render["projection_dir"]) / "site-manifest.json") != render["site_manifest_sha256"]):
-        raise ValueError("publisher target does not match the saved D projection")
-    daily_config = {**base, "projection_dir": render["projection_dir"]}
-    daily_path = run_root / "pages-publisher-config.json"
+    daily_config = _reports_publisher_input(config, day, render, run_root)
+    daily_path = run_root / "reports-publisher-config.json"
     if daily_path.is_symlink():
         raise ValueError("date-scoped publisher config cannot be a symlink")
     if not (daily_path.is_file() and _read(daily_path) == daily_config):
         _atomic(daily_path, daily_config)
-    argv = [str(_absolute(config, "python")), str(_absolute(config, "publisher_script")),
-            "--config", str(daily_path), "--publish"]
-    if render["synthetic_fixture"]:
-        argv.append("--allow-synthetic")
-    try:
-        done = subprocess.run(argv, check=False, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=300)
-        exit_code = done.returncode
-    except subprocess.TimeoutExpired:
-        exit_code = 124
-    state = {"report_date": day.isoformat(), "status": "published" if exit_code == 0 else "publisher_failed",
-             "publisher_exit_code": exit_code, "report_sha256": _hash(report),
-             "site_manifest_sha256": render["site_manifest_sha256"],
+    release_root = Path(_read(_absolute(config, "release_manifest"))["release_root"]).resolve(strict=True)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(release_root / "src")  # the publisher renders with the frozen release code
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    mode = "sync" if sync_only and previous.get("local_done") is True else "run"
+    exit_code, outcome = _run_reports_publisher(config, daily_path, mode, render, env)
+    if mode == "sync" and outcome.get("status") == "nothing_to_do":
+        mode = "run"  # nothing was waiting in the journal, so render and check the remote again
+        exit_code, outcome = _run_reports_publisher(config, daily_path, mode, render, env)
+    state = {"report_date": day.isoformat(),
+             "status": "published" if exit_code == 0 else "publisher_failed",
+             "publisher_exit_code": exit_code, "publisher_mode": mode,
+             "publisher_status": outcome.get("status"),
+             "local_done": bool(outcome.get("local_done")) or previous.get("local_done") is True,
+             "report_sha256": _hash(report),
              "publisher_config_path": str(daily_path), "publisher_config_sha256": _hash(daily_path)}
-    checkout_manifest = _absolute(config, "site_checkout") / "public" / "site-manifest.json"
-    if exit_code == 0 and (not checkout_manifest.is_file() or
-                           _hash(checkout_manifest) != render["site_manifest_sha256"]):
-        state["status"] = "publisher_failed"
-        state["reason"] = "published_checkout_manifest_mismatch"
+    if exit_code != 0 and outcome.get("detail"):
+        state["publisher_detail"] = outcome["detail"] if isinstance(outcome["detail"], (str, list)) else None
     if state["status"] == "published":
-        commit = subprocess.run(["git", "-C", str(_absolute(config, "site_checkout")),
-                                 "rev-parse", "HEAD"], stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL, text=True, check=False, timeout=10)
-        if commit.returncode or not re.fullmatch(r"[0-9a-f]{40}", commit.stdout.strip()):
+        commit = outcome.get("commit")
+        checkout = _absolute(config, "reports_checkout")
+        head = subprocess.run(["git", "-C", str(checkout), "rev-parse", "--verify",
+                               f"refs/remotes/origin/{config['reports_branch']}^{{commit}}"],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                              check=False, timeout=10)
+        if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
             state["status"] = "publisher_failed"
-            state["reason"] = "site_commit_unavailable"
+            state["reason"] = "reports_commit_unavailable"
+        elif head.returncode or head.stdout.strip() != commit:
+            state["status"] = "publisher_failed"
+            state["reason"] = "reports_commit_mismatch"
         else:
-            state["site_commit"] = commit.stdout.strip()
-    _atomic(run_root / "coordinator-publication.json", state)
+            state["reports_commit"] = commit
+    _atomic(publication_path, state)
     return state
 
 
-def _actions_status(config: dict[str, Any], commit: str) -> dict[str, Any]:
-    repository = config["actions_repository"]
-    workflow = config["actions_workflow"]
-    query = urlencode({"head_sha": commit, "branch": "site", "per_page": "20"})
-    url = f"https://api.github.com/repos/{repository}/actions/workflows/{workflow}/runs?{query}"
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "daily-market-briefing"}
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = "Bearer " + token
-    request = urllib.request.Request(url, headers=headers)
+def _run_reports_publisher(config: dict[str, Any], daily_path: Path, mode: str,
+                           render: dict[str, Any], env: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    argv = [str(_absolute(config, "python")), str(_absolute(config, "reports_publisher")),
+            mode, "--config", str(daily_path)]
+    if render["synthetic_fixture"]:
+        argv.append("--allow-synthetic")
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            payload = json.loads(response.read(2_000_000))
-    except (OSError, ValueError, urllib.error.URLError):
-        return {"status": "unavailable", "site_commit": commit}
-    runs = [row for row in payload.get("workflow_runs", [])
-            if row.get("head_sha") == commit and row.get("head_branch") == "site"]
-    if not runs:
-        return {"status": "pending", "site_commit": commit}
-    newest = max(runs, key=lambda row: (row.get("run_number", 0), row.get("run_attempt", 0)))
-    status = ("success" if newest.get("status") == "completed" and newest.get("conclusion") == "success"
-              else "failed" if newest.get("status") == "completed" else "pending")
-    return {"status": status, "site_commit": commit,
-            "run_id": newest.get("id"), "conclusion": newest.get("conclusion")}
+        done = subprocess.run(argv, env=env, check=False, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True, timeout=PUBLISHER_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return 124, {}
+    return done.returncode, _last_json_line(done.stdout)
+
+
+def _remote_contains(config: dict[str, Any], commit: str) -> str:
+    """Does remote main contain the commit the publisher pushed?  Uses ``git ls-remote``.
+
+    If remote main moved on (for example, the owner pushed a later commit), the commit counts as
+    contained when it is an ancestor of the new head.  The ancestry check fetches into a private
+    ref (``refs/monitor/main``), never into the ref the publisher uses.
+    """
+    checkout = _absolute(config, "reports_checkout")
+    branch = config["reports_branch"]
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+    def git(*args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", "-C", str(checkout), *args], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True, check=False, env=env,
+                              timeout=timeout)
+
+    try:
+        listed = git("ls-remote", config["reports_remote_url"], f"refs/heads/{branch}")
+        if listed.returncode or not listed.stdout.split():
+            return "unavailable"
+        head = listed.stdout.split()[0]
+        if head == commit:
+            return "contained"
+        if git("cat-file", "-e", f"{head}^{{commit}}").returncode:
+            fetched = git("fetch", "--no-tags", config["reports_remote_url"],
+                          f"+refs/heads/{branch}:refs/monitor/{branch}", timeout=120)
+            if fetched.returncode or git("cat-file", "-e", f"{head}^{{commit}}").returncode:
+                return "unavailable"
+        ancestry = git("merge-base", "--is-ancestor", commit, head)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+    if ancestry.returncode == 0:
+        return "contained"
+    return "not_contained" if ancestry.returncode == 1 else "unavailable"
 
 
 def monitor_stage(config: dict[str, Any], day: date, *, attempt: int) -> dict[str, Any]:
@@ -462,7 +472,7 @@ def monitor_stage(config: dict[str, Any], day: date, *, attempt: int) -> dict[st
     root = _day_dir(config, day)
     selection_path = _absolute(config, "selection_root") / day.isoformat() / "selection-state.json"
     axes: dict[str, str] = {"input": "unknown", "inference": "unknown", "rights": "unknown",
-                            "publisher": "unknown", "actions": "unknown", "public_url": "unknown"}
+                            "publisher": "unknown", "remote": "unknown"}
     if not selection_path.is_file():
         axes["input"] = "missing"
     else:
@@ -470,7 +480,7 @@ def monitor_stage(config: dict[str, Any], day: date, *, attempt: int) -> dict[st
         axes["input"] = "ready" if selected.get("status") == "selected" else selected.get("status", "missing")
         if selected.get("status") == "holiday":
             axes.update({"inference": "skipped", "rights": "not_applicable",
-                         "publisher": "skipped", "actions": "skipped", "public_url": "skipped"})
+                         "publisher": "skipped", "remote": "skipped"})
             state = {"report_date": day.isoformat(), "attempt": attempt,
                      "scheduled_minute": RETRY_MINUTES[attempt], "status": "holiday_skipped",
                      "axes": axes, "retry_allowed": False}
@@ -481,6 +491,7 @@ def monitor_stage(config: dict[str, Any], day: date, *, attempt: int) -> dict[st
         axes["inference"] = _read(inference_path).get("status", "failed")
     report_path = root / f"report-{day.isoformat()}.json"
     if report_path.is_file():
+        # Informational only: the owner-only repository does not use the public-source gate.
         report = _read(report_path)
         gates = [item.get("publication", {}).get("status") for item in report.get("markets", [])]
         gates.append(report.get("opening", {}).get("publication", {}).get("status"))
@@ -489,29 +500,19 @@ def monitor_stage(config: dict[str, Any], day: date, *, attempt: int) -> dict[st
     if publication_path.is_file():
         axes["publisher"] = _read(publication_path).get("status", "publisher_failed")
     if axes["publisher"] == "publisher_failed" and attempt > 0 and config["publisher_enabled"]:
-        # The publisher's journal retries the same commit from the saved report.
-        axes["publisher"] = publish_stage(config, day)["status"]
+        # Retry the sync step only; the publisher's journal finishes the same unit.
+        axes["publisher"] = publish_stage(config, day, sync_only=True)["status"]
     if axes["publisher"] == "published":
         published = _read(publication_path)
-        commit = published.get("site_commit")
+        commit = published.get("reports_commit")
         if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
-            axes["actions"] = "pending"
+            axes["remote"] = "pending"
         elif config["external_verification_enabled"]:
-            actions = _actions_status(config, commit)
-            _atomic(root / "actions-deployment.json", actions)
-            axes["actions"] = actions["status"]
+            axes["remote"] = _remote_contains(config, commit)
+            _atomic(root / "remote-verification.json",
+                    {"reports_commit": commit, "status": axes["remote"]})
         else:
-            axes["actions"] = "pending"
-        if axes["actions"] == "success":
-            try:
-                with urllib.request.urlopen(config["public_manifest_url"], timeout=10) as response:
-                    public = json.loads(response.read(2_000_000))
-                expected = _read(Path(_read(root / "coordinator-render.json")["projection_dir"]) /
-                                 "site-manifest.json")
-                axes["public_url"] = ("verified" if public.get("latest_report_date") == day.isoformat()
-                                      and public == expected else "stale")
-            except (OSError, ValueError, urllib.error.URLError):
-                axes["public_url"] = "unreachable"
+            axes["remote"] = "pending"
     if axes["input"] == "missing":
         status = "input_missing"
     elif axes["inference"] in {"unknown", "inference_failed"}:
@@ -520,21 +521,15 @@ def monitor_stage(config: dict[str, Any], day: date, *, attempt: int) -> dict[st
         status = "publisher_failed"
     elif axes["publisher"] == "publication_withheld":
         status = "publication_withheld"
-    elif axes["actions"] == "failed":
-        status = "actions_failed"
-    elif axes["actions"] != "success":
-        status = "actions_pending"
-    elif axes["public_url"] == "stale":
-        status = "public_url_stale"
-    elif axes["public_url"] == "unreachable":
-        status = "public_url_unreachable"
-    elif axes["public_url"] == "verified":
-        status = "verified_withheld" if axes["rights"] == "withheld" else "verified"
+    elif axes["remote"] == "contained":
+        status = "verified"
+    elif axes["remote"] == "not_contained":
+        status = "remote_missing_commit"
     else:
-        status = "actions_pending"
+        status = "remote_pending"
     state = {"report_date": day.isoformat(), "attempt": attempt,
              "scheduled_minute": RETRY_MINUTES[attempt], "status": status, "axes": axes,
-             "retry_allowed": attempt < len(RETRY_MINUTES) - 1 and status not in {"verified", "verified_withheld"}}
+             "retry_allowed": attempt < len(RETRY_MINUTES) - 1 and status != "verified"}
     _atomic(root / f"monitor-{attempt}.json", state)
     return state
 
