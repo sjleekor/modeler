@@ -167,8 +167,13 @@ def score_cross_section(
     if set(contract.get("excluded_features", ())) != set(EXCLUDED_FEATURES):
         raise ValueError("prepared panel does not record the fixed balance feature exclusion")
 
-    name_by_symbol = (
-        dict(zip(panel.get_column("ticker").cast(pl.String).to_list(), panel.get_column("name").cast(pl.String).to_list(), strict=True))
+    # Display names come from the prepared panel's ``name`` column (kr_prepare joins them from the
+    # snapshot's raw stock_master). Keyed by (ticker, market): one code can exist on both exchanges.
+    name_by_key = (
+        dict(zip(
+            zip(panel.get_column("ticker").cast(pl.String).to_list(),
+                panel.get_column("market").cast(pl.String).to_list(), strict=True),
+            panel.get_column("name").cast(pl.String).to_list(), strict=True))
         if "name" in panel.columns else {}
     )
     if panel.select(["ticker", "market"]).is_duplicated().any():
@@ -184,7 +189,8 @@ def score_cross_section(
         raise ValueError("KR model returned an invalid p_raw score")
     symbols = selected.get_column("ticker").cast(pl.String).to_list()
     markets = selected.get_column("market").cast(pl.String).to_list()
-    names = [name_by_symbol.get(symbol) or symbol for symbol in symbols]
+    names = [name_by_key.get((symbol, market)) or symbol
+             for symbol, market in zip(symbols, markets, strict=True)]
     rows = sorted(
         zip(symbols, markets, names, scores.tolist(), strict=True),
         key=lambda row: (-row[3], row[0]),

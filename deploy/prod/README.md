@@ -268,13 +268,54 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
 
 `ops.json`은 `publisher_enabled=false`, `external_verification_enabled=false`로 만듭니다. `opening_*`는 null, `private_projection_root`는 `private-projection`입니다. `reports_*` 키는 채우되(`reports_repository=sjleekor/stock_reports`, `reports_audience=owner_only`, `reports_branch=main`, `reports_remote_url`은 SSH URL, `reports_checkout`은 `--reports-checkout` 값, `reports_publisher(_sha256)`은 `serving/publisher/publish_reports.py`) 게시는 켜지 않습니다. `--reports-checkout`은 아직 없어도 되지만 serving root 안에 있으면 안 됩니다. `pins.json`에 E 표, evidence, publisher 스크립트의 sha를 남깁니다. KR 달력은 2026-12-31까지라 2027년 전에 휴장일 CSV와 달력을 갱신해야 합니다.
 
-### wrapper 둘
+### wrapper 셋
 
 - `bin/briefing-stage.sh <select|run|monitor> [--attempt N]`: `SERVING_ROOT`(기본 `/home/whi/apps/market-briefing/serving`)의 `config/ops.json`에서 release root와 python을 읽습니다. release root에서 `PYTHONPATH=<release>/src`로 `python -m modeler.serving.daily_wrapper <stage> --config <ops.json>`을 실행합니다. `--attempt`는 `monitor`에서만 쓰고 0\~3입니다. 종료 코드는 wrapper의 것을 그대로 돌려주고, 인자 오류는 2, serving root 문제는 10입니다. 로그는 stdout·stderr로 나가 Cronicle이 받습니다.
-- `bin/us-prepare.sh [--run-date YYYY-MM-DD]`: 실행일 T(KST)에 `us_expected session --report-date T+1`로 A를 구하고, `pins.json`의 evidence sha를 확인한 뒤 `STOCK_DATA_ROOT=<serving>/stock_data`, `POLARS_MAX_THREADS=2`, `taskset -c 0,1`, `timeout 1800`으로 `us_daily prepare --as-of A --raw-feature-parity-status score_equivalent --raw-feature-parity-evidence <config 사본>`을 돌립니다. 이미 같은 A가 서빙 가능 상태(`score_equivalent`, `serving_eligible`, 현재 코드 hash, evidence sha 일치)로 있으면 성공으로 건너뜁니다. 종료 코드는 10(설정), 11(evidence sha 불일치), 12(A 계산 실패), 20(A 데이터가 lake에 아직 없음: `prices_daily`·`universe_daily` 최대 날짜 < A 또는 lake를 못 읽음), 21(prepare는 끝났는데 서빙 가능한 native가 없음)이고, 그 밖에는 prepare의 코드입니다(124는 timeout). evidence 경로가 `prep_hash`에 들어가므로 config 사본 경로를 옮기지 마십시오.
+- `bin/us-prepare.sh [--run-date YYYY-MM-DD]`: 실행일 T(KST)에 `us_expected session --report-date T+1`로 A를 구하고, `pins.json`의 evidence sha를 확인합니다. lake가 A를 아직 덮지 못하면 멈추지 않고 **A′**(`us_daily resolve-session`: A 이하의 가장 최근 XNYS 세션 가운데 `prices_daily`와 `universe_daily`가 둘 다 덮는 세션)로 바꿔 만듭니다. `STOCK_DATA_ROOT=<serving>/stock_data`, `POLARS_MAX_THREADS=2`, `taskset -c 0,1`, `timeout 1800`으로 `us_daily prepare --as-of A′ --raw-feature-parity-status score_equivalent --raw-feature-parity-evidence <config 사본>`을 돌립니다. 같은 A′가 이미 서빙 가능 상태(`score_equivalent`, `serving_eligible`, 현재 코드 hash, evidence sha 일치)로 있으면 성공으로 건너뜁니다. 종료 코드는 10(설정, `flock` 없음 포함), 11(evidence sha 불일치), 12(A 계산 실패), 20(lake가 완결 세션을 하나도 덮지 못하거나 lake를 못 읽음), 21(prepare는 끝났는데 서빙 가능한 native가 없음)이고, 그 밖에는 prepare의 코드입니다(124는 timeout). A′가 A보다 이르면 `WARNING`을 남기고 종료 코드는 0입니다. evidence 경로가 `prep_hash`에 들어가므로 config 사본 경로를 옮기지 마십시오.
+- `bin/kr-prepare.sh [--report-date YYYY-MM-DD]`: 기다리지 않고 KR native를 만듭니다. 아래 "기다리지 않는 실행"에 있습니다.
 
 ### 첫 실제 실행 순서
 
 1. 10-01 17:30 `us-prepare.sh`: A는 2026-09-30입니다. 16:30 `sdc_daily_us_universe_incremental`이 끝난 뒤여야 합니다. 2026-09-30 실측에서 운영 lake의 `universe_daily`는 2026-09-22 snapshot(최대 날짜 09-18)이고 incremental 완료 marker가 없어, prepare가 `US universe_daily requires a completed incremental membership snapshot`으로 멈춥니다. incremental이 먼저 한 번 돌아야 합니다.
 2. 10-02 09:30 `briefing-stage.sh select`: D 선택이 잠깁니다. 이 시각 전에는 실행하지 마십시오.
 3. 10-02 10:00 `briefing-stage.sh run`. 이어서 10:15·10:17·10:22·10:32에 `monitor`(`--attempt` 0\~3)입니다. publisher를 켜기 전에는 `publication_withheld`로 끝나는 것이 정상입니다.
+
+## 기다리지 않는 실행 (R3 · 2026-10-06, 서버에는 아직 반영하지 않음)
+
+원칙은 "막지 말고 표시한다"입니다. 정확성 조건(입력 완료 시각 ≤ D 09:30, 해시·marker·schema, US 서빙 허용 수치 판정, 달력 범위 밖, marker 없는 snapshot)은 그대로 막고, 신선도는 막지 않고 리포트에 적습니다. 계획은 `my/milestones/common/20261005_daily_briefing_reports/00_candidate_plan/04_run_without_waiting.md`입니다. 이 절의 변경은 release가 바뀌므로 US native를 다시 prepare해야 합니다(`code_tree_hash`가 `us_daily.py`를 포함합니다).
+
+### KR prepare: 대기 없이 기준일을 고릅니다
+
+`kr-prepare.sh`는 D 07:30까지 기다리지 않습니다. 순서는 다음과 같습니다.
+
+| 단계 | 하는 일 |
+|---|---|
+| 0. lock | `$SERVING_ROOT/locks/kr-prepare.lock`에 `flock -n`을 잡고 보존 정리 끝까지 쥡니다. chain 실행과 fallback 타이머 실행이 같은 파일을 씁니다. 못 잡으면 `locked`를 남기고 종료 코드 0으로 끝납니다. lock은 프로세스가 끝나면(죽어도) 풀립니다 |
+| 1. 게이트 | `kr-export-wait-ready.sh --deadline-seconds 0`을 한 번 부릅니다. 판정(`ready`·`not_yet`·`blocked`, 오류)과 DART run 기록은 증거에만 남기고 막지 않습니다. `KR_PREPARE_GATE=off`면 부르지 않습니다 |
+| 2. raw export | 그 시점 DB를 단일 snapshot으로 내보냅니다 |
+| 3. 기준일 선택 | `modeler.serving.kr_reference`가 **내보낸 snapshot 자체에** 완결성 검사를 돌립니다. 가격 종목 수가 직전 세션의 97% 이상이고 수급 그룹(해외보유·투자자·공매도)이 그 세션까지 오면 완결입니다. K가 완결이면 `complete_K`, 아니면 K 아래 5세션까지 가장 최근의 완결 세션 K′를 `fallback_K_prime`으로, 없으면 `none`으로 정합니다 |
+| 4. mart | 기준일 R(K 또는 K′)로 `kr_live_prepare`를 돌립니다. export에 R 뒤 행이 있으면 `--cut-to-asof`로 R 뒤 행(가격·수급·DART 접수일)을 가립니다. 가린 결과는 R일에 내보냈다면 나왔을 입력과 같습니다(fixture로 확인). R이 K이고 뒤 행이 없으면 가리지 않아 지금까지의 경로와 같습니다 |
+| 5. native | `kr_prepare`가 `prepared/kr/score_date=R/prep_id=D`를 만듭니다. `--reference-evidence`로 1\~3단계의 증거를 manifest에 넣고, 표시용 종목명을 같은 snapshot의 raw `stock_master`에서 붙입니다(모델 입력 아님) |
+| 6. 보존 정리 | 지금까지와 같습니다 |
+
+증거는 `$SERVING_ROOT/logs/kr-prepare/D=<D>/reference-selection.json`(스키마 `kr-reference-selection.v1`)에 있고 native manifest의 `reference_selection`에도 들어갑니다. `prep_id=D` 아래 어떤 `score_date`든 `completion.json`이 있으면 그날은 끝난 것으로 보고 바로 종료합니다. **한 번 K′로 끝난 날 나중에 K가 완결돼도 같은 날 다시 만들지 않습니다**(snapshot이 D 하나이기 때문입니다).
+
+종료 코드: 0 완료·이미 완료·`locked`·휴장일, 2 사용법, 10 설정 또는 `flock` 없음, 12 달력 범위 밖, **32 `none`**(완결 세션이 없어 prepared를 만들지 않았습니다. selector가 이전 prepared를 stale로 씁니다), 143·130·129 TERM·INT·HUP으로 멈춤, 그 밖에는 단계의 코드입니다(124는 timeout). 예전의 30(게이트 시간 초과)·31(게이트 blocked)은 없어졌습니다.
+
+### 중단 신호와 프로세스 그룹
+
+`kr-prepare.sh`와 `us-prepare.sh`는 단계마다 하위 명령을 별도 프로세스 그룹으로 띄우고(`set -m`) 스크립트는 `wait`합니다. TERM·INT·HUP을 받으면 그 그룹 전체를 TERM, 20초 뒤 KILL로 끝내고 종료 코드 143·130·129로 나옵니다. 2026-10-06 04:29 Cronicle이 메모리 제한으로 job을 중단했을 때 wrapper만 죽고 `nice`·`taskset` 아래 Python이 빌드를 끝낸 문제를 막으려는 것입니다. `us-prepare.sh`도 같은 구조에 `locks/us-prepare.lock`을 더했습니다. `briefing-stage.sh`는 `exec`으로 Python wrapper로 바뀌어 셸 층이 없습니다. 대신 Python 쪽(`daily_wrapper`, `daily_coordinator.run_group`)이 runner·opening·publisher를 별도 프로세스 그룹으로 띄우고, timeout이나 TERM·INT·HUP에 그 그룹 전체를 끝냅니다. 서버에서 쓰는 `flock`은 util-linux 것입니다(맥에는 없어 시험은 `fcntl.flock` shim을 씁니다).
+
+### select·run·envelope
+
+- **KR 이전 prepared를 stale로**: select가 `score_date` ≤ K인 가장 최근 prepared를 고릅니다. K보다 이르면 `stale`이고 지연 세션 수(K와의 KR 세션 차이)를 `lag_sessions`로 적습니다. K보다 늦은 것은 쓰지 않고, 달력이 그 날짜를 몰라 지연을 셀 수 없으면 `unavailable`입니다.
+- **US 지연은 표시**: `market_lag_limit_sessions`(ops의 E 표)와 도착 지연 2세션 중단은 더 이상 막지 않고 `stale`로 표시합니다. 지연은 U와의 세션 차이(`market_lag`)입니다.
+- **5세션 상한(Q5)**: 지연이 5세션을 넘으면 report의 순위를 비우고 `quality.rankings_withheld`에 사유를 적습니다. 섹션 상태는 `stale`입니다(`freshness.MAX_STALE_SESSIONS`, 렌더러의 `LAG_SUPPRESS`와 같은 값).
+- **자동 select**: `daily_wrapper run`이 selection이 없으면 같은 규칙으로 직접 고릅니다(D 10:00 이후일 때만, 아니면 실패). selection에는 `selected_at`, `selection_mode`(`scheduled`·`run_fallback`)를 적고, 입력별 `producer_completed_at`을 따로 둡니다(`completed_at`은 없어졌습니다). infer는 입력 완료 ≤ cutoff를 모든 모드에서 확인하고, `selected_at`이 D 10:00 뒤인 selection은 `run_fallback`일 때만 받습니다. 옛 selection(`completed_at`만 있음)은 `scheduled`로 읽습니다.
+- **envelope 상태**: 전 섹션 `ok`면 `ok`, 낸 섹션(`ok`·`partial`·`stale`)이 하나도 없으면 `failed`, 나머지는 `partial`입니다. 공개 게이트와 opening은 상태에 넣지 않습니다. KR adapter가 늘 `partial`을 내므로 KR이 들어간 날은 `ok`가 나오지 않습니다(결정 필요).
+- **runner timeout·예외**: infer가 이번 실행의 report를 받지 못하면(timeout, 비정상 종료, selection 실패, report 없음) coordinator가 실패 report를 만들어 render·publish로 넘깁니다. 모든 모델 섹션이 `failed`이고 `failure`에 단계·원인 클래스·timeout 여부가 있습니다. 이번 실행의 `run-state.json`도 같이 씁니다. 같은 D에 이전 실행의 report가 있으면 `report-D.superseded-<sha12>.json`으로 옮겨 두고 쓰지 않습니다. 이 경우 publisher는 내용이 달라 정정을 요구합니다(종료 30).
+- report `quality`의 새 키: `selection_mode`, `selected_at`, `producer_completed_at`, `lag_sessions`, `status_before_stale`, `rankings_withheld`. KR은 `reference_verdict`, `reference_k`, `reference_date`, `reference_lag_sessions`, `k_ticker_count`, `k_ticker_ratio`, `k_previous_session`, `export_gate_verdict`, `dart_chain_ended_at`도 있고 `provenance.reference_selection`에 증거 전체가 있습니다.
+
+### US universe revision 불일치
+
+새 US 세션이 없는 날에도 derive-daily가 `prices_daily`를 새로 쓰고 universe incremental은 건너뛰어, 표별 최신 snapshot과 universe completion이 기록한 입력 revision이 달라졌습니다(2026-10-05 A=10-02 실측). `us_daily.prepare`는 이제 universe 입력 네 표(`prices_daily`, `listing_snapshots`, `filings_sub`, `midas_security_daily`)를 universe completion이 기록한 revision으로 고정하고 나머지 표는 최신을 씁니다. `verify_universe_completion`은 그대로입니다(고정한 snapshot의 해시가 바뀌면 계속 멈춥니다). 데이터가 같아 look-ahead는 없고, universe보다 새 prices는 universe를 다시 만들 때까지 못 씁니다. 그 경우 A′가 두 표가 같이 덮는 세션으로 내려갑니다. 근본 수정(collector derive-daily가 새 행이 없으면 새 snapshot을 쓰지 않음)은 collector 몫입니다.

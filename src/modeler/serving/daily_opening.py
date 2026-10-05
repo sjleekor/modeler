@@ -8,7 +8,7 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
-from .daily_coordinator import SEOUL, _absolute, _atomic, _day_dir, _hash, _read
+from .daily_coordinator import SEOUL, _absolute, _atomic, _day_dir, _hash, _read, run_group
 from .daily_inputs import _release_jobs
 
 
@@ -46,9 +46,8 @@ def prepare_opening(config: dict[str, Any], day: date) -> dict[str, Any]:
             argv.extend(("--snapshot-json", str(path)))
         env = os.environ.copy()
         env["PYTHONPATH"] = str(release_root / "src")
-        done = subprocess.run(argv, cwd=release_root, env=env, check=False,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              text=True, timeout=90)
+        done = run_group(argv, cwd=release_root, env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, timeout=90)
         if done.returncode:
             raise RuntimeError("opening mapper exited nonzero")
         result = json.loads(done.stdout)

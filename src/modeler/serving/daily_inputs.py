@@ -17,7 +17,10 @@ from zoneinfo import ZoneInfo
 
 from .calendars import SessionCalendar
 from .freshness import assess_freshness
-from .orchestration import EXPECTED_MODEL_IDENTITIES, code_inventory_sha256, us_native_block_reason
+from .orchestration import (
+    EXPECTED_MODEL_IDENTITIES, SELECTION_MODES, code_inventory_sha256, session_lag,
+    us_native_block_reason,
+)
 
 SEOUL = ZoneInfo("Asia/Seoul")
 HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -206,8 +209,16 @@ def _lock(path: Path):
 
 def select(*, report_date: date, selected_at: datetime, prepared_root: Path,
            output_root: Path, release_manifest: Path, kr_calendar_path: Path,
-           us_calendar_path: Path, us_expected_path: Path) -> dict[str, Any]:
-    """Select only producer-complete inputs; never infer E from observed A."""
+           us_calendar_path: Path, us_expected_path: Path,
+           mode: str = "scheduled") -> dict[str, Any]:
+    """Select only producer-complete inputs; never infer E from observed A.
+
+    ``mode`` is ``scheduled`` (the 09:30 event, D 09:30 through 10:00) or ``run_fallback`` (the run
+    stage selects for itself because no selection exists; any time from D 09:30).  The mode never
+    changes which inputs qualify: a producer completion after D 09:30 is excluded in both.
+    """
+    if mode not in SELECTION_MODES:
+        raise ValueError("selection mode must be scheduled or run_fallback")
     prepared = prepared_root.resolve(strict=True)
     output_root.mkdir(parents=True, exist_ok=True)
     output = output_root.resolve(strict=True)
@@ -217,12 +228,13 @@ def select(*, report_date: date, selected_at: datetime, prepared_root: Path,
         return _select_once(report_date=report_date, selected_at=selected_at,
             prepared_root=prepared, output_root=output, release_manifest=release_manifest,
             kr_calendar_path=kr_calendar_path, us_calendar_path=us_calendar_path,
-            us_expected_path=us_expected_path)
+            us_expected_path=us_expected_path, mode=mode)
 
 
 def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Path,
                  output_root: Path, release_manifest: Path, kr_calendar_path: Path,
-                 us_calendar_path: Path, us_expected_path: Path) -> dict[str, Any]:
+                 us_calendar_path: Path, us_expected_path: Path,
+                 mode: str = "scheduled") -> dict[str, Any]:
     target = output_root / report_date.isoformat()
     if target.is_dir():
         state = _load(target / "selection-state.json")
@@ -244,8 +256,9 @@ def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Pat
         raise ValueError("D selection path is not a regular directory")
     decision = datetime.combine(report_date, time(10), SEOUL)
     cutoff = datetime.combine(report_date, time(9, 30), SEOUL)
-    if selected_at.tzinfo is None or selected_at < cutoff or selected_at > decision:
-        raise ValueError("selection must occur from D 09:30 through D 10:00 KST")
+    if selected_at.tzinfo is None or selected_at < cutoff or (mode == "scheduled" and selected_at > decision):
+        raise ValueError("selection must occur from D 09:30 through D 10:00 KST"
+                         if mode == "scheduled" else "selection must occur at or after D 09:30 KST")
     calendars = {"KR": SessionCalendar.from_manifest(_load(kr_calendar_path))}
     if calendars["KR"].is_session(report_date) is None:
         raise ValueError("KR calendar does not cover report date")
@@ -283,7 +296,8 @@ def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Pat
     k_day = calendars["KR"].previous_session(report_date)
     stage = Path(tempfile.mkdtemp(prefix=f".{report_date.isoformat()}-", dir=output_root))
     result = {"schema_version": "daily-input-selection.v1", "report_date": report_date.isoformat(),
-              "selected_at": selected_at.isoformat(), "input_cutoff": cutoff.isoformat(),
+              "selected_at": selected_at.isoformat(), "selection_mode": mode,
+              "input_cutoff": cutoff.isoformat(),
               "release_manifest": str(release_manifest.resolve(strict=True)),
               "release_manifest_sha256": _hash(release_manifest),
               "kr_calendar_sha256": _hash(kr_calendar_path),
@@ -302,7 +316,9 @@ def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Pat
             if bool(candidate["native"].get("synthetic_fixture", False)) != fixture_mode:
                 reason = "native_fixture_mode_mismatch"
                 continue
-            if market == "KR" and candidate["asof"] != k_day:
+            if market == "KR" and (k_day is None or candidate["asof"] > k_day):
+                # K보다 이른 prepared는 stale로 고릅니다(변경 3). K보다 늦은 것은 쓰지 않습니다.
+                reason = "kr_prepared_newer_than_k"
                 continue
             if market == "US" and (expected is None or latest_us is None or candidate["asof"] > latest_us):
                 reason = "us_expected_source_schedule_missing" if expected is None else "us_calendar_unavailable"
@@ -318,7 +334,7 @@ def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Pat
                 verified_available_by=candidate["available"],
                 availability_evidence_type="prepared_features_completion",
                 availability_evidence=evidence, max_us_market_lag=lag_limit if market == "US" else None)
-            if freshness.status not in ({"ok", "stale"} if market == "US" else {"ok"}):
+            if freshness.status not in {"ok", "stale"}:
                 reason = freshness.reason or freshness.status
                 continue
             selected = candidate, freshness, evidence
@@ -338,9 +354,12 @@ def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Pat
             "availability_evidence": evidence,
             "verified_available_by": candidate["available"].isoformat(),
             "source_first_available_at": None, "input_cutoff": cutoff.isoformat(),
-            "completed_at": selected_at.isoformat(), "calendar": _load(
-                kr_calendar_path if market == "KR" else us_calendar_path),
-            "freshness_status": freshness.status}
+            # 입력이 끝난 시각(producer)과 selection을 만든 시각을 따로 적습니다(변경 5).
+            "producer_completed_at": candidate["available"].isoformat(),
+            "selected_at": selected_at.isoformat(), "selection_mode": mode,
+            "calendar": _load(kr_calendar_path if market == "KR" else us_calendar_path),
+            "freshness_status": freshness.status, "freshness_reason": freshness.reason,
+            "lag_sessions": session_lag(market, freshness.as_dict())}
         if market == "KR":
             selection["kr_session"] = k_day.isoformat()
         else:
@@ -361,7 +380,10 @@ def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Pat
                 "native_manifest": str(candidate["native_path"]),
                 "native_manifest_sha256": candidate["native_hash"]})
         result["markets"][market] = {"status": freshness.status,
-                                      "feature_asof_date": candidate["asof"].isoformat()}
+                                      "feature_asof_date": candidate["asof"].isoformat(),
+                                      "lag_sessions": session_lag(market, freshness.as_dict()),
+                                      "freshness_reason": freshness.reason,
+                                      "producer_completed_at": candidate["available"].isoformat()}
     jobs_path = target / "jobs.json"
     _atomic_new(stage / "jobs.json", {"jobs": result["jobs"]})
     result["jobs_config"] = str(jobs_path)

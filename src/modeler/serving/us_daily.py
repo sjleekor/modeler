@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -992,6 +993,71 @@ def fingerprint_source_snapshots(root: DataRoot, revisions: dict[str, str]) -> d
     return result
 
 
+#: The four tables ``universe_daily`` is built from.  Its completion record names the exact
+#: snapshot of each (``input_snapshots``).
+UNIVERSE_INPUT_TABLES = ("prices_daily", "listing_snapshots", "filings_sub", "midas_security_daily")
+
+
+def collect_pinned_revisions(root: DataRoot, lake: UsLake) -> dict[str, str]:
+    """Snapshot of every table to read: the newest, except the universe inputs.
+
+    The universe inputs are pinned to the snapshots the newest ``universe_daily`` completion
+    recorded.  ``verify_universe_completion`` requires exactly those revisions, but the derive job
+    writes a new ``prices_daily`` snapshot every day, also on a day without a new session, while the
+    universe is rebuilt only when a session arrives.  Reading "the newest of every table" then
+    fails the revision check on every weekend and holiday morning (2026-10-05, A=10-02).  The data
+    are the same, so there is no look-ahead; the cost is that a prices snapshot newer than the
+    universe cannot be used until the universe is rebuilt from it (``latest_complete_session``
+    then falls back to the session both cover).  The verification itself is unchanged.
+    """
+    revisions = collect_source_revision(lake)
+    marker = (root.derived / "snapshots" / "universe_daily" /
+              f"snapshot_date={revisions['universe_daily']}" / "completion.json")
+    try:
+        inputs = json.loads(marker.read_text()).get("input_snapshots")
+    except (OSError, ValueError, AttributeError):
+        return revisions  # verify_universe_completion reports the invalid evidence
+    if not isinstance(inputs, dict):
+        return revisions
+    for table in UNIVERSE_INPUT_TABLES:
+        pinned = inputs.get(table)
+        if isinstance(pinned, str):
+            try:
+                date.fromisoformat(pinned)
+            except ValueError:
+                continue
+            revisions[table] = pinned
+    return revisions
+
+
+def latest_complete_session(as_of: date, *, root: DataRoot | None = None) -> dict[str, Any]:
+    """The newest XNYS session <= ``as_of`` that prices and universe both cover (A').
+
+    Reads the same pinned snapshots ``prepare_daily_features`` will use, so a session returned here
+    can be prepared.  ``resolved`` is None when the lake covers no session at all.
+    """
+    root = root or DataRoot.resolve(market="us")
+    lake = PinnedUsLake(root, collect_pinned_revisions(root, UsLake(root)))
+
+    def newest(table: str) -> date | None:
+        value = lake.scan_raw(table).select(pl.col("date").max()).collect().item()
+        return value.date() if isinstance(value, datetime) else value
+
+    prices_max, universe_max = newest("prices_daily"), newest("universe_daily")
+    resolved = None
+    if prices_max is not None and universe_max is not None:
+        bound = min(as_of, prices_max, universe_max)
+        resolved = (
+            lake.scan("trading_calendar")
+            .filter((pl.col("exchange") == "XNYS") & (pl.col("date") <= bound))
+            .select(pl.col("date").max()).collect().item())
+    return {"requested": as_of.isoformat(), "prices_max": prices_max.isoformat() if prices_max else None,
+            "universe_max": universe_max.isoformat() if universe_max else None,
+            "resolved": resolved.isoformat() if resolved else None,
+            "stale": bool(resolved and resolved < as_of),
+            "pinned_inputs": {t: lake.snapshots[t] for t in UNIVERSE_INPUT_TABLES}}
+
+
 def verify_universe_completion(root: DataRoot, revision: str,
                                source_revisions: dict[str, str]) -> str:
     """Require the monthly seed/stitch manifest for a live US preparation."""
@@ -1118,7 +1184,7 @@ def prepare_daily_features(scoring_date: date, *, diagnostic_only: bool = False,
     prepare_started_at = datetime.now().astimezone()
     root = DataRoot.resolve(market="us")
     live_lake = UsLake(root)
-    revisions = collect_source_revision(live_lake)
+    revisions = collect_pinned_revisions(root, live_lake)
     source_snapshot_files = fingerprint_source_snapshots(root, revisions)
     universe_completion_sha256 = verify_universe_completion(
         root, revisions["universe_daily"], revisions)
@@ -1688,6 +1754,9 @@ def main(argv: list[str] | None = None) -> int:
         "--raw-feature-parity-status", choices=[US_PARITY_SCORE_EQUIVALENT],
         help="gate를 통과한 evidence가 있을 때만 score_equivalent로 서빙 가능한 준비를 만듭니다",
     )
+    resolve = subparsers.add_parser(
+        "resolve-session", help="레이크가 덮는 가장 최근 완결 세션 A'(<= as-of)를 찍는다")
+    resolve.add_argument("--as-of", required=True, help="기대 세션 A (YYYY-MM-DD)")
     select = subparsers.add_parser("select", help="D 09:30에 native US A를 선택해 freshness 고정")
     select.add_argument("--prepared-manifest", required=True)
     select.add_argument("--report-date", required=True)
@@ -1727,6 +1796,13 @@ def main(argv: list[str] | None = None) -> int:
             raw_feature_parity_evidence=args.raw_feature_parity_evidence,
         )
         print(f"prepared: {manifest}")
+        return 0
+    if args.command == "resolve-session":
+        found = latest_complete_session(date.fromisoformat(args.as_of))
+        print(json.dumps(found, sort_keys=True), file=sys.stderr)
+        if found["resolved"] is None:
+            return 3
+        print(found["resolved"])
         return 0
     if args.command == "select":
         path = create_daily_selection_manifest(

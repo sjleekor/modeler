@@ -246,14 +246,24 @@ def test_failed_second_invocation_does_not_reuse_old_report(tmp_path: Path, monk
     release, config_path = _setup(tmp_path)
     assert _cli(release, config_path, "select", fixture_now="2026-09-29T09:30:00+09:00")["status"] == "selected"
     assert _cli(release, config_path, "infer")["status"] == "inferred"
+    run_dir = tmp_path / "runs" / D.isoformat()
+    old_bytes = (run_dir / f"report-{D}.json").read_bytes()
     config = daily_coordinator._config(config_path)
-    monkeypatch.setattr(daily_coordinator.subprocess, "run",
-                        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1))
+    monkeypatch.setattr(daily_coordinator, "run_group",
+                        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1))
     status = daily_coordinator.infer_stage(config, D, daily_coordinator.datetime.fromisoformat(
         "2026-09-29T10:00:00+09:00"))
     assert status["status"] == "inference_failed"
     assert status["this_invocation_completed"] is False
     assert status["successful_jobs"] == 0
+    # The unit is still made, from this invocation's own failure report, not from the old success.
+    assert status["report_ready"] is True and status["failure_report"] is True
+    report = json.loads((run_dir / f"report-{D}.json").read_text())
+    assert report["status"] == "failed" and report["markets"] == []
+    assert report["invocation_id"] == status["invocation_id"]
+    assert json.loads((run_dir / "run-state.json").read_text())["invocation_id"] == status["invocation_id"]
+    (kept,) = run_dir.glob(f"report-{D}.superseded-*.json")
+    assert kept.read_bytes() == old_bytes
 
 
 def test_wrapper_renders_status_page_when_no_models_run(tmp_path: Path) -> None:
@@ -342,7 +352,7 @@ def test_wrapper_exits_nonzero_on_publisher_failure(tmp_path: Path, monkeypatch,
     monkeypatch.setattr(daily_wrapper, "_read", lambda path: {"synthetic_fixture": True})
     monkeypatch.setattr(daily_wrapper, "_day_dir", lambda config, day: tmp_path)
     monkeypatch.setattr(daily_wrapper, "_lock", lambda path: nullcontext())
-    monkeypatch.setattr(daily_wrapper, "_selected", lambda config, day: {"status": "selected"})
+    monkeypatch.setattr(daily_wrapper, "ensure_selection", lambda config, day, now: {"status": "selected"})
     monkeypatch.setattr(daily_wrapper, "infer_stage", lambda config, day, now: {
         "status": "inferred", "this_invocation_completed": True})
     monkeypatch.setattr(daily_wrapper, "render_stage", lambda config, day: {"status": "rendered"})
@@ -389,7 +399,7 @@ def test_opening_builder_only_passes_slots_received_by_ten(tmp_path: Path, monke
     def fake_run(argv, **kwargs):
         observed_argv.extend(argv)
         return subprocess.CompletedProcess(argv, 0, json.dumps({"path": str(artifact)}), "")
-    monkeypatch.setattr(daily_opening.subprocess, "run", fake_run)
+    monkeypatch.setattr(daily_opening, "run_group", fake_run)
     state = daily_opening.prepare_opening(config, D)
     assert state["snapshot_count"] == 1
     assert str(before) in observed_argv
@@ -411,7 +421,7 @@ def test_opening_child_never_runs_with_tampered_frozen_source(tmp_path: Path, mo
     opening_source.write_text(opening_source.read_text() + "\n# tampered after release pin\n")
     def forbidden_child(*args, **kwargs):
         pytest.fail("opening child ran with unpinned source")
-    monkeypatch.setattr(daily_opening.subprocess, "run", forbidden_child)
+    monkeypatch.setattr(daily_opening, "run_group", forbidden_child)
     state = daily_opening.prepare_opening(config, D)
     assert state == {"status": "unavailable", "report_date": D.isoformat(),
                      "error_class": "ValueError"}
