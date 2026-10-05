@@ -673,3 +673,15 @@ def test_briefing_stage_execs_the_python_wrapper_without_a_shell_layer():
     """No shell stays between Cronicle and Python: TERM reaches the Python wrapper itself, which
     ends the runner's process group (``daily_coordinator.run_group``)."""
     assert '\nexec "$python" -m modeler.serving.daily_wrapper' in STAGE.read_text()
+
+
+def test_kr_prepare_new_export_voids_the_old_reference_evidence(kr):
+    """After an operator deletes a sealed snapshot to export again, the old verdict must not stick."""
+    first = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"], {"FAKE_REF_RC": "32"})
+    assert first.returncode == 32
+    raw = kr["lake"] / "kr" / "raw" / "raw_postgres" / "snapshot_date=2026-10-05"
+    shutil.rmtree(raw)  # export again from scratch
+    second = _run(KR_PREPARE, ["--report-date", "2026-10-05"], kr["env"])
+    assert second.returncode == 0, second.stderr
+    assert len([c for c in _calls(kr) if c.startswith("export ")]) == 2
+    assert (kr["out"] / "completion.json").is_file()

@@ -355,6 +355,8 @@ else
       *) log "WARNING export gate errored (exit $gate_exit); continuing without its verdict";;
     esac
   fi
+  # A new export starts a new decision: an evidence file of an earlier (deleted) export is void.
+  rm -f "$evidence" "$work/reference.out"
   export_args=(--snapshot-date "$SNAP")
   [ "$consistent" = 0 ] || export_args+=(--consistent-snapshot)
   log "2/6 raw export ${export_args[*]}"
