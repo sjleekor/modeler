@@ -1,0 +1,19 @@
+{
+  "schema_version": "daily-briefing-runtime.v1",
+  "python": "3.14.8",
+  "implementation": "CPython",
+  "system": "Linux",
+  "machine": "x86_64",
+  "packages": {
+    "numpy": "2.5.3",
+    "scipy": "1.18.1",
+    "pandas": "2.3.3",
+    "polars": "1.44.2",
+    "pyarrow": "25.0.1",
+    "scikit-learn": "1.9.1",
+    "lightgbm": "4.7.0",
+    "joblib": "1.6.0",
+    "duckdb": "1.5.5"
+  },
+  "evidence": "sj2 uv-managed CPython 3.14.8 venv with the same 28 package versions as the 3.12.3 venv, rebuilt after the Ubuntu 26.04 upgrade on 2026-10-06"
+}
