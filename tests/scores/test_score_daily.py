@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from datetime import date, datetime
+import sys
+from datetime import date, datetime, time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
@@ -18,7 +20,12 @@ import pytest
 from modeler.scores.common.calendar import SessionCalendar
 from modeler.scores.market_sector import inputs_pin as ip
 from modeler.scores.market_sector import score_daily as sd
-from modeler.scores.market_sector.bundle import BundleError, verify_bundle_dir
+from modeler.scores.market_sector.bundle import (
+    BundleError,
+    read_calendar_file,
+    sha256_file,
+    verify_bundle_dir,
+)
 from modeler.scores.market_sector.config import MsConfig
 
 from . import ms_world as W
@@ -347,9 +354,12 @@ def test_observed_price_date_calendar_is_rejected(world, bundle_dir):
 
 
 def test_calendar_version_and_session_hash_must_match(world, bundle_dir):
-    spec = _kr_spec(bundle_dir)
-    cal = sd.kr_computation_calendar(spec, world.kr_sessions[-1])
-    assert sd.verify_calendar(cal, spec)["frozen_sessions"] == spec["n_sessions"]
+    bundle = sd.load_bundle(bundle_dir)
+    spec = bundle.markets["KR"].calendar
+    cal, check = sd.bundle_calendar(bundle.markets["KR"])
+    assert check["frozen_sessions"] == spec["n_sessions"]
+    assert check["source"] == "bundle_calendar_file"
+    assert check["file_sha256"] == bundle.manifest["files"]["kr/calendar.json"]
     with pytest.raises(sd.CalendarMismatchError, match="exchange_calendars==0.0.1"):
         sd.verify_calendar(cal, {**spec, "basis": "exchange_calendars==0.0.1"})
     with pytest.raises(sd.CalendarMismatchError, match="세션 목록이 동결 때와 다릅니다"):
@@ -362,28 +372,235 @@ def test_calendar_version_and_session_hash_must_match(world, bundle_dir):
         sd.verify_calendar(shifted, spec)
 
 
-def test_kr_scoring_without_exchange_calendars_is_refused_and_us_still_scores(
-        world, bundle_dir, tmp_path, monkeypatch):
-    monkeypatch.setattr(SessionCalendar, "from_exchange_calendars",
-                        classmethod(lambda cls, *a, **k: None))
-    summary, out = _score(world, bundle_dir, tmp_path)
-    assert summary["markets"] == {"US": "ok", "KR": "calendar_mismatch"}
-    doc = json.loads(out.read_text())
-    assert doc["status"] == "partial"
-    assert doc["failures"] == {"KR": {"error_class": "CalendarMismatchError",
-                                      "reason": "calendar_mismatch"}}
-    assert {a["market"] for a in doc["assets"]} == {"US"}
+@pytest.mark.parametrize("market", ["US", "KR"])
+def test_calendar_file_equals_the_library_calendar(world, bundle_dir, market):
+    """(a) 파일의 세션·개장·폐장은 exchange_calendars가 주는 값과 같다(US는 합성 레이크)."""
+    mb = sd.load_bundle(bundle_dir).markets[market]
+    cal = mb.session_calendar()
+    assert cal.sessions[-1] <= sd.CALENDAR_RANGE_END and cal.sessions[-1] > date(2027, 12, 20)
+    if market == "KR":
+        lib = SessionCalendar.from_exchange_calendars(
+            "XKRX", cal.sessions[0], sd.CALENDAR_RANGE_END)
+        assert cal == lib
+        assert cal.calendar_basis == sd.xcals_basis()
+    else:
+        sessions = W.sessions_of("XNYS", cal.sessions[0], sd.CALENDAR_RANGE_END)
+        lib = SessionCalendar.from_sessions(
+            "XNYS", sessions, calendar_basis=cal.calendar_basis,
+            close_local=[time(16, 0)] * len(sessions))
+        assert cal == lib
+    assert mb.spec["calendar"]["file_n_sessions"] == len(cal.sessions)
+    assert mb.spec["calendar"]["range_end"] == "2027-12-31"
 
 
-def test_us_calendar_changed_since_the_freeze_is_refused(world, bundle_dir, tmp_path):
-    w = _copy_world(world, tmp_path)
+def test_scoring_does_not_need_exchange_calendars(world, bundle_dir, tmp_path, monkeypatch):
+    """(d) 운영 venv에는 exchange_calendars가 없다. import가 막혀도 채점 문서는 같은 바이트다."""
+    for name in ("with", "without"):
+        (tmp_path / name).mkdir()
+    _, with_lib = _score(world, bundle_dir, tmp_path / "with")
+    monkeypatch.setitem(sys.modules, "exchange_calendars", None)  # import -> ImportError
+    with pytest.raises(ImportError):
+        import exchange_calendars  # noqa: F401
+    start, end = date(2024, 4, 1), date(2024, 5, 1)
+    assert SessionCalendar.from_exchange_calendars("XKRX", start, end) is None
+    summary, without = _score(world, bundle_dir, tmp_path / "without")
+    assert summary["markets"] == {"US": "ok", "KR": "ok"} and summary["status"] == "ok"
+    assert with_lib.read_bytes() == without.read_bytes()
+    assert "exchange_calendars" not in json.loads(without.read_text())["provenance"]["env"]
+
+
+def test_scoring_uses_the_bundle_file_not_the_lake_calendar(world, bundle_dir, tmp_path):
+    """레이크 trading_calendar가 달라져도(세션이 빠져도) 채점은 bundle 달력만 쓴다."""
+    (tmp_path / "base").mkdir()
+    _, base = _score(world, bundle_dir, tmp_path / "base")
+    w = _copy_world(world, tmp_path / "copy")
+    (tmp_path / "copy" / "out").mkdir()
     cal = pl.read_parquet(w.us_table_file("trading_calendar", W.CAL_SNAP))
     dropped = cal.filter(pl.col("date") != w.us_sessions[300])
     W.write_us_table(w.root, "trading_calendar", "2026-09-23", dropped,
                      datetime(2026, 9, 23, 0, 20, tzinfo=W.SEOUL))
-    summary, out = _score(w, tmp_path / "bundle", tmp_path)
-    assert summary["markets"]["US"] == "calendar_mismatch" and summary["markets"]["KR"] == "ok"
-    assert json.loads(out.read_text())["status"] == "partial"
+    summary, out = _score(w, tmp_path / "copy" / "bundle", tmp_path / "copy" / "out")
+    assert summary["markets"] == {"US": "ok", "KR": "ok"}
+    # 문서는 입력 snapshot 기록(provenance.input_snapshots)만 다르다
+    new, old = json.loads(out.read_text()), json.loads(base.read_text())
+    assert {k for k in new if new[k] != old[k]} == {"provenance"}
+    assert new["assets"] == old["assets"]
+
+
+def test_calendar_file_changed_after_the_freeze_is_refused(world, bundle_dir, tmp_path):
+    copy = tmp_path / "b"
+    shutil.copytree(bundle_dir, copy)
+    path = copy / "us" / "calendar.json"
+    path.write_text(path.read_text().replace("2026-09-24", "2026-09-26", 1))
+    with pytest.raises(BundleError, match="바뀌었습니다"):
+        verify_bundle_dir(copy)
+    # bundle.json의 sha까지 다시 맞춰도, 동결 구간 세션이 동결 때와 다르면 거부한다
+    body = json.loads((bundle_dir / "us" / "calendar.json").read_text())
+    body["sessions"] = [r for r in body["sessions"] if r[0] != "2026-09-24"]
+    body["n_sessions"] = len(body["sessions"])
+    body["sessions_sha256"] = sd.sessions_sha256(r[0] for r in body["sessions"])
+    path.write_text(sd.calendar_file_text(body))
+    manifest = json.loads((copy / "bundle.json").read_text())
+    manifest["files"]["us/calendar.json"] = sha256_file(path)
+    manifest["markets"]["US"]["calendar"]["file_n_sessions"] = body["n_sessions"]
+    manifest["markets"]["US"]["calendar"]["file_sessions_sha256"] = body["sessions_sha256"]
+    (copy / "bundle.json").write_text(json.dumps(manifest))
+    with pytest.raises(BundleError, match="동결 구간 세션이 동결 때와 다릅니다"):
+        verify_bundle_dir(copy)
+
+
+def test_bundle_without_a_calendar_file_is_refused(world, bundle_dir, tmp_path):
+    copy = tmp_path / "b"
+    shutil.copytree(bundle_dir, copy)
+    manifest = json.loads((copy / "bundle.json").read_text())
+    del manifest["files"]["kr/calendar.json"]
+    manifest["markets"]["KR"]["calendar"].pop("file")
+    (copy / "kr" / "calendar.json").unlink()
+    (copy / "bundle.json").write_text(json.dumps(manifest))
+    with pytest.raises(BundleError, match="계산 달력 파일 항목이 없습니다"):
+        verify_bundle_dir(copy)
+
+
+@pytest.mark.parametrize("what", ["unsorted", "header", "columns", "naive_time"])
+def test_malformed_calendar_files_are_refused(world, bundle_dir, tmp_path, what):
+    body = json.loads((bundle_dir / "kr" / "calendar.json").read_text())
+    if what == "unsorted":
+        body["sessions"][5], body["sessions"][6] = body["sessions"][6], body["sessions"][5]
+    elif what == "header":
+        body["n_sessions"] += 1
+    elif what == "columns":
+        body["columns"] = ["session", "close_utc", "open_utc"]
+    else:
+        body["sessions"][0][1] = "2024-04-01T09:00:00"
+    path = tmp_path / "calendar.json"
+    path.write_text(json.dumps(body))
+    with pytest.raises(BundleError):
+        read_calendar_file(path)
+
+
+def test_range_exhausted_is_refused_per_market(world, bundle_dir, tmp_path):
+    """결정일 + 20일이 달력 파일 범위(2027-12-31) 밖이면 calendar_range_exhausted로 거부한다."""
+    sel_path, sel = _select(world, bundle_dir, tmp_path)
+    bundle = sd.load_bundle(bundle_dir)
+    # 마지막으로 통과하는 결정일: 범위 끝 - 20일
+    edge = date(2027, 12, 31) - sd.timedelta(days=sd.CALENDAR_TAIL_DAYS)
+    sd.ensure_calendar_range(bundle.markets["US"].calendar, "US", edge)
+    with pytest.raises(sd.CalendarRangeExhaustedError, match="bundle을 다시 만드십시오"):
+        sd.ensure_calendar_range(bundle.markets["US"].calendar, "US", edge + sd.timedelta(days=1))
+    with pytest.raises(sd.CalendarRangeExhaustedError):
+        sd.ensure_calendar_range(bundle.markets["KR"].calendar, "KR", date(2028, 1, 4))
+    # 채점: US의 기준 상한이 범위를 넘으면 US만 거부하고 KR은 낸다
+    late = {**sel, "limits": {**sel["limits"], "US": "2027-12-20"}}
+    sel_path.write_text(json.dumps(late, sort_keys=True))
+    out = tmp_path / "doc.json"
+    summary = sd.run_score(
+        report_date=W.D, selection_path=sel_path, selection_sha256=None, bundle_path=bundle_dir,
+        bundle_sha256=None, output=out)
+    assert summary["markets"] == {"US": "calendar_range_exhausted", "KR": "ok"}
+    doc = json.loads(out.read_text())
+    assert doc["status"] == "partial"
+    assert doc["failures"] == {"US": {"error_class": "CalendarRangeExhaustedError",
+                                      "reason": "calendar_range_exhausted"}}
+    # 리포트 날짜가 범위 밖이면 두 시장 모두 거부한다(문서 없음)
+    late = {**sel, "report_date": "2028-01-10"}
+    sel_path.write_text(json.dumps(late, sort_keys=True))
+    out.unlink()
+    summary = sd.run_score(
+        report_date=date(2028, 1, 10), selection_path=sel_path, selection_sha256=None,
+        bundle_path=bundle_dir, bundle_sha256=None, output=out)
+    assert summary["status"] == "failed" and not out.exists()
+    assert {f["reason"] for f in summary["failures"].values()} == {"calendar_range_exhausted"}
+
+
+# --- build-bundle 쪽: 라이브러리에서 파일 내용 만들기 ---------------------------------
+def _kr_cal_man(first=date(2024, 4, 1)):
+    return {"calendar_id": "XKRX", "calendar_basis": sd.xcals_basis(),
+            "first_session": first.isoformat()}
+
+
+def test_kr_calendar_file_is_made_from_the_pinned_library(tmp_path):
+    first = date(2024, 4, 1)
+    frozen = [s for s in W.sessions_of("XKRX", first, date(2026, 9, 28))]
+    cal, body = sd.kr_calendar_file(_kr_cal_man(first), frozen)
+    assert body["range_end"] == "2027-12-31" and body["last_session"] <= "2027-12-31"
+    assert body["calendar_basis"] == sd.xcals_basis() and body["market"] == "KR"
+    assert body["n_sessions"] == len(cal.sessions) == len(body["sessions"])
+    assert body["sessions_sha256"] == sd.sessions_sha(cal.sessions)
+    assert [r[0] for r in body["sessions"]][:3] == [d.isoformat() for d in cal.sessions[:3]]
+    assert "2027-12-31 뒤" not in body["valid_through_note"] and "calendar_range_exhausted" in body[
+        "valid_through_note"]
+    # 파일로 쓰고 읽으면 같은 달력이고, 같은 내용은 같은 바이트다
+    text = sd.calendar_file_text(body)
+    path = tmp_path / "calendar.json"
+    path.write_text(text)
+    assert sd.calendar_file_text(read_calendar_file(path)) == text
+    assert sd.calendar_from_file(path) == cal
+    # 버전이 다르면(동결 패널의 기준 문자열과 다르면) 멈춘다
+    with pytest.raises(BundleError, match="버전이 동결 패널과 다릅니다"):
+        sd.kr_calendar_file({**_kr_cal_man(first), "calendar_basis": "exchange_calendars==0.0.1"},
+                            frozen)
+    # 동결 구간 세션이 동결 때와 다르면 멈춘다
+    with pytest.raises(sd.CalendarMismatchError):
+        sd.kr_calendar_file(_kr_cal_man(first), frozen[:100] + frozen[101:])
+    # 라이브러리가 없으면 멈춘다
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(SessionCalendar, "from_exchange_calendars",
+                   classmethod(lambda cls, *a, **k: None))
+        with pytest.raises(BundleError, match="불러올 수 없어"):
+            sd.kr_calendar_file(_kr_cal_man(first), frozen)
+
+
+def _fake_us_lake(tmp_path, *, tamper: bool = False, lake_end=date(2026, 12, 31)):
+    """동결 패널이 쓴 레이크 trading_calendar snapshot을 흉내 낸다(라이브러리가 만든 표)."""
+    first, snap = date(2024, 4, 1), "2026-09-22"
+    lake = SessionCalendar.from_exchange_calendars("XNYS", first, lake_end)
+    ny = ZoneInfo("America/New_York")
+    closes = [c.astimezone(ny).time() for c in lake.closes]
+    if tamper:
+        closes[40] = time(12, 0)
+    table = pl.DataFrame({
+        "date": list(lake.sessions), "exchange": ["XNYS"] * len(lake.sessions),
+        "close_local": closes, "is_early_close": [False] * len(lake.sessions),
+        "source_rev": [sd.xcals_basis().replace("==", " ")] * len(lake.sessions)})
+    folder = (tmp_path / "us" / "derived" / "snapshots" / "trading_calendar"
+              / f"snapshot_date={snap}")
+    folder.mkdir(parents=True)
+    table.write_parquet(folder / "part.parquet")
+    panel_man = {"inputs": {"trading_calendar": {
+        "snapshot_date": snap,
+        "files": {"part.parquet": {"sha256": sha256_file(folder / "part.parquet")}}}}}
+    cal_man = {"calendar_id": "XNYS", "calendar_basis": f"lake_trading_calendar@{snap}",
+               "first_session": first.isoformat()}
+    return cal_man, panel_man, [d for d in lake.sessions if d <= date(2026, 9, 25)], lake
+
+
+def test_us_calendar_file_is_the_lake_snapshot_extended_by_the_library(tmp_path, monkeypatch):
+    monkeypatch.setattr(sd, "XCALS_PIN", sd.xcals_basis())
+    cal_man, panel_man, frozen, lake = _fake_us_lake(tmp_path)
+    cal, body = sd.us_calendar_file(tmp_path, cal_man, panel_man, frozen)
+    assert cal.calendar_basis == "lake_trading_calendar@2026-09-22"
+    assert cal.sessions[:len(lake.sessions)] == lake.sessions
+    assert cal.sessions[-1] == date(2027, 12, 31)
+    assert [seg["n_sessions"] for seg in body["segments"]] == [
+        len(lake.sessions), len(cal.sessions) - len(lake.sessions)]
+    assert "part.parquet sha256" in body["segments"][0]["source"]
+    lib = SessionCalendar.from_exchange_calendars("XNYS", lake.sessions[0], sd.CALENDAR_RANGE_END)
+    assert cal.sessions == lib.sessions and cal.opens == lib.opens and cal.closes == lib.closes
+    # 레이크 표가 라이브러리와 겹치는 구간에서 다르면(폐장 시각) 이어 붙이지 않고 멈춘다
+    other = tmp_path / "tampered"
+    cal_man2, panel_man2, frozen2, _ = _fake_us_lake(other, tamper=True)
+    with pytest.raises(BundleError, match="겹치는 구간에서 다릅니다"):
+        sd.us_calendar_file(other, cal_man2, panel_man2, frozen2)
+    # 동결 패널이 쓴 파일이 아니면 멈춘다
+    panel_man["inputs"]["trading_calendar"]["files"]["part.parquet"]["sha256"] = "0" * 64
+    with pytest.raises(BundleError, match="동결 패널이 쓴 파일과 다릅니다"):
+        sd.us_calendar_file(tmp_path, cal_man, panel_man, frozen)
+    # 버전이 4.13.2가 아니면 멈춘다
+    monkeypatch.setattr(sd, "XCALS_PIN", "exchange_calendars==0.0.1")
+    panel_man["inputs"]["trading_calendar"]["files"]["part.parquet"]["sha256"] = sha256_file(
+        tmp_path / "us/derived/snapshots/trading_calendar/snapshot_date=2026-09-22/part.parquet")
+    with pytest.raises(BundleError, match="버전이"):
+        sd.us_calendar_file(tmp_path, cal_man, panel_man, frozen)
 
 
 # --------------------------------------------------------------------------- 선택 뒤 변경
@@ -428,8 +645,9 @@ def test_frozen_run_is_reproduced_from_the_frozen_inputs(tmp_path):
     root = Path(os.environ["MS_FROZEN_ROOT"])
     built = sd.build_bundle(root, tmp_path / "bundle")
     report = sd.verify_frozen(root, tmp_path / "bundle")
-    assert built["files"] == 12
+    assert built["files"] == 14  # 시장마다 모델 3 + manifest·oof·latest_scores + calendar
     for market in ("US", "KR"):
         assert report[market]["max_abs_diff"] <= 1e-9, market
         assert report[market]["window_pass"], market
+        assert built["calendars"][market]["range_end"] == "2027-12-31"
     assert report["overall_pass"]

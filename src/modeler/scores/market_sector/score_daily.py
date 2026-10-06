@@ -11,9 +11,12 @@
    같아야 한다.
 2. **입력**: ``ms-selection.json``(``inputs_pin.py``)이 고정한 snapshot 파일만 연다. 열기 전에
    sha256과 파일 목록을 다시 확인한다. 레이크의 "최신 snapshot"을 스스로 찾지 않는다.
-3. **계산 달력**: MS1 패널은 KR을 ``exchange_calendars`` XKRX로 만들었다. 같은 버전·같은 동결
-   구간 세션 sha256이 아니면 거부한다. 관측 가격일 달력으로 대신하지 않는다. 운영 달력(리포트를
-   만들지, K가 무엇인지)은 별개다(계획 03 §6.2).
+3. **계산 달력**: MS1 패널은 KR을 ``exchange_calendars`` XKRX로, US를 레이크 ``trading_calendar``로
+   만들었다. 이 세션 목록은 bundle의 달력 파일(``<시장>/calendar.json``)에 들어 있고, 채점은
+   ``exchange_calendars``나 레이크 달력 대신 **이 파일만** 쓴다(운영 venv에 그 패키지가 없다).
+   달력 기준·동결 구간 세션 sha256이 동결 때와 다르면 거부하고, 결정일 + 20일이 파일 범위
+   (2027-12-31)를 넘으면 ``calendar_range_exhausted``로 거부한다. 관측 가격일 달력으로 대신하지
+   않는다. 운영 달력(리포트를 만들지, K가 무엇인지)은 별개다(계획 03 §6.2).
 4. **피쳐**: 가격 경로는 전체 이력으로 만든다(라벨·``b_opp_mean``이 전체 이력의 평균이다).
    피쳐는 최근 창(252세션 + 여유)만으로 만들고, 마지막 행의 가격 피쳐가 전체 패널 피쳐와
    같은지 확인한다.
@@ -23,7 +26,7 @@
 CLI (``python -m modeler.scores.market_sector.score_daily``)::
 
     score         --report-date D --selection SEL.json --bundle DIR --output OUT.json
-    build-bundle  --stock-data-root ROOT --output DIR     # 동결 run -> bundle (읽기만)
+    build-bundle  --stock-data-root ROOT --output DIR     # 동결 run -> bundle (읽기만, 맥에서)
     verify-frozen --stock-data-root ROOT --bundle DIR     # 동결 run과 같은 입력으로 재현 검사
 
 종료 코드: 0 문서를 썼다(시장 하나만 실패해도 0), 1 시장 둘 다 실패(문서 없음), 2 사용법·입력
@@ -42,6 +45,7 @@ import platform
 import shutil
 import tempfile
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -72,12 +76,19 @@ from modeler.scores.common.total_return import load_us_total_return
 from modeler.scores.market_sector import baselines as bl
 from modeler.scores.market_sector.build_panel import assemble
 from modeler.scores.market_sector.bundle import (
+    CALENDAR_COLUMNS,
+    CALENDAR_SCHEMA,
     FROZEN_TAG,
     MARKETS,
     MODEL_NAMES,
     BundleError,
+    read_calendar_file,
+    sessions_sha256,
     sha256_file,
     verify_bundle_dir,
+)
+from modeler.scores.market_sector.bundle import (
+    SCHEMA as BUNDLE_SCHEMA,
 )
 from modeler.scores.market_sector.config import MsConfig
 from modeler.scores.market_sector.daily_doc import SCHEMA
@@ -108,6 +119,9 @@ log = logging.getLogger("score_daily")
 FROZEN_RUN_ID = {"US": "ms_us_202609300940", "KR": "ms_kr_202609300941"}
 FROZEN_PANEL = {"US": "ms_panel_v3", "KR": "ms_panel_kr_v2"}
 FROZEN_FEATURES = {"US": "ms_feat_v2", "KR": "ms_feat_kr_v1"}
+#: 계산 달력을 만드는 ``exchange_calendars`` 버전. MS1 동결 때와 같다(uv.lock).
+#: 다르면 build-bundle이 멈춘다.
+XCALS_PIN = "exchange_calendars==4.13.2"
 CASH_SERIES = {"US": "DGS3MO", "KR": "rate_kr_cd91"}
 #: 피쳐 창: 가장 긴 lookback(252세션) + 현재 행 + 여유. 여유는 창 피쳐와 전체 패널 피쳐를
 #: 비교하는 구간이다.
@@ -117,7 +131,11 @@ WINDOW_TOLERANCE = 1e-9
 #: 이 값을 넘게 늦은 입력은 section status를 stale로 둔다. KR 지수는 T+1 공표라 1세션
 #: 늦은 것이 정상이다.
 NOMINAL_LAG_SESSIONS = {"US": 0, "KR": 1}
-KR_CALENDAR_TAIL_DAYS = 20  # kr_session_calendar와 같은 규칙: 마지막 지수 세션 + 20일
+#: 계산 달력 파일이 덮는 마지막 날. 이 날 뒤로 가려면 bundle을 다시 만들어야 한다.
+CALENDAR_RANGE_END = date(2027, 12, 31)
+#: 결정일 + 이 일수가 달력 범위 끝 안에 있어야 채점한다(다음 세션 개장 시각·진입일 계산 여유).
+CALENDAR_TAIL_DAYS = 20
+CALENDAR_GENERATED_BY = "modeler.scores.market_sector.score_daily build-bundle (맥, 네트워크 없음)"
 
 LAB_COLS = [
     "asset_id",
@@ -169,6 +187,10 @@ class CalendarMismatchError(RuntimeError):
     """계산 달력이 동결 때와 다르다(버전·기준·동결 구간 세션 sha256). 대신 쓸 달력은 없다."""
 
 
+class CalendarRangeExhaustedError(RuntimeError):
+    """결정일(+20일)이 bundle 달력 파일의 범위 끝을 넘었다. bundle을 다시 만들어야 한다."""
+
+
 class WindowMismatchError(RuntimeError):
     """창 피쳐가 전체 패널 피쳐와 다르다."""
 
@@ -183,6 +205,8 @@ def failure_reason(exc: BaseException) -> str:
         return "input_changed"
     if isinstance(exc, InputPinError):
         return "input_unavailable"
+    if isinstance(exc, CalendarRangeExhaustedError):
+        return "calendar_range_exhausted"
     if isinstance(exc, CalendarMismatchError):
         return "calendar_mismatch"
     if isinstance(exc, WindowMismatchError):
@@ -195,8 +219,8 @@ def failure_reason(exc: BaseException) -> str:
 
 
 # --------------------------------------------------------------------------- 공용
-def sessions_sha(sessions: list[date]) -> str:
-    return hashlib.sha256("\n".join(d.isoformat() for d in sessions).encode()).hexdigest()
+def sessions_sha(sessions: Sequence[date]) -> str:
+    return sessions_sha256(d.isoformat() for d in sessions)
 
 
 def fnum(x: Any, nd: int | None = None) -> float | None:
@@ -244,6 +268,7 @@ class MarketBundle:
     oof_rows: int
     latest: dict[str, dict[str, Any]]
     _models: dict[str, Any] = field(default_factory=dict)
+    _calendar: SessionCalendar | None = None
 
     def model(self, name: str) -> Any:
         if name not in self._models:
@@ -253,6 +278,12 @@ class MarketBundle:
     @property
     def calendar(self) -> dict[str, Any]:
         return self.spec["calendar"]
+
+    def session_calendar(self) -> SessionCalendar:
+        """bundle 달력 파일의 계산 달력. 파일 형식과 내부 지문은 읽을 때 확인한다."""
+        if self._calendar is None:
+            self._calendar = calendar_from_file(self.directory / self.calendar["file"])
+        return self._calendar
 
     def model_sha(self) -> dict[str, str]:
         files = self.spec["_files"]
@@ -331,24 +362,45 @@ def verify_calendar(cal: SessionCalendar, spec: dict[str, Any]) -> dict[str, Any
     }
 
 
-def kr_computation_calendar(spec: dict[str, Any], last_index_session: date) -> SessionCalendar:
-    """KR 계산 달력: ``exchange_calendars`` XKRX.
+def calendar_from_file(path: Path) -> SessionCalendar:
+    """달력 파일(``market-sector-calendar.v1``)을 ``SessionCalendar``로 읽는다.
 
-    없으면 거부한다. 관측 가격일 달력으로 대신하지 않는다.
+    ``exchange_calendars``는 쓰지 않는다.
     """
-    try:
-        cal = SessionCalendar.from_exchange_calendars(
-            "XKRX",
-            date.fromisoformat(spec["calendar_start"]),
-            last_index_session + timedelta(days=KR_CALENDAR_TAIL_DAYS),
+    body = read_calendar_file(path)
+    rows = body["sessions"]
+    return SessionCalendar(
+        body["calendar_id"],
+        body["calendar_basis"],
+        tuple(date.fromisoformat(r[0]) for r in rows),
+        tuple(datetime.fromisoformat(r[1]).astimezone(UTC) for r in rows),
+        tuple(datetime.fromisoformat(r[2]).astimezone(UTC) for r in rows),
+    )
+
+
+def bundle_calendar(bundle_m: MarketBundle) -> tuple[SessionCalendar, dict[str, Any]]:
+    """bundle 달력 파일의 계산 달력과, 동결 때와 같은지 확인한 결과(문서 provenance)."""
+    cal = bundle_m.session_calendar()
+    check = verify_calendar(cal, bundle_m.calendar)
+    file_rel = bundle_m.calendar["file"]
+    check.update(
+        source="bundle_calendar_file",
+        file=file_rel,
+        file_sha256=bundle_m.spec["_files"][file_rel],
+        file_range_end=bundle_m.calendar["range_end"],
+        file_sessions=len(cal.sessions),
+    )
+    return cal, check
+
+
+def ensure_calendar_range(spec: dict[str, Any], market: str, decision: date) -> None:
+    """결정일 + ``CALENDAR_TAIL_DAYS``가 달력 파일 범위 안에 있어야 한다. 아니면 거부한다."""
+    range_end = date.fromisoformat(spec["range_end"])
+    if decision + timedelta(days=CALENDAR_TAIL_DAYS) > range_end:
+        raise CalendarRangeExhaustedError(
+            f"{market} 계산 달력 파일은 {range_end}까지입니다. 결정일 {decision} + "
+            f"{CALENDAR_TAIL_DAYS}일이 그 뒤입니다. bundle을 다시 만드십시오"
         )
-    except Exception as exc:  # 범위 오류 등: kr_session_calendar와 달리 대체하지 않는다
-        raise CalendarMismatchError("exchange_calendars XKRX 달력을 만들지 못했습니다") from exc
-    if cal is None:
-        raise CalendarMismatchError(
-            "exchange_calendars가 없습니다 — 관측 가격일 달력으로 대신하지 않습니다"
-        )
-    return cal
 
 
 # --------------------------------------------------------------------------- 시장 입력
@@ -390,6 +442,10 @@ def build_frames(
     market: str, selection: dict[str, Any], bundle_m: MarketBundle, cfg: MsConfig
 ) -> Frames:
     """selection이 고정한 입력만 연다. 먼저 sha256과 파일 목록을 다시 확인한다."""
+    decision = [date.fromisoformat(selection["report_date"])]
+    if selection["limits"].get(market):
+        decision.append(date.fromisoformat(selection["limits"][market]))
+    ensure_calendar_range(bundle_m.calendar, market, max(decision))  # 싼 검사를 먼저 한다
     verify_pins(selection, market)
     roots = selection["roots"]
     us_tables = selection["us"]["tables"]
@@ -399,8 +455,7 @@ def build_frames(
         symbols = {a.asset_id: a.proxy for a in assets}
         snaps = {t: us_tables[t]["snapshot_date"] for t in US_TABLES_FOR["US"]}
         lake = PinnedScopedLake(root=us_root, snapshots=snaps, symbols=tuple(symbols.values()))
-        cal = SessionCalendar.from_us_lake(lake)
-        check = verify_calendar(cal, bundle_m.calendar)
+        cal, check = bundle_calendar(bundle_m)
         paths, _ = load_us_total_return(lake, symbols, sessions=frozenset(cal.sessions))
         rates = load_us_rates(lake, CASH_SERIES["US"])
         if rates is None:
@@ -413,16 +468,14 @@ def build_frames(
             "prices_daily_by_asset": {a: paths[a]["session"].max() for a in paths},
             "corp_actions_max_ex_date": ca_max,
             "macro_series": _macro_max_dates(macro_rows),
-            "trading_calendar": {"first": cal.sessions[0], "last": cal.sessions[-1]},
+            "calendar": {"first": cal.sessions[0], "last": cal.sessions[-1]},
         }
     else:
         kr_root = DataRoot(Path(roots["kr"]))
         kr = selection["kr"]
         kr_lake = KrLake.resolve(kr_root, snapshot_date=kr["snapshot_date"])
         keys = {a.asset_id: kr_index_key(a.asset_id) for a in assets}
-        probe = load_kr_index_paths(kr_lake, {"_probe": kr_index_key("kr_kospi")})[0]["_probe"]
-        cal = kr_computation_calendar(bundle_m.calendar, probe["session"].max())
-        check = verify_calendar(cal, bundle_m.calendar)
+        cal, check = bundle_calendar(bundle_m)
         paths, _ = load_kr_index_paths(kr_lake, keys, sessions=frozenset(cal.sessions))
         rates = load_kr_rates(kr_lake, CASH_SERIES["KR"], cal.sessions)
         if rates is None:
@@ -888,7 +941,6 @@ def compose_document(
                 "numpy": np.__version__,
                 "scikit-learn": sklearn.__version__,
                 "joblib": joblib.__version__,
-                "exchange_calendars": _xcals_version(),
             },
             "rounding": "ret/rvol/dd/cash 6자리, 퍼센트·점수 4자리",
         },
@@ -975,9 +1027,16 @@ def _copy_checked(src: Path, dst: Path, expected: str | None = None) -> str:
 
 
 def calendar_spec(
-    cal_man: dict[str, Any], sessions: list[date]
+    cal_man: dict[str, Any],
+    sessions: list[date],
+    *,
+    file: str | None = None,
+    body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """동결 구간(첫 자산 패널의 첫~마지막 세션)의 계산 달력 지문."""
+    """동결 구간(첫 자산 패널의 첫~마지막 세션)의 계산 달력 지문.
+
+    달력 파일이 있으면(``file``, ``body``) 그 항목도 적는다.
+    """
     basis = cal_man["calendar_basis"]
     lake = basis.startswith("lake_trading_calendar@")
     spec = {
@@ -992,7 +1051,162 @@ def calendar_spec(
     }
     if lake:
         spec["basis_prefix"] = "lake_trading_calendar@"
+    if file is not None and body is not None:
+        spec.update(
+            file=file,
+            range_end=body["range_end"],
+            file_n_sessions=body["n_sessions"],
+            file_sessions_sha256=body["sessions_sha256"],
+        )
     return spec
+
+
+# --- 계산 달력 파일 ------------------------------------------------------------------
+def _calendar_rows(cal: SessionCalendar) -> list[list[str]]:
+    return [
+        [s.isoformat(), o.astimezone(UTC).isoformat(), c.astimezone(UTC).isoformat()]
+        for s, o, c in zip(cal.sessions, cal.opens, cal.closes, strict=True)
+    ]
+
+
+def _segment(source: str, cal: SessionCalendar, first: int, last: int) -> dict[str, Any]:
+    return {"source": source, "first_session": cal.sessions[first].isoformat(),
+            "last_session": cal.sessions[last - 1].isoformat(), "n_sessions": last - first}
+
+
+def calendar_file_body(
+    market: str,
+    cal: SessionCalendar,
+    *,
+    range_end: date,
+    method: str,
+    segments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """달력 파일(``market-sector-calendar.v1``)의 내용. 세션·개장·폐장은 UTC ISO 시각이다."""
+    return {
+        "schema_version": CALENDAR_SCHEMA,
+        "market": market,
+        "calendar_id": cal.calendar_id,
+        "calendar_basis": cal.calendar_basis,
+        "generated_by": CALENDAR_GENERATED_BY,
+        "method": method,
+        "segments": segments,
+        "range_start": cal.sessions[0].isoformat(),
+        "range_end": range_end.isoformat(),
+        "first_session": cal.sessions[0].isoformat(),
+        "last_session": cal.sessions[-1].isoformat(),
+        "n_sessions": len(cal.sessions),
+        "sessions_sha256": sessions_sha(cal.sessions),
+        "valid_through_note": (
+            f"결정일 + {CALENDAR_TAIL_DAYS}일이 range_end({range_end.isoformat()})를 넘으면 채점이 "
+            "calendar_range_exhausted로 거부한다. 그 뒤로 가려면 build-bundle로 bundle을 다시 "
+            "만들고 release를 새로 빌드해야 한다."
+        ),
+        "columns": CALENDAR_COLUMNS,
+        "sessions": _calendar_rows(cal),
+    }
+
+
+def calendar_file_text(body: dict[str, Any]) -> str:
+    """머리말은 키 이름순, 세션은 한 줄에 하나. 같은 내용이면 같은 바이트다."""
+    head = {k: v for k, v in body.items() if k != "sessions"}
+    text = json.dumps(head, ensure_ascii=False, sort_keys=True, indent=2)
+    rows = ",\n".join("    " + json.dumps(r, separators=(",", ":")) for r in body["sessions"])
+    return text[:-2] + ',\n  "sessions": [\n' + rows + "\n  ]\n}\n"
+
+
+def kr_calendar_file(
+    cal_man: dict[str, Any], frozen_sessions: list[date]
+) -> tuple[SessionCalendar, dict[str, Any]]:
+    """KR: ``exchange_calendars`` XKRX를 동결 패널과 같은 버전으로 계산해 파일 내용을 만든다.
+
+    라이브러리가 없거나 버전이 동결 패널과 다르거나, 동결 구간 세션이 동결 때와 다르면 멈춘다.
+    """
+    start = date.fromisoformat(cal_man["first_session"])
+    cal = SessionCalendar.from_exchange_calendars("XKRX", start, CALENDAR_RANGE_END)
+    if cal is None:
+        raise BundleError("exchange_calendars를 불러올 수 없어 KR 계산 달력을 만들지 못합니다")
+    if cal.calendar_basis != cal_man["calendar_basis"]:
+        raise BundleError(
+            f"exchange_calendars 버전이 동결 패널과 다릅니다: 지금 {cal.calendar_basis}, "
+            f"동결 {cal_man['calendar_basis']}"
+        )
+    verify_calendar(cal, calendar_spec(cal_man, frozen_sessions))
+    source = (f"{cal.calendar_basis} get_calendar('XKRX', start={start.isoformat()}, "
+              f"end={CALENDAR_RANGE_END.isoformat()}).schedule")
+    body = calendar_file_body(
+        "KR", cal, range_end=CALENDAR_RANGE_END,
+        method=(
+            f"맥 modeler venv의 {cal.calendar_basis}가 계산한 XKRX 세션과 개장·폐장 시각(UTC)을 "
+            "그대로 적었다. 동결 구간의 세션 목록이 동결 패널과 같은지 build-bundle이 확인했다. "
+            "2026-06-03·07-17처럼 라이브러리에만 있는 세션도 그대로 둔다(동결 방식)."
+        ),
+        segments=[_segment(source, cal, 0, len(cal.sessions))],
+    )
+    return cal, body
+
+
+def us_calendar_file(
+    root: Path, cal_man: dict[str, Any], panel_man: dict[str, Any], frozen_sessions: list[date]
+) -> tuple[SessionCalendar, dict[str, Any]]:
+    """US: 동결 패널이 쓴 레이크 ``trading_calendar`` snapshot의 세션 목록으로 파일 내용을 만든다.
+
+    snapshot은 2027-09-22까지라서, 그 뒤 ``CALENDAR_RANGE_END``까지는 같은 버전
+    ``exchange_calendars``로 이어 붙인다. 이어 붙이기 전에 snapshot이 그 라이브러리와 겹치는
+    구간에서 세션·개장·폐장이 전부 같은지 확인한다(레이크 표가 ``exchange_calendars 4.13.2``로
+    만든 것이다). 다르면 멈춘다.
+    """
+    basis = cal_man["calendar_basis"]
+    snap = basis.split("@", 1)[1]
+    pin = panel_man["inputs"]["trading_calendar"]
+    part = (root / "us" / "derived" / "snapshots" / "trading_calendar"
+            / f"snapshot_date={snap}" / "part.parquet")
+    if pin["snapshot_date"] != snap or sha256_file(part) != pin["files"]["part.parquet"]["sha256"]:
+        raise BundleError("US trading_calendar snapshot이 동결 패널이 쓴 파일과 다릅니다")
+    tab = (
+        pl.read_parquet(part)
+        .filter(pl.col("exchange") == cal_man["calendar_id"])
+        .unique(subset=["date"], keep="last")
+        .sort("date")
+    )
+    lake = SessionCalendar.from_sessions(
+        cal_man["calendar_id"], tab["date"].to_list(), calendar_basis=basis,
+        close_local=tab["close_local"].to_list(),
+    )
+    verify_calendar(lake, calendar_spec(cal_man, frozen_sessions))
+    lib = SessionCalendar.from_exchange_calendars(
+        cal_man["calendar_id"], lake.sessions[0], CALENDAR_RANGE_END)
+    if lib is None:
+        raise BundleError("exchange_calendars를 불러올 수 없어 US 계산 달력을 이어 붙이지 못합니다")
+    if lib.calendar_basis != XCALS_PIN:
+        raise BundleError(f"exchange_calendars 버전이 {XCALS_PIN}가 아닙니다: {lib.calendar_basis}")
+    k = bisect.bisect_right(lib.sessions, lake.sessions[-1])
+    if not (k == len(lake.sessions) and lib.sessions[:k] == lake.sessions
+            and lib.opens[:k] == lake.opens and lib.closes[:k] == lake.closes):
+        raise BundleError(
+            "레이크 trading_calendar snapshot이 exchange_calendars와 겹치는 구간에서 다릅니다")
+    cal = SessionCalendar(
+        lake.calendar_id, basis, lake.sessions + lib.sessions[k:], lake.opens + lib.opens[k:],
+        lake.closes + lib.closes[k:])
+    revs = sorted(set(tab["source_rev"].to_list())) if "source_rev" in tab.columns else []
+    segments = [
+        _segment(f"{basis} part.parquet sha256 {pin['files']['part.parquet']['sha256']} "
+                 f"(source_rev {', '.join(revs) or '-'})", cal, 0, k),
+        _segment(f"{lib.calendar_basis} get_calendar('{lake.calendar_id}', "
+                 f"start={lake.sessions[0].isoformat()}, end={CALENDAR_RANGE_END.isoformat()})"
+                 ".schedule, 레이크 snapshot 뒤", cal, k, len(cal.sessions)),
+    ]
+    body = calendar_file_body(
+        "US", cal, range_end=CALENDAR_RANGE_END,
+        method=(
+            f"동결 패널이 쓴 레이크 {basis}의 세션과 폐장 시각(UTC)을 그대로 적고, snapshot이 끝난 "
+            f"뒤부터 {CALENDAR_RANGE_END.isoformat()}까지는 {lib.calendar_basis}로 이어 붙였다. "
+            "이어 붙이기 전에 snapshot이 그 라이브러리와 겹치는 구간에서 세션·개장·폐장이 같은지 "
+            "build-bundle이 확인했다. 동결 구간의 세션 목록이 동결 패널과 같은지도 확인했다."
+        ),
+        segments=segments,
+    )
+    return cal, body
 
 
 def bundle_manifest(
@@ -1003,7 +1217,12 @@ def bundle_manifest(
     for market, block in VERDICTS.items():
         verdicts[market] = {k: {"label": lab, "detail": det} for k, (lab, det) in block.items()}
     return {
-        "schema_version": "market-sector-bundle.v1",
+        "schema_version": BUNDLE_SCHEMA,
+        "calendar_range_note": (
+            f"계산 달력 파일은 {CALENDAR_RANGE_END.isoformat()}까지다. "
+            f"결정일 + {CALENDAR_TAIL_DAYS}일이 그 뒤이면 채점이 calendar_range_exhausted로 "
+            "거부한다. 그 전에 build-bundle로 bundle을 다시 만들고 release를 새로 빌드해야 한다."
+        ),
         "frozen_tag": FROZEN_TAG,
         "config_hash": cfg.config_hash(),
         "asset_registry": {"version": registry_version(), "hash": registry_hash()},
@@ -1028,6 +1247,7 @@ def build_bundle(
     try:
         files: dict[str, str] = {}
         markets: dict[str, Any] = {}
+        calendars: dict[str, Any] = {}
         for market in MARKETS:
             m = market.lower()
             run = root / m / "output" / "market_sector" / FROZEN_RUN_ID[market]
@@ -1069,6 +1289,16 @@ def build_bundle(
                 frozen_pins["us_macro_series"] = {
                     "snapshot_date": feat_man["macro_series_snapshot_date"],
                     "files": feat_man["macro_series_files"]}
+            cal_rel = f"{m}/calendar.json"
+            if market == "KR":
+                _, cal_body = kr_calendar_file(panel_man["calendar"], sessions)
+            else:
+                _, cal_body = us_calendar_file(root, panel_man["calendar"], panel_man, sessions)
+            cal_text = calendar_file_text(cal_body)
+            files[cal_rel] = _write_text_atomic(stage / cal_rel, cal_text)
+            calendars[market] = {k: cal_body[k] for k in (
+                "calendar_basis", "range_start", "range_end", "first_session", "last_session",
+                "n_sessions", "sessions_sha256")} | {"file_sha256": files[cal_rel]}
             any_latest = latest[0]
             markets[market] = {
                 "run_id": FROZEN_RUN_ID[market],
@@ -1078,7 +1308,8 @@ def build_bundle(
                 "panel": {"version": FROZEN_PANEL[market],
                           "manifest_sha256": sha256_file(panel_dir / "manifest.json"),
                           "features": FROZEN_FEATURES[market]},
-                "calendar": calendar_spec(panel_man["calendar"], sessions),
+                "calendar": calendar_spec(panel_man["calendar"], sessions, file=cal_rel,
+                                          body=cal_body),
                 "frozen_input_pins": frozen_pins,
                 "frozen_latest_session": any_latest["session"],
                 "assets": sorted(r["asset_id"] for r in latest),
@@ -1095,7 +1326,7 @@ def build_bundle(
         shutil.rmtree(stage, ignore_errors=True)
         raise
     return {"bundle": str(output), "bundle_sha256": sha256_file(output / "bundle.json"),
-            "files": len(files)}
+            "files": len(files), "calendars": calendars}
 
 
 # --------------------------------------------------------------------------- 동결 재현

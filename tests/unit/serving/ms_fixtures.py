@@ -24,10 +24,16 @@ from r3_world import ADAPTER_R3, _calendar, write_native
 if str(e2e.PROJECT) not in sys.path:  # ``tests.scores.ms_world`` lives in the project package
     sys.path.append(str(e2e.PROJECT))
 
+from modeler.scores.market_sector.bundle import (
+    CALENDAR_COLUMNS,
+    CALENDAR_SCHEMA,
+    SCHEMA,
+    sessions_sha256,
+)
 from modeler.serving import release_build as rb
 from modeler.serving.daily_inputs import MS_BUNDLE_DIR, MS_BUNDLE_PATH, MS_CODE_PATH, MS_ENTRYPOINT
 from modeler.serving.orchestration import code_inventory_sha256
-from modeler.serving.runtime_contract import MARKET_SECTOR_PACKAGES, PACKAGES, probe_code
+from modeler.serving.runtime_contract import PACKAGES, probe_code
 
 D = date(2026, 10, 7)
 SELECT_AT = "2026-10-07T09:30:00+09:00"
@@ -41,13 +47,31 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def runtime_manifest_with_calendars(target: Path) -> Path:
-    """A runtime manifest of the running interpreter that also pins ``exchange_calendars``."""
-    probe = subprocess.run([sys.executable, "-c", probe_code((*PACKAGES, *MARKET_SECTOR_PACKAGES))],
+def runtime_manifest(target: Path, extra: tuple[str, ...] = ()) -> Path:
+    """A runtime manifest of the running interpreter (model packages, plus ``extra`` if given)."""
+    probe = subprocess.run([sys.executable, "-c", probe_code((*PACKAGES, *extra))],
                            capture_output=True, text=True, check=True)
     body = {"schema_version": "daily-briefing-runtime.v1", **json.loads(probe.stdout)}
     target.write_text(json.dumps(body, sort_keys=True) + "\n", encoding="utf-8")
     return target
+
+
+def _fake_calendar(directory: Path, market: str, files: dict[str, str]) -> dict:
+    """A small valid calculation-calendar file (three sessions) and its bundle.json entry."""
+    sessions = ["2026-09-28", "2026-09-29", "2026-09-30"]
+    rows = [[d, f"{d}T00:00:00+00:00", f"{d}T06:30:00+00:00"] for d in sessions]
+    sha = sessions_sha256(sessions)
+    body = {"schema_version": CALENDAR_SCHEMA, "market": market, "calendar_id": "FAKE",
+            "calendar_basis": "fake", "range_end": "2027-12-31", "first_session": sessions[0],
+            "last_session": sessions[-1], "n_sessions": len(sessions), "sessions_sha256": sha,
+            "columns": CALENDAR_COLUMNS, "sessions": rows}
+    rel = f"{market.lower()}/calendar.json"
+    (directory / rel).write_text(json.dumps(body, sort_keys=True), encoding="utf-8")
+    files[rel] = _sha((directory / rel).read_bytes())
+    return {"calendar_id": "FAKE", "basis": "fake", "file": rel, "range_end": "2027-12-31",
+            "file_n_sessions": len(sessions), "file_sessions_sha256": sha,
+            "first_session": sessions[0], "last_session": sessions[-1], "n_sessions": len(sessions),
+            "sessions_sha256": sha}
 
 
 def fake_ms_bundle(directory: Path) -> Path:
@@ -66,8 +90,9 @@ def fake_ms_bundle(directory: Path) -> Path:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(f"junk {market} {path}".encode())
             files[path] = _sha(target.read_bytes())
-        markets[market] = {"run_id": f"fake_{m}", **rel, "models": models}
-    manifest = {"schema_version": "market-sector-bundle.v1", "files": files, "markets": markets}
+        calendar = _fake_calendar(directory, market, files)
+        markets[market] = {"run_id": f"fake_{m}", **rel, "models": models, "calendar": calendar}
+    manifest = {"schema_version": SCHEMA, "files": files, "markets": markets}
     (directory / "bundle.json").write_text(json.dumps(manifest, sort_keys=True))
     return directory
 
@@ -89,7 +114,7 @@ def build_release_world(tmp_path: Path, monkeypatch, *, kr_snapshot_done: str | 
     adapter = release / "src" / "modeler" / "serving" / "adapters.py"
     adapter.write_text(ADAPTER_R3)
     shutil.copy2(e2e.PROJECT / "uv.lock", release / "uv.lock")
-    runtime_manifest_with_calendars(release / "runtime.json")
+    runtime_manifest(release / "runtime.json")
     cards = e2e._write(release / "model-cards.json", {
         model_id: {"title": model_id, "summary": "Synthetic fixture model card."}
         for _, model_id in MODEL_IDS})

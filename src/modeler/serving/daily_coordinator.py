@@ -25,7 +25,7 @@ from modeler.serving.schema import report_template
 
 from .daily_inputs import MS_ENTRYPOINT, _release_market_sector, select
 from .orchestration import combine_reports
-from .runtime_contract import MARKET_SECTOR_PACKAGES, verify_runtime
+from .runtime_contract import verify_runtime
 
 SEOUL = ZoneInfo("Asia/Seoul")
 RETRY_MINUTES = (15, 17, 22, 32)
@@ -150,8 +150,7 @@ def _config(path: Path) -> dict[str, Any]:
         raise ValueError("model card SHA-256 changed")
     if _hash(_absolute(config, "python")) != config.get("python_sha256"):
         raise ValueError("serving Python executable SHA-256 changed")
-    verify_runtime(_absolute(config, "python"), _absolute(config, "runtime_manifest"),
-                   extra_packages=runtime_extra_packages(config))
+    verify_runtime(_absolute(config, "python"), _absolute(config, "runtime_manifest"))
     opening_keys = ("opening_snapshot_root", "opening_output_root", "opening_max_age_seconds")
     if any(config.get(key) is not None for key in opening_keys):
         if any(config.get(key) is None for key in opening_keys):
@@ -215,16 +214,6 @@ def _selected(config: dict[str, Any], day: date) -> dict[str, Any]:
     if _hash(jobs) != state.get("jobs_config_sha256"):
         raise ValueError("selected jobs config changed since 09:30")
     return state
-
-
-def runtime_extra_packages(config: dict[str, Any]) -> tuple[str, ...]:
-    """Packages the runtime manifest must pin on top of the model dependencies.
-
-    The market-sector section needs ``exchange_calendars`` (MS1's KR calendar); a config without the
-    section needs nothing extra, so an older runtime manifest keeps working.
-    """
-    on = any(config.get(key) is not None for key in MARKET_SECTOR_ROOT_KEYS)
-    return MARKET_SECTOR_PACKAGES if on else ()
 
 
 def _market_sector_roots(config: dict[str, Any]) -> dict[str, Path] | None:

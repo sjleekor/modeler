@@ -265,20 +265,13 @@ def test_reports_checkout_and_url_are_checked(world):
 
 
 def _ms_args(world, tmp_path):
-    """Provisioning arguments with the section on (runtime manifest pinning exchange_calendars)."""
+    """Provisioning arguments with the section on (the unchanged runtime manifest)."""
     import ms_fixtures
 
     ms_bundle = ms_fixtures.fake_ms_bundle(tmp_path / "ms-bundle")
     kr_root = tmp_path / "kr-data"
     (kr_root / "raw").mkdir(parents=True)
-    modeler = world["tmp"] / "modeler"
-    runtime = ms_fixtures.runtime_manifest_with_calendars(modeler / "deploy/prod/runtime-ms.json")
-    listing = (world["tmp"] / "SOURCE_MANIFEST.sha256").read_text()
-    manifest = tmp_path / "SOURCE_MANIFEST.ms.sha256"
-    line = f"{_sha(runtime.read_bytes())}  modeler/deploy/prod/runtime-ms.json\n"
-    manifest.write_text(listing + line)
-    return ["--ms-bundle", str(ms_bundle), "--ms-kr-root", str(kr_root),
-            "--runtime-manifest", str(runtime), "--source-manifest", str(manifest)], kr_root
+    return ["--ms-bundle", str(ms_bundle), "--ms-kr-root", str(kr_root)], kr_root
 
 
 def test_provision_with_the_market_sector_section(world, tmp_path):
@@ -302,7 +295,9 @@ def test_provision_with_the_market_sector_section(world, tmp_path):
         config = _config(root / "config/ops.json")
         assert config["market_sector_kr_root"] == str(kr_root)
         assert json.loads(out)["validation"]["config_ok"] is True
-        assert "exchange_calendars" in json.loads(out)["validation"]["packages"]
+        # the calculation calendar is a bundle file: the serving venv needs no exchange_calendars
+        assert "exchange_calendars" not in json.loads(out)["validation"]["packages"]
+        assert (release / "bundles/market_sector/us/calendar.json").is_file()
         # the first (no --ms-bundle) provisioning keeps the section off
         first = json.loads((world["root"] / "config/ops.json").read_text())
         assert first["market_sector_kr_root"] is None and first["market_sector_us_root"] is None
@@ -311,39 +306,43 @@ def test_provision_with_the_market_sector_section(world, tmp_path):
             os.chmod(current, 0o700)
 
 
-def test_the_section_needs_a_runtime_manifest_that_pins_exchange_calendars(world, tmp_path):
-    """The old runtime manifest has no exchange_calendars: provisioning stops before building."""
+def test_the_section_refuses_a_bundle_without_a_calendar_file(world, tmp_path):
+    """A bundle that lacks its calculation-calendar file never reaches a release."""
     extra, _ = _ms_args(world, tmp_path)
-    root = tmp_path / "serving-ms-old-runtime"
-    old_runtime = ["--runtime-manifest", str(world["tmp"] / "modeler/deploy/prod/runtime.json")]
-    code, out, err = _run(["--serving-root", str(root), "--release-id", "r3",
-                           *world["base"], *extra, *old_runtime])
-    assert code == 1 and "does not pin all model dependencies" in err
+    bundle = Path(extra[1])
+    manifest = json.loads((bundle / "bundle.json").read_text())
+    del manifest["files"]["kr/calendar.json"]
+    manifest["markets"]["KR"]["calendar"].pop("file")
+    (bundle / "kr/calendar.json").unlink()
+    (bundle / "bundle.json").write_text(json.dumps(manifest))
+    root = tmp_path / "serving-ms-no-calendar"
+    code, _, err = _run(["--serving-root", str(root), "--release-id", "r3",
+                         *world["base"], *extra])
+    assert code == 1 and "계산 달력 파일 항목이 없습니다" in err
     assert not (root / "releases/r3").exists()
 
 
-def test_runtime_contract_checks_the_extra_packages(tmp_path):
+def test_runtime_contract_does_not_require_exchange_calendars(tmp_path):
+    """The serving venv has no exchange_calendars (2026-10-06): the section must not need it."""
     import ms_fixtures
 
-    from modeler.serving.runtime_contract import MARKET_SECTOR_PACKAGES, verify_runtime
+    from modeler.serving.runtime_contract import PACKAGES, verify_runtime
 
-    plain = tmp_path / "plain.json"
-    probe = subprocess.run([sys.executable, "-c", PROBE], capture_output=True, text=True,
-                           check=True)
-    plain.write_text(json.dumps({"schema_version": "daily-briefing-runtime.v1",
-                                 **json.loads(probe.stdout)}))
-    with_calendars = ms_fixtures.runtime_manifest_with_calendars(tmp_path / "ms.json")
+    plain = ms_fixtures.runtime_manifest(tmp_path / "plain.json")
     python = Path(sys.executable)
-    assert verify_runtime(python, plain)["python"]
+    verified = verify_runtime(python, plain)
+    assert set(verified["packages"]) == set(PACKAGES)
+    assert "exchange_calendars" not in verified["packages"]
+    # a manifest still has to pin every model dependency
+    body = json.loads(plain.read_text())
+    del body["packages"]["polars"]
+    short = tmp_path / "short.json"
+    short.write_text(json.dumps(body))
     with pytest.raises(ValueError, match="does not pin"):
-        verify_runtime(python, plain, extra_packages=MARKET_SECTOR_PACKAGES)
-    verified = verify_runtime(python, with_calendars, extra_packages=MARKET_SECTOR_PACKAGES)
-    assert verified["packages"]["exchange_calendars"]
-    # a manifest made for the section still serves a config that has the section off
-    assert verify_runtime(python, with_calendars)
-    body = json.loads(with_calendars.read_text())
-    body["packages"]["exchange_calendars"] = "0.0.1"
+        verify_runtime(python, short)
+    body = json.loads(plain.read_text())
+    body["packages"]["numpy"] = "0.0.1"
     wrong = tmp_path / "wrong.json"
     wrong.write_text(json.dumps(body))
     with pytest.raises(ValueError, match="differ"):
-        verify_runtime(python, wrong, extra_packages=MARKET_SECTOR_PACKAGES)
+        verify_runtime(python, wrong)

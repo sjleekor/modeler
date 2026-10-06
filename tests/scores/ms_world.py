@@ -29,8 +29,12 @@ from modeler.scores.market_sector.bundle import MODEL_NAMES
 from modeler.scores.market_sector.config import MsConfig
 from modeler.scores.market_sector.models import fit_model
 from modeler.scores.market_sector.score_daily import (
+    CALENDAR_RANGE_END,
     bundle_manifest,
+    calendar_file_body,
+    calendar_file_text,
     calendar_spec,
+    xcals_basis,
 )
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -210,7 +214,11 @@ def build_world(
 
 # --------------------------------------------------------------------------- bundle
 def make_bundle(world: World, out_dir: Path, *, null_stability_asset: str | None = None) -> Path:
-    """합성 bundle. 계산 달력 지문은 이 세계의 달력에서 계산한다(동결 구간 = 합성 데이터 구간)."""
+    """합성 bundle. 계산 달력 지문은 이 세계의 달력에서 계산한다(동결 구간 = 합성 데이터 구간).
+
+    계산 달력 파일(``<시장>/calendar.json``)도 만든다: US는 합성 레이크 달력(폐장 16:00 고정)의
+    세션, KR은 ``exchange_calendars`` XKRX. 범위는 둘 다 ``CALENDAR_RANGE_END``(2027-12-31)까지다.
+    """
     cfg = world.cfg
     out_dir.mkdir(parents=True)
     files: dict[str, str] = {}
@@ -251,17 +259,28 @@ def make_bundle(world: World, out_dir: Path, *, null_stability_asset: str | None
             sessions = [s for s in sessions_of("XNYS", START, A) if s >= world.us_sessions[0]]
             cal_man = {"calendar_id": "XNYS", "calendar_basis": f"lake_trading_calendar@{CAL_SNAP}",
                        "first_session": world.us_sessions[0].isoformat()}
+            file_sessions = [s for s in sessions_of("XNYS", START, CALENDAR_RANGE_END)
+                             if s >= world.us_sessions[0]]
+            file_cal = SessionCalendar.from_sessions(
+                "XNYS", file_sessions, calendar_basis=cal_man["calendar_basis"],
+                close_local=[time(16, 0)] * len(file_sessions))
         else:
             sessions = list(world.kr_sessions)
-            from modeler.scores.market_sector.score_daily import xcals_basis
-
             cal_man = {"calendar_id": "XKRX", "calendar_basis": xcals_basis(),
                        "first_session": world.kr_sessions[0].isoformat()}
+            file_cal = SessionCalendar.from_exchange_calendars(
+                "XKRX", world.kr_sessions[0], CALENDAR_RANGE_END)
+            assert file_cal is not None
+        cal_rel = f"{m}/calendar.json"
+        cal_body = calendar_file_body(market, file_cal, range_end=CALENDAR_RANGE_END,
+                                      method="synthetic test calendar", segments=[])
+        (out_dir / cal_rel).write_text(calendar_file_text(cal_body), encoding="utf-8")
+        files[cal_rel] = sha256_file(out_dir / cal_rel)
         markets[market] = {
             "run_id": RUN_IDS[market], **rel, "models": model_rel,
             "modeler_git_commit": "0" * 40,
             "panel": {"version": "synthetic", "manifest_sha256": "0" * 64, "features": "synthetic"},
-            "calendar": calendar_spec(cal_man, sessions),
+            "calendar": calendar_spec(cal_man, sessions, file=cal_rel, body=cal_body),
             "frozen_input_pins": {}, "frozen_latest_session": "2026-09-28",
             "assets": asset_ids,
             "train": {"boundary_label_end_before": "2026-09-28T23:30:00+00:00", "n_train": 1234},

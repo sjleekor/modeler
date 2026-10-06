@@ -63,7 +63,7 @@ synthetic 입력으로 실제 세 bundle을 호출한 `release_nav` E2E입니다
 
 `code_sha256`은 release의 절대경로를 포함하므로 만든 뒤에 release를 옮기거나 복사할 수 없습니다.
 
-`--ms-bundle <디렉터리>`를 주면 시장·섹터 bundle(`score_daily build-bundle`의 결과)을 `bundles/market_sector/`로 복사하고 `release.json`의 `market_sector` 블록에 `bundle.json`의 sha256과 채점 코드(`src/modeler/scores/market_sector/score_daily.py`)를 적습니다. bundle은 파일마다 `bundle.json`의 sha256과 맞는지 보고 복사하고, 목록에 없는 파일이 있어도 멈춥니다. 채점 코드는 release가 어차피 통째로 복사하는 `src/modeler/**`에 들어 있으므로, **검토 목록(`SOURCE_MANIFEST`)에 `modeler/src/modeler/scores/**`의 `.py`가 모두 있어야 합니다**(`bundle.py`·`inputs_pin.py`·`daily_doc.py`·`score_daily.py` 넷이 새 파일입니다). `--ms-bundle`이 없으면 release는 전과 같습니다.
+`--ms-bundle <디렉터리>`를 주면 시장·섹터 bundle(`score_daily build-bundle`의 결과)을 `bundles/market_sector/`로 복사하고 `release.json`의 `market_sector` 블록에 `bundle.json`의 sha256과 채점 코드(`src/modeler/scores/market_sector/score_daily.py`)를 적습니다. bundle은 파일마다 `bundle.json`의 sha256과 맞는지 보고 복사하고, 목록에 없는 파일이 있어도 멈춥니다. 시장마다 계산 달력 파일(`kr/calendar.json`, `us/calendar.json`)이 없거나 형식·지문이 `bundle.json`과 다르면 release 빌드가 멈춥니다. 채점 코드는 release가 어차피 통째로 복사하는 `src/modeler/**`에 들어 있으므로, **검토 목록(`SOURCE_MANIFEST`)에 `modeler/src/modeler/scores/**`의 `.py`가 모두 있어야 합니다**(`bundle.py`·`inputs_pin.py`·`daily_doc.py`·`score_daily.py` 넷이 새 파일입니다). `--ms-bundle`이 없으면 release는 전과 같습니다.
 
 패키지 데이터는 allowlist(`holidays_krx.csv`)만 복사하고 `release.json`의 `data_files`에 경로와 sha를 적습니다. `_release_jobs`는 `data_files`가 있으면 release root 안 상대경로, symlink 아님, 파일 존재, sha256 일치, 경로 중복 없음을 검증합니다. 키가 없는 기존 fixture release는 그대로 통과합니다.
 
@@ -143,7 +143,7 @@ Pages용 `base_path`·`projection_root`·`previous_projection_dir`·`publisher_s
 | `reports_checkout` | 깨끗한 checkout 경로. 예: `/home/whi/apps/market-briefing/reports-checkout`. 작성자는 이 checkout의 git 설정(`stock-reports-bot`)입니다 |
 | `reports_publisher`, `reports_publisher_sha256` | `serving/publisher/publish_reports.py`와 그 sha256 |
 | `reports_top_n` | 모델별로 올릴 상위 개수(1\~500, 기본 100) |
-| `market_sector_kr_root`, `market_sector_us_root` | 시장·섹터 섹션이 읽는 KR·US 데이터 root(`<stock_data>/kr`, `<stock_data>/us`, 읽기만). **둘 다 설정해야 섹션이 켜집니다.** 둘 다 null이면 섹션은 꺼지고 리포트는 "입력 없음"으로 적습니다. 켜면 release에 `market_sector` 블록이 있어야 하고 runtime manifest에 `exchange_calendars`가 있어야 합니다 |
+| `market_sector_kr_root`, `market_sector_us_root` | 시장·섹터 섹션이 읽는 KR·US 데이터 root(`<stock_data>/kr`, `<stock_data>/us`, 읽기만). **둘 다 설정해야 섹션이 켜집니다.** 둘 다 null이면 섹션은 꺼지고 리포트는 "입력 없음"으로 적습니다. 켜면 release에 `market_sector` 블록이 있어야 합니다. runtime manifest에 `exchange_calendars`는 필요 없습니다. 적지도 마십시오. sj2 venv에 없는 패키지를 적으면 runtime 검사가 멈춥니다 |
 
 checkout 옆(같은 부모 디렉터리)에 숨김 파일 둘이 생깁니다. `.reports-checkout.reports-publish.lock`(flock)과 `.reports-checkout.reports-publish-journal.json`(0600, 처리할 단위가 없으면 지움)입니다. journal은 단위별로 `sync_pending`·`push_pending`·`rejected`·`correction_required`와 단위 해시, 커밋 sha를 적습니다. checkout 안에는 아무것도 만들지 않습니다.
 
@@ -250,7 +250,7 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
   --us-lake /home/whi/data/stock_data/us
 ```
 
-시장·섹터를 켜려면 `--ms-bundle <bundle 디렉터리>`와 `--runtime-manifest <exchange_calendars를 적은 manifest>`를 더합니다. KR 데이터 root는 `--ms-kr-root`(기본 `/home/whi/data/stock_data/kr`)입니다. 그러면 `ops.json`에 `market_sector_kr_root`와 `market_sector_us_root`(`<serving root>/stock_data/us`)가 들어갑니다. 예시 manifest는 `runtime-market-sector.example.json`이고, **sj2 venv에서 읽은 값이 아닙니다.**
+시장·섹터를 켜려면 `--ms-bundle <bundle 디렉터리>`를 더합니다. runtime manifest는 지금 것(`runtime-verified-sj2-20260930.json`)을 그대로 씁니다. 계산 달력은 bundle 파일이라 `exchange_calendars`가 필요 없습니다. KR 데이터 root는 `--ms-kr-root`(기본 `/home/whi/data/stock_data/kr`)입니다. 그러면 `ops.json`에 `market_sector_kr_root`와 `market_sector_us_root`(`<serving root>/stock_data/us`)가 들어갑니다.
 
 이 스크립트는 lake를 읽기 전용 링크로만 걸고 `select`·`run`·`monitor`를 실행하지 않습니다. 끝에서 `daily_coordinator._config`, `daily_inputs._release_jobs`, `runtime_contract` 검증과 prepared root 구조 확인을 하고 요약 JSON을 찍습니다.
 
@@ -359,7 +359,7 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
 
 1. bundle의 모든 파일 sha256과 `config_hash`·자산 레지스트리가 현재 코드와 같은지 봅니다.
 2. selection이 가리키는 파일만 엽니다. 열기 전에 sha256과 파일 목록을 다시 확인합니다. 고정한 뒤 파일이 바뀌거나 늘거나 줄면 그 시장을 거부합니다(`input_changed`).
-3. **계산 달력**: KR은 `exchange_calendars` XKRX여야 하고 달력 기준 문자열(`exchange_calendars==4.13.2`)과 동결 구간(2010-01-04\~2026-09-28) 세션 4,121개의 sha256이 bundle과 같아야 합니다. US는 레이크 `trading_calendar`의 동결 구간(2011-01-03\~2026-09-25) 세션 3,956개 sha256을 봅니다. `exchange_calendars`가 없거나 다르면 `calendar_mismatch`로 거부하고, 관측 가격일 달력으로 대신하지 않습니다. 운영 달력(리포트를 만들지, K가 무엇인지)은 지금까지와 같고 이 단계와 무관합니다.
+3. **계산 달력**: `exchange_calendars`나 레이크 `trading_calendar` 대신 **bundle의 달력 파일**(`kr/calendar.json`, `us/calendar.json`)만 씁니다. 달력 기준 문자열(KR `exchange_calendars==4.13.2`, US `lake_trading_calendar@2026-09-22`)과 동결 구간 세션의 sha256이 동결 때와 같은지 매번 확인합니다(KR 2010-01-04\~2026-09-28 4,121개, US 2011-01-03\~2026-09-25 3,956개). 다르면 `calendar_mismatch`, 관측 가격일 달력이면 마찬가지로 거부하고, 대신 쓸 달력은 없습니다. 결정일(리포트 날짜와 기준 상한 중 늦은 쪽) + 20일이 파일 범위(2027-12-31)를 넘으면 `calendar_range_exhausted`로 거부합니다(아래 "계산 달력 파일"). 운영 달력(리포트를 만들지, K가 무엇인지)은 지금까지와 같고 이 단계와 무관합니다.
 4. 가격 경로·라벨은 전체 이력으로 만들고 피쳐는 최근 창(252 + 1 + 64 = 317행)으로 만듭니다. `b_opp_mean`은 전체 라벨 이력의 PIT 평균입니다. 마지막 행의 가격 피쳐가 전체 패널 피쳐와 같은지(1e-9) 매번 확인하고, 다르면 `window_mismatch`로 거부합니다.
 5. 고정 fit 모델 셋(`p_opp_ridge`, `p_stab_logit`, `b_stab_logit_rvol`)으로 채점합니다. LightGBM과 섹터 상대 선택(`p_mkt_*`)은 일일 표에 넣지 않았습니다. 섹터 상대 선택은 MS1 판정이 보류·실패라 값을 매일 보이면 신호로 읽히기 때문입니다.
 
@@ -367,10 +367,26 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
 
 문서의 `status`는 `ok`, `stale`(KR 지수가 기준 세션보다 2세션 이상, 또는 US 가격이 1세션 이상 늦음), `partial`입니다. KR 지수는 T+1 공표라 1세션 늦은 것이 정상입니다. 문서는 입력이 같으면 바이트까지 같습니다(시각을 넣지 않습니다). 지수 종가 수준은 어디에도 넣지 않습니다(Q1). 판정은 렌더러가 읽는 문자열(`verdicts`)과 근거(`verdict_details`)로 나눠 적습니다.
 
+### 계산 달력 파일 (2026-10-06)
+
+sj2 serving venv에는 `exchange_calendars`가 없습니다(2026-10-06 확인: polars 1.44.2, scikit-learn 1.9.1, lightgbm 4.7.0, numpy 2.5.3). 운영 venv에 패키지를 설치하지 않으므로, 계산 달력은 맥에서 미리 계산해 bundle에 파일로 넣습니다. 채점은 이 파일만 읽습니다. `runtime_contract`는 `exchange_calendars`를 요구하지 않습니다.
+
+| | KR | US |
+|---|---|---|
+| 파일 | `kr/calendar.json` | `us/calendar.json` |
+| 기준 | `exchange_calendars==4.13.2` XKRX | `lake_trading_calendar@2026-09-22` |
+| 만든 방법 | 맥 modeler venv의 4.13.2가 계산한 세션·개장·폐장(UTC). 버전이 다르면 `build-bundle`이 멈춥니다 | 동결 패널이 쓴 레이크 snapshot의 세션·폐장. snapshot은 2027-09-22에 끝나므로 그 뒤는 4.13.2로 이어 붙입니다. 이어 붙이기 전에 snapshot과 라이브러리가 겹치는 4,204세션에서 세션·개장·폐장이 같은지 확인하고, 다르면 멈춥니다 |
+| 범위 | 2010-01-04\~2027-12-31(세션 4,432개, 마지막 세션 2027-12-30) | 2011-01-03\~2027-12-31(세션 4,274개) |
+
+- 파일 머리말에 `calendar_basis`, 생성 방법(`method`, `segments`), 범위(`range_start`·`range_end`), 세션 수, 세션 날짜 목록의 sha256(`sessions_sha256`)을 적습니다. 개장·폐장 시각까지 포함한 파일 전체의 sha256은 `bundle.json`의 `files`가 고정하고, release 빌드와 select가 `bundle.json`을 검증할 때 같이 봅니다.
+- 동결 구간 세션의 sha256은 파일을 만들 때와 읽을 때 모두 동결 패널의 세션 목록과 맞춥니다. 2026-06-03·07-17처럼 라이브러리에만 있는 KR 세션도 동결 때처럼 그대로 둡니다.
+- **2027-12-31 뒤로 가려면 bundle을 다시 만들어야 합니다.** 채점은 결정일 + 20일이 `range_end`를 넘으면 그 시장을 `calendar_range_exhausted`로 거부합니다(문서에는 사유와 `CalendarRangeExhaustedError`가 남습니다). 그래서 실제로 멈추는 첫 결정일은 2027-12-12입니다. 2027년 11월까지 `build-bundle`을 다시 돌려 `CALENDAR_RANGE_END`를 늘리고(`score_daily.py`), release를 새로 빌드해 배포하십시오. 다시 만든 파일은 동결 구간 세션이 같아야 하므로 같은 검사를 통과해야 합니다.
+- select는 아직 US 레이크 `trading_calendar`도 고정합니다. 채점은 이 표를 읽지 않으므로, 이 표가 없어서 US가 `unavailable`이 되는 일은 남아 있습니다(고치지 않았습니다).
+
 ### release와 runtime에서 R6가 바꿀 것
 
-- `exchange_calendars`는 `uv.lock`에 4.13.2로 있습니다(collector 의존성). 그러나 `runtime-verified-sj2-20260930.json`의 패키지 목록에는 없고, sj2 venv에 있는지는 서버에 접속하지 않아 확인하지 못했습니다. R6에서 sj2 격리 venv의 `importlib.metadata.version("exchange_calendars")`가 4.13.2인지 보고, 그 값을 적은 runtime manifest를 만들어 `--runtime-manifest`로 줍니다. `runtime_contract.verify_runtime(..., extra_packages=...)`가 섹션이 켜진 config에서는 이 패키지가 manifest에 있고 버전이 맞는지 봅니다. 섹션이 꺼진 config는 지금 manifest 그대로 통과합니다.
-- 검토 목록에 `modeler/src/modeler/scores/**`의 `.py` 전부와 새 manifest를 넣습니다.
-- bundle(동결 run 산출물 약 3.4MB)은 맥에서 `build-bundle`로 만들어 `--ms-bundle`로 넘깁니다. 같은 동결 run에서 만들면 바이트까지 같습니다(세 번 만들어 `bundle.json` sha256이 같았습니다).
+- runtime manifest는 `runtime-verified-sj2-20260930.json`을 그대로 씁니다. `exchange_calendars`를 더하지 않습니다. `runtime-market-sector.example.json`은 지웠습니다.
+- 검토 목록에 `modeler/src/modeler/scores/**`의 `.py` 전부를 넣습니다.
+- bundle(동결 run 산출물과 달력 파일 두 개, 약 4.0MB)은 맥에서 `build-bundle`로 만들어 `--ms-bundle`로 넘깁니다. 같은 동결 run에서 만들면 바이트까지 같습니다(두 번 만들어 `bundle.json` sha256이 `6e274910…`으로 같았습니다. 2026-10-06 맥에서 만든 값은 `6e2749105f172acd01ea485b6efa8cf7dab211e7ad5ff68b10967c4ca12ac88b`입니다).
 - 이 변경은 `us_daily.py`를 바꾸지 않아 US native의 code hash에는 영향이 없습니다.
 
