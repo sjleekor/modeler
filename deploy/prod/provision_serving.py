@@ -16,7 +16,8 @@ purpose; Cronicle runs as the same user and nothing else needs access):
     config/                      ops.json (0640), pins.json, E table, parity evidence,
                                  calendars/ (all 0440)                      (0750)
     publisher/                   publish_reports.py, validate_reports.py    (0750, files 0440)
-    stock_data/us/raw|derived    read-only symlinks to the operational lake
+    stock_data/us/raw|derived    read-only symlinks to the operational lake (also the market-sector
+                                 section's US input, ``market_sector_us_root``)
     stock_data/us/output/        real directory, the only place prepare writes  (0750)
     prepared/kr/                 empty                                     (0750)
     prepared/us                  symlink -> stock_data/us/output/us_scoring_daily_v1/prepared
@@ -155,6 +156,14 @@ class Plan:
         self.uv_lock = _regular(Path(a.uv_lock) if a.uv_lock else self.modeler / "uv.lock", "uv.lock")
         for bundle in (a.kr_bundle, a.us_lightgbm_bundle, a.us_ridge_bundle):
             _directory(Path(bundle), "model bundle")
+        self.ms_bundle = Path(a.ms_bundle) if a.ms_bundle else None
+        self.ms_kr_root = Path(os.path.abspath(a.ms_kr_root))
+        if self.ms_bundle is not None:
+            _directory(self.ms_bundle, "market sector bundle")
+            _regular(self.ms_bundle / "bundle.json", "market sector bundle.json")
+            _directory(self.ms_kr_root / "raw", "KR data root (market sector input)")
+            _need(not self.ms_kr_root.is_symlink(), "KR data root cannot be a symlink")
+            self.checks["market_sector"] = True
         expected = _regular(Path(a.us_expected_source), "US expected source")
         evidence = _regular(Path(a.parity_evidence), "parity evidence")
         _need(sha256_file(expected) == _pin(a.us_expected_sha256, "--us-expected-sha256"),
@@ -247,9 +256,12 @@ def _freeze(release: Path) -> None:
 
 
 def _verify_runtime(plan: Plan, python: Path) -> None:
+    # With the market-sector section the manifest must also pin exchange_calendars.
+    extra = "('exchange_calendars',)" if plan.ms_bundle is not None else "()"
     code = ("import sys; from pathlib import Path; "
             "from modeler.serving.runtime_contract import verify_runtime; "
-            "verify_runtime(Path(sys.argv[1]), Path(sys.argv[2])); print('ok')")
+            f"verify_runtime(Path(sys.argv[1]), Path(sys.argv[2]), extra_packages={extra}); "
+            "print('ok')")
     _run([str(python), "-c", code, str(python), str(plan.runtime_manifest)],
          cwd=plan.modeler, pythonpath=str(plan.modeler / "src"), timeout=120)
 
@@ -279,7 +291,8 @@ ops = Path(sys.argv[1])
 config = coordinator._config(ops)
 jobs, fixture = inputs._release_jobs(Path(config["release_manifest"]))
 assert fixture is False, "release must not be synthetic"
-runtime = verify_runtime(Path(config["python"]), Path(config["runtime_manifest"]))
+runtime = verify_runtime(Path(config["python"]), Path(config["runtime_manifest"]),
+                         extra_packages=coordinator.runtime_extra_packages(config))
 cards = json.loads(Path(config["model_cards_path"]).read_text())
 assert set(cards) == {model for _, model in jobs}, "model cards do not match the release jobs"
 calendars = {}
@@ -328,13 +341,17 @@ def provision(plan: Plan) -> dict[str, Any]:
     python = plan.venv / "bin" / "python"
     _verify_runtime(plan, python)
     # frozen release
-    _run([str(python), "-m", "modeler.serving.release_build",
-          "--modeler-root", str(plan.modeler), "--collector-root", str(plan.collector),
-          "--kr-bundle", a.kr_bundle, "--us-lightgbm-bundle", a.us_lightgbm_bundle,
-          "--us-ridge-bundle", a.us_ridge_bundle, "--model-cards", str(plan.model_cards),
-          "--runtime-manifest", str(plan.runtime_manifest), "--uv-lock", str(plan.uv_lock),
-          "--source-manifest", a.source_manifest, "--output", str(plan.release)],
-         cwd=plan.modeler, pythonpath=f"{plan.modeler / 'src'}:{plan.collector / 'src'}")
+    release_argv = [str(python), "-m", "modeler.serving.release_build",
+                    "--modeler-root", str(plan.modeler), "--collector-root", str(plan.collector),
+                    "--kr-bundle", a.kr_bundle, "--us-lightgbm-bundle", a.us_lightgbm_bundle,
+                    "--us-ridge-bundle", a.us_ridge_bundle, "--model-cards", str(plan.model_cards),
+                    "--runtime-manifest", str(plan.runtime_manifest),
+                    "--uv-lock", str(plan.uv_lock), "--source-manifest", a.source_manifest,
+                    "--output", str(plan.release)]
+    if plan.ms_bundle is not None:
+        release_argv += ["--ms-bundle", str(plan.ms_bundle)]
+    _run(release_argv, cwd=plan.modeler,
+         pythonpath=f"{plan.modeler / 'src'}:{plan.collector / 'src'}")
     release = plan.release.resolve(strict=True)
     # config: pinned inputs, calendars
     expected_sha = _copy_file(Path(a.us_expected_source), plan.expected_target, 0o440)
@@ -380,6 +397,11 @@ def provision(plan: Plan) -> dict[str, Any]:
            "opening_artifact": None, "opening_snapshot_root": None, "opening_output_root": None,
            "opening_max_age_seconds": None,
            "publisher_enabled": False, "external_verification_enabled": False,
+           # Market-sector section: the KR data root and the US lake link, read only.  Both null
+           # (no --ms-bundle) leaves the section off and the unit says its input is missing.
+           "market_sector_kr_root": str(plan.ms_kr_root) if plan.ms_bundle else None,
+           "market_sector_us_root": (str(plan.root / "stock_data" / "us")
+                                     if plan.ms_bundle else None),
            "reports_repository": a.reports_repository, "reports_audience": "owner_only",
            "reports_branch": "main", "reports_remote_url": a.reports_remote_url,
            "reports_checkout": str(plan.reports_checkout),
@@ -421,6 +443,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--reports-repository", default=REPORTS_REPOSITORY)
     p.add_argument("--reports-remote-url", default=REPORTS_REMOTE_URL)
     p.add_argument("--us-lake", default="/home/whi/data/stock_data/us", help="operational lake (read-only link target)")
+    p.add_argument("--ms-bundle", help="market-sector bundle directory (score_daily build-bundle "
+                   "output); without it the section stays off")
+    p.add_argument("--ms-kr-root", default="/home/whi/data/stock_data/kr",
+                   help="KR data root holding raw/raw_postgres (read only; used with --ms-bundle)")
     p.add_argument("--model-cards")
     p.add_argument("--runtime-manifest")
     p.add_argument("--uv-lock")

@@ -20,6 +20,8 @@
   "opening_snapshot_root": null,
   "opening_output_root": null,
   "opening_max_age_seconds": null,
+  "market_sector_kr_root": null,
+  "market_sector_us_root": null,
   "publisher_enabled": false,
   "external_verification_enabled": false,
   "reports_repository": "sjleekor/stock_reports",

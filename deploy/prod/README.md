@@ -63,6 +63,8 @@ synthetic 입력으로 실제 세 bundle을 호출한 `release_nav` E2E입니다
 
 `code_sha256`은 release의 절대경로를 포함하므로 만든 뒤에 release를 옮기거나 복사할 수 없습니다.
 
+`--ms-bundle <디렉터리>`를 주면 시장·섹터 bundle(`score_daily build-bundle`의 결과)을 `bundles/market_sector/`로 복사하고 `release.json`의 `market_sector` 블록에 `bundle.json`의 sha256과 채점 코드(`src/modeler/scores/market_sector/score_daily.py`)를 적습니다. bundle은 파일마다 `bundle.json`의 sha256과 맞는지 보고 복사하고, 목록에 없는 파일이 있어도 멈춥니다. 채점 코드는 release가 어차피 통째로 복사하는 `src/modeler/**`에 들어 있으므로, **검토 목록(`SOURCE_MANIFEST`)에 `modeler/src/modeler/scores/**`의 `.py`가 모두 있어야 합니다**(`bundle.py`·`inputs_pin.py`·`daily_doc.py`·`score_daily.py` 넷이 새 파일입니다). `--ms-bundle`이 없으면 release는 전과 같습니다.
+
 패키지 데이터는 allowlist(`holidays_krx.csv`)만 복사하고 `release.json`의 `data_files`에 경로와 sha를 적습니다. `_release_jobs`는 `data_files`가 있으면 release root 안 상대경로, symlink 아님, 파일 존재, sha256 일치, 경로 중복 없음을 검증합니다. 키가 없는 기존 fixture release는 그대로 통과합니다.
 
 ## `stock_reports` 게시 (reports publisher)
@@ -141,6 +143,7 @@ Pages용 `base_path`·`projection_root`·`previous_projection_dir`·`publisher_s
 | `reports_checkout` | 깨끗한 checkout 경로. 예: `/home/whi/apps/market-briefing/reports-checkout`. 작성자는 이 checkout의 git 설정(`stock-reports-bot`)입니다 |
 | `reports_publisher`, `reports_publisher_sha256` | `serving/publisher/publish_reports.py`와 그 sha256 |
 | `reports_top_n` | 모델별로 올릴 상위 개수(1\~500, 기본 100) |
+| `market_sector_kr_root`, `market_sector_us_root` | 시장·섹터 섹션이 읽는 KR·US 데이터 root(`<stock_data>/kr`, `<stock_data>/us`, 읽기만). **둘 다 설정해야 섹션이 켜집니다.** 둘 다 null이면 섹션은 꺼지고 리포트는 "입력 없음"으로 적습니다. 켜면 release에 `market_sector` 블록이 있어야 하고 runtime manifest에 `exchange_calendars`가 있어야 합니다 |
 
 checkout 옆(같은 부모 디렉터리)에 숨김 파일 둘이 생깁니다. `.reports-checkout.reports-publish.lock`(flock)과 `.reports-checkout.reports-publish-journal.json`(0600, 처리할 단위가 없으면 지움)입니다. journal은 단위별로 `sync_pending`·`push_pending`·`rejected`·`correction_required`와 단위 해시, 커밋 sha를 적습니다. checkout 안에는 아무것도 만들지 않습니다.
 
@@ -247,6 +250,8 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
   --us-lake /home/whi/data/stock_data/us
 ```
 
+시장·섹터를 켜려면 `--ms-bundle <bundle 디렉터리>`와 `--runtime-manifest <exchange_calendars를 적은 manifest>`를 더합니다. KR 데이터 root는 `--ms-kr-root`(기본 `/home/whi/data/stock_data/kr`)입니다. 그러면 `ops.json`에 `market_sector_kr_root`와 `market_sector_us_root`(`<serving root>/stock_data/us`)가 들어갑니다. 예시 manifest는 `runtime-market-sector.example.json`이고, **sj2 venv에서 읽은 값이 아닙니다.**
+
 이 스크립트는 lake를 읽기 전용 링크로만 걸고 `select`·`run`·`monitor`를 실행하지 않습니다. 끝에서 `daily_coordinator._config`, `daily_inputs._release_jobs`, `runtime_contract` 검증과 prepared root 구조 확인을 하고 요약 JSON을 찍습니다.
 
 | 경로 (serving root 아래) | 내용 | 권한 |
@@ -319,3 +324,53 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
 ### US universe revision 불일치
 
 새 US 세션이 없는 날에도 derive-daily가 `prices_daily`를 새로 쓰고 universe incremental은 건너뛰어, 표별 최신 snapshot과 universe completion이 기록한 입력 revision이 달라졌습니다(2026-10-05 A=10-02 실측). `us_daily.prepare`는 이제 universe 입력 네 표(`prices_daily`, `listing_snapshots`, `filings_sub`, `midas_security_daily`)를 universe completion이 기록한 revision으로 고정하고 나머지 표는 최신을 씁니다. `verify_universe_completion`은 그대로입니다(고정한 snapshot의 해시가 바뀌면 계속 멈춥니다). 데이터가 같아 look-ahead는 없고, universe보다 새 prices는 universe를 다시 만들 때까지 못 씁니다. 그 경우 A′가 두 표가 같이 덮는 세션으로 내려갑니다. 근본 수정(collector derive-daily가 새 행이 없으면 새 snapshot을 쓰지 않음)은 collector 몫입니다.
+
+## 시장·섹터 섹션 (R4 · 2026-10-06, 서버에는 아직 반영하지 않음)
+
+시장·섹터는 종목 순위가 아니므로 네 번째 순위 모델로 넣지 않았습니다. `select`가 입력을 고정하고, `run`이 추론과 렌더 사이에서 별도 단계로 채점해 `runs/<D>/market-sector-<D>.json`을 만듭니다. 이 파일을 렌더러(`--market-sector`)와 publisher가 읽습니다. 계획은 `my/milestones/common/20261005_daily_briefing_reports/00_candidate_plan/03_market_sector_daily.md`입니다.
+
+| 일 | 어디서 |
+|---|---|
+| 동결 run을 bundle로 묶습니다(맥, `stock_data` 읽기만) | `python -m modeler.scores.market_sector.score_daily build-bundle --stock-data-root ../stock_data --output <새 디렉터리>` |
+| 입력을 D 09:30 기준으로 고정합니다 | `select` 단계. `selection/<D>/ms-selection.json` |
+| 채점합니다(재학습 없음) | `daily_wrapper run`의 `market_sector` 단계. 별도 프로세스 그룹, timeout 900초. 단독 실행은 `daily_coordinator market-sector` |
+| 동결 run과 점수를 맞춰 봅니다 | `score_daily verify-frozen --stock-data-root ../stock_data --bundle <디렉터리>` |
+
+### 별도 단계로 둔 이유
+
+- `schema.validate_report`는 `rankings`를 요구하고 `EXPECTED_MODEL_IDENTITIES`·`release_build.JOBS`는 모델 셋으로 닫혀 있습니다. 시장·섹터를 네 번째 job으로 넣으면 이 계약 셋을 다 열어야 하고, 시장·섹터가 실패해도 순위 단위의 상태가 흔들립니다.
+- infer와 한 프로세스에 두면 timeout이나 메모리 문제가 세 모델과 같이 갑니다. 별도 프로세스 그룹이면 시장·섹터가 죽어도 순위 단위는 그대로 나옵니다.
+- 시장·섹터는 모델 입력(prepared native)이 아니라 raw snapshot과 US 레이크를 직접 읽습니다. 그래서 select 단계에서 따로 고정합니다.
+- 단계는 `ensure_selection`으로 selection이 없는 날도 처리하고, 실패해도 `failed` 문서를 써서 단위를 막지 않습니다. 이번 실행이 못 만든 날 이전 실행의 문서를 쓰지 않으려고, 단계를 시작할 때 같은 D의 기존 문서를 `market-sector-<D>.superseded-<sha12>.json`으로 옮깁니다.
+
+### select: 입력 고정 (`ms-selection.json`)
+
+규칙은 종목 입력과 같습니다. **D 09:30 KST 이전에 끝난 snapshot만 고르고, 그 뒤에 끝난 것은 그 전의 가장 최근 snapshot으로 대신합니다.** 없으면 그 시장은 `unavailable`입니다.
+
+| 입력 | 끝난 시각 | 기록하는 것 |
+|---|---|---|
+| KR raw snapshot(`krx_index_daily`, `common_feature_observation_raw`) | `_manifests/_SUCCESS.json`의 `finished_at` | snapshot 날짜, `pg_snapshot_id`, export marker sha256, 표마다 table manifest sha256과 parquet 파일 sha256 |
+| US 레이크(`prices_daily`, `corp_actions`, `macro_series`, `trading_calendar`) | snapshot 파일의 가장 늦은 mtime(레이크에 완료 marker가 없습니다) | 표마다 snapshot 날짜, 완료 시각, 파일 sha256. KR 피쳐도 US `macro_series`를 씁니다 |
+| bundle | | `bundle.json` sha256 |
+
+기준 상한은 KR이 직전 KR 세션 K, US가 직전 완료 US 세션입니다. 계산 달력 세션으로 맞추는 일은 채점이 합니다. `selection-state.json`에는 `market_sector: {status, selection, selection_sha256, markets}`가 들어갑니다. `status`는 `selected`(두 시장), `partial`(한 시장), `unavailable`, `failed`(예외, 사유는 예외 클래스 이름만)입니다. 시장·섹터가 실패해도 select의 상태(`selected`·`partial`)는 바뀌지 않습니다.
+
+### 채점: 새 진입점 `score_daily`
+
+1. bundle의 모든 파일 sha256과 `config_hash`·자산 레지스트리가 현재 코드와 같은지 봅니다.
+2. selection이 가리키는 파일만 엽니다. 열기 전에 sha256과 파일 목록을 다시 확인합니다. 고정한 뒤 파일이 바뀌거나 늘거나 줄면 그 시장을 거부합니다(`input_changed`).
+3. **계산 달력**: KR은 `exchange_calendars` XKRX여야 하고 달력 기준 문자열(`exchange_calendars==4.13.2`)과 동결 구간(2010-01-04\~2026-09-28) 세션 4,121개의 sha256이 bundle과 같아야 합니다. US는 레이크 `trading_calendar`의 동결 구간(2011-01-03\~2026-09-25) 세션 3,956개 sha256을 봅니다. `exchange_calendars`가 없거나 다르면 `calendar_mismatch`로 거부하고, 관측 가격일 달력으로 대신하지 않습니다. 운영 달력(리포트를 만들지, K가 무엇인지)은 지금까지와 같고 이 단계와 무관합니다.
+4. 가격 경로·라벨은 전체 이력으로 만들고 피쳐는 최근 창(252 + 1 + 64 = 317행)으로 만듭니다. `b_opp_mean`은 전체 라벨 이력의 PIT 평균입니다. 마지막 행의 가격 피쳐가 전체 패널 피쳐와 같은지(1e-9) 매번 확인하고, 다르면 `window_mismatch`로 거부합니다.
+5. 고정 fit 모델 셋(`p_opp_ridge`, `p_stab_logit`, `b_stab_logit_rvol`)으로 채점합니다. LightGBM과 섹터 상대 선택(`p_mkt_*`)은 일일 표에 넣지 않았습니다. 섹터 상대 선택은 MS1 판정이 보류·실패라 값을 매일 보이면 신호로 읽히기 때문입니다.
+
+한 시장이 실패하면 그 시장만 문서에서 빠지고(`failures`에 사유 코드와 예외 클래스), 문서 상태는 `partial`입니다. 두 시장이 다 실패하면 문서를 쓰지 않고 종료 코드 1이며, coordinator가 `failure` 블록(단계·원인 클래스·사유·timeout)이 있는 실패 문서를 대신 씁니다. 렌더러는 이 사유를 섹션 실패 이유로 적습니다.
+
+문서의 `status`는 `ok`, `stale`(KR 지수가 기준 세션보다 2세션 이상, 또는 US 가격이 1세션 이상 늦음), `partial`입니다. KR 지수는 T+1 공표라 1세션 늦은 것이 정상입니다. 문서는 입력이 같으면 바이트까지 같습니다(시각을 넣지 않습니다). 지수 종가 수준은 어디에도 넣지 않습니다(Q1). 판정은 렌더러가 읽는 문자열(`verdicts`)과 근거(`verdict_details`)로 나눠 적습니다.
+
+### release와 runtime에서 R6가 바꿀 것
+
+- `exchange_calendars`는 `uv.lock`에 4.13.2로 있습니다(collector 의존성). 그러나 `runtime-verified-sj2-20260930.json`의 패키지 목록에는 없고, sj2 venv에 있는지는 서버에 접속하지 않아 확인하지 못했습니다. R6에서 sj2 격리 venv의 `importlib.metadata.version("exchange_calendars")`가 4.13.2인지 보고, 그 값을 적은 runtime manifest를 만들어 `--runtime-manifest`로 줍니다. `runtime_contract.verify_runtime(..., extra_packages=...)`가 섹션이 켜진 config에서는 이 패키지가 manifest에 있고 버전이 맞는지 봅니다. 섹션이 꺼진 config는 지금 manifest 그대로 통과합니다.
+- 검토 목록에 `modeler/src/modeler/scores/**`의 `.py` 전부와 새 manifest를 넣습니다.
+- bundle(동결 run 산출물 약 3.4MB)은 맥에서 `build-bundle`로 만들어 `--ms-bundle`로 넘깁니다. 같은 동결 run에서 만들면 바이트까지 같습니다(세 번 만들어 `bundle.json` sha256이 같았습니다).
+- 이 변경은 `us_daily.py`를 바꾸지 않아 US native의 code hash에는 영향이 없습니다.
+

@@ -10,7 +10,8 @@ from pathlib import Path
 
 from .daily_coordinator import (
     SEOUL, _absolute, _config, _day_dir, _lock, _read,
-    ensure_selection, infer_stage, monitor_stage, publish_stage, render_stage, select_stage,
+    ensure_selection, infer_stage, market_sector_stage, monitor_stage, publish_stage, render_stage,
+    select_stage,
 )
 from .daily_opening import prepare_opening
 
@@ -73,6 +74,14 @@ def main(argv: list[str] | None = None) -> int:
                 elif inference.get("report_ready", inference.get("this_invocation_completed")):
                     # Even zero successful model jobs, a runner timeout or an exception produce a
                     # current-D status unit: infer_stage wrote this invocation's own report.
+                    # The market-sector section is scored apart from the ranking models: its failure
+                    # fails that section only, never the run.
+                    try:
+                        ms_status = market_sector_stage(config, day, now)["status"]
+                    except Exception:
+                        ms_status = "market_sector_failed"
+                    if ms_status != "disabled":  # a release without the section reports as before
+                        states["market_sector"] = ms_status
                     states["render"] = render_stage(config, day)["status"]
                     states["publication"] = publish_stage(config, day)["status"]
                     failed = failed or states["publication"] == "publisher_failed"

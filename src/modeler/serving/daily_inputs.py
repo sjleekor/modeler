@@ -28,6 +28,15 @@ NATIVE_NAMES = {"KR": ("feature_panel.parquet", "prepare_manifest.json"),
                 "US": ("features.parquet", "manifest.json")}
 ENTRYPOINTS = {"KR": "modeler.serving.adapters:infer_kr_daily",
                "US": "modeler.serving.adapters:infer_us_model"}
+# The market-sector section is not a fourth ranking model: it has its own entry point, bundle and
+# selection file (``ms-selection.json``), pinned by the optional ``market_sector`` block of
+# release.json.  ``modeler.scores.market_sector`` is imported only when that block is used, so a
+# release without the section (and the synthetic fixtures of the older tests) never needs it.
+MS_ENTRYPOINT = "modeler.scores.market_sector.score_daily"
+MS_BUNDLE_DIR = "bundles/market_sector"
+MS_BUNDLE_PATH = f"{MS_BUNDLE_DIR}/bundle.json"
+MS_CODE_PATH = "src/modeler/scores/market_sector/score_daily.py"
+MS_SELECTION_NAME = "ms-selection.json"
 
 
 def _hash(path: Path) -> str:
@@ -179,6 +188,40 @@ def _release_jobs(release_path: Path) -> tuple[dict[tuple[str, str], dict[str, A
     return jobs, fixture
 
 
+def _release_market_sector(release_path: Path,
+                           jobs: dict[tuple[str, str], dict[str, Any]] | None = None
+                           ) -> dict[str, Any] | None:
+    """Verify the optional ``market_sector`` block of a frozen release; ``None`` when it has none.
+
+    The bundle (frozen MS1 run: fixed-fit models, OOF reference, calendar fingerprint) is pinned by
+    the SHA-256 of ``bundle.json``, which in turn lists every bundle file.  The scoring code is the
+    same ``src`` inventory the three jobs pin, so ``code_sha256`` must equal theirs and
+    ``score_daily.py`` must be part of it.
+    """
+    release = _load(release_path)
+    block = release.get("market_sector")
+    if block is None:
+        return None
+    from modeler.scores.market_sector.bundle import verify_bundle_dir
+
+    if not isinstance(block, dict) or block.get("entrypoint") != MS_ENTRYPOINT:
+        raise ValueError("release market_sector entrypoint mismatch")
+    if block.get("bundle_path") != MS_BUNDLE_PATH or block.get("code_path") != MS_CODE_PATH:
+        raise ValueError("release market_sector paths are not the expected ones")
+    root = Path(release["release_root"]).resolve(strict=True)
+    bundle_json = _pinned(root / block["bundle_path"], block.get("bundle_sha256"), root)
+    verify_bundle_dir(bundle_json.parent, expected_sha256=block["bundle_sha256"])
+    code = _pinned(root / block["code_path"], block.get("code_path_sha256"), root)
+    if jobs is None:
+        jobs, _ = _release_jobs(release_path)
+    for job in jobs.values():
+        if block.get("code_sha256") != job["code_sha256"] or str(code) not in {
+                item["path"] for item in job["code_files"]}:
+            raise ValueError("market_sector code is not part of the pinned release inventory")
+    return {"bundle_path": str(bundle_json), "bundle_sha256": block["bundle_sha256"],
+            "code_path": str(code), "code_sha256": block["code_sha256"]}
+
+
 def _atomic_new(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = (json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
@@ -210,12 +253,17 @@ def _lock(path: Path):
 def select(*, report_date: date, selected_at: datetime, prepared_root: Path,
            output_root: Path, release_manifest: Path, kr_calendar_path: Path,
            us_calendar_path: Path, us_expected_path: Path,
-           mode: str = "scheduled") -> dict[str, Any]:
+           mode: str = "scheduled",
+           market_sector: dict[str, Path] | None = None) -> dict[str, Any]:
     """Select only producer-complete inputs; never infer E from observed A.
 
     ``mode`` is ``scheduled`` (the 09:30 event, D 09:30 through 10:00) or ``run_fallback`` (the run
     stage selects for itself because no selection exists; any time from D 09:30).  The mode never
     changes which inputs qualify: a producer completion after D 09:30 is excluded in both.
+
+    ``market_sector`` (``{"kr": <KR data root>, "us": <US data root>}``) also pins the market-sector
+    inputs into ``ms-selection.json`` with the same rule.  A failure there never fails the
+    selection: the section alone ends up ``failed`` and the units still run.
     """
     if mode not in SELECTION_MODES:
         raise ValueError("selection mode must be scheduled or run_fallback")
@@ -228,13 +276,14 @@ def select(*, report_date: date, selected_at: datetime, prepared_root: Path,
         return _select_once(report_date=report_date, selected_at=selected_at,
             prepared_root=prepared, output_root=output, release_manifest=release_manifest,
             kr_calendar_path=kr_calendar_path, us_calendar_path=us_calendar_path,
-            us_expected_path=us_expected_path, mode=mode)
+            us_expected_path=us_expected_path, mode=mode, market_sector=market_sector)
 
 
 def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Path,
                  output_root: Path, release_manifest: Path, kr_calendar_path: Path,
                  us_calendar_path: Path, us_expected_path: Path,
-                 mode: str = "scheduled") -> dict[str, Any]:
+                 mode: str = "scheduled",
+                 market_sector: dict[str, Path] | None = None) -> dict[str, Any]:
     target = output_root / report_date.isoformat()
     if target.is_dir():
         state = _load(target / "selection-state.json")
@@ -251,6 +300,10 @@ def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Pat
             for job in state.get("jobs", []):
                 if job.get("market") == market and _hash(Path(job["prepared_manifest"])) != job.get("prepared_manifest_sha256"):
                     raise ValueError("existing selected manifest changed")
+        ms_state = state.get("market_sector")
+        if isinstance(ms_state, dict) and ms_state.get("selection_sha256") is not None and (
+                _hash(target / MS_SELECTION_NAME) != ms_state["selection_sha256"]):
+            raise ValueError("existing D market-sector selection changed")
         return state
     if target.exists() or target.is_symlink():
         raise ValueError("D selection path is not a regular directory")
@@ -384,6 +437,11 @@ def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Pat
                                       "lag_sessions": session_lag(market, freshness.as_dict()),
                                       "freshness_reason": freshness.reason,
                                       "producer_completed_at": candidate["available"].isoformat()}
+    if market_sector is not None:
+        result["market_sector"] = _select_market_sector(
+            stage=stage, target=target, release_manifest=release_manifest, roots=market_sector,
+            report_date=report_date, selected_at=selected_at, mode=mode,
+            limits={"KR": k_day, "US": latest_us}, jobs=release_jobs)
     jobs_path = target / "jobs.json"
     _atomic_new(stage / "jobs.json", {"jobs": result["jobs"]})
     result["jobs_config"] = str(jobs_path)
@@ -396,6 +454,37 @@ def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Pat
         shutil.rmtree(stage, ignore_errors=True)
         raise
     return result
+
+
+def _select_market_sector(*, stage: Path, target: Path, release_manifest: Path,
+                          roots: dict[str, Path], report_date: date, selected_at: datetime,
+                          mode: str, limits: dict[str, date | None],
+                          jobs: dict[tuple[str, str], dict[str, Any]]) -> dict[str, Any]:
+    """Pin the market-sector inputs (D 09:30 rule) into ``ms-selection.json`` inside the stage dir.
+
+    Returns the summary stored in ``selection-state.json``.  Any error becomes ``failed`` with the
+    exception class only; the selection itself continues.
+    """
+    try:
+        from modeler.scores.market_sector import inputs_pin as ms_pin
+
+        pinned = _release_market_sector(release_manifest, jobs)
+        if pinned is None:
+            return {"status": "failed", "reason": "release_without_market_sector"}
+        selection = ms_pin.select_market_sector_inputs(
+            report_date=report_date, selected_at=selected_at, mode=mode,
+            kr_root=roots["kr"], us_root=roots["us"], limits=limits,
+            bundle_path=Path(pinned["bundle_path"]), bundle_sha256=pinned["bundle_sha256"])
+        _atomic_new(stage / MS_SELECTION_NAME, selection)
+        markets = ms_pin.market_status(selection)
+        ready = [m for m, block in markets.items() if block["status"] == "selected"]
+        status = "selected" if len(ready) == 2 else ("partial" if ready else "unavailable")
+        return {"status": status, "selection": str(target / MS_SELECTION_NAME),
+                "selection_sha256": _hash(stage / MS_SELECTION_NAME),
+                "bundle_sha256": pinned["bundle_sha256"], "markets": markets,
+                "reason": None if ready else "inputs_unavailable"}
+    except Exception as exc:  # the section fails alone; the ranking units are unaffected
+        return {"status": "failed", "reason": type(exc).__name__}
 
 
 def main(argv: list[str] | None = None) -> int:
