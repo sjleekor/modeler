@@ -4,7 +4,7 @@
 
 ## 고정 release와 경로
 
-검토한 소스 파일만 별도 release 디렉터리에 복사하고 hash를 고정합니다. 가변 `source/` checkout이나 전체 repository를 runtime에 직접 연결하지 않습니다. Release manifest는 세 모델의 entrypoint, bundle manifest, code inventory와 hash를 묶습니다. frozen release에는 `collector` Python package도 포함해야 합니다. `runtime-verified-sj2-20260930.json`은 sj2 **격리 시험 venv**에서 확인한 Python·패키지 버전입니다. 운영 image가 같은 구성이라는 증거는 아닙니다. `model-cards.json`의 최종 SHA-256은 `f45f4326adcdbeb6e2c8799de3c69b3e9c0c37935d1b76a2d90c5f598d09e385`이며, 운영 config의 `model_cards_path`와 `model_cards_sha256`은 이 파일의 고정 release 사본을 가리켜야 합니다. 카드의 `publication.allowed`는 자체 작성 설명문에만 적용됩니다. report의 `publication` 필드는 지우지 않았지만, private 저장소에 본인만 보는 게시는 이 gate와 별개의 경로입니다(아래 `stock_reports` 절).
+검토한 소스 파일만 별도 release 디렉터리에 복사하고 hash를 고정합니다. 가변 `source/` checkout이나 전체 repository를 runtime에 직접 연결하지 않습니다. Release manifest는 세 모델의 entrypoint, bundle manifest, code inventory와 hash를 묶습니다. frozen release에는 `collector` Python package도 포함해야 합니다. `runtime-verified-sj2-20260930.json`은 sj2 **격리 시험 venv**에서 확인한 Python·패키지 버전입니다. 운영 image가 같은 구성이라는 증거는 아닙니다. 운영은 2026-10-06 밤 sj2 OS를 Ubuntu 26.04.1로 올리면서 serving venv를 uv가 관리하는 CPython 3.14.8로 다시 만들었고(패키지 28개 버전은 그대로), runtime manifest를 `runtime-verified-sj2-20261007-py314.json`(sha256 `d37e5022…`)으로 바꿨습니다. production release는 `r20261005-py314`입니다(코드는 `r20261005`와 같고 `runtime.json`만 다릅니다). serving Python은 `ops.json`의 `python_sha256`으로 고정되므로, apt가 시스템 Python을 올려도 바이너리 sha가 바뀌지 않게 venv는 일부러 uv 관리 Python을 씁니다. `model-cards.json`의 최종 SHA-256은 `f45f4326adcdbeb6e2c8799de3c69b3e9c0c37935d1b76a2d90c5f598d09e385`이며, 운영 config의 `model_cards_path`와 `model_cards_sha256`은 이 파일의 고정 release 사본을 가리켜야 합니다. 카드의 `publication.allowed`는 자체 작성 설명문에만 적용됩니다. report의 `publication` 필드는 지우지 않았지만, private 저장소에 본인만 보는 게시는 이 gate와 별개의 경로입니다(아래 `stock_reports` 절).
 
 Serving data root 아래 `prepared/kr`, `prepared/us`에는 읽기 전용 native 산출물, `prepared/selections`에는 D별 불변 selection, `runs/`에는 report·coordinator state, `private-projections/`에는 내부 렌더 결과를 둡니다. `selection_root`는 `prepared_root` 아래에 있어야 합니다. 모델 프로세스는 collector raw 테이블을 바꾸거나 holdout label을 읽지 않습니다. 학습과 일일 추론은 분리합니다.
 
@@ -252,7 +252,7 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
   --us-lake /home/whi/data/stock_data/us
 ```
 
-시장·섹터를 켜려면 `--ms-bundle <bundle 디렉터리>`를 더합니다. runtime manifest는 지금 것(`runtime-verified-sj2-20260930.json`)을 그대로 씁니다. 계산 달력은 bundle 파일이라 `exchange_calendars`가 필요 없습니다. KR 데이터 root는 `--ms-kr-root`(기본 `/home/whi/data/stock_data/kr`)입니다. 그러면 `ops.json`에 `market_sector_kr_root`와 `market_sector_us_root`(`<serving root>/stock_data/us`)가 들어갑니다. 이름 원천 `security_names_us_root`는 `--ms-bundle` 없이도 `<serving root>/stock_data/us`로 들어가고, `security_names_kr_root`는 `--ms-bundle`이 있을 때만 `--ms-kr-root`로 들어갑니다.
+시장·섹터를 켜려면 `--ms-bundle <bundle 디렉터리>`를 더합니다. runtime manifest는 운영 것(`runtime-verified-sj2-20261007-py314.json`, uv 관리 CPython 3.14.8 · 2026-10-06 밤 OS 업그레이드 이후 · release `r20261005-py314`)을 그대로 씁니다. 계산 달력은 bundle 파일이라 `exchange_calendars`가 필요 없습니다. KR 데이터 root는 `--ms-kr-root`(기본 `/home/whi/data/stock_data/kr`)입니다. 그러면 `ops.json`에 `market_sector_kr_root`와 `market_sector_us_root`(`<serving root>/stock_data/us`)가 들어갑니다. 이름 원천 `security_names_us_root`는 `--ms-bundle` 없이도 `<serving root>/stock_data/us`로 들어가고, `security_names_kr_root`는 `--ms-bundle`이 있을 때만 `--ms-kr-root`로 들어갑니다.
 
 이 스크립트는 lake를 읽기 전용 링크로만 걸고 `select`·`run`·`monitor`를 실행하지 않습니다. 끝에서 `daily_coordinator._config`, `daily_inputs._release_jobs`, `runtime_contract` 검증과 prepared root 구조 확인을 하고 요약 JSON을 찍습니다.
 
@@ -388,7 +388,7 @@ sj2 serving venv에는 `exchange_calendars`가 없습니다(2026-10-06 확인: p
 
 ### release와 runtime에서 R6가 바꿀 것
 
-- runtime manifest는 `runtime-verified-sj2-20260930.json`을 그대로 씁니다. `exchange_calendars`를 더하지 않습니다. `runtime-market-sector.example.json`은 지웠습니다.
+- runtime manifest는 `runtime-verified-sj2-20261007-py314.json`을 그대로 씁니다. `exchange_calendars`를 더하지 않습니다. `runtime-market-sector.example.json`은 지웠습니다.
 - 검토 목록에 `modeler/src/modeler/scores/**`의 `.py` 전부를 넣습니다.
 - bundle(동결 run 산출물과 달력 파일 두 개, 약 4.0MB)은 맥에서 `build-bundle`로 만들어 `--ms-bundle`로 넘깁니다. 같은 동결 run에서 만들면 바이트까지 같습니다(두 번 만들어 `bundle.json` sha256이 `6e274910…`으로 같았습니다. 2026-10-06 맥에서 만든 값은 `6e2749105f172acd01ea485b6efa8cf7dab211e7ad5ff68b10967c4ca12ac88b`입니다).
 - 이 변경은 `us_daily.py`를 바꾸지 않아 US native의 code hash에는 영향이 없습니다.
