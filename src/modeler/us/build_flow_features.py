@@ -20,6 +20,13 @@ manifest에 적는다(``02_lag_constants.md``).
 던져 그 자리에서 멈춘다. U-D8의 "10/11까지 표가 안 굳으면 뺀다"는 판단은
 **사람이 그 시점에 이 튜플에서 F19 행을 지우는 방식**으로 하는 것이지, 코드가
 표 유무를 보고 스스로 빼지 않는다(조용한 실패를 피하려는 이 저장소의 관례).
+
+**유니버스 v2.** 입력 패널(``--source-panel``, 기본 ``us_panel_v2``)의 manifest가 적은
+``universe_version``을 읽어 데이터셋 이름 규칙을 적용한다 — v2 패널이면 이름에 ``_u2``가 있어야
+하고 v1이면 없어야 한다(``dataset.check_dataset_name``). v2 패널로 만들 때는 ``--name``을 직접
+준다. ``--security-boundaries``는 롤링을 종목 구간(``security_id``) 단위로 하는 **켜야만
+동작하는** 모드다 — v2 패널에서만, 이름에 ``_fwd``가 있으면 거부한다(전진 등록 §10의 보조 판정은
+동결 코드 = 꺼짐).
 """
 
 from __future__ import annotations
@@ -33,7 +40,13 @@ import polars as pl
 
 from modeler.etl.config import DataRoot
 from modeler.us.build_features import _missing_rate
-from modeler.us.dataset import git_commit, write_dataset
+from modeler.us.dataset import (
+    assert_dataset_absent,
+    check_dataset_name,
+    git_commit,
+    manifest_universe_version,
+    write_dataset,
+)
 from modeler.us.features.ftd import LAG_FTD_DAYS, add_ftd
 from modeler.us.features.institutional import LAG_13F_DAYS, add_institutional
 from modeler.us.features.order_flow import (
@@ -42,6 +55,7 @@ from modeler.us.features.order_flow import (
     add_order_flow,
 )
 from modeler.us.lake import UsLake
+from modeler.us.panel import universe_manifest
 
 DATASET_NAME = "us_features_flow_v1"
 SOURCE_PANEL_NAME = "us_panel_v2"
@@ -59,20 +73,22 @@ class OutputExistsError(RuntimeError):
     """출력 데이터셋 디렉터리가 이미 있다 — 덮지 않고 멈춘다."""
 
 
-def _read_panel_keys(root: DataRoot) -> pl.DataFrame:
-    """``us_panel_v2``에서 ``(date, symbol)`` 키만 읽는다. 다른 컬럼은 안 가져온다."""
-    panel_dir = root.datasets / SOURCE_PANEL_NAME
+def _read_panel_keys(root: DataRoot, panel_name: str = SOURCE_PANEL_NAME) -> pl.DataFrame:
+    """입력 패널(기본 ``us_panel_v2``)의 ``(date, symbol)`` 키만 읽는다. 다른 컬럼은 안 가져온다."""
+    panel_dir = root.datasets / panel_name
     part = panel_dir / "part.parquet"
     if not part.exists():
         raise FileNotFoundError(
-            f"{SOURCE_PANEL_NAME} 데이터셋이 없습니다: {part}. 먼저 build_panel을 돌려야 합니다."
+            f"{panel_name} 데이터셋이 없습니다: {part}. 먼저 build_panel을 돌려야 합니다."
         )
     keys = pl.read_parquet(part, columns=["date", "symbol"]).unique().sort(["date", "symbol"])
     return keys
 
 
-def _source_panel_manifest(root: DataRoot) -> dict[str, object]:
-    manifest_path = root.datasets / SOURCE_PANEL_NAME / "manifest.json"
+def _source_panel_manifest(
+    root: DataRoot, panel_name: str = SOURCE_PANEL_NAME
+) -> dict[str, object]:
+    manifest_path = root.datasets / panel_name / "manifest.json"
     return json.loads(manifest_path.read_text())
 
 
@@ -91,7 +107,19 @@ def _lag_constants_manifest() -> dict[str, object]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--name", default=DATASET_NAME, help=f"데이터셋 이름 (기본: {DATASET_NAME})"
+        "--name",
+        default=None,
+        help=f"데이터셋 이름 (v1 패널 기본: {DATASET_NAME}. v2 패널은 _u2가 든 이름을 직접 준다)",
+    )
+    parser.add_argument(
+        "--source-panel",
+        default=SOURCE_PANEL_NAME,
+        help=f"입력 패널 데이터셋 이름 (기본: {SOURCE_PANEL_NAME})",
+    )
+    parser.add_argument(
+        "--security-boundaries",
+        action="store_true",
+        help="롤링을 종목 구간(security_id) 단위로 한다. v2 패널에서만, _fwd 이름 불가.",
     )
     parser.add_argument(
         "--allow-dirty",
@@ -102,7 +130,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = DataRoot.resolve(market="us")
-    dataset_dir = root.datasets / args.name
+    source_manifest = _source_panel_manifest(root, args.source_panel)
+    universe_version = manifest_universe_version(source_manifest)
+    name = args.name or (DATASET_NAME if universe_version == "v1" else None)
+    if name is None:
+        parser.error("v2 패널로 만들 때는 --name(_u2가 든 이름)이 필요합니다.")
+    check_dataset_name(
+        name, universe_version=universe_version, security_boundaries=args.security_boundaries
+    )
+    dataset_dir = root.datasets / name
     if dataset_dir.exists():
         print(
             f"{dataset_dir} 가 이미 있습니다 — 덮지 않고 멈춥니다. "
@@ -110,9 +146,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    assert_dataset_absent(root, name)
 
     lake = UsLake.resolve()
-    panel_keys = _read_panel_keys(root)
+    feature_lake = lake.with_security_boundaries() if args.security_boundaries else lake
+    panel_keys = _read_panel_keys(root, args.source_panel)
     panel_columns = list(panel_keys.columns)
 
     features = panel_keys
@@ -120,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     feature_columns: list[str] = []
     for family_name, add_family in FAMILY_ORDER:
         before = set(features.columns)
-        features = add_family(features, lake)
+        features = add_family(features, feature_lake)
         added = [c for c in features.columns if c not in before]
         family_order.append({"family": family_name, "columns_added": added})
         feature_columns.extend(added)
@@ -134,8 +172,9 @@ def main(argv: list[str] | None = None) -> int:
         "input_table_snapshots": lake.snapshot_manifest(),
         "modeler_git_commit": git_commit(modeler_repo, allow_dirty=args.allow_dirty),
         "collector_git_commit": git_commit(collector_repo, allow_dirty=args.allow_dirty),
-        "source_panel": SOURCE_PANEL_NAME,
-        "source_panel_manifest": _source_panel_manifest(root),
+        "source_panel": args.source_panel,
+        "source_panel_manifest": source_manifest,
+        **universe_manifest(lake, universe_version, security_boundaries=args.security_boundaries),
         "panel_columns": panel_columns,
         "panel_start": str(features["date"].min()),
         "panel_end": str(features["date"].max()),
@@ -145,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         "feature_columns_total": len(feature_columns),
         "feature_missing_rate": missing_rate,
     }
-    written_dir = write_dataset(features, root, args.name, manifest=manifest)
+    written_dir = write_dataset(features, root, name, manifest=manifest)
     print(f"{written_dir}  {features.height:,}행 · {features.width}열")
     return 0
 

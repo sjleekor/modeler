@@ -31,6 +31,7 @@ from modeler.us.features._daily import (
     panel_symbols,
 )
 from modeler.us.lake import UsLake
+from modeler.us.segments import group_key
 
 _FEATURES = ("mom_12_1", "mom_6_1", "mom_1m")
 
@@ -38,17 +39,18 @@ _FEATURES = ("mom_12_1", "mom_6_1", "mom_1m")
 def add_momentum(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
     """``panel``의 ``(date, symbol)``에 F1 모멘텀 피쳐 + ``_isna``를 붙인다."""
     daily = daily_prices(lake, symbols=panel_symbols(panel))
+    by = group_key(lake)
     close = pl.col("adj_close")
     date_col = pl.col("date")
-    close_t21 = close.shift(21).over("symbol")
+    close_t21 = close.shift(21).over(by)
 
-    mom_12_1 = close_t21 / close.shift(252).over("symbol") - 1.0
-    mom_6_1 = close_t21 / close.shift(126).over("symbol") - 1.0
+    mom_12_1 = close_t21 / close.shift(252).over(by) - 1.0
+    mom_6_1 = close_t21 / close.shift(126).over(by) - 1.0
     mom_1m = close / close_t21 - 1.0
 
     features = daily.with_columns(
-        mask_ticker_reuse_gap(mom_12_1, date_col, 252).alias("mom_12_1"),
-        mask_ticker_reuse_gap(mom_6_1, date_col, 126).alias("mom_6_1"),
-        mask_ticker_reuse_gap(mom_1m, date_col, 21).alias("mom_1m"),
+        mask_ticker_reuse_gap(mom_12_1, date_col, 252, by=by).alias("mom_12_1"),
+        mask_ticker_reuse_gap(mom_6_1, date_col, 126, by=by).alias("mom_6_1"),
+        mask_ticker_reuse_gap(mom_1m, date_col, 21, by=by).alias("mom_1m"),
     )
     return join_features(panel, features, _FEATURES)

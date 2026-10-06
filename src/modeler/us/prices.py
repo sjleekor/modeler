@@ -26,6 +26,7 @@ from datetime import date, timedelta
 import polars as pl
 
 from modeler.us.lake import UsLake
+from modeler.us.segments import SECURITY_ID, attach_security_id
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +150,7 @@ def split_factors(
     *,
     base_date: date | None = None,
     diagnostics: dict[str, int] | None = None,
+    security_boundaries: bool | None = None,
 ) -> pl.LazyFrame:
     """(symbol, date) -> 누적 분할 계수.
 
@@ -169,7 +171,14 @@ def split_factors(
     (``_validate_splits_against_price``). 검증 결과 세 부류(``confirmed``·
     ``rejected_price_mismatch``·``unverifiable``)와 무조건 버린 수(``invalid_factor``)를
     로그로 남기고, ``diagnostics``(dict)를 주면 그 안에도 채운다.
+
+    **``security_boundaries``(안 주면 ``lake.security_boundaries``)가 켜져 있으면** 분할을 그
+    ``ex_date``가 속한 종목 구간(``security_id``)에 붙이고 누적곱도 구간 안에서만 쓴다 — 뒤 구간의
+    분할이 앞 구간 가격에 곱해지지 않는다. 그때 결과에 ``security_id`` 열이 더해진다. 꺼짐이면
+    지금과 같다(``symbol`` 단위). 가격 검증(``_validate_splits_against_price``)은 두 모드에서 같다.
     """
+    if security_boundaries is None:
+        security_boundaries = lake.security_boundaries
     if base_date is None:
         base_date = _base_date_default(lake)
 
@@ -216,6 +225,17 @@ def split_factors(
     # symbol별로 ex_date를 **내림차순**으로 두고 누적곱하면, 각 행에는 "자신과
     # 자신보다 늦은 모든 분할"의 곱이 쌓인다 — 그게 바로 그 ex_date 이전 가격에
     # 필요한 계수다 (t < ex_date_i <= ... <= T인 모든 분할이 적용되는 구간).
+    if security_boundaries:
+        # 구간 단위: ex_date가 속한 구간에 분할을 붙이고, 그 구간 안에서만 누적곱한다.
+        keyed = attach_security_id(survivors, lake, date_col="ex_date")
+        return (
+            keyed.sort([SECURITY_ID, "ex_date"], descending=[False, True])
+            .with_columns(pl.col("_own_factor").cum_prod().over(SECURITY_ID).alias("split_factor"))
+            .select(["symbol", SECURITY_ID, "ex_date", "split_factor"])
+            .rename({"ex_date": "date"})
+            .sort([SECURITY_ID, "date"])
+        )
+
     cumulative = (
         survivors.sort(["symbol", "ex_date"], descending=[False, True])
         .with_columns(pl.col("_own_factor").cum_prod().over("symbol").alias("split_factor"))
@@ -226,7 +246,12 @@ def split_factors(
     return cumulative
 
 
-def adjusted_daily(lake: UsLake, *, base_date: date | None = None) -> pl.LazyFrame:
+def adjusted_daily(
+    lake: UsLake,
+    *,
+    base_date: date | None = None,
+    security_boundaries: bool | None = None,
+) -> pl.LazyFrame:
     """일별 조정 가격.
 
     반환 컬럼: ``date, symbol, close(원시), adj_open, adj_high, adj_low,
@@ -236,7 +261,15 @@ def adjusted_daily(lake: UsLake, *, base_date: date | None = None) -> pl.LazyFra
     adj_volume, adj_dollar_volume``)은 아니지만 같은 계수를 곱하는 것뿐이라
     비용이 없고, M2가 고가·저가 기반 피쳐(예: 변동성)를 만들 때 다시 만들지
     않아도 되게 같이 낸다.
+
+    ``security_boundaries``를 안 주면 ``lake.security_boundaries``를 따른다(기본 꺼짐).
+    켜지면 분할 조정이 종목 구간 안에서만 이뤄지고(``split_factors`` 참고) 결과에
+    ``security_id`` 열이 더해진다. 구간마다 그 구간 끝(T)을 기준으로 정규화되므로 **서로 다른
+    구간의 조정가는 비교하지 않는다.** 패널(``panel.build_panel``)은 ``False``를 넘겨 지금
+    조정을 그대로 쓴다 — 패널 열은 v1과 같아야 한다.
     """
+    if security_boundaries is None:
+        security_boundaries = lake.security_boundaries
     if base_date is None:
         base_date = _base_date_default(lake)
 
@@ -254,18 +287,25 @@ def adjusted_daily(lake: UsLake, *, base_date: date | None = None) -> pl.LazyFra
     # ">="로 바꾸려고 경계를 하루 당긴다: ex_date - 1일 >= t  <=>  ex_date > t.
     # 둘 다 날짜(하루 단위) 컬럼이라 이 변환이 정확하다 — 경계 검산은
     # tests/unit/us/test_prices.py에 있다.
+    if security_boundaries:
+        by = SECURITY_ID
+        factors = split_factors(lake, base_date=base_date, security_boundaries=True)
+        prices = attach_security_id(prices, lake)
+    else:
+        by = "symbol"
+        factors = split_factors(lake, base_date=base_date, security_boundaries=False)
+
     breakpoints = (
-        split_factors(lake, base_date=base_date)
-        .with_columns((pl.col("date") - timedelta(days=1)).alias("_boundary"))
-        .select(["symbol", "_boundary", "split_factor"])
-        .sort(["symbol", "_boundary"])
+        factors.with_columns((pl.col("date") - timedelta(days=1)).alias("_boundary"))
+        .select([by, "_boundary", "split_factor"])
+        .sort([by, "_boundary"])
     )
 
-    joined = prices.sort(["symbol", "date"]).join_asof(
+    joined = prices.sort([by, "date"]).join_asof(
         breakpoints,
         left_on="date",
         right_on="_boundary",
-        by="symbol",
+        by=by,
         strategy="forward",
     )
     # 매칭되는 미래 분할이 없으면(마지막 분할 이후, 또는 분할이 아예 없는 종목)
@@ -285,6 +325,7 @@ def adjusted_daily(lake: UsLake, *, base_date: date | None = None) -> pl.LazyFra
     return adjusted.select(
         "date",
         "symbol",
+        *([SECURITY_ID] if security_boundaries else []),
         "close",
         "adj_open",
         "adj_high",

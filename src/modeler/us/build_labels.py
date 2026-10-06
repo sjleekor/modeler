@@ -14,6 +14,11 @@ manifest의 ``modeler_git_commit``이 가리키는 코드로 이 명령을 돌�
 h21의 ``content_hash``가 이 파라미터화 전과 같아야 재현이 깨지지 않은
 것이다. 다른 horizon은 ``us_labels_h{N}_v1``로 이름이 갈린다.
 
+**유니버스 v2** (``--universe-version v2`` 또는 ``--panel-name``으로 받은 패널의 manifest). v2
+데이터셋 이름에는 ``_u2``가 있어야 하고 v1에는 없어야 한다. ``--security-boundaries``는 라벨을
+종목 구간 안에서만 계산하고 지평이 구간 끝을 넘는 행은 뺀다 — v2 패널에서만, ``_fwd`` 이름 불가
+(``build_features.py`` docstring 참고). 같은 이름이 이미 있으면 쓰기를 거부한다.
+
 **SPY 벤치마크 비교는 h21에서만 낸다.** ``benchmark.spy_monthly_return``이
 ``labels.HORIZON_TRADING_DAYS``(h21)를 그대로 쓰기 때문에(SPY 쪽은 이번
 파라미터화 대상이 아니다 — ``05`` M3 검정 범위 밖), h5·h63 라벨과 그대로
@@ -28,10 +33,19 @@ from pathlib import Path
 
 from modeler.etl.config import DataRoot
 from modeler.us.benchmark import ew_minus_spy_monthly, spy_total_return_daily
+from modeler.us.build_panel import universe_filter
 from modeler.us.cost import DEFAULT_K, DEFAULT_Q_DOLLAR, cost_grid, daily_volatility
-from modeler.us.dataset import git_commit, write_dataset
+from modeler.us.dataset import (
+    assert_dataset_absent,
+    check_dataset_name,
+    git_commit,
+    manifest_universe_version,
+    read_panel_dataset,
+    write_dataset,
+)
 from modeler.us.labels import HORIZON_TRADING_DAYS, build_labels
 from modeler.us.lake import UsLake
+from modeler.us.panel import UNIVERSE_VERSIONS, build_panel, universe_manifest
 
 DATASET_NAME = "us_labels_v1"
 
@@ -55,7 +69,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--name",
         default=None,
-        help="데이터셋 이름 (기본: h21이면 us_labels_v1, 아니면 us_labels_h{horizon}_v1)",
+        help="데이터셋 이름 (v1 기본: h21이면 us_labels_v1, 아니면 us_labels_h{horizon}_v1. "
+        "v2는 _u2가 든 이름을 직접 준다)",
+    )
+    parser.add_argument(
+        "--universe-version",
+        choices=UNIVERSE_VERSIONS,
+        default=None,
+        help="유니버스 버전 (기본: v1). --panel-name을 주면 그 패널 manifest 값을 따른다.",
+    )
+    parser.add_argument(
+        "--panel-name",
+        default=None,
+        help="저장된 패널 데이터셋을 입력으로 쓴다(없으면 패널을 새로 만든다).",
+    )
+    parser.add_argument(
+        "--security-boundaries",
+        action="store_true",
+        help="라벨을 종목 구간(security_id) 안에서만 계산한다. v2 패널에서만, _fwd 이름 불가.",
     )
     parser.add_argument(
         "--allow-dirty",
@@ -64,12 +95,38 @@ def main(argv: list[str] | None = None) -> int:
         "manifest 의 커밋으로 다시 만들 수 없게 된다.",
     )
     args = parser.parse_args(argv)
-    dataset_name = args.name or _dataset_name(args.horizon)
 
+    root = DataRoot.resolve(market="us")
     lake = UsLake.resolve()
-    labels, diagnostics = build_labels(lake, horizon=args.horizon)
+    if args.panel_name:
+        panel, panel_manifest = read_panel_dataset(root, args.panel_name)
+        universe_version = manifest_universe_version(panel_manifest)
+        if args.universe_version not in (None, universe_version):
+            parser.error(
+                f"--universe-version {args.universe_version}이 패널 manifest의 "
+                f"{universe_version}과 다릅니다."
+            )
+    else:
+        panel_manifest = None
+        universe_version = args.universe_version or "v1"
+    dataset_name = args.name or (
+        _dataset_name(args.horizon) if universe_version == "v1" else None
+    )
+    if dataset_name is None:
+        parser.error("유니버스 v2는 --name(_u2가 든 이름)이 필요합니다.")
+    check_dataset_name(
+        dataset_name,
+        universe_version=universe_version,
+        security_boundaries=args.security_boundaries,
+    )
+    assert_dataset_absent(root, dataset_name)
+    if not args.panel_name:
+        panel = build_panel(lake, universe_version=universe_version)
 
-    sigma = daily_volatility(lake).select("date", "symbol", "sigma_daily").collect()
+    label_lake = lake.with_security_boundaries() if args.security_boundaries else lake
+    labels, diagnostics = build_labels(label_lake, panel=panel, horizon=args.horizon)
+
+    sigma = daily_volatility(label_lake).select("date", "symbol", "sigma_daily").collect()
     with_sigma = labels.join(sigma, on=["date", "symbol"], how="left")
     grid = cost_grid(with_sigma)
 
@@ -80,6 +137,10 @@ def main(argv: list[str] | None = None) -> int:
         "input_table_snapshots": lake.snapshot_manifest(),
         "modeler_git_commit": git_commit(modeler_repo, allow_dirty=args.allow_dirty),
         "collector_git_commit": git_commit(collector_repo, allow_dirty=args.allow_dirty),
+        "universe_filter": universe_filter(universe_version),
+        **universe_manifest(lake, universe_version, security_boundaries=args.security_boundaries),
+        "source_panel": args.panel_name,
+        "source_panel_content_hash": panel_manifest["content_hash"] if panel_manifest else None,
         "horizon_trading_days": args.horizon,
         "labels_start": str(labels["date"].min()) if labels.height else None,
         "labels_end": str(labels["date"].max()) if labels.height else None,
@@ -111,9 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             "(build_features.py 작업 보고 참고, 05 M3 범위 밖)."
         )
 
-    dataset_dir = write_dataset(
-        labels, DataRoot.resolve(market="us"), dataset_name, manifest=manifest
-    )
+    dataset_dir = write_dataset(labels, root, dataset_name, manifest=manifest)
     print(f"{dataset_dir}  {labels.height:,}행")
     return 0
 

@@ -33,6 +33,7 @@ from modeler.us.features._daily import (
     panel_symbols,
 )
 from modeler.us.lake import UsLake
+from modeler.us.segments import group_key
 
 _FEATURES = ("log_dvol_20", "amihud_20", "turnover_rank", "mcap_rank")
 
@@ -44,6 +45,7 @@ def add_liquidity(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
     산출물이면 있다).
     """
     daily = daily_prices(lake, symbols=panel_symbols(panel))
+    by = group_key(lake)
     date_col = pl.col("date")
     dvol = pl.col("adj_dollar_volume")
     illiq_daily = pl.when(dvol > 0).then(pl.col("ret").abs() / dvol).otherwise(None)
@@ -51,8 +53,8 @@ def add_liquidity(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
 
     price_features = (
         daily.with_columns(
-            positive_dvol.rolling_mean(window_size=20).over("symbol").alias("_dvol_mean_20"),
-            illiq_daily.rolling_mean(window_size=20).over("symbol").alias("_amihud_20"),
+            positive_dvol.rolling_mean(window_size=20).over(by).alias("_dvol_mean_20"),
+            illiq_daily.rolling_mean(window_size=20).over(by).alias("_amihud_20"),
         )
         .with_columns(
             pl.when(pl.col("_dvol_mean_20") > 0)
@@ -61,8 +63,8 @@ def add_liquidity(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
             .alias("_log_dvol_20")
         )
         .with_columns(
-            mask_ticker_reuse_gap(pl.col("_log_dvol_20"), date_col, 19).alias("log_dvol_20"),
-            mask_ticker_reuse_gap(pl.col("_amihud_20"), date_col, 19).alias("amihud_20"),
+            mask_ticker_reuse_gap(pl.col("_log_dvol_20"), date_col, 19, by=by).alias("log_dvol_20"),
+            mask_ticker_reuse_gap(pl.col("_amihud_20"), date_col, 19, by=by).alias("amihud_20"),
         )
         .select("date", "symbol", "log_dvol_20", "amihud_20")
     )

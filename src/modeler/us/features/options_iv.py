@@ -49,6 +49,7 @@ import polars as pl
 
 from modeler.us.features._daily import daily_prices, mask_ticker_reuse_gap, panel_symbols
 from modeler.us.lake import UsLake
+from modeler.us.segments import group_key
 
 _TRADING_DAYS_PER_YEAR = 252
 #: 04에 없는 이 모듈만의 판단이다 — 위 docstring의 실측(p99=7일, 최대 2,125일) 근거.
@@ -94,12 +95,13 @@ def add_options_iv(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
         tolerance=_TOLERANCE,
     )
 
-    hv_20_raw = pl.col("ret").rolling_std(window_size=20).over("symbol") * math.sqrt(
+    by = group_key(lake)
+    hv_20_raw = pl.col("ret").rolling_std(window_size=20).over(by) * math.sqrt(
         _TRADING_DAYS_PER_YEAR
     )
     hv_20 = (
         daily_prices(lake, symbols=symbols)
-        .with_columns(mask_ticker_reuse_gap(hv_20_raw, pl.col("date"), 19).alias("hv_20"))
+        .with_columns(mask_ticker_reuse_gap(hv_20_raw, pl.col("date"), 19, by=by).alias("hv_20"))
         .select("date", "symbol", "hv_20")
     )
 

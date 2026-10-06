@@ -31,6 +31,7 @@ from modeler.us.features._daily import (
     panel_symbols,
 )
 from modeler.us.lake import UsLake
+from modeler.us.segments import group_key
 
 _FEATURES = ("rev_1w", "max_ret_1m")
 
@@ -38,13 +39,14 @@ _FEATURES = ("rev_1w", "max_ret_1m")
 def add_reversal(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
     """``panel``의 ``(date, symbol)``에 F2 단기 반전 피쳐 + ``_isna``를 붙인다."""
     daily = daily_prices(lake, symbols=panel_symbols(panel))
+    by = group_key(lake)
     date_col = pl.col("date")
 
-    rev_1w = pl.col("adj_close") / pl.col("adj_close").shift(5).over("symbol") - 1.0
-    max_ret_1m = pl.col("ret").rolling_max(window_size=21).over("symbol")
+    rev_1w = pl.col("adj_close") / pl.col("adj_close").shift(5).over(by) - 1.0
+    max_ret_1m = pl.col("ret").rolling_max(window_size=21).over(by)
 
     features = daily.with_columns(
-        mask_ticker_reuse_gap(rev_1w, date_col, 5).alias("rev_1w"),
-        mask_ticker_reuse_gap(max_ret_1m, date_col, 20).alias("max_ret_1m"),
+        mask_ticker_reuse_gap(rev_1w, date_col, 5, by=by).alias("rev_1w"),
+        mask_ticker_reuse_gap(max_ret_1m, date_col, 20, by=by).alias("max_ret_1m"),
     )
     return join_features(panel, features, _FEATURES)

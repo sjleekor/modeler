@@ -13,6 +13,11 @@ date)`` 오름차순으로 정렬한 뒤 ``.shift(n).over("symbol")``로 얻는 
 거래된 날짜에서만 SPY와 짝을 지어 회귀하게 된다. ``04``도 두 방식 중 어느 것을
 쓰라고 못박지 않았다.
 
+**종목 구간 모드.** ``lake.security_boundaries``가 켜지면(유니버스 v2 설계 §3) 위 "종목별"이
+``symbol``이 아니라 ``security_id``(``segments.py``)다 — 롤링·``shift``·``ret``이 구간을 넘어
+앞 구간 행을 읽지 않는다. 묶음 열 이름은 ``segments.group_key(lake)``가 준다. 꺼짐이면
+(기본) 코드 경로가 이전과 같다.
+
 각 피쳐 모듈은 ``daily_prices()``로 조정 가격 + 당일 단순수익률을 얻고, 필요하면
 ``spy_daily_returns()``로 SPY 수익률을 날짜로 붙인 뒤, 롤링 피쳐를 계산해
 ``join_features()``로 패널에 붙인다.
@@ -27,6 +32,7 @@ import polars as pl
 
 from modeler.us.lake import UsLake
 from modeler.us.prices import adjusted_daily
+from modeler.us.segments import group_key
 
 #: SPY를 시장 수익률 대용으로 쓴다 — ``01_data_readiness.md`` §6 (``SP500``
 #: 거시 계열은 vintage가 없어 쓰지 않는다).
@@ -60,7 +66,8 @@ def daily_prices(lake: UsLake, *, symbols: Sequence[str] | None = None) -> pl.La
     반환 컬럼: ``date, symbol, adj_open, adj_high, adj_low, adj_close, adj_volume,
     adj_dollar_volume, ret``. ``ret``은 ``adj_close``의 전일 대비 단순수익률이다 —
     조정 가격을 쓰므로 분할 낀 날에도 점프가 없다(``prices.py`` 경계 검산 참고).
-    각 종목의 첫 행은 전일이 없어 ``ret``이 null이다.
+    각 종목의 첫 행은 전일이 없어 ``ret``이 null이다. 종목 구간 모드(``lake.security_boundaries``)
+    에서는 ``security_id`` 열이 더해지고, ``ret``·정렬이 구간 단위라 **구간의 첫 행**이 null이다.
 
     ``symbols``를 주면 그 종목만 남긴다 — 패널에 없는 종목의 29M행 전체를 스캔할
     필요가 없다. ``None``이면 전체 종목이다.
@@ -68,9 +75,10 @@ def daily_prices(lake: UsLake, *, symbols: Sequence[str] | None = None) -> pl.La
     prices = adjusted_daily(lake)
     if symbols is not None:
         prices = prices.filter(pl.col("symbol").is_in(list(symbols)))
-    prices = prices.sort(["symbol", "date"])
+    by = group_key(lake)
+    prices = prices.sort([by, "date"])
     return prices.with_columns(
-        (pl.col("adj_close") / pl.col("adj_close").shift(1).over("symbol") - 1.0).alias("ret")
+        (pl.col("adj_close") / pl.col("adj_close").shift(1).over(by) - 1.0).alias("ret")
     )
 
 
@@ -103,7 +111,9 @@ def with_market_return(daily: pl.LazyFrame, lake: UsLake) -> pl.LazyFrame:
     )
 
 
-def mask_ticker_reuse_gap(value: pl.Expr, date_col: pl.Expr, n_trading_days: int) -> pl.Expr:
+def mask_ticker_reuse_gap(
+    value: pl.Expr, date_col: pl.Expr, n_trading_days: int, *, by: str = "symbol"
+) -> pl.Expr:
     """``n_trading_days``개 행 전을 참조하는 계산에서, 그 구간의 달력일 폭이
     비정상적으로 크면(같은 티커가 몇 년 뒤 다른 회사에 재사용된 경우) ``value``를
     null로 무효화한다.
@@ -121,8 +131,11 @@ def mask_ticker_reuse_gap(value: pl.Expr, date_col: pl.Expr, n_trading_days: int
     넘으면 무효화한다. warm-up으로 ``shift``가 애초에 null이면(``date_col`` 뺄셈도
     null) 비교가 null이 되어 ``when``이 ``otherwise``(=None)로 빠진다 — 원래도
     null이었을 값이라 동작이 바뀌지 않는다.
+
+    ``by``는 ``shift``를 묶는 열이다 — 종목 구간 모드에서는 ``"security_id"``를 넘긴다
+    (``segments.group_key``). 기본은 지금과 같은 ``"symbol"``.
     """
-    shifted_date = date_col.shift(n_trading_days).over("symbol")
+    shifted_date = date_col.shift(n_trading_days).over(by)
     gap_days = (date_col - shifted_date).dt.total_days()
     return pl.when(gap_days <= _max_calendar_days(n_trading_days)).then(value).otherwise(None)
 

@@ -16,6 +16,7 @@ import polars as pl
 
 from modeler.us.lake import UsLake
 from modeler.us.prices import adjusted_daily
+from modeler.us.segments import group_key
 
 #: 스프레드 하한 (비율). 2bp.
 MIN_SPREAD = 0.0002
@@ -64,15 +65,21 @@ def daily_volatility(lake: UsLake, *, window: int = 20) -> pl.LazyFrame:
     ``volatility_daily``(옵션 IV·HV)는 커버리지가 약 1,600종목뿐이라
     (``01_data_readiness.md`` §2) 비용 모델 전체 유니버스의 분모로 못 쓴다 —
     조정 종가에서 직접 실현 변동성을 구한다. 첫 ``window`` 거래일은 결측이다.
+    ``lake.security_boundaries``가 켜지면 종목 구간(``security_id``) 안에서만 굴린다.
     """
-    prices = adjusted_daily(lake).select("date", "symbol", "adj_close").sort(["symbol", "date"])
+    by = group_key(lake)
+    prices = (
+        adjusted_daily(lake)
+        .select("date", *dict.fromkeys(["symbol", by]), "adj_close")
+        .sort([by, "date"])
+    )
     returns = prices.with_columns(
-        (pl.col("adj_close") / pl.col("adj_close").shift(1).over("symbol") - 1).alias("_ret")
+        (pl.col("adj_close") / pl.col("adj_close").shift(1).over(by) - 1).alias("_ret")
     )
     return returns.with_columns(
         pl.col("_ret")
         .rolling_std(window_size=window, min_samples=window)
-        .over("symbol")
+        .over(by)
         .alias("sigma_daily")
     ).select("date", "symbol", "sigma_daily")
 
