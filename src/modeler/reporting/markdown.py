@@ -848,6 +848,39 @@ def build_market_sections(
     return kr, us
 
 
+MS_STAGE_KO = {"select": "입력 선택", "release": "release 확인", "score": "채점"}
+
+
+def market_failure_text(market: str, failure: object) -> str:
+    """시장 하나의 자산 행이 없는 이유. 채점이 남긴 실패 정보가 있으면 사유 코드를 적습니다."""
+    if not isinstance(failure, dict) or not _safe_str(failure.get("reason")):
+        return f"{market} 자산 행이 없습니다"
+    text = "{} 시장·섹터 계산이 실패했습니다: 사유 {}".format(market, code(failure["reason"]))
+    if _safe_str(failure.get("error_class")):
+        text += ", 원인 클래스 " + code(failure["error_class"])
+    return text
+
+
+def ms_failure_reasons(failure: dict) -> list:
+    """채점을 끝내지 못한 날의 `failure` 블록(coordinator가 씀)을 섹션 실패 사유 줄로 바꿉니다."""
+    stage = _safe_str(failure.get("stage"))
+    stage_name = MS_STAGE_KO.get(stage, stage or "알 수 없음")
+    text = f"시장·섹터 계산이 실패했습니다: 단계 {c(stage_name)}"
+    if _safe_str(failure.get("error_class")):
+        text += ", 원인 클래스 " + code(failure["error_class"])
+    if _safe_str(failure.get("reason")):
+        text += ", 사유 " + code(failure["reason"])
+    reasons = [text + "."]
+    if failure.get("timed_out") is True:
+        reasons.append("시간 제한(timeout)을 넘겨 끝났습니다.")
+    markets = failure.get("markets")
+    if isinstance(markets, dict):
+        for market in sorted(k for k in markets if k in ("US", "KR")):
+            if isinstance(markets[market], dict) and markets[market].get("reason"):
+                reasons.append(market_failure_text(market, markets[market]))
+    return reasons
+
+
 def build_ms_section(ms: dict | None, report_date: str) -> dict:
     sec = {
         "key": "market-sector",
@@ -869,6 +902,9 @@ def build_ms_section(ms: dict | None, report_date: str) -> dict:
         sec["reason"].append(
             "입력 날짜 불일치: 입력 {}, 리포트 {}.".format(c(ms.get("report_date")), report_date)
         )
+        return sec
+    if ms.get("status") == "failed" and isinstance(ms.get("failure"), dict):
+        sec["reason"] += ms_failure_reasons(ms["failure"])
         return sec
     assets = [a for a in assets_raw if isinstance(a, dict) and a.get("market") in ("US", "KR")]
     if not assets:
@@ -894,9 +930,10 @@ def build_ms_section(ms: dict | None, report_date: str) -> dict:
                     c(a.get("name") or a.get("asset_id")), ", ".join(missing)
                 )
             )
+    market_failures = ms.get("failures") if isinstance(ms.get("failures"), dict) else {}
     for market in ("US", "KR"):
         if not any(a["market"] == market for a in assets):
-            problems.append(f"{market} 자산 행이 없습니다")
+            problems.append(market_failure_text(market, market_failures.get(market)))
     status = "partial" if problems else "ok"
     if status == "ok" and ms.get("status") == "stale":
         status = "stale"
@@ -1660,6 +1697,142 @@ def kind_status_lines(ctx: dict) -> list:
     )
 
 
+SELECTION_MODE_KO = {"scheduled": "정시 select", "run_fallback": "run이 대신 select함"}
+SELECTION_KEYS = ("selection_mode", "selected_at", "producer_completed_at", "lag_sessions")
+FAILURE_STAGE_KO = {"select": "입력 선택", "infer": "추론", "release": "release 확인"}
+
+
+def selection_lines(ctx: dict) -> list:
+    """모델마다 select 방식·시각·입력 완료 시각·지연 세션 수. 값이 하나도 없으면 쓰지 않습니다.
+
+    `selection_mode`는 09:30 select가 돌았는지(`scheduled`), 안 돌아서 run이 같은 규칙으로 직접
+    골랐는지(`run_fallback`)입니다. 어느 쪽이든 D 09:30 뒤에 끝난 입력은 쓰지 않습니다.
+    """
+    rows, fallback = [], False
+    for sec in (ctx["kr"], ctx["us"]):
+        for m in sec["models"]:
+            q = m["quality"]
+            if m["report"] is None or not any(k in q for k in SELECTION_KEYS):
+                continue
+            mode = q.get("selection_mode")
+            fallback = fallback or mode == "run_fallback"
+            rows.append(
+                [
+                    m["market"],
+                    code(m["model_id"]),
+                    c(SELECTION_MODE_KO.get(mode, mode) if isinstance(mode, str) else "-"),
+                    kst_text(q.get("selected_at")),
+                    kst_text(q.get("producer_completed_at")),
+                    str(q["lag_sessions"]) if is_num(q.get("lag_sessions")) else "-",
+                ]
+            )
+    if not rows:
+        return []
+    lines = ["## 입력 선택", ""]
+    lines += md_table(
+        ["시장", "모델", "선택 방식", "선택 시각", "입력 완료 시각", "지연 세션 수"],
+        rows,
+        right=(5,),
+    )
+    if fallback:
+        lines += [
+            "",
+            "run이 대신 select함: 09:30 select가 돌지 않아 run 단계가 같은 규칙으로 직접 입력을 "
+            "골랐습니다. D 09:30 뒤에 끝난 입력은 이때도 쓰지 않았습니다.",
+        ]
+    return lines + [""]
+
+
+KR_REFERENCE_VERDICT_KO = {
+    "complete_K": "K 완결",
+    "fallback_K_prime": "K보다 앞선 세션(K′)으로 내려감",
+    "none": "쓸 수 있는 세션 없음",
+}
+KR_REFERENCE_KEYS = (
+    "reference_verdict",
+    "reference_k",
+    "reference_date",
+    "reference_lag_sessions",
+    "k_ticker_ratio",
+    "export_gate_verdict",
+    "dart_chain_ended_at",
+)
+
+
+def kr_reference_lines(ctx: dict) -> list:
+    """KR 기준일을 어떻게 골랐는지 보여 주는 증거. 값이 하나도 없으면 아무것도 쓰지 않습니다."""
+    lines: list = []
+    for m in ctx["kr"]["models"]:
+        q = m["quality"]
+        if m["report"] is None or not any(k in q for k in KR_REFERENCE_KEYS):
+            continue
+        verdict = q.get("reference_verdict")
+        verdict_text = (
+            c(KR_REFERENCE_VERDICT_KO.get(verdict, verdict)) if isinstance(verdict, str) else "-"
+        )
+        gate = q.get("export_gate_verdict")
+        ref_lag = q.get("reference_lag_sessions")
+        rows = [
+            ["기준일 판정", verdict_text],
+            ["K (직전 KR 세션)", c(good_date(q.get("reference_k")) or "-")],
+            ["기준일", c(good_date(q.get("reference_date")) or "-")],
+            ["K와의 차이(세션)", str(ref_lag) if is_num(ref_lag) else "-"],
+            ["K 종목 수 / 직전 세션 종목 수", pct(q.get("k_ticker_ratio"), 1, signed=False)],
+            ["export gate 판정 (참고용)", c(gate) if isinstance(gate, str) else "-"],
+            ["DART 수집 chain 종료 시각", kst_text(q.get("dart_chain_ended_at"))],
+        ]
+        lines += ["## KR 기준일 증거", ""] if not lines else [""]
+        lines += [f"모델 {code(m['model_id'])}", ""]
+        lines += md_table(["항목", "값"], rows)
+    if not lines:
+        return []
+    return lines + [
+        "",
+        "기준일 판정은 export한 snapshot에서 K의 종목 수(직전 세션의 97% 이상)와 수급 세 그룹이 "
+        "K까지 들어 있는지 보고 정합니다. export gate와 DART chain은 참고 기록이며 기준일을 막지 "
+        "않습니다.",
+        "",
+    ]
+
+
+def env_failure_info(raw: object) -> dict | None:
+    """envelope의 `failure`(coordinator가 만든 실패 단위)에서 표시할 값만 남깁니다."""
+    if not isinstance(raw, dict):
+        return None
+    code_value = raw.get("runner_exit_code")
+    return {
+        "stage": _safe_str(raw.get("stage")),
+        "error_class": _safe_str(raw.get("error_class")),
+        "exit_code": code_value if is_num(code_value) else None,
+        "timed_out": raw.get("timed_out") is True,
+        "synthesized_by": _safe_str(raw.get("synthesized_by")),
+    }
+
+
+def env_failure_lines(ctx: dict) -> list:
+    """이번 실행이 실패 report를 직접 만든 날의 단계와 timeout. `failure`가 없으면 쓰지 않습니다."""
+    info = ctx.get("env_failure")
+    if not info:
+        return []
+    stage = info["stage"]
+    rows = [
+        [
+            c(FAILURE_STAGE_KO.get(stage, stage or "알 수 없음")),
+            code(info["error_class"]) if info["error_class"] else "-",
+            "-" if info["exit_code"] is None else str(info["exit_code"]),
+            "예" if info["timed_out"] else "아니오",
+        ]
+    ]
+    lines = [""]
+    lines += md_table(["실패 단계", "원인 클래스", "runner 종료 코드", "timeout"], rows, right=(2,))
+    lines += [
+        "",
+        "이번 실행이 실패한 단계를 기록하고 직접 만든 실패 단위입니다. 이전 실행의 report는 쓰지 "
+        "않습니다.",
+    ]
+    return lines
+
+
 def render_status(ctx: dict) -> tuple[list, dict]:
     title = title_for(ctx, "데이터 상태")
     lines = head_lines(ctx, title)
@@ -1749,6 +1922,8 @@ def render_status(ctx: dict) -> tuple[list, dict]:
         % (", ".join(cutoffs) if cutoffs else "D 09:30 KST"),
     ]
     lines += ["", f"시장·섹터 입력 기준일: {c(asof_ms)}.", ""]
+    lines += selection_lines(ctx)
+    lines += kr_reference_lines(ctx)
     lines += ["## 실패", ""]
     failure_rows = [
         [
@@ -1762,6 +1937,7 @@ def render_status(ctx: dict) -> tuple[list, dict]:
         lines += md_table(["시장", "모델", "원인 클래스"], failure_rows)
     else:
         lines.append("envelope에 기록된 추론 실패가 없습니다.")
+    lines += env_failure_lines(ctx)
     lines += ["", "## 게이트와 품질 값", ""]
     gate_rows = []
     pub_states: set = set()
@@ -2177,6 +2353,7 @@ def build_context(
         "us": us,
         "ms": ms_sec,
         "failures": failures,
+        "env_failure": env_failure_info(env.get("failure")),
         "env_status": env.get("status") if isinstance(env.get("status"), str) else "failed",
     }
     ctx["status"] = unit_status([kr["status"], us["status"], ms_sec["status"]])

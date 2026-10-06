@@ -23,9 +23,9 @@ from zoneinfo import ZoneInfo
 from modeler.reporting.site import PRIVATE_MANIFEST_NAME, PrivateViewBuilder, _read_tree
 from modeler.serving.schema import report_template
 
-from .daily_inputs import select
+from .daily_inputs import MS_ENTRYPOINT, _release_market_sector, select
 from .orchestration import combine_reports
-from .runtime_contract import verify_runtime
+from .runtime_contract import MARKET_SECTOR_PACKAGES, verify_runtime
 
 SEOUL = ZoneInfo("Asia/Seoul")
 RETRY_MINUTES = (15, 17, 22, 32)
@@ -34,6 +34,8 @@ REPORTS_AUDIENCE = "owner_only"
 REPORTS_BRANCH = "main"
 PUBLISHER_TIMEOUT_SECONDS = 300
 RUNNER_TIMEOUT_SECONDS = 1800
+MARKET_SECTOR_TIMEOUT_SECONDS = 900
+MARKET_SECTOR_ROOT_KEYS = ("market_sector_kr_root", "market_sector_us_root")
 
 
 def _stop_group(process: "subprocess.Popen[Any]", grace_seconds: float = 5.0) -> None:
@@ -148,7 +150,8 @@ def _config(path: Path) -> dict[str, Any]:
         raise ValueError("model card SHA-256 changed")
     if _hash(_absolute(config, "python")) != config.get("python_sha256"):
         raise ValueError("serving Python executable SHA-256 changed")
-    verify_runtime(_absolute(config, "python"), _absolute(config, "runtime_manifest"))
+    verify_runtime(_absolute(config, "python"), _absolute(config, "runtime_manifest"),
+                   extra_packages=runtime_extra_packages(config))
     opening_keys = ("opening_snapshot_root", "opening_output_root", "opening_max_age_seconds")
     if any(config.get(key) is not None for key in opening_keys):
         if any(config.get(key) is None for key in opening_keys):
@@ -158,6 +161,9 @@ def _config(path: Path) -> dict[str, Any]:
         if (not isinstance(config["opening_max_age_seconds"], int) or
                 not 1 <= config["opening_max_age_seconds"] <= 3600):
             raise ValueError("opening max age must be 1..3600 seconds")
+    if _market_sector_roots(config) is not None and _release_market_sector(
+            _absolute(config, "release_manifest"), jobs={}) is None:
+        raise ValueError("market sector inputs are configured but the frozen release has no bundle")
     if config.get("private_projection_root") is not None:
         private = _absolute(config, "private_projection_root").resolve()
         others = [_absolute(config, "run_root").resolve()]
@@ -211,9 +217,34 @@ def _selected(config: dict[str, Any], day: date) -> dict[str, Any]:
     return state
 
 
+def runtime_extra_packages(config: dict[str, Any]) -> tuple[str, ...]:
+    """Packages the runtime manifest must pin on top of the model dependencies.
+
+    The market-sector section needs ``exchange_calendars`` (MS1's KR calendar); a config without the
+    section needs nothing extra, so an older runtime manifest keeps working.
+    """
+    on = any(config.get(key) is not None for key in MARKET_SECTOR_ROOT_KEYS)
+    return MARKET_SECTOR_PACKAGES if on else ()
+
+
+def _market_sector_roots(config: dict[str, Any]) -> dict[str, Path] | None:
+    """The KR and US data roots the market-sector section reads; ``None`` when it is not configured.
+
+    Both keys are optional and must be set together.  They are the ``DataRoot`` bases
+    (``<stock_data>/kr``, ``<stock_data>/us``), read only.
+    """
+    kr, us = (config.get(key) for key in MARKET_SECTOR_ROOT_KEYS)
+    if kr is None and us is None:
+        return None
+    if kr is None or us is None:
+        raise ValueError("market_sector_kr_root and market_sector_us_root must be set together")
+    return {"kr": _absolute(config, MARKET_SECTOR_ROOT_KEYS[0], exists=True),
+            "us": _absolute(config, MARKET_SECTOR_ROOT_KEYS[1], exists=True)}
+
+
 def select_stage(config: dict[str, Any], day: date, now: datetime, *,
                  mode: str = "scheduled") -> dict[str, Any]:
-    return select(report_date=day, selected_at=now,
+    return select(report_date=day, selected_at=now, market_sector=_market_sector_roots(config),
         prepared_root=_absolute(config, "prepared_root"),
         output_root=_absolute(config, "selection_root"),
         release_manifest=_absolute(config, "release_manifest"),
@@ -360,6 +391,120 @@ def infer_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, A
              "synthetic_fixture": selected["synthetic_fixture"], "successful_jobs": successful_jobs,
              "this_invocation_completed": True, "report_ready": True, "failure_report": False}
     _atomic(run_root / "coordinator-inference.json", state)
+    return state
+
+
+def _retire_ms_document(path: Path) -> None:
+    """Set an earlier market-sector document of the same D aside; it is never reused."""
+    if path.is_file():
+        digest = _hash(path)[:12]
+        os.replace(path, path.with_name(f"{path.stem}.superseded-{digest}{path.suffix}"))
+
+
+def _install_ms_document(path: Path, body: bytes) -> str:
+    fd, temp = tempfile.mkstemp(prefix=".market-sector-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        Path(temp).unlink(missing_ok=True)
+    return hashlib.sha256(body).hexdigest()
+
+
+def market_sector_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, Any]:
+    """Score the market-sector section into ``runs/D/market-sector-D.json`` (own process group).
+
+    It is not a fourth ranking job: the section is not a ranking, and a failure here must never
+    touch the three model jobs.  It reads only the files ``ms-selection.json`` pinned at select
+    time.  Whatever goes wrong, the section ends up ``failed`` with its cause in the document (the
+    renderer writes it into the unit); the units still render and publish.  Not configured means
+    no document, and the renderer says the input is missing.
+    """
+    run_root = _day_dir(config, day)
+    run_root.mkdir(parents=True, exist_ok=True)
+    state_path = run_root / "coordinator-market-sector.json"
+    document = run_root / f"market-sector-{day.isoformat()}.json"
+    if _market_sector_roots(config) is None:
+        state = {"report_date": day.isoformat(), "status": "disabled"}
+        _atomic(state_path, state)
+        return state
+    _retire_ms_document(document)
+
+    def failed(stage: str, error_class: str, reason: str, *, exit_code: int | None = None,
+               timed_out: bool = False, markets: Any = None) -> dict[str, Any]:
+        from modeler.scores.market_sector.daily_doc import failure_document
+
+        body = failure_document(day, stage=stage, error_class=error_class, reason=reason,
+                                exit_code=exit_code, timed_out=timed_out,
+                                markets=markets if isinstance(markets, dict) else None)
+        raw = json.dumps(body, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
+        sha = _install_ms_document(document, raw.encode())
+        state = {"report_date": day.isoformat(), "status": "market_sector_failed", "stage": stage,
+                 "error_class": error_class, "reason": reason, "timed_out": timed_out,
+                 "document_sha256": sha}
+        _atomic(state_path, state)
+        return state
+
+    try:
+        selected = ensure_selection(config, day, now)
+    except Exception as exc:
+        return failed("select", type(exc).__name__, "selection_unavailable")
+    if selected.get("status") == "holiday":
+        state = {"report_date": day.isoformat(), "status": "holiday"}
+        _atomic(state_path, state)
+        return state
+    block = selected.get("market_sector")
+    if not isinstance(block, dict):
+        return failed("select", "MarketSectorNotSelected", "not_in_selection")
+    if block.get("status") not in {"selected", "partial"}:
+        return failed("select", "MarketSectorInputsUnavailable",
+                      str(block.get("reason") or "inputs_unavailable"),
+                      markets=block.get("markets"))
+    release = _read(_absolute(config, "release_manifest"))
+    release_root = Path(release["release_root"]).resolve(strict=True)
+    try:
+        pinned = _release_market_sector(_absolute(config, "release_manifest"), jobs={})
+    except Exception as exc:
+        return failed("release", type(exc).__name__, "release_invalid")
+    if pinned is None:
+        return failed("release", "MarketSectorNotInRelease", "release_without_market_sector")
+    scratch = run_root / f".market-sector-{day.isoformat()}.new"
+    scratch.unlink(missing_ok=True)
+    argv = [str(_absolute(config, "python")), "-m", MS_ENTRYPOINT, "score",
+            "--report-date", day.isoformat(), "--selection", block["selection"],
+            "--selection-sha256", block["selection_sha256"],
+            "--bundle", str(Path(pinned["bundle_path"]).parent),
+            "--bundle-sha256", pinned["bundle_sha256"], "--output", str(scratch)]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(release_root / "src")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        done = run_group(argv, cwd=release_root, env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True,
+                         timeout=MARKET_SECTOR_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        scratch.unlink(missing_ok=True)
+        return failed("score", "MarketSectorTimeout", "timeout", exit_code=124, timed_out=True)
+    except OSError as exc:
+        return failed("score", type(exc).__name__, "spawn_error", exit_code=127)
+    summary = _last_json_line(done.stdout or "")
+    if done.returncode != 0 or not scratch.is_file():
+        scratch.unlink(missing_ok=True)
+        error_class = "MarketSectorExitNonzero" if done.returncode else "MarketSectorOutputMissing"
+        return failed("score", error_class,
+                      str(summary.get("reason") or summary.get("status") or "score_failed"),
+                      exit_code=done.returncode, markets=summary.get("failures"))
+    sha = _install_ms_document(document, scratch.read_bytes())
+    scratch.unlink(missing_ok=True)
+    partial = summary.get("status") == "partial"
+    scored = "market_sector_partial" if partial else "market_sector_ready"
+    state = {"report_date": day.isoformat(), "status": scored, "markets": summary.get("markets"),
+             "document_sha256": sha, "selection_sha256": block["selection_sha256"],
+             "bundle_sha256": pinned["bundle_sha256"]}
+    _atomic(state_path, state)
     return state
 
 
@@ -671,7 +816,8 @@ def monitor_stage(config: dict[str, Any], day: date, *, attempt: int) -> dict[st
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="modeler-daily-coordinator")
-    parser.add_argument("stage", choices=("select", "infer", "render", "publish", "monitor"))
+    parser.add_argument("stage", choices=("select", "infer", "market-sector", "render", "publish",
+                                          "monitor"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--report-date", type=date.fromisoformat, required=True)
     parser.add_argument("--attempt", type=int, default=0)
@@ -688,6 +834,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = select_stage(config, args.report_date, now)
             elif args.stage == "infer":
                 result = infer_stage(config, args.report_date, now)
+            elif args.stage == "market-sector":
+                result = market_sector_stage(config, args.report_date, now)
             elif args.stage == "render":
                 result = render_stage(config, args.report_date)
             elif args.stage == "publish":
@@ -697,7 +845,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": result["status"], "report_date": args.report_date.isoformat()}, sort_keys=True))
         return 0 if result["status"] in {"selected", "partial", "holiday", "holiday_skipped",
                                           "inferred", "inferred_partial", "rendered",
-                                          "published", "verified", "publication_withheld"} else 1
+                                          "published", "verified", "publication_withheld",
+                                          "disabled", "market_sector_ready",
+                                          "market_sector_partial"} else 1
     except Exception as exc:
         print(json.dumps({"status": "failed", "error_class": type(exc).__name__}), file=sys.stderr)
         return 1

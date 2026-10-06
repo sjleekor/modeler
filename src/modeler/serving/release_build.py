@@ -5,6 +5,11 @@ CLI copies only files whose SHA-256 appears in a reviewed ``sha256sum`` list,
 pins the three model bundles, and self-checks with the coordinator's own
 ``_release_jobs`` validator.  It never touches the network, a database or a lake.
 
+``--ms-bundle`` (optional) adds the market-sector section: the frozen MS1 run bundle
+(``score_daily build-bundle``) is copied to ``bundles/market_sector/`` file by file and pinned by
+the SHA-256 of its ``bundle.json``; the scoring code (``src/modeler/scores/**``) is part of the same
+reviewed ``src`` inventory, so the reviewed source list must cover those files too.
+
 ``code_sha256`` is computed over the *absolute* release paths (that is how
 ``_release_jobs`` recomputes it), so a release is bound to its final location.
 """
@@ -21,7 +26,16 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .daily_inputs import _release_jobs
+from modeler.scores.market_sector.bundle import BUNDLE_FILE, verify_bundle_dir
+
+from .daily_inputs import (
+    MS_BUNDLE_DIR,
+    MS_BUNDLE_PATH,
+    MS_CODE_PATH,
+    MS_ENTRYPOINT,
+    _release_jobs,
+    _release_market_sector,
+)
 from .orchestration import code_inventory_sha256
 
 HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -193,10 +207,22 @@ def copy_bundle(source_dir: Path, target_dir: Path, kind: str, model_version: st
     return manifest_sha
 
 
+def copy_ms_bundle(source_dir: Path, target_dir: Path) -> str:
+    """Copy the market-sector bundle after checking every file against its ``bundle.json``."""
+    source_dir = Path(source_dir)
+    manifest = verify_bundle_dir(source_dir)
+    for rel, digest in sorted(manifest["files"].items()):
+        _copy_verified(source_dir / rel, target_dir / rel, digest, f"market sector bundle {rel}")
+    _copy_verified(source_dir / BUNDLE_FILE, target_dir / BUNDLE_FILE, manifest["_sha256"],
+                   "market sector bundle.json")
+    return manifest["_sha256"]
+
+
 def build_release(*, modeler_root: Path, collector_root: Path, kr_bundle: Path,
                   us_lightgbm_bundle: Path, us_ridge_bundle: Path, model_cards: Path,
                   runtime_manifest: Path, uv_lock: Path, source_manifest: Path,
-                  output: Path, synthetic_fixture: bool = False) -> dict[str, Any]:
+                  output: Path, synthetic_fixture: bool = False,
+                  ms_bundle: Path | None = None) -> dict[str, Any]:
     output = Path(output)
     parent = output.parent.resolve(strict=True)
     final = parent / output.name
@@ -219,6 +245,15 @@ def build_release(*, modeler_root: Path, collector_root: Path, kr_bundle: Path,
                          "bundle_sha256": manifest_sha, "code_path": ADAPTER,
                          "code_path_sha256": adapter_sha, "code_files": inventory,
                          "code_sha256": code_sha})
+        ms_block = None
+        if ms_bundle is not None:
+            code = next((item for item in inventory if item["path"] == MS_CODE_PATH), None)
+            if code is None:
+                raise BuildError("score_daily.py is absent from the copied source")
+            ms_block = {"entrypoint": MS_ENTRYPOINT, "bundle_path": MS_BUNDLE_PATH,
+                        "bundle_sha256": copy_ms_bundle(Path(ms_bundle), stage / MS_BUNDLE_DIR),
+                        "code_path": MS_CODE_PATH, "code_path_sha256": code["sha256"],
+                        "code_sha256": code_sha}
         for source, name in ((model_cards, "model-cards.json"), (runtime_manifest, "runtime.json"),
                              (uv_lock, "uv.lock")):
             source = Path(source)
@@ -229,6 +264,8 @@ def build_release(*, modeler_root: Path, collector_root: Path, kr_bundle: Path,
                    "synthetic_fixture": bool(synthetic_fixture), "release_root": str(final),
                    "source_manifest_sha256": sha256_file(source_manifest),
                    "data_files": data_files, "jobs": jobs}
+        if ms_block is not None:
+            release["market_sector"] = ms_block
         (stage / "release.json").write_text(
             json.dumps(release, sort_keys=True, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         os.rename(stage, final)
@@ -237,6 +274,9 @@ def build_release(*, modeler_root: Path, collector_root: Path, kr_bundle: Path,
         raise
     try:
         checked, fixture = _release_jobs(final / "release.json")
+        ms_checked = _release_market_sector(final / "release.json", checked)
+        if (ms_bundle is None) != (ms_checked is None):
+            raise BuildError("market sector block does not match --ms-bundle")
     except BaseException:
         shutil.rmtree(final, ignore_errors=True)
         raise
@@ -244,7 +284,9 @@ def build_release(*, modeler_root: Path, collector_root: Path, kr_bundle: Path,
     for (_, model_id, _, _, bundle_rel, kind) in JOBS:
         manifest = json.loads((final / bundle_rel / "manifest.json").read_text(encoding="utf-8"))
         weights[model_id] = _pinned_names(kind, manifest)["model.joblib"]
-    return {"release_json": str(final / "release.json"),
+    summary_ms = None if ms_checked is None else {
+        "bundle_sha256": ms_checked["bundle_sha256"], "code_path": MS_CODE_PATH}
+    return {"release_json": str(final / "release.json"), "market_sector": summary_ms,
             "release_json_sha256": sha256_file(final / "release.json"),
             "python_file_count": len(inventory), "code_sha256": code_sha,
             "source_manifest_sha256": release["source_manifest_sha256"],
@@ -261,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
                  "source-manifest", "output"):
         parser.add_argument(f"--{name}", required=True, type=Path)
     parser.add_argument("--synthetic-fixture", action="store_true")
+    parser.add_argument("--ms-bundle", type=Path, default=None,
+                        help="market-sector bundle directory (score_daily build-bundle output)")
     args = parser.parse_args(argv)
     try:
         summary = build_release(
@@ -269,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
             us_ridge_bundle=args.us_ridge_bundle, model_cards=args.model_cards,
             runtime_manifest=args.runtime_manifest, uv_lock=args.uv_lock,
             source_manifest=args.source_manifest, output=args.output,
-            synthetic_fixture=args.synthetic_fixture)
+            synthetic_fixture=args.synthetic_fixture, ms_bundle=args.ms_bundle)
     except (BuildError, OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         print(f"release_build failed: {error}", file=sys.stderr)
         return 1
