@@ -36,6 +36,11 @@ PUBLISHER_TIMEOUT_SECONDS = 300
 RUNNER_TIMEOUT_SECONDS = 1800
 MARKET_SECTOR_TIMEOUT_SECONDS = 900
 MARKET_SECTOR_ROOT_KEYS = ("market_sector_kr_root", "market_sector_us_root")
+# 증권 이름 입력을 만들 레이크 root. 전용 키가 없으면 같은 레이크를 가리키는 시장·섹터 root를 씁니다.
+SECURITY_NAMES_ROOT_KEYS = (
+    ("security_names_us_root", "market_sector_us_root"),
+    ("security_names_kr_root", "market_sector_kr_root"),
+)
 
 
 def _stop_group(process: "subprocess.Popen[Any]", grace_seconds: float = 5.0) -> None:
@@ -163,6 +168,7 @@ def _config(path: Path) -> dict[str, Any]:
     if _market_sector_roots(config) is not None and _release_market_sector(
             _absolute(config, "release_manifest"), jobs={}) is None:
         raise ValueError("market sector inputs are configured but the frozen release has no bundle")
+    _security_names_roots(config)  # 절대 경로인지만 봅니다. 없는 경로는 publisher가 열 생략으로 처리합니다
     if config.get("private_projection_root") is not None:
         private = _absolute(config, "private_projection_root").resolve()
         others = [_absolute(config, "run_root").resolve()]
@@ -229,6 +235,22 @@ def _market_sector_roots(config: dict[str, Any]) -> dict[str, Path] | None:
         raise ValueError("market_sector_kr_root and market_sector_us_root must be set together")
     return {"kr": _absolute(config, MARKET_SECTOR_ROOT_KEYS[0], exists=True),
             "us": _absolute(config, MARKET_SECTOR_ROOT_KEYS[1], exists=True)}
+
+
+def _security_names_roots(config: dict[str, Any]) -> dict[str, str]:
+    """publisher가 순위 종목의 이름을 읽을 레이크 root. 설정이 없으면 빈 dict입니다.
+
+    ``security_names_us_root``·``security_names_kr_root``(``<stock_data>/us``·``<stock_data>/kr``,
+    읽기만)가 있으면 그것을, 없으면 같은 레이크를 가리키는 ``market_sector_*_root``를 씁니다.
+    경로가 실제로 있는지는 여기서 보지 않습니다. 이름은 표시용이라 읽지 못해도 단위는 나가고,
+    publisher가 데이터 상태에 사유를 적습니다.
+    """
+    roots: dict[str, str] = {}
+    for key, fallback in SECURITY_NAMES_ROOT_KEYS:
+        source = key if config.get(key) is not None else fallback
+        if config.get(source) is not None:
+            roots[key] = str(_absolute(config, source))
+    return roots
 
 
 def select_stage(config: dict[str, Any], day: date, now: datetime, *,
@@ -621,6 +643,7 @@ def _reports_publisher_input(config: dict[str, Any], day: date, render: dict[str
         "invocation_id": render["invocation_id"],
         "model_cards_path": str(_absolute(config, "model_cards_path")),
         "top_n": config.get("reports_top_n", 100),
+        **_security_names_roots(config),
     }
 
 

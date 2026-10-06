@@ -76,6 +76,7 @@ Pages 공개 경로는 없앴습니다. `publish` 단계는 private 저장소 `s
 | 구성 요소 | 위치 | 하는 일 |
 |---|---|---|
 | 렌더러 | `src/modeler/reporting/markdown.py` (release 안) | report를 단위 폴더(`README.md`·`market-sector.md`·`kr-stocks.md`·`us-stocks.md`·`data-status.md`)로 렌더하고, 인덱스 자동 구간을 다시 쓰고, 트리를 검증합니다. 표준 라이브러리만 쓰고, 템플릿은 `.py` 문자열이라 release `DATA_FILES`를 늘리지 않습니다. **release 검토 목록(`SOURCE_MANIFEST`)에 이 파일을 넣어야 release 빌드가 통과합니다.** |
+| 증권 이름 | `src/modeler/reporting/security_names.py` (release 안) | 순위 종목의 이름 입력(`security-names.v1`)을 레이크에서 만듭니다. publisher 로컬 단계가 부릅니다(`publish_reports.py`가 import하므로 **release 검토 목록과 import 따라가기 진입 모듈에 넣어야 합니다**). polars는 함수 안에서 불러(serving venv에 있습니다) 패키지를 가볍게 둡니다. 수동으로는 `python -m modeler.reporting.security_names --envelope … --us-root … --kr-root … --out …` |
 | publisher | `deploy/reports/publish_reports.py` (release 밖, `serving/publisher/`로 복사, sha256 고정) | 로컬 단계와 동기화 단계 |
 | 검증기 | `deploy/reports/validate_reports.py` (같은 곳) | 경로 allowlist, front matter, 크기, 상대 링크, 과거 단위 보호, 서버 경로·비밀값, symlink |
 
@@ -144,10 +145,11 @@ Pages용 `base_path`·`projection_root`·`previous_projection_dir`·`publisher_s
 | `reports_publisher`, `reports_publisher_sha256` | `serving/publisher/publish_reports.py`와 그 sha256 |
 | `reports_top_n` | 모델별로 올릴 상위 개수(1\~500, 기본 100) |
 | `market_sector_kr_root`, `market_sector_us_root` | 시장·섹터 섹션이 읽는 KR·US 데이터 root(`<stock_data>/kr`, `<stock_data>/us`, 읽기만). **둘 다 설정해야 섹션이 켜집니다.** 둘 다 null이면 섹션은 꺼지고 리포트는 "입력 없음"으로 적습니다. 켜면 release에 `market_sector` 블록이 있어야 합니다. runtime manifest에 `exchange_calendars`는 필요 없습니다. 적지도 마십시오. sj2 venv에 없는 패키지를 적으면 runtime 검사가 멈춥니다 |
+| `security_names_us_root`, `security_names_kr_root` | 순위 표 `종류` 열의 이름 원천이 되는 레이크 root(`<stock_data>/us`, `<stock_data>/kr`, 읽기만). 선택이고 시장별로 따로 받습니다. **없으면 `market_sector_us_root`·`market_sector_kr_root`를 대신 씁니다**(같은 레이크). 둘 다 없으면 이름 입력 없이 렌더하고 US `종류` 열이 빠집니다. 경로는 절대 경로여야 하지만 실제로 있는지는 보지 않습니다. US는 `<root>/derived/snapshots/listing_snapshots`의 가장 최근 snapshot, KR은 `<root>/raw/raw_postgres`의 D 이전 가장 최근 snapshot(`source=sj2_remote`, `_SUCCESS.json` 있는 것, 없으면 D 뒤 가장 이른 것)의 `stock_master`를 읽습니다. KR 순위 행에 이름이 있으면(R3 F3 이후 report) 그 이름을 먼저 쓰고 이 입력은 이름이 없는 행만 채웁니다. 못 읽으면 그 시장만 `종류` 열을 빼고 데이터 상태 `증권 종류` 절에 사유를 적습니다(단위는 계속 올라갑니다) |
 
 checkout 옆(같은 부모 디렉터리)에 숨김 파일 둘이 생깁니다. `.reports-checkout.reports-publish.lock`(flock)과 `.reports-checkout.reports-publish-journal.json`(0600, 처리할 단위가 없으면 지움)입니다. journal은 단위별로 `sync_pending`·`push_pending`·`rejected`·`correction_required`와 단위 해시, 커밋 sha를 적습니다. checkout 안에는 아무것도 만들지 않습니다.
 
-날짜별 입력은 coordinator가 `run_root/<D>/reports-publisher-config.json`에 원자적으로 씁니다(저장소·checkout·release id·report sha256·invocation id·모델 카드 경로·top_n). 비공개 화면 경로는 여기 넣지 않습니다. 합성 fixture release에서만 `--allow-synthetic`을 붙입니다.
+날짜별 입력은 coordinator가 `run_root/<D>/reports-publisher-config.json`에 원자적으로 씁니다(저장소·checkout·release id·report sha256·invocation id·모델 카드 경로·top_n, 이름 원천 root가 있으면 `security_names_us_root`·`security_names_kr_root`). publisher 로컬 단계는 이 root에서 `security-names.v1`을 만들어 `run_root/<D>/markdown/security-names.json`에 고정하고(sha256는 journal에 적습니다), 동기화 단계는 그 파일로 다시 렌더합니다. 비공개 화면 경로는 여기 넣지 않습니다. 합성 fixture release에서만 `--allow-synthetic`을 붙입니다.
 
 ### monitor 상태
 
@@ -250,7 +252,7 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
   --us-lake /home/whi/data/stock_data/us
 ```
 
-시장·섹터를 켜려면 `--ms-bundle <bundle 디렉터리>`를 더합니다. runtime manifest는 지금 것(`runtime-verified-sj2-20260930.json`)을 그대로 씁니다. 계산 달력은 bundle 파일이라 `exchange_calendars`가 필요 없습니다. KR 데이터 root는 `--ms-kr-root`(기본 `/home/whi/data/stock_data/kr`)입니다. 그러면 `ops.json`에 `market_sector_kr_root`와 `market_sector_us_root`(`<serving root>/stock_data/us`)가 들어갑니다.
+시장·섹터를 켜려면 `--ms-bundle <bundle 디렉터리>`를 더합니다. runtime manifest는 지금 것(`runtime-verified-sj2-20260930.json`)을 그대로 씁니다. 계산 달력은 bundle 파일이라 `exchange_calendars`가 필요 없습니다. KR 데이터 root는 `--ms-kr-root`(기본 `/home/whi/data/stock_data/kr`)입니다. 그러면 `ops.json`에 `market_sector_kr_root`와 `market_sector_us_root`(`<serving root>/stock_data/us`)가 들어갑니다. 이름 원천 `security_names_us_root`는 `--ms-bundle` 없이도 `<serving root>/stock_data/us`로 들어가고, `security_names_kr_root`는 `--ms-bundle`이 있을 때만 `--ms-kr-root`로 들어갑니다.
 
 이 스크립트는 lake를 읽기 전용 링크로만 걸고 `select`·`run`·`monitor`를 실행하지 않습니다. 끝에서 `daily_coordinator._config`, `daily_inputs._release_jobs`, `runtime_contract` 검증과 prepared root 구조 확인을 하고 요약 JSON을 찍습니다.
 

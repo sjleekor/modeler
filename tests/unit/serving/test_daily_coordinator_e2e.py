@@ -30,6 +30,7 @@ MODULES = (
     "modeler/serving/opening_prepare.py",
     "modeler/serving/runtime_contract.py", "modeler/reporting/__init__.py",
     "modeler/reporting/site.py", "modeler/reporting/markdown.py",
+    "modeler/reporting/security_names.py",
 )
 ADAPTER = '''from modeler.serving.schema import report_template
 

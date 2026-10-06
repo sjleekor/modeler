@@ -181,6 +181,9 @@ def test_ops_json_fields(world):
     assert ops["runtime_lock"] == str(release / "uv.lock") and ops["model_cards_path"] == str(release / "model-cards.json")
     assert ops["us_expected_source"] == str(root / "config" / world["expected"].name)
     assert ops["python"] == str(root / "venv/bin/python")
+    # security names for the kind column: the US lake link always, KR only with --ms-bundle
+    assert ops["security_names_us_root"] == str(root / "stock_data" / "us")
+    assert ops["security_names_kr_root"] is None
     assert json.loads((release / "release.json").read_text())["synthetic_fixture"] is False
     pins = json.loads((root / "config/pins.json").read_text())
     assert pins["us_expected_source"]["sha256"] == _sha(world["expected"].read_bytes())
@@ -274,6 +277,22 @@ def _ms_args(world, tmp_path):
     return ["--ms-bundle", str(ms_bundle), "--ms-kr-root", str(kr_root)], kr_root
 
 
+def test_config_checks_the_names_roots_but_not_that_they_exist(world, tmp_path):
+    """An unreadable lake only drops the kind column; the config must not stop a run for it."""
+    ops = json.loads((world["root"] / "config/ops.json").read_text())
+
+    def load(**changes):
+        path = tmp_path / "ops-names.json"
+        path.write_text(json.dumps({**ops, **changes}))
+        return _config(path)
+
+    missing = "/does/not/exist"
+    assert load(security_names_us_root=missing)["security_names_us_root"] == missing
+    assert load(security_names_kr_root=None)["security_names_kr_root"] is None
+    with pytest.raises(ValueError, match="absolute"):
+        load(security_names_kr_root="relative/kr")
+
+
 def test_provision_with_the_market_sector_section(world, tmp_path):
     """--ms-bundle pins the bundle in the release and turns the section on in ops.json."""
     extra, kr_root = _ms_args(world, tmp_path)
@@ -288,6 +307,8 @@ def test_provision_with_the_market_sector_section(world, tmp_path):
         ops = json.loads((root / "config/ops.json").read_text())
         assert ops["market_sector_kr_root"] == str(kr_root)
         assert ops["market_sector_us_root"] == str(root / "stock_data" / "us")
+        assert ops["security_names_us_root"] == str(root / "stock_data" / "us")
+        assert ops["security_names_kr_root"] == str(kr_root)
         release = root / "releases/r2"
         block = json.loads((release / "release.json").read_text())["market_sector"]
         assert block["bundle_path"] == "bundles/market_sector/bundle.json"

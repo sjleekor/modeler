@@ -17,7 +17,8 @@ purpose; Cronicle runs as the same user and nothing else needs access):
                                  calendars/ (all 0440)                      (0750)
     publisher/                   publish_reports.py, validate_reports.py    (0750, files 0440)
     stock_data/us/raw|derived    read-only symlinks to the operational lake (also the market-sector
-                                 section's US input, ``market_sector_us_root``)
+                                 section's US input, ``market_sector_us_root``, and the
+                                 security-names input, ``security_names_us_root``)
     stock_data/us/output/        real directory, the only place prepare writes  (0750)
     prepared/kr/                 empty                                     (0750)
     prepared/us                  symlink -> stock_data/us/output/us_scoring_daily_v1/prepared
@@ -401,6 +402,11 @@ def provision(plan: Plan) -> dict[str, Any]:
            "market_sector_kr_root": str(plan.ms_kr_root) if plan.ms_bundle else None,
            "market_sector_us_root": (str(plan.root / "stock_data" / "us")
                                      if plan.ms_bundle else None),
+           # Security names for the rank tables' kind column (read only): the US lake link, and
+           # the KR data root when --ms-bundle names one.  Unreadable at run time leaves the
+           # column out.
+           "security_names_us_root": str(plan.root / "stock_data" / "us"),
+           "security_names_kr_root": str(plan.ms_kr_root) if plan.ms_bundle else None,
            "reports_repository": a.reports_repository, "reports_audience": "owner_only",
            "reports_branch": "main", "reports_remote_url": a.reports_remote_url,
            "reports_checkout": str(plan.reports_checkout),

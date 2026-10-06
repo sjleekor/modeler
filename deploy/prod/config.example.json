@@ -22,6 +22,8 @@
   "opening_max_age_seconds": null,
   "market_sector_kr_root": null,
   "market_sector_us_root": null,
+  "security_names_us_root": null,
+  "security_names_kr_root": null,
   "publisher_enabled": false,
   "external_verification_enabled": false,
   "reports_repository": "sjleekor/stock_reports",
