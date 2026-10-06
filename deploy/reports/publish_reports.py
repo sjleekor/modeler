@@ -44,6 +44,7 @@ from pathlib import Path
 import validate_reports as vr
 
 from modeler.reporting import markdown as md
+from modeler.reporting import security_names as sn
 
 EXPECTED_REPOSITORY = "sjleekor/stock_reports"
 EXPECTED_REMOTE_URL = f"git@github.com:{EXPECTED_REPOSITORY}.git"
@@ -62,9 +63,14 @@ OPTIONAL_KEYS = {
     "top_n",
     "generated_at",
     "market_sector_input",
+    "security_names_us_root",
+    "security_names_kr_root",
     "report_date",
 }
 ALLOWED_KEYS = REQUIRED_KEYS | LOCAL_KEYS | OPTIONAL_KEYS
+# 증권 이름 입력(security-names.v1)을 레이크에서 만드는 데 쓰는 root. 시장별로 따로 받습니다.
+NAMES_ROOT_KEYS = (("US", "security_names_us_root"), ("KR", "security_names_kr_root"))
+NAMES_FILE = "security-names.json"
 
 # 단위 상태. journal에는 앞의 넷만 남습니다.
 SYNC_PENDING = "sync_pending"
@@ -162,6 +168,9 @@ def check_config(config: dict, *, need_local: bool, strict_remote: bool = True) 
     top_n = config.get("top_n", md.DEFAULT_TOP_N)
     if isinstance(top_n, bool) or not isinstance(top_n, int) or not 1 <= top_n <= 500:
         raise PublishError("top_n must be 1..500")
+    for _market, key in NAMES_ROOT_KEYS:
+        if config.get(key) is not None:
+            _absolute(config[key], key)
 
 
 def _absolute(value: object, label: str) -> Path:
@@ -430,6 +439,39 @@ def _reject_local(config: dict, checkout: Path, markdown_dir: Path | None, probl
     return result(REJECTED, unit=unit, detail=detail, local_done=True)
 
 
+def _security_names_step(config: dict, envelope: dict, markdown_dir: Path) -> dict:
+    """L1b. 레이크에서 증권 이름 입력을 만들어 `markdown/security-names.json`에 고정합니다.
+
+    동기화 단계가 같은 입력으로 다시 렌더하도록 파일과 sha256를 journal에 남깁니다.
+    root를 설정하지 않았으면 아무것도 하지 않습니다(이름 입력 없이 렌더, 이전과 같은 출력).
+    root가 있는데 원천이 없거나 읽지 못하면 그 시장만 이름 없이 렌더하고 사유를
+    `notes`로 돌려줍니다. 어느 쪽이든 단위는 계속됩니다.
+    """
+    roots = {m: config.get(key) for m, key in NAMES_ROOT_KEYS}
+    target = markdown_dir / NAMES_FILE
+    target.unlink(missing_ok=True)  # 이전 실행의 입력을 남기지 않습니다
+    off = {"raw": None, "path": None, "sha256": None, "notes": None}
+    if not any(roots.values()):
+        return off
+    try:
+        built = sn.from_roots(
+            envelope,
+            us_root=Path(roots["US"]) if roots["US"] else None,
+            kr_root=Path(roots["KR"]) if roots["KR"] else None,
+        )
+    except Exception as exc:  # 이름은 표시용입니다. 어떤 실패도 단위를 막지 않습니다
+        reason = f"증권 이름 입력을 만들지 못함 ({type(exc).__name__})"
+        return {**off, "notes": {m: reason for m, root in roots.items() if root}}
+    notes = dict(built.notes) or None
+    found = ", ".join(f"{m} {n}/{k}" for m, (n, k) in built.counts.items())
+    log(f"증권 이름: {found or '없음'}" + (f" (생략: {notes})" if notes else ""))
+    if built.raw is None:
+        return {**off, "notes": notes}
+    _write_atomic(target, built.raw)
+    digest = hashlib.sha256(built.raw).hexdigest()
+    return {"raw": built.raw, "path": str(target), "sha256": digest, "notes": notes}
+
+
 def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dict:
     unit = config["report_date"]
     run_dir = Path(config["run_dir"])
@@ -473,6 +515,7 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         ms_bytes = ms_file.read_bytes()
     else:
         ms_file = None
+    names = _security_names_step(config, envelope, markdown_dir)
 
     # L2. 렌더합니다. 같은 입력을 다시 돌려 내용이 같으면 파일을 그대로 둡니다(generated_at 고정).
     md.reset_scrub_hits()
@@ -485,6 +528,8 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
             config.get("generated_at"),
             config.get("top_n", md.DEFAULT_TOP_N),
             log,
+            security_names=names["raw"],
+            names_notes=names["notes"],
         )
         files = md.render_unit(ctx)
     except md.InputError as exc:
@@ -517,6 +562,9 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         "market_sector_sha256": (
             hashlib.sha256(ms_bytes).hexdigest() if ms_bytes is not None else None
         ),
+        "security_names_path": names["path"],
+        "security_names_sha256": names["sha256"],
+        "security_names_notes": names["notes"],
         "unit_sha256": unit_hash,
         "scrub_hits": len(md.SCRUB_HITS),
     }
@@ -537,6 +585,9 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         "top_n": manifest["top_n"],
         "market_sector_path": manifest["market_sector_path"],
         "market_sector_sha256": manifest["market_sector_sha256"],
+        "security_names_path": names["path"],
+        "security_names_sha256": names["sha256"],
+        "security_names_notes": names["notes"],
         "synthetic_fixture": envelope.get("synthetic_fixture") is True,
         "updated_at": now_kst(),
     }
@@ -701,9 +752,23 @@ def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: 
         ms_bytes = Path(entry["market_sector_path"]).read_bytes()
         if hashlib.sha256(ms_bytes).hexdigest() != entry["market_sector_sha256"]:
             raise PublishError("market sector input changed since the local step")
+    names_bytes = None
+    if entry.get("security_names_path"):
+        names_file = _regular_file(Path(entry["security_names_path"]), "security names input")
+        names_bytes = names_file.read_bytes()
+        if hashlib.sha256(names_bytes).hexdigest() != entry.get("security_names_sha256"):
+            raise PublishError("security names input changed since the local step")
     try:
         return md.build_context(
-            checkout, report_bytes, ms_bytes, entry["release"], stamp, entry["top_n"], log
+            checkout,
+            report_bytes,
+            ms_bytes,
+            entry["release"],
+            stamp,
+            entry["top_n"],
+            log,
+            security_names=names_bytes,
+            names_notes=entry.get("security_names_notes"),
         )
     except md.InputError as exc:
         raise PublishError(f"cannot render from the journaled inputs: {exc}") from None

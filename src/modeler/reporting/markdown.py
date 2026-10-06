@@ -1737,7 +1737,11 @@ def kind_status_lines(ctx: dict) -> list:
     ):
         names = sec.get("names")
         if not sec.get("show_kind"):
-            rows.append([market, "없음", "-", "이름 원천이 없어 `종류` 열을 생략했습니다"])
+            omitted = "이름 원천이 없어 `종류` 열을 생략했습니다"
+            note = (ctx.get("names_notes") or {}).get(market)
+            if note:
+                omitted += f" (사유: {c(note)})"
+            rows.append([market, "없음", "-", omitted])
             continue
         if names:
             source, basis = c(names["source"] or "증권 이름 입력"), c(names["basis"] or "-")
@@ -2335,6 +2339,13 @@ def parse_envelope(env: dict) -> tuple[str, datetime]:
     return unit, decision
 
 
+def _names_notes(notes: object) -> dict:
+    """{시장: 사유} 중 KR·US의 문자열 사유만 남깁니다."""
+    if not isinstance(notes, dict):
+        return {}
+    return {m: notes[m] for m in ("KR", "US") if isinstance(notes.get(m), str) and notes[m]}
+
+
 def build_context(
     repo: Path,
     env_bytes: bytes,
@@ -2344,12 +2355,15 @@ def build_context(
     top_n: int,
     log,
     security_names: bytes | None = None,
+    names_notes: dict | None = None,
 ) -> dict:
     """envelope(JSON 바이트)와 시장·섹터 입력으로 렌더 입력(ctx)을 만듭니다. 파일은 쓰지 않습니다.
 
     `repo`는 "마지막 정상 단위" 링크를 찾으려고 읽기만 합니다. 없는 디렉터리여도 됩니다.
     `security_names`는 `security-names.v1` JSON 바이트입니다. 없으면 KR은 순위 행의 이름으로
     종류를 판정하고, 이름이 없는 시장은 종류 열을 생략합니다.
+    `names_notes`는 {시장: 이름 원천을 쓰지 못한 사유}입니다. 종류 열을 생략한 시장의 데이터 상태
+    `증권 종류` 절에 사유로 적습니다(publisher가 레이크에서 이름을 만들지 못했을 때).
     """
     env = load_json_bytes(env_bytes, "envelope")
     unit, decision = parse_envelope(env)
@@ -2411,6 +2425,7 @@ def build_context(
         "release": release,
         "sha": sha256_bytes(env_bytes),
         "names_sha": sha256_bytes(security_names) if security_names is not None else None,
+        "names_notes": _names_notes(names_notes),
         "replay": replay,
         "replay_info": env.get("replay"),
         "synthetic": env.get("synthetic_fixture") is True,
