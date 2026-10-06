@@ -8,10 +8,9 @@ from typing import Any
 
 PACKAGES = ("numpy", "scipy", "pandas", "polars", "pyarrow", "scikit-learn",
             "lightgbm", "joblib", "duckdb")
-#: Extra packages a release needs when the market-sector section is on.  MS1's KR panel was built
-#: with ``exchange_calendars`` XKRX, and the scoring refuses any other calendar (there is no
-#: fallback), so the venv must carry the pinned version and the runtime manifest must list it.
-MARKET_SECTOR_PACKAGES = ("exchange_calendars",)
+# The market-sector section needs no extra package: its calculation calendar (MS1's KR panel was
+# built with ``exchange_calendars`` XKRX) is a frozen file inside the market-sector bundle, made on
+# the Mac, so the serving venv does not carry ``exchange_calendars``.
 
 
 def probe_code(packages: tuple[str, ...] = PACKAGES) -> str:
@@ -27,20 +26,17 @@ def probe_code(packages: tuple[str, ...] = PACKAGES) -> str:
 PROBE = probe_code(PACKAGES)
 
 
-def verify_runtime(python: Path, manifest_path: Path, *,
-                   extra_packages: tuple[str, ...] = ()) -> dict[str, Any]:
+def verify_runtime(python: Path, manifest_path: Path) -> dict[str, Any]:
     """Compare the interpreter with the frozen runtime manifest.
 
-    ``extra_packages`` must be pinned in addition to ``PACKAGES`` (``MARKET_SECTOR_PACKAGES`` when
-    the section is on).  The manifest may pin more than that (a manifest made for the section keeps
-    working with a config that has it off); every package it lists is checked.
+    The manifest must pin ``PACKAGES``.  It may pin more; every package it lists is checked, so a
+    manifest that lists a package the venv lacks (for example ``exchange_calendars``) is refused.
     """
     contract = json.loads(manifest_path.read_text(encoding="utf-8"))
     if contract.get("schema_version") != "daily-briefing-runtime.v1":
         raise ValueError("frozen runtime manifest version mismatch")
     expected = {key: contract[key] for key in ("python", "implementation", "system", "machine", "packages")}
-    wanted = (*PACKAGES, *extra_packages)
-    if not set(wanted) <= set(expected["packages"]):
+    if not set(PACKAGES) <= set(expected["packages"]):
         raise ValueError("runtime manifest does not pin all model dependencies")
     try:
         probe = subprocess.run([str(python), "-c", probe_code(tuple(sorted(expected["packages"])))],

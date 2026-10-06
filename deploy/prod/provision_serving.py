@@ -256,11 +256,11 @@ def _freeze(release: Path) -> None:
 
 
 def _verify_runtime(plan: Plan, python: Path) -> None:
-    # With the market-sector section the manifest must also pin exchange_calendars.
-    extra = "('exchange_calendars',)" if plan.ms_bundle is not None else "()"
+    # The market-sector section needs no extra package: its calculation calendar is a file in the
+    # bundle, so the serving venv does not need (and must not list) exchange_calendars.
     code = ("import sys; from pathlib import Path; "
             "from modeler.serving.runtime_contract import verify_runtime; "
-            f"verify_runtime(Path(sys.argv[1]), Path(sys.argv[2]), extra_packages={extra}); "
+            "verify_runtime(Path(sys.argv[1]), Path(sys.argv[2])); "
             "print('ok')")
     _run([str(python), "-c", code, str(python), str(plan.runtime_manifest)],
          cwd=plan.modeler, pythonpath=str(plan.modeler / "src"), timeout=120)
@@ -291,8 +291,7 @@ ops = Path(sys.argv[1])
 config = coordinator._config(ops)
 jobs, fixture = inputs._release_jobs(Path(config["release_manifest"]))
 assert fixture is False, "release must not be synthetic"
-runtime = verify_runtime(Path(config["python"]), Path(config["runtime_manifest"]),
-                         extra_packages=coordinator.runtime_extra_packages(config))
+runtime = verify_runtime(Path(config["python"]), Path(config["runtime_manifest"]))
 cards = json.loads(Path(config["model_cards_path"]).read_text())
 assert set(cards) == {model for _, model in jobs}, "model cards do not match the release jobs"
 calendars = {}

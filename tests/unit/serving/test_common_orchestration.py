@@ -382,3 +382,63 @@ def test_stale_reports_keep_the_ranking_up_to_five_sessions_and_drop_it_beyond()
     _annotate_selection(fresh, {**meta, "freshness_status": "ok", "freshness": {"delivery_lag": 0}}, "KR")
     assert fresh["status"] == "ok" and len(fresh["rankings"]) == 2
     assert "rankings_withheld" not in fresh["quality"]
+
+
+# ---- E6: what select recorded goes into the envelope ----------------------------------------
+def test_selection_summary_copies_only_the_keys_select_wrote():
+    from modeler.serving.orchestration import selection_summary
+
+    state = {"markets": {
+        "KR": {"status": "stale", "feature_asof_date": "2026-09-24", "lag_sessions": 2,
+               "freshness_reason": "KR feature session does not match K",
+               "producer_completed_at": "2026-09-29T03:00:00+09:00"},
+        "US": {"status": "unavailable", "reason": "producer_completion_missing"}},
+        "jobs": [{"prepared_input": "/secret/path"}], "kr_calendar_sha256": "x"}
+    assert selection_summary(state) == {
+        "KR": {"status": "stale", "feature_asof_date": "2026-09-24", "lag_sessions": 2,
+               "freshness_reason": "KR feature session does not match K"},
+        "US": {"status": "unavailable", "reason": "producer_completion_missing"}}
+    # nothing usable -> no summary (a holiday state has no markets, an old state may lack the key)
+    assert selection_summary({}) is None and selection_summary({"markets": {}}) is None
+    assert selection_summary({"markets": {"US": {"lag_sessions": True, "status": 3}}}) is None
+    assert selection_summary({"markets": {"XX": {"status": "ok"}}}) is None
+
+
+def test_envelope_has_the_summary_only_when_one_is_given():
+    from modeler.serving.orchestration import combine_reports
+
+    plain = combine_reports(report_date=REPORT_DATE, decision_at=DECISION, reports=[_report("ok")])
+    assert "selection_summary" not in plain
+    same = combine_reports(report_date=REPORT_DATE, decision_at=DECISION, reports=[_report("ok")],
+                           selection_summary=None)
+    assert json.dumps(same, sort_keys=True) == json.dumps(plain, sort_keys=True)
+    summary = {"US": {"status": "unavailable", "reason": "producer_completion_missing"}}
+    with_summary = combine_reports(report_date=REPORT_DATE, decision_at=DECISION,
+                                   reports=[_report("ok")], selection_summary=summary)
+    assert with_summary["selection_summary"] == summary
+    assert {k: v for k, v in with_summary.items() if k != "selection_summary"} == plain
+
+
+def test_runner_refuses_a_selection_state_that_does_not_match_its_hash(tmp_path, capsys):
+    from modeler.serving import runner
+
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text('{"jobs": []}')
+    state = tmp_path / "selection-state.json"
+    state.write_text(json.dumps({"markets": {"US": {"status": "unavailable",
+                                                    "reason": "producer_completion_missing"}}}))
+    base = ["infer", "--report-date", "2026-09-29", "--prepared-root", str(prepared),
+            "--run-root", str(tmp_path / "run"), "--jobs-config", str(jobs)]
+    assert runner.main([*base, "--selection-state", str(state),
+                        "--selection-state-sha256", "0" * 64]) == 1
+    assert "ValueError" in capsys.readouterr().err
+    assert runner.main([*base, "--selection-state", str(state)]) == 1  # the hash is required too
+    # with the right hash the summary reaches the envelope (no job ran: every model is missing)
+    code = runner.main([*base, "--selection-state", str(state),
+                        "--selection-state-sha256", _hash(state)])
+    envelope = json.loads((tmp_path / "run" / "report-2026-09-29.json").read_text())
+    assert code == 1  # no inference at all is "failed"
+    assert envelope["selection_summary"] == {
+        "US": {"status": "unavailable", "reason": "producer_completion_missing"}}

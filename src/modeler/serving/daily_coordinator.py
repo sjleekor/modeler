@@ -24,8 +24,8 @@ from modeler.reporting.site import PRIVATE_MANIFEST_NAME, PrivateViewBuilder, _r
 from modeler.serving.schema import report_template
 
 from .daily_inputs import MS_ENTRYPOINT, _release_market_sector, select
-from .orchestration import combine_reports
-from .runtime_contract import MARKET_SECTOR_PACKAGES, verify_runtime
+from .orchestration import combine_reports, selection_summary
+from .runtime_contract import verify_runtime
 
 SEOUL = ZoneInfo("Asia/Seoul")
 RETRY_MINUTES = (15, 17, 22, 32)
@@ -150,8 +150,7 @@ def _config(path: Path) -> dict[str, Any]:
         raise ValueError("model card SHA-256 changed")
     if _hash(_absolute(config, "python")) != config.get("python_sha256"):
         raise ValueError("serving Python executable SHA-256 changed")
-    verify_runtime(_absolute(config, "python"), _absolute(config, "runtime_manifest"),
-                   extra_packages=runtime_extra_packages(config))
+    verify_runtime(_absolute(config, "python"), _absolute(config, "runtime_manifest"))
     opening_keys = ("opening_snapshot_root", "opening_output_root", "opening_max_age_seconds")
     if any(config.get(key) is not None for key in opening_keys):
         if any(config.get(key) is None for key in opening_keys):
@@ -217,16 +216,6 @@ def _selected(config: dict[str, Any], day: date) -> dict[str, Any]:
     return state
 
 
-def runtime_extra_packages(config: dict[str, Any]) -> tuple[str, ...]:
-    """Packages the runtime manifest must pin on top of the model dependencies.
-
-    The market-sector section needs ``exchange_calendars`` (MS1's KR calendar); a config without the
-    section needs nothing extra, so an older runtime manifest keeps working.
-    """
-    on = any(config.get(key) is not None for key in MARKET_SECTOR_ROOT_KEYS)
-    return MARKET_SECTOR_PACKAGES if on else ()
-
-
 def _market_sector_roots(config: dict[str, Any]) -> dict[str, Path] | None:
     """The KR and US data roots the market-sector section reads; ``None`` when it is not configured.
 
@@ -276,17 +265,21 @@ def _release_jobs_brief(config: dict[str, Any]) -> tuple[list[dict[str, str]], b
 
 def _failed_inference(config: dict[str, Any], day: date, run_root: Path, invocation_id: str, *,
                       stage: str, error_class: str, exit_code: int | None, timed_out: bool,
-                      fixture: bool) -> dict[str, Any]:
+                      fixture: bool,
+                      select_summary: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Make this invocation's own failure report when the runner left none (변경 6).
 
     Every model section is ``failed`` with the cause class; the unit still renders and publishes.
+    ``select_summary`` (what the 09:30 select recorded per market, when a selection exists) goes
+    into the envelope so the failed sections can say why select found no input.
     A report of an earlier invocation on the same D is never reused: it is set aside under
     ``report-D.superseded-<sha>.json`` and replaced by this one, which carries this invocation id.
     """
     decision = datetime.combine(day, time(10), SEOUL)
     jobs, _ = _release_jobs_brief(config)
     envelope = combine_reports(report_date=day, decision_at=decision, reports=[], opening=None,
-        failures=[{**job, "error_class": error_class} for job in jobs])
+        failures=[{**job, "error_class": error_class} for job in jobs],
+        selection_summary=select_summary)
     envelope.update(historical_replay=False, synthetic_fixture=fixture, invocation_id=invocation_id,
         failure={"stage": stage, "error_class": error_class, "runner_exit_code": exit_code,
                  "timed_out": timed_out, "synthesized_by": "coordinator"})
@@ -308,11 +301,13 @@ def infer_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, A
     run_root.mkdir(parents=True, exist_ok=True)
     invocation_id = secrets.token_hex(16)
     _, fixture = _release_jobs_brief(config)
+    select_summary: dict[str, dict[str, Any]] | None = None  # set once a selection exists
 
     def failed(stage: str, error_class: str, *, exit_code: int | None = None,
                timed_out: bool = False) -> dict[str, Any]:
         written = _failed_inference(config, day, run_root, invocation_id, stage=stage,
-            error_class=error_class, exit_code=exit_code, timed_out=timed_out, fixture=fixture)
+            error_class=error_class, exit_code=exit_code, timed_out=timed_out, fixture=fixture,
+            select_summary=select_summary)
         state = {"report_date": day.isoformat(), "status": "inference_failed",
                  "invocation_id": invocation_id, "runner_exit_code": exit_code,
                  "report_path": written["report_path"], "report_sha256": written["report_sha256"],
@@ -329,6 +324,8 @@ def infer_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, A
         return failed("select", type(exc).__name__)
     if selected.get("status") == "holiday":
         return {"status": "holiday", "report_date": day.isoformat()}
+    select_summary = selection_summary(selected)
+    state_path = _absolute(config, "selection_root") / day.isoformat() / "selection-state.json"
     release = _read(_absolute(config, "release_manifest"))
     release_root = Path(release["release_root"]).resolve(strict=True)
     argv = [str(_absolute(config, "python")), "-m", "modeler.serving.runner", "infer",
@@ -337,6 +334,9 @@ def infer_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, A
             "--kr-calendar-json", str(_absolute(config, "kr_calendar")),
             "--kr-calendar-sha256", selected["kr_calendar_sha256"],
             "--invocation-id", invocation_id]
+    if select_summary:
+        argv += ["--selection-state", str(state_path),
+                 "--selection-state-sha256", _hash(state_path)]
     opening = config.get("opening_artifact")
     if opening is not None:
         opening_path = _absolute(config, "opening_artifact", exists=True)

@@ -529,3 +529,86 @@ def test_8_failure_unit_is_kept_locally_while_the_remote_is_unreachable(
 
 def test_main_scenarios_are_exercised_through_the_shared_helpers() -> None:
     assert e2e.D == w.D and sys.version_info >= (3, 11)
+
+
+# ---- 10. E6: the failed US section says why select found no input ---------------------------
+
+
+def test_10_us_native_missing_puts_the_select_reason_in_the_envelope_and_the_unit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The 2026-10-06 situation: KR prepared, US prepare did not finish (US: MissingInference)."""
+    release, config = w.build(tmp_path, monkeypatch, kr=[("2026-09-28", EARLY)])
+    done = _day(release, config)
+    assert done.returncode == 0, done.stderr
+    rep = w.report(tmp_path)
+    assert {(f["market"], f["error_class"]) for f in rep["failures"]} == {
+        ("US", "MissingInference")
+    }
+    # what select wrote in selection-state.json, and nothing else, goes into the envelope
+    state = json.loads(
+        (tmp_path / "prepared" / "selections" / "2026-09-29" / "selection-state.json").read_text()
+    )
+    us_state = {"status": "unavailable", "reason": "producer_completion_missing"}
+    assert state["markets"]["US"] == us_state
+    assert rep["selection_summary"]["US"] == state["markets"]["US"]
+    assert rep["selection_summary"]["KR"] == {
+        "status": "ok",
+        "feature_asof_date": "2026-09-28",
+        "lag_sessions": 0,
+    }
+    ctx = _context(tmp_path)
+    assert ctx["us"]["status"] == "failed"
+    for model in ctx["us"]["models"]:
+        reasons = "\n".join(model["reason"])
+        assert "`MissingInference`" in reasons
+        assert "사유 `producer_completion_missing`" in reasons
+    text = "\n".join(markdown.render_us_model(ctx, ctx["us"]["models"][0], False))
+    assert ("select 사유: 상태 `unavailable`(고른 입력 없음), "
+            "사유 `producer_completion_missing`") in text
+    assert all("select 사유" not in line for line in markdown.render_kr(ctx)[0])  # KR ranked fine
+
+
+def test_10_the_failure_report_path_carries_the_select_summary_too(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A runner timeout makes the coordinator write the envelope itself: it names select's state."""
+    release, config = w.build(
+        tmp_path, monkeypatch, kr=[("2026-09-28", EARLY)], us=[("2026-09-28", EARLY)]
+    )
+    selected = w.wrapper(release, config, "select", w.SELECT_AT)
+    assert selected.returncode == 0, selected.stderr
+    slow = tmp_path / "slow.flag"
+    slow.write_text("x")
+    monkeypatch.setenv("R3_SLOW_FLAG", str(slow))
+    monkeypatch.setattr(daily_coordinator, "RUNNER_TIMEOUT_SECONDS", 2)
+    code = daily_wrapper.main(
+        ["run", "--config", str(config), "--report-date", w.D.isoformat(),
+         "--fixture-now", w.RUN_AT]
+    )
+    assert code == 1
+    rep = w.report(tmp_path)
+    assert rep["failure"]["error_class"] == "RunnerTimeout" and rep["failure"]["synthesized_by"]
+    assert rep["selection_summary"] == {
+        "KR": {"status": "ok", "feature_asof_date": "2026-09-28", "lag_sessions": 0},
+        "US": {"status": "ok", "feature_asof_date": "2026-09-28", "lag_sessions": 0},
+    }
+    ctx = _context(tmp_path)
+    reasons = "\n".join(ctx["us"]["models"][0]["reason"])
+    assert "`RunnerTimeout`" in reasons and "select 사유: 상태 `ok`(정상)" in reasons
+
+
+def test_10_nothing_prepared_names_the_missing_input_for_both_markets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Nothing prepared at all still leaves a selection (every market unavailable)."""
+    release, config = w.build(tmp_path, monkeypatch)
+    done = _day(release, config)
+    assert done.returncode == 1
+    rep = w.report(tmp_path)
+    assert {m: b["reason"] for m, b in rep["selection_summary"].items()} == {
+        "KR": "producer_completion_missing",
+        "US": "producer_completion_missing",
+    }
+    text = "\n".join(_lines(markdown.render_kr(_context(tmp_path))).splitlines())
+    assert "사유 `producer_completion_missing`" in text and "`MissingInference`" in text
