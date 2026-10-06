@@ -15,6 +15,12 @@
 그것을 쓴다 — 같은 행 안의 값이라 시점이 어긋날 일도 없다. ``dtc``·``si_chg``도
 마찬가지로 FINRA가 이미 계산해 준 ``days_to_cover``·``change_percent``를
 그대로 쓴다(``03_schema_and_pit.md`` §4.4) — 재계산하지 않는다.
+
+**종목 구간 모드** (``lake.security_boundaries``). 롤링인 ``sv_share_20``만 구간 단위다 —
+``short_volume`` 행에 ``(symbol, date)``로 ``security_id``를 붙여 20일 평균을 구간 안에서만
+굴리고(구간 첫 19행은 이미 ``min_samples``=20이라 빈다), 패널과도 구간 단위로 맞춘다.
+공표 지연 뒤 값을 그대로 가져오는 ``short_interest`` 쪽(``si_ratio``·``dtc``·``si_chg``)은
+롤링이 없어 ``symbol`` 결합 그대로다.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import polars as pl
 
 from modeler.us.features._trading_days import shift_trading_days
 from modeler.us.lake import ASOF_LAG_TRADING_DAYS, UsLake
+from modeler.us.segments import attach_security_id, group_key
 
 _SETTLEMENT_LAG = ASOF_LAG_TRADING_DAYS["short_interest"]
 
@@ -63,7 +70,8 @@ def _sv_share_daily(lake: UsLake) -> pl.LazyFrame:
     전체 거래량이 아니다 — ``sv_share_20``이 "시장 전체 공매도 비율"이 아닌
     이유가 여기 있다(전체의 중앙값 39.2%, ``01_data_readiness.md`` §2).
     """
-    daily = (
+    by = group_key(lake)
+    ratios = (
         lake.scan("short_volume")
         .with_columns(pl.col("short_exempt_volume").fill_null(0.0))
         .filter(pl.col("total_volume") > 0)
@@ -72,22 +80,27 @@ def _sv_share_daily(lake: UsLake) -> pl.LazyFrame:
                 (pl.col("short_volume") + pl.col("short_exempt_volume")) / pl.col("total_volume")
             ).alias("_sv_ratio")
         )
-        .sort(["symbol", "date"])
+    )
+    if lake.security_boundaries:
+        ratios = attach_security_id(ratios, lake)
+    daily = (
+        ratios.sort([by, "date"])
         .with_columns(
             pl.col("_sv_ratio")
             .rolling_mean(window_size=_SV_WINDOW, min_samples=_SV_WINDOW)
-            .over("symbol")
+            .over(by)
             .alias("sv_share_20")
         )
-        .select("date", "symbol", "sv_share_20")
+        .select("date", *dict.fromkeys(["symbol", by]), "sv_share_20")
     )
     return daily
 
 
 def add_short(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
     """F11(``si_ratio`` · ``dtc`` · ``si_chg`` · ``sv_share_20``)를 붙인다."""
+    by = group_key(lake)
     eligible = _eligible_short_interest(lake).sort(["symbol", "_eligible_date"])
-    sv_daily = _sv_share_daily(lake).sort(["symbol", "date"])
+    sv_daily = _sv_share_daily(lake).sort([by, "date"])
 
     panel_lf = panel.lazy().sort(["symbol", "date"])
 
@@ -106,11 +119,15 @@ def add_short(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
         pl.col("change_percent").alias("si_chg"),
     )
 
+    if lake.security_boundaries:
+        with_si = attach_security_id(with_si, lake)
+        # 겹치는 이름(symbol)은 오른쪽 접미사가 붙지 않게 sv 쪽에서 뺀다.
+        sv_daily = sv_daily.drop("symbol")
     with_sv = with_si.join_asof(
         sv_daily,
         left_on="date",
         right_on="date",
-        by="symbol",
+        by=by,
         strategy="backward",
     )
 

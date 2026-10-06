@@ -54,6 +54,14 @@ null"은 ``period_of_report``의 연·월 차이가 정확히 3개월(같은 분
 F17이 ``settlement_date`` 창을 쓰지 ``available_date`` 창을 쓰지 않는 것과 같은
 이유다: 보유 변화의 크기를 그 분기 당시의 유동성으로 정규화하는 것이지, 60일
 뒤 알게 된 시점의 유동성으로 정규화하는 게 아니다.
+
+**종목 구간 모드** (``lake.security_boundaries``, 유니버스 v2 설계 §3). 롤링은 거래량 20일
+평균(``avg_volume_20``) 하나뿐이다 — ``prices_daily`` 행에 ``security_id``를 붙여 구간 안에서만
+굴리고, 보유 분기(``period_of_report``)의 거래량을 그 분기가 속한 구간에서 가져온다.
+``min_samples``는 꺼짐과 같고(10), 대신 구간 안 행 위치(0부터)가 19 미만인 첫 19행은 비운다
+(``segments.mask_warmup``). 보유 표 자체의
+조인(CUSIP→심볼, 분기 간 변화, 패널과의 ``symbol`` 기준 ``join_asof``)은 롤링이 아니라
+그대로 둔다 — 분기 값은 ``(symbol, 날짜)``로 붙는다.
 """
 
 from __future__ import annotations
@@ -62,6 +70,7 @@ import polars as pl
 
 from modeler.us.features._daily import panel_symbols
 from modeler.us.lake import UsLake
+from modeler.us.segments import attach_security_id, group_key, mask_warmup
 
 #: ``period_of_report`` + 이 값(달력일)부터 그 분기 13F 보유 표를 알 수 있다.
 #: 초안 §5.3·§5.4 — 법정 45일, 임시값(미측정 · U-D8 데드라인 전에 실측 예정).
@@ -173,25 +182,46 @@ def add_institutional(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
         with_symbol, group_keys=["symbol", "period_of_report"], tie_break="n_settlement_dates"
     )
 
-    raw_volume = (
+    by = group_key(lake)
+    segmented = lake.security_boundaries
+
+    prices = (
         lake.scan("prices_daily")
         .filter(pl.col("symbol").is_in(symbols))
         .select("date", "symbol", pl.col("volume").cast(pl.Float64))
-        .sort(["symbol", "date"])
+    )
+    if segmented:
+        prices = attach_security_id(prices, lake)
+    raw_volume = (
+        prices.sort([by, "date"])
         .with_columns(
             pl.col("volume")
             .rolling_mean(window_size=_VOLUME_WINDOW, min_samples=_VOLUME_MIN_VALID_DAYS)
-            .over("symbol")
+            .over(by)
             .alias("avg_volume_20")
         )
-        .select("symbol", "date", "avg_volume_20")
+        .with_columns(
+            (
+                mask_warmup(pl.col("avg_volume_20"), by, _VOLUME_WINDOW)
+                if segmented
+                else pl.col("avg_volume_20")
+            ).alias("avg_volume_20")
+        )
+        .select(*dict.fromkeys(["symbol", by]), "date", "avg_volume_20")
     )
 
-    with_volume = with_symbol.sort(["symbol", "period_of_report"]).join_asof(
-        raw_volume.sort(["symbol", "date"]),
+    holdings_by_symbol = with_symbol.sort(["symbol", "period_of_report"])
+    if segmented:
+        # 보유 분기가 속한 구간의 거래량을 쓴다. (symbol, period_of_report)로 구간을 정한다.
+        holdings_by_symbol = attach_security_id(
+            holdings_by_symbol, lake, date_col="period_of_report"
+        )
+        raw_volume = raw_volume.drop("symbol")
+    with_volume = holdings_by_symbol.join_asof(
+        raw_volume.sort([by, "date"]),
         left_on="period_of_report",
         right_on="date",
-        by="symbol",
+        by=by,
         strategy="backward",
     )
 

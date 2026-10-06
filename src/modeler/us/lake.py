@@ -21,6 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import ClassVar
 
 import polars as pl
 
@@ -56,6 +57,17 @@ US_TABLES: tuple[str, ...] = (
     "trading_calendar",
     "universe_daily",
     "volatility_daily",
+)
+
+#: 유니버스 v2(``20261006_universe_v2/02_design.md`` §2) 표 넷 — collector derive가
+#: 2026-10-06부터 만든다. ``US_TABLES``에 넣지 않는다: ``snapshot_manifest()``(v1 데이터셋
+#: manifest·서빙 pinned revision)가 표 목록 그대로 키를 내서, 여기 더하면 v1 경로의
+#: 출력이 달라진다. v2 경로는 ``snapshot_manifest_for``로 이 표를 따로 적는다.
+US_TABLES_V2: tuple[str, ...] = (
+    "listing_snapshots_v2",
+    "security_master",
+    "security_segments",
+    "universe_daily_v2",
 )
 
 #: 표 -> as-of 축 컬럼명 (``01_data_readiness.md`` §2 표 그대로).
@@ -128,9 +140,10 @@ _EASTERN_TZ = "America/New_York"
 
 
 def _require_known_table(table: str) -> None:
-    if table not in US_TABLES:
+    if table not in US_TABLES and table not in US_TABLES_V2:
         raise KeyError(
-            f"모르는 미국 표입니다: {table!r}. US_TABLES {len(US_TABLES)}개 중 하나여야 합니다."
+            f"모르는 미국 표입니다: {table!r}. US_TABLES {len(US_TABLES)}개 "
+            f"(또는 v2 표 {len(US_TABLES_V2)}개) 중 하나여야 합니다."
         )
 
 
@@ -208,6 +221,16 @@ class UsLake:
 
     root: DataRoot
 
+    #: 종목 구간(``security_id``) 단위 계산을 켜는지. **기본 꺼짐이다.** 클래스 속성이라
+    #: dataclass 필드가 아니다 — ``PinnedUsLake``(서빙)가 필드를 더 얹는 구조라 기본값
+    #: 필드를 부모에 두면 그쪽 생성자가 깨진다. 켠 리더는 ``with_security_boundaries()``로
+    #: 만든다(``SegmentedUsLake``). 소비하는 쪽은 ``lake.security_boundaries``만 본다.
+    security_boundaries: ClassVar[bool] = False
+
+    def with_security_boundaries(self) -> SegmentedUsLake:
+        """같은 루트를 읽되 종목 구간 단위 계산이 켜진 리더."""
+        return SegmentedUsLake(root=self.root)
+
     @classmethod
     def resolve(cls) -> UsLake:
         """``$STOCK_DATA_ROOT/us``를 가리키는 ``UsLake``.
@@ -277,3 +300,14 @@ class UsLake:
     def snapshot_manifest(self) -> dict[str, str]:
         """표 이름 -> 쓴 snapshot_date(ISO). 데이터셋 manifest에 그대로 들어간다."""
         return {table: self.latest_snapshot(table).isoformat() for table in US_TABLES}
+
+    def snapshot_manifest_for(self, tables: tuple[str, ...]) -> dict[str, str]:
+        """``tables``만 같은 꼴로. v2 표(``US_TABLES_V2``)처럼 기본 manifest에 없는 표용."""
+        return {table: self.latest_snapshot(table).isoformat() for table in tables}
+
+
+@dataclass(frozen=True)
+class SegmentedUsLake(UsLake):
+    """``security_boundaries``가 켜진 리더 — 롤링·분할 조정·라벨이 ``security_id`` 단위다."""
+
+    security_boundaries: ClassVar[bool] = True

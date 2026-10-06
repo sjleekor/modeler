@@ -37,6 +37,12 @@
 그 부류의 유니버스 종목은 넷 다 ``_isna``가 항상 True다(초안 §5.2,
 [07_midas_unused_columns.md](../../../../../my/milestones/us/research/data/source_expansion/07_midas_unused_columns.md)
 §8.7). 미래 정보는 아니지만 이 다섯 부류의 지시변수가 된다는 점을 기록해 둔다.
+
+**종목 구간 모드** (``lake.security_boundaries``, 유니버스 v2 설계 §3). MIDAS 행에
+``(symbol, date)``로 ``security_id``를 붙여 20거래일 합을 구간 안에서만 굴리고, 패널과도
+구간 단위로 ``join_asof``한다. ``min_samples``는 꺼짐과 같고(``_MIN_VALID_DAYS``), 대신 구간 안
+행 위치(0부터)가 19 미만인 첫 19행은 비운다(``segments.mask_warmup``). 창 안에 빈 값이 있어도
+위치가 19 이상이면 값이 나온다.
 """
 
 from __future__ import annotations
@@ -47,6 +53,7 @@ import polars as pl
 
 from modeler.us.features._daily import mask_ticker_reuse_gap, panel_symbols
 from modeler.us.lake import UsLake
+from modeler.us.segments import attach_security_id, group_key, mask_warmup
 
 #: 창(거래일). 창 안 유효 일수가 이 값 미만이면 null — §5 인트로 일반 규칙.
 _WINDOW = 20
@@ -132,6 +139,8 @@ def _with_available_date(midas: pl.LazyFrame) -> pl.LazyFrame:
 def add_order_flow(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
     """``panel``의 ``(date, symbol)``에 F18 주문흐름 피쳐 + ``_isna``를 붙인다."""
     symbols = panel_symbols(panel)
+    by = group_key(lake)
+    segmented = lake.security_boundaries
 
     midas = (
         # security_type == 'Stock'만 (lake._clean_midas_security_daily가 이미 건다).
@@ -151,6 +160,11 @@ def add_order_flow(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
         )
     )
     midas = _with_available_date(midas)
+    if segmented:
+        midas = attach_security_id(midas, lake)
+
+    def _warm(expr: pl.Expr) -> pl.Expr:
+        return mask_warmup(expr, by, _WINDOW) if segmented else expr
 
     rolling_cols = []
     ratio_terms = []
@@ -159,22 +173,28 @@ def add_order_flow(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
         denom_20 = f"_{denom_col}_20"
         rolling_cols.append(
             mask_ticker_reuse_gap(
-                pl.col(numer_col)
-                .cast(pl.Float64)
-                .rolling_sum(window_size=_WINDOW, min_samples=_MIN_VALID_DAYS)
-                .over("symbol"),
+                _warm(
+                    pl.col(numer_col)
+                    .cast(pl.Float64)
+                    .rolling_sum(window_size=_WINDOW, min_samples=_MIN_VALID_DAYS)
+                    .over(by)
+                ),
                 pl.col("date"),
                 _WINDOW - 1,
+                by=by,
             ).alias(numer_20)
         )
         rolling_cols.append(
             mask_ticker_reuse_gap(
-                pl.col(denom_col)
-                .cast(pl.Float64)
-                .rolling_sum(window_size=_WINDOW, min_samples=_MIN_VALID_DAYS)
-                .over("symbol"),
+                _warm(
+                    pl.col(denom_col)
+                    .cast(pl.Float64)
+                    .rolling_sum(window_size=_WINDOW, min_samples=_MIN_VALID_DAYS)
+                    .over(by)
+                ),
                 pl.col("date"),
                 _WINDOW - 1,
+                by=by,
             ).alias(denom_20)
         )
         ratio_terms.append(
@@ -185,18 +205,20 @@ def add_order_flow(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
         )
 
     daily = (
-        midas.sort(["symbol", "date"])
+        midas.sort([by, "date"])
         .with_columns(rolling_cols)
         .with_columns(ratio_terms)
-        .select("symbol", "date", "available_date", *_FEATURES)
+        .select(*dict.fromkeys(["symbol", by]), "date", "available_date", *_FEATURES)
     )
 
     panel_lf = panel.lazy().sort(["symbol", "date"])
+    if segmented:
+        panel_lf = attach_security_id(panel_lf, lake)
     joined = panel_lf.join_asof(
-        daily.sort(["symbol", "available_date"]),
+        daily.sort([by, "available_date"]),
         left_on="date",
         right_on="available_date",
-        by="symbol",
+        by=by,
         strategy="backward",
     )
 

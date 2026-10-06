@@ -35,41 +35,43 @@ from modeler.us.features._daily import (
     with_market_return,
 )
 from modeler.us.lake import UsLake
+from modeler.us.segments import group_key
 
 _FEATURES = ("rv_20", "rv_60", "idio_vol_60", "beta_252")
 
 
-def _residual_vol(ret: pl.Expr, ret_spy: pl.Expr, window: int) -> pl.Expr:
-    var_stock = ret.rolling_std(window_size=window).over("symbol") ** 2
-    var_mkt = ret_spy.rolling_std(window_size=window).over("symbol") ** 2
-    cov = pl.rolling_cov(ret, ret_spy, window_size=window).over("symbol")
+def _residual_vol(ret: pl.Expr, ret_spy: pl.Expr, window: int, by: str = "symbol") -> pl.Expr:
+    var_stock = ret.rolling_std(window_size=window).over(by) ** 2
+    var_mkt = ret_spy.rolling_std(window_size=window).over(by) ** 2
+    cov = pl.rolling_cov(ret, ret_spy, window_size=window).over(by)
     beta = cov / var_mkt
     resid_var = (var_stock - beta**2 * var_mkt).clip(lower_bound=0.0)
     return resid_var.sqrt()
 
 
-def _beta(ret: pl.Expr, ret_spy: pl.Expr, window: int) -> pl.Expr:
-    var_mkt = ret_spy.rolling_std(window_size=window).over("symbol") ** 2
-    cov = pl.rolling_cov(ret, ret_spy, window_size=window).over("symbol")
+def _beta(ret: pl.Expr, ret_spy: pl.Expr, window: int, by: str = "symbol") -> pl.Expr:
+    var_mkt = ret_spy.rolling_std(window_size=window).over(by) ** 2
+    cov = pl.rolling_cov(ret, ret_spy, window_size=window).over(by)
     return cov / var_mkt
 
 
 def add_volatility(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
     """``panel``의 ``(date, symbol)``에 F3 변동성 피쳐 + ``_isna``를 붙인다."""
     daily = with_market_return(daily_prices(lake, symbols=panel_symbols(panel)), lake)
+    by = group_key(lake)
     ret = pl.col("ret")
     ret_spy = pl.col("ret_spy")
     date_col = pl.col("date")
 
-    rv_20 = ret.rolling_std(window_size=20).over("symbol")
-    rv_60 = ret.rolling_std(window_size=60).over("symbol")
-    idio_vol_60 = _residual_vol(ret, ret_spy, 60)
-    beta_252 = _beta(ret, ret_spy, 252)
+    rv_20 = ret.rolling_std(window_size=20).over(by)
+    rv_60 = ret.rolling_std(window_size=60).over(by)
+    idio_vol_60 = _residual_vol(ret, ret_spy, 60, by)
+    beta_252 = _beta(ret, ret_spy, 252, by)
 
     features = daily.with_columns(
-        mask_ticker_reuse_gap(rv_20, date_col, 19).alias("rv_20"),
-        mask_ticker_reuse_gap(rv_60, date_col, 59).alias("rv_60"),
-        mask_ticker_reuse_gap(idio_vol_60, date_col, 59).alias("idio_vol_60"),
-        mask_ticker_reuse_gap(beta_252, date_col, 251).alias("beta_252"),
+        mask_ticker_reuse_gap(rv_20, date_col, 19, by=by).alias("rv_20"),
+        mask_ticker_reuse_gap(rv_60, date_col, 59, by=by).alias("rv_60"),
+        mask_ticker_reuse_gap(idio_vol_60, date_col, 59, by=by).alias("idio_vol_60"),
+        mask_ticker_reuse_gap(beta_252, date_col, 251, by=by).alias("beta_252"),
     )
     return join_features(panel, features, _FEATURES)

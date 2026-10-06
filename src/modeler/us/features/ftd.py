@@ -39,6 +39,15 @@
 왜곡에 그쳐(전체 계열을 오염시키지 않는다) 우선순위가 낮다고 판단했다.
 보고에 이 결정을 적는다 — 나중에 문제가 되면 ``prices.split_factors``를
 가져와 창 안 결제일마다 같은 기준으로 재조정하면 된다.
+
+**종목 구간 모드** (``lake.security_boundaries``, 유니버스 v2 설계 §3). 밀집 격자를 심볼이
+아니라 종목 구간(``security_id``)마다 만든다 — 결제일이 속한 구간을 ``(symbol, 결제일)``로
+정하고(``segments.attach_security_id``), 구간의 **첫 가격일 이후** 결제일만 둔다. 20결제일
+롤링·``ftd_chg`` 시프트는 구간 안에서만 굴러 앞 구간 결제일을 읽지 않고, 패널과도 구간
+단위로 ``join_asof``한다. ``min_samples``는 꺼짐과 같고(``_MIN_VALID_DAYS``), 대신 구간 격자 안
+위치(0부터)가 19 미만인 첫 19결제일은 비운다(``segments.mask_warmup``). 창 안에 거래량
+빈 값이 있어도 위치가 19 이상이면 값이 나온다.
+``ftd_chg``는 시프트한 ``ftd_share_20``이 비어 있으면 함께 빈다.
 """
 
 from __future__ import annotations
@@ -49,6 +58,7 @@ import polars as pl
 
 from modeler.us.features._daily import panel_symbols
 from modeler.us.lake import UsLake
+from modeler.us.segments import SECURITY_ID, attach_security_id, group_key, mask_warmup
 
 #: 창(결제일 수). 창 안 유효 일수가 이 값 미만이면 null — §5 인트로 일반 규칙
 #: ("창 안 유효 일수가 10 미만이면 피쳐를 null로 둔다")을 그대로 따른다.
@@ -104,6 +114,8 @@ def _global_settlement_calendar(lake: UsLake, buffer_start: date) -> pl.LazyFram
 def add_ftd(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
     """``panel``의 ``(date, symbol)``에 F17 결제실패 피쳐 + ``_isna``를 붙인다."""
     symbols = panel_symbols(panel)
+    by = group_key(lake)
+    segmented = lake.security_boundaries
     panel_min_date = panel["date"].min()
     buffer_start = panel_min_date - timedelta(days=_LOOKBACK_BUFFER_DAYS)
 
@@ -136,23 +148,47 @@ def add_ftd(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
         )
     )
 
+    if segmented:
+        # 구간 단위 격자: 결제일마다 속한 구간을 붙이고 구간의 첫 가격일 앞은 버린다.
+        first_price = (
+            attach_security_id(raw_volume, lake, date_col="settlement_date")
+            .group_by(SECURITY_ID)
+            .agg(pl.col("settlement_date").min().alias("_first_price_date"))
+        )
+        dense = (
+            attach_security_id(dense, lake, date_col="settlement_date")
+            .join(first_price, on=SECURITY_ID, how="left")
+            .filter(pl.col("settlement_date") >= pl.col("_first_price_date"))
+            .drop("_first_price_date")
+        )
+
     daily = (
         dense.join(raw_volume, on=["settlement_date", "symbol"], how="left")
-        .sort(["symbol", "settlement_date"])
+        .sort([by, "settlement_date"])
         .with_columns(
             pl.col("quantity")
             .rolling_sum(window_size=_WINDOW, min_samples=_MIN_VALID_DAYS)
-            .over("symbol")
+            .over(by)
             .alias("_qty_sum_20"),
             (pl.col("quantity") > 0)
             .cast(pl.Int32)
             .rolling_sum(window_size=_WINDOW, min_samples=_MIN_VALID_DAYS)
-            .over("symbol")
+            .over(by)
             .alias("ftd_days_20"),
             pl.col("volume")
             .rolling_sum(window_size=_WINDOW, min_samples=_MIN_VALID_DAYS)
-            .over("symbol")
+            .over(by)
             .alias("_vol_sum_20"),
+        )
+        .with_columns(
+            *(
+                [
+                    mask_warmup(pl.col(c), by, _WINDOW).alias(c)
+                    for c in ("_qty_sum_20", "ftd_days_20", "_vol_sum_20")
+                ]
+                if segmented
+                else []
+            )
         )
         .with_columns(
             pl.when(pl.col("_vol_sum_20") > 0)
@@ -163,18 +199,20 @@ def add_ftd(panel: pl.DataFrame, lake: UsLake) -> pl.DataFrame:
         .with_columns(
             (
                 pl.col("ftd_share_20")
-                - pl.col("ftd_share_20").shift(_CHG_LAG_TRADING_DAYS).over("symbol")
+                - pl.col("ftd_share_20").shift(_CHG_LAG_TRADING_DAYS).over(by)
             ).alias("ftd_chg")
         )
-        .select("symbol", "settlement_date", "available_date", *_FEATURES)
+        .select(*dict.fromkeys(["symbol", by]), "settlement_date", "available_date", *_FEATURES)
     )
 
     panel_lf = panel.lazy().sort(["symbol", "date"])
+    if segmented:
+        panel_lf = attach_security_id(panel_lf, lake)
     joined = panel_lf.join_asof(
-        daily.sort(["symbol", "available_date"]),
+        daily.sort([by, "available_date"]),
         left_on="date",
         right_on="available_date",
-        by="symbol",
+        by=by,
         strategy="backward",
     )
 

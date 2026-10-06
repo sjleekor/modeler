@@ -61,6 +61,7 @@ import polars as pl
 from modeler.us.lake import UsLake
 from modeler.us.panel import build_panel
 from modeler.us.prices import adjusted_daily
+from modeler.us.segments import SECURITY_ID, attach_security_id
 
 #: 리밸런스 t에서 라벨 만기까지의 거래일 수 (``02`` §1 h21 — 주 horizon).
 HORIZON_TRADING_DAYS = 21
@@ -295,6 +296,7 @@ def _segment_terminal(
     t21: date,
     *,
     max_gap_days: int = MAX_TICKER_GAP_DAYS,
+    key: str = "symbol",
 ) -> pl.DataFrame:
     """``t``(anchor)부터 ``t21``까지 **끊기지 않고 이어진** 마지막 관측을 찾는다.
 
@@ -304,16 +306,19 @@ def _segment_terminal(
     넘는 지점(티커 재사용 의심, 모듈 docstring·``MAX_TICKER_GAP_DAYS`` 참고)을
     만나면 그 **앞**에서 멈춘다.
 
-    반환: ``symbol, terminal_date, terminal_adj_close, had_gap``.
+    ``key``는 종목을 가르는 열이다 — 기본 ``symbol``, 종목 구간 모드에서는 ``security_id``
+    (``anchor``·``daily``에 그 열이 있어야 한다). 반환의 키 열 이름도 ``key``다.
+
+    반환: ``<key>, terminal_date, terminal_adj_close, had_gap``.
     ``had_gap``이 참이면 ``terminal_date``가 공백 앞의 마지막 관측일이고,
     ``t21``보다 이르다 — 그 심볼은 정확히 ``t21``에 값이 있어도 공백을 건넌
     값이므로 이어짐으로 치지 않는다(호출부가 그 값을 안 쓴다).
     """
-    symbols = anchor["symbol"].to_list()
+    symbols = anchor[key].to_list()
     if not symbols:
         return pl.DataFrame(
             schema={
-                "symbol": pl.String,
+                key: pl.String,
                 "terminal_date": pl.Date,
                 "terminal_adj_close": pl.Float64,
                 "had_gap": pl.Boolean,
@@ -322,33 +327,33 @@ def _segment_terminal(
     t = anchor["date"][0]
 
     window = daily.filter(
-        pl.col("symbol").is_in(symbols) & (pl.col("date") > t) & (pl.col("date") <= t21)
-    ).select("symbol", "date", "adj_close")
+        pl.col(key).is_in(symbols) & (pl.col("date") > t) & (pl.col("date") <= t21)
+    ).select(key, "date", "adj_close")
 
     combined = (
-        pl.concat([anchor.select("symbol", "date", "adj_close"), window])
-        .sort(["symbol", "date"])
+        pl.concat([anchor.select(key, "date", "adj_close"), window])
+        .sort([key, "date"])
         .with_columns(
-            (pl.col("date") - pl.col("date").shift(1).over("symbol"))
+            (pl.col("date") - pl.col("date").shift(1).over(key))
             .dt.total_days()
             .fill_null(0)
             .alias("_gap_days")
         )
         .with_columns((pl.col("_gap_days") > max_gap_days).alias("_is_break"))
-        .with_columns(pl.col("_is_break").cast(pl.Int32).cum_sum().over("symbol").alias("_segment"))
+        .with_columns(pl.col("_is_break").cast(pl.Int32).cum_sum().over(key).alias("_segment"))
     )
 
-    had_gap = combined.group_by("symbol").agg(pl.col("_is_break").any().alias("had_gap"))
+    had_gap = combined.group_by(key).agg(pl.col("_is_break").any().alias("had_gap"))
     terminal = (
         combined.filter(pl.col("_segment") == 0)
-        .sort(["symbol", "date"])
-        .group_by("symbol", maintain_order=True)
+        .sort([key, "date"])
+        .group_by(key, maintain_order=True)
         .agg(
             pl.col("date").last().alias("terminal_date"),
             pl.col("adj_close").last().alias("terminal_adj_close"),
         )
     )
-    return terminal.join(had_gap, on="symbol", how="left")
+    return terminal.join(had_gap, on=key, how="left")
 
 
 def _distress_at(
@@ -388,6 +393,8 @@ def _label_one_date(
     t21: date,
     daily: pl.DataFrame,
     listing_snapshots: pl.DataFrame,
+    *,
+    key: str = "symbol",
 ) -> tuple[pl.DataFrame, dict[str, int]]:
     """``universe_t``(그 날 유니버스, panel 행) 하나에 ``L0``와 종가 사유를 붙인다.
 
@@ -398,10 +405,13 @@ def _label_one_date(
 
     반환: (``L0``가 붙은 DataFrame,
     {"distress_delisted": n, "other": n, "ticker_reuse_gap": n}).
+
+    ``key``는 ``_segment_terminal``과 같다 — 종목 구간 모드에서는 ``security_id``로 끝 값을
+    찾아, 같은 구간 안의 가격만 본다(구간 끝을 넘는 행은 호출부가 미리 뺀다).
     """
-    anchor = universe_t.select("symbol", "date", "adj_close")
-    terminal = _segment_terminal(daily, anchor, t21)
-    joined = universe_t.join(terminal, on="symbol", how="left")
+    anchor = universe_t.select(key, "date", "adj_close")
+    terminal = _segment_terminal(daily, anchor, t21, key=key)
+    joined = universe_t.join(terminal, on=key, how="left")
 
     gapped = joined.filter(pl.col("had_gap"))
     continuous = joined.filter(~pl.col("had_gap"))
@@ -456,6 +466,13 @@ def build_labels(
 
     ``panel``을 안 주면 ``panel.build_panel(lake)``로 만든다.
 
+    **종목 구간 모드** (``lake.security_boundaries``, 유니버스 v2 설계 §3). 패널 행마다
+    ``security_id``와 구간 끝(``seg_end``)을 붙이고, 끝 값을 같은 구간 안의 가격에서만 찾는다.
+    ``t + horizon``이 구간 끝을 넘으면(``seg_end < t+horizon``) 그 행은 라벨에서 뺀다
+    (``diagnostics["security_boundaries"]["dropped_segment_end"]``). 시작 가격 ``adj_close``도
+    구간 기준 조정가(``adjusted_daily`` 켜짐 모드)로 바꿔 끝 값과 같은 눈금으로 계산한 뒤 패널의
+    원래 ``adj_close``로 되돌린다 — 라벨 스키마는 꺼짐과 같다. 꺼짐이면 지금과 같다.
+
     ``horizon``은 리밸런스 ``t``에서 라벨 만기까지의 거래일 수다. 기본값은
     주 horizon인 ``HORIZON_TRADING_DAYS``(h21)다 — ``04_feature_test_plan.md``
     §4가 단일피쳐 검정에서 h5·h63의 IC 감쇠도 보라고 해서 인자로 뺐다
@@ -478,7 +495,13 @@ def build_labels(
 
     max_price_date = lake.scan("prices_daily").select(pl.col("date").max()).collect().item()
 
-    daily = adjusted_daily(lake).select("date", "symbol", "adj_close").collect()
+    segmented = lake.security_boundaries
+    key = SECURITY_ID if segmented else "symbol"
+    daily = (
+        adjusted_daily(lake)
+        .select("date", "symbol", *([SECURITY_ID] if segmented else []), "adj_close")
+        .collect()
+    )
     listing_snapshots = (
         lake.scan("listing_snapshots").select("symbol", "as_of", "financial_status").collect()
     )
@@ -492,13 +515,39 @@ def build_labels(
         else:
             usable_dates.append(t)
 
+    if segmented:
+        # 패널 행에 구간 id·끝을 붙이고, 시작 가격을 구간 기준 조정가로 바꾼다(원래 값은 보관).
+        panel_seg = (
+            attach_security_id(panel.lazy(), lake, with_seg_end=True)
+            .join(
+                daily.lazy().select(
+                    "date", "symbol", pl.col("adj_close").alias("_seg_adj_close")
+                ),
+                on=["date", "symbol"],
+                how="left",
+            )
+            .with_columns(
+                pl.col("adj_close").alias("_panel_adj_close"),
+                pl.col("_seg_adj_close").alias("adj_close"),
+            )
+            .drop("_seg_adj_close")
+            .collect()
+        )
+    dropped_segment_end = 0
+
     parts: list[pl.DataFrame] = []
     closed_by_reason = {"distress_delisted": 0, "other": 0, "ticker_reuse_gap": 0}
     for t in usable_dates:
-        universe_t = panel.filter(pl.col("date") == t)
         t21 = offsets[t]
         assert t21 is not None
-        labeled_t, counts = _label_one_date(universe_t, t21, daily, listing_snapshots)
+        if segmented:
+            universe_t = panel_seg.filter(pl.col("date") == t)
+            crossing = pl.col("seg_end").is_not_null() & (pl.col("seg_end") < t21)
+            dropped_segment_end += universe_t.filter(crossing).height
+            universe_t = universe_t.filter(~crossing)
+        else:
+            universe_t = panel.filter(pl.col("date") == t)
+        labeled_t, counts = _label_one_date(universe_t, t21, daily, listing_snapshots, key=key)
         for reason in closed_by_reason:
             closed_by_reason[reason] += counts[reason]
         parts.append(labeled_t)
@@ -550,6 +599,12 @@ def build_labels(
     if implausible.height:
         l0_df = l0_df.filter(pl.col("L0").abs() <= MAX_PLAUSIBLE_ABS_L0)
 
+    if segmented and parts:
+        # 패널의 원래 adj_close·열 구성으로 되돌린다. (구간 id·끝은 라벨 스키마에 없다.)
+        l0_df = l0_df.with_columns(pl.col("_panel_adj_close").alias("adj_close")).drop(
+            "_panel_adj_close", SECURITY_ID, "seg_end"
+        )
+
     l1_df = l0_df.with_columns((pl.col("L0") - pl.col("L0").mean().over("date")).alias("L1"))
     labeled = add_l2(l1_df).sort(["date", "symbol"])
 
@@ -580,4 +635,9 @@ def build_labels(
         },
         "constant_has_mcap_months": constant_has_mcap_months,
     }
+    if segmented:
+        diagnostics["security_boundaries"] = {
+            "enabled": True,
+            "dropped_segment_end": dropped_segment_end,
+        }
     return labeled, diagnostics
