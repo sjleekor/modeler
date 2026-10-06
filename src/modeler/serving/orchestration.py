@@ -353,11 +353,44 @@ def _annotate_selection(report: dict[str, Any], metadata: dict[str, Any], market
     report["quality"] = quality
 
 
+#: Keys of ``selection-state.json["markets"][market]`` that ``selection_summary`` copies.
+SELECTION_SUMMARY_STR_KEYS = ("status", "reason", "feature_asof_date", "freshness_reason")
+
+
+def selection_summary(state: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
+    """What the 09:30 select recorded per market, for the unit's failed and stale sections.
+
+    The envelope only names the cause class of a failed model (``MissingInference`` when select
+    found no input at all), so a reader cannot tell why.  This copies the few keys select itself
+    wrote (``status``, ``reason`` such as ``producer_completion_missing``, ``feature_asof_date``,
+    ``lag_sessions``, ``freshness_reason``) and nothing else: no paths, hashes or free text.
+    ``None`` when the state names no market (a holiday, or an old state), so the envelope then has
+    no ``selection_summary`` field at all.
+    """
+    markets = state.get("markets")
+    if not isinstance(markets, dict):
+        return None
+    summary: dict[str, dict[str, Any]] = {}
+    for market in ("KR", "US"):
+        block = markets.get(market)
+        if not isinstance(block, dict):
+            continue
+        row: dict[str, Any] = {key: block[key] for key in SELECTION_SUMMARY_STR_KEYS
+                               if isinstance(block.get(key), str) and block[key]}
+        lag = block.get("lag_sessions")
+        if isinstance(lag, int) and not isinstance(lag, bool):
+            row["lag_sessions"] = lag
+        if row:
+            summary[market] = row
+    return summary or None
+
+
 def combine_reports(*, report_date: date, decision_at: datetime,
                     reports: Iterable[dict[str, Any]],
                     opening: dict[str, Any] | None = None,
                     failures: Iterable[dict[str, str]] = (),
-                    expected_identities: Iterable[tuple[str, str]] = EXPECTED_MODEL_IDENTITIES) -> dict[str, Any]:
+                    expected_identities: Iterable[tuple[str, str]] = EXPECTED_MODEL_IDENTITIES,
+                    selection_summary: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     markets = []
     for report in reports:
         validate_report(report)
@@ -380,12 +413,16 @@ def combine_reports(*, report_date: date, decision_at: datetime,
                         for market, model_id in sorted(missing))
     status = envelope_status(markets, failures)
     fixture_marks = {bool(item.get("synthetic_fixture", False)) for item in markets}
-    return {"schema_version": "1.0", "report_date": report_date.isoformat(),
-            "decision_at": decision_at.isoformat(), "status": status,
-            "markets": sorted(markets, key=lambda item: (item["market"], item["model_id"])),
-            "failures": failures,
-            "opening": opening or {"status": "unavailable", "publication": {"status": "unresolved", "evidence": []}},
-            "synthetic_fixture": fixture_marks == {True}}
+    envelope = {"schema_version": "1.0", "report_date": report_date.isoformat(),
+                "decision_at": decision_at.isoformat(), "status": status,
+                "markets": sorted(markets, key=lambda item: (item["market"], item["model_id"])),
+                "failures": failures,
+                "opening": opening or {"status": "unavailable",
+                                       "publication": {"status": "unresolved", "evidence": []}},
+                "synthetic_fixture": fixture_marks == {True}}
+    if selection_summary:  # without it the envelope is byte-identical to the earlier one
+        envelope["selection_summary"] = selection_summary
+    return envelope
 
 
 def run_daily(*, report_date: date, decision_at: datetime, prepared_root: Path,
@@ -395,7 +432,8 @@ def run_daily(*, report_date: date, decision_at: datetime, prepared_root: Path,
               expected_identities: Iterable[tuple[str, str]] = EXPECTED_MODEL_IDENTITIES,
               historical_replay: bool = False, fixture_mode: bool = False,
               invocation_id: str | None = None,
-              now: datetime | None = None) -> dict[str, Any]:
+              now: datetime | None = None,
+              selection_summary: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Infer from hash-pinned inputs, preserve revisions, and record failures safely."""
     if decision_at.tzinfo is None or decision_at.utcoffset() is None:
         raise ValueError("decision_at requires a timezone")
@@ -501,7 +539,8 @@ def run_daily(*, report_date: date, decision_at: datetime, prepared_root: Path,
                                         fixture_mode=fixture_mode)
         envelope = combine_reports(report_date=report_date, decision_at=decision,
                                    reports=results, opening=safe_opening, failures=failures,
-                                   expected_identities=expected_identities)
+                                   expected_identities=expected_identities,
+                                   selection_summary=selection_summary)
         envelope["historical_replay"] = historical_replay
         envelope["synthetic_fixture"] = fixture_mode
         _atomic_json(run_root / f"report-{report_date.isoformat()}.json", envelope)

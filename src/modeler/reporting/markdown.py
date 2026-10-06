@@ -103,6 +103,44 @@ REASON_KO = {
     "decision_at is not D 10:00 Asia/Seoul": "판단 시각이 D 10:00 KST가 아닙니다",
     "input_cutoff must be D 09:30 Asia/Seoul": "입력 cutoff가 D 09:30 KST가 아닙니다",
 }
+# 09:30 select가 시장별로 남기는 사유 코드(daily_inputs.py). 모르는 코드는 그대로 적습니다.
+SELECT_REASON_KO = {
+    "producer_completion_missing": "D 09:30 전에 끝난 prepare 입력(native)이 없습니다",
+    "us_expected_source_or_calendar_unavailable": "US 기대 세션 표나 달력을 읽지 못했습니다",
+    "us_expected_source_schedule_missing": "US 기대 세션 표에 이 날짜가 없습니다",
+    "us_calendar_unavailable": "US 달력이 직전 완료 세션을 정하지 못했습니다",
+    "native_fixture_mode_mismatch": "prepare 입력의 fixture 표시가 실행 모드와 다릅니다",
+    "kr_prepared_newer_than_k": "KR prepare 입력의 기준일이 K보다 늦어 쓰지 않았습니다",
+}
+SELECT_STATUS_KO = {"unavailable": "고른 입력 없음", "ok": "정상", "stale": "자료 지연"}
+
+
+def select_reason_text(block: object) -> str | None:
+    """envelope의 `selection_summary[시장]`(select가 남긴 상태·사유)을 한 줄로 적습니다.
+
+    값이 하나도 없거나 형식이 맞지 않으면 `None`이라 줄을 만들지 않습니다.
+    """
+    if not isinstance(block, dict):
+        return None
+    parts = []
+    status = _safe_str(block.get("status"))
+    if status:
+        label = SELECT_STATUS_KO.get(status)
+        parts.append("상태 " + code(status) + (f"({label})" if label else ""))
+    reason = _safe_str(block.get("reason"))
+    if reason:
+        why = SELECT_REASON_KO.get(reason) or REASON_KO.get(reason)
+        parts.append("사유 " + code(reason) + (f"({why})" if why else ""))
+    fresh = _safe_str(block.get("freshness_reason"))
+    if fresh:
+        parts.append("신선도 사유 " + (REASON_KO.get(fresh) or code(fresh)))
+    asof = good_date(block.get("feature_asof_date"))
+    if asof:
+        parts.append("기준일 " + asof)
+    lag = block.get("lag_sessions")
+    if is_num(lag):
+        parts.append(f"지연 {int(lag)}세션")
+    return ("select 사유: " + ", ".join(parts) + ".") if parts else None
 
 SECTION_FILES = {
     "summary": "README.md",
@@ -746,8 +784,17 @@ KIND_OMITTED = "종류를 판정할 이름 원천이 이 단위에 없어 `종�
 
 
 def build_model_entry(
-    market: str, model_id: str, report: dict | None, failures: list, top_n: int
+    market: str,
+    model_id: str,
+    report: dict | None,
+    failures: list,
+    top_n: int,
+    select: object = None,
 ) -> dict:
+    """모델 하나의 표시 값.
+
+    `select`는 envelope `selection_summary`의 이 시장 블록입니다(없으면 None).
+    """
     entry = {
         "market": market,
         "model_id": model_id,
@@ -761,6 +808,7 @@ def build_model_entry(
         "fresh": {},
         "quality": {},
         "prov": {},
+        "select": select_reason_text(select),
     }
     matched = [
         f
@@ -777,6 +825,8 @@ def build_model_entry(
             )
         else:
             entry["reason"].append("입력 없음: 이 모델의 report가 envelope에 없습니다.")
+        if entry["select"]:
+            entry["reason"].append(entry["select"])
         return entry
     entry["internal"] = report["status"]
     entry["status"] = STATUS_MAP[report["status"]]
@@ -813,6 +863,8 @@ def build_model_entry(
                     INTERNAL_KO.get(report["status"], report["status"])
                 )
             )
+        if entry["select"]:
+            entry["reason"].append(entry["select"])
     elif lag is not None and lag > LAG_SUPPRESS:
         entry["suppressed"] = True
     return entry
@@ -835,8 +887,15 @@ def build_market_sections(
     us_reports = {r["model_id"]: r for r in reports if r["market"] == "US"}
     kr_ids = [KR_MODEL] + sorted(set(kr_reports) - {KR_MODEL})
     us_ids = list(US_MODELS) + sorted(set(us_reports) - set(US_MODELS))
-    kr_models = [build_model_entry("KR", m, kr_reports.get(m), failures, top_n) for m in kr_ids]
-    us_models = [build_model_entry("US", m, us_reports.get(m), failures, top_n) for m in us_ids]
+    summary = env.get("selection_summary") if isinstance(env.get("selection_summary"), dict) else {}
+    kr_models = [
+        build_model_entry("KR", m, kr_reports.get(m), failures, top_n, summary.get("KR"))
+        for m in kr_ids
+    ]
+    us_models = [
+        build_model_entry("US", m, us_reports.get(m), failures, top_n, summary.get("US"))
+        for m in us_ids
+    ]
     # 기대 모델이 없고 다른 모델도 없을 때만 기대 모델 행을 남깁니다.
     # 있으면 그 행이 이미 들어 있습니다.
     kr = {"key": "kr-stocks", "models": kr_models}
@@ -1170,6 +1229,8 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
     banner = stale_banner_kr(m)
     if banner:
         lines += [banner, ""]
+        if m["select"] and m["status"] == "stale":
+            lines += ["> " + m["select"], ""]
     if m["status"] == "failed":
         lines += ["순위를 내지 못했습니다.", ""]
         lines += ["- " + r for r in m["reason"]] + [""]
@@ -1287,6 +1348,8 @@ def render_us_model(ctx: dict, m: dict, show_name: bool, show_kind: bool = False
         ]
     elif m["status"] == "stale" and not m["suppressed"]:
         lines += ["> 주의: 미국 입력이 최신 세션보다 늦습니다. 지연 세션 수를 확인하십시오.", ""]
+    if m["status"] == "stale" and not m["suppressed"] and m["select"]:
+        lines += ["> " + m["select"], ""]
     if m["status"] == "failed":
         lines += ["순위를 내지 못했습니다.", ""]
         lines += ["- " + r for r in m["reason"]] + [""]
@@ -1851,6 +1914,8 @@ def render_status(ctx: dict) -> tuple[list, dict]:
                     else "지연 세션 수 {}로 순위 표를 내지 않았습니다".format(m["lag"])
                 )
                 parts.append(("{}: ".format(code(m["model_id"]))) + what)
+            elif m["status"] == "stale" and m["select"]:
+                parts.append("{}: {}".format(code(m["model_id"]), m["select"]))
         return "<br>".join(parts) if parts else "-"
 
     asof_ms = asof_text(ms["data_asof"])
@@ -2067,6 +2132,8 @@ def render_summary(ctx: dict) -> tuple[list, dict]:
                 text = f"입력이 {m['lag']}세션 늦어(5세션 초과) 순위 표를 내지 않았습니다."
             elif m["status"] == "stale":
                 text = f"입력이 {'?' if m['lag'] is None else m['lag']}세션 늦습니다."
+                if m["select"]:
+                    text += " " + m["select"]
             else:
                 continue
             groups.setdefault(text, []).append(m)

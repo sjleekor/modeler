@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from .orchestration import InferenceJob, code_inventory_sha256, retry_publication, run_daily
+from .orchestration import (
+    InferenceJob, code_inventory_sha256, retry_publication, run_daily, selection_summary,
+)
 from .calendars import SessionCalendar
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -84,6 +86,11 @@ def _parser() -> argparse.ArgumentParser:
                        help="pinned KR calendar independent of KR model-input availability")
     infer.add_argument("--kr-calendar-sha256",
                        help="SHA-256 of the pinned KR calendar file")
+    infer.add_argument("--selection-state", type=Path,
+                       help="the D selection-state.json; its per-market select status and reason "
+                            "go into the envelope's selection_summary")
+    infer.add_argument("--selection-state-sha256",
+                       help="SHA-256 of the selection-state.json file")
     infer.add_argument("--historical-replay", action="store_true")
     infer.add_argument("--fixture-mode", action="store_true")
     infer.add_argument("--invocation-id", help="date-scoped coordinator invocation nonce")
@@ -114,11 +121,20 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("pinned KR calendar hash mismatch")
             opening_calendar = SessionCalendar.from_manifest(json.loads(
                 args.kr_calendar_json.read_text(encoding="utf-8")))
+        summary = None
+        if args.selection_state or args.selection_state_sha256:
+            if not args.selection_state or not args.selection_state_sha256:
+                raise ValueError("selection state path and SHA-256 must both be present")
+            if args.selection_state.is_symlink() or hashlib.sha256(
+                    args.selection_state.read_bytes()).hexdigest() != args.selection_state_sha256:
+                raise ValueError("pinned selection state hash mismatch")
+            summary = selection_summary(
+                json.loads(args.selection_state.read_text(encoding="utf-8")))
         envelope = run_daily(report_date=report_day, decision_at=decision_at,
             prepared_root=args.prepared_root, run_root=args.run_root, jobs=jobs,
             opening=opening, opening_calendar=opening_calendar,
             historical_replay=args.historical_replay, fixture_mode=args.fixture_mode,
-            invocation_id=args.invocation_id)
+            invocation_id=args.invocation_id, selection_summary=summary)
         print(json.dumps({"report_date": report_day.isoformat(), "status": envelope["status"],
                           "market_count": len(envelope["markets"]),
                           "failure_count": len(envelope["failures"]),
