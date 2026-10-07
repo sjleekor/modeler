@@ -19,6 +19,10 @@
 
 `run`은 두 단계를 차례로 돕니다. 정정은 `sync --correct <단위> --reason <사유>`로만 합니다.
 
+운영자 메모: run 디렉터리에 `operator-memo-D.json`(`operator-memo.v1`)이 있으면 로컬 단계가 읽어
+실패·stale 섹션에 붙입니다. 파일 경로와 sha256은 manifest·journal에 남고 동기화 단계는 같은 파일로
+다시 렌더합니다. 이미 올린 단위에 메모를 더하면 내용이 달라지므로 `--correct`가 있어야 올라갑니다.
+
 release의 `modeler` 패키지가 `PYTHONPATH`에 있어야 합니다(coordinator가 맞춰 줍니다).
 이 스크립트와 `validate_reports.py`는 release 밖에 두고 sha256을 고정합니다.
 """
@@ -516,6 +520,13 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
     else:
         ms_file = None
     names = _security_names_step(config, envelope, markdown_dir)
+    # 운영자가 남기는 메모. 없으면 없는 대로 렌더합니다.
+    memo_file = run_dir / f"operator-memo-{unit}.json"
+    memo_bytes = None
+    if memo_file.is_symlink() or (memo_file.exists() and not memo_file.is_file()):
+        return _reject_local(config, checkout, markdown_dir, ["운영자 메모가 일반 파일이 아닙니다"])
+    if memo_file.is_file():
+        memo_bytes = memo_file.read_bytes()
 
     # L2. 렌더합니다. 같은 입력을 다시 돌려 내용이 같으면 파일을 그대로 둡니다(generated_at 고정).
     md.reset_scrub_hits()
@@ -530,6 +541,7 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
             log,
             security_names=names["raw"],
             names_notes=names["notes"],
+            operator_memo=memo_bytes,
         )
         files = md.render_unit(ctx)
     except md.InputError as exc:
@@ -568,6 +580,13 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         "unit_sha256": unit_hash,
         "scrub_hits": len(md.SCRUB_HITS),
     }
+    memo_fields = {}
+    if memo_bytes is not None:  # 메모가 없으면 manifest·journal은 전과 같습니다
+        memo_fields = {
+            "operator_memo_path": str(memo_file),
+            "operator_memo_sha256": hashlib.sha256(memo_bytes).hexdigest(),
+        }
+    manifest.update(memo_fields)
     _write_atomic(
         markdown_dir / "manifest.json",
         (json.dumps(manifest, sort_keys=True, ensure_ascii=False, indent=2) + "\n").encode(),
@@ -590,6 +609,7 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         "security_names_notes": names["notes"],
         "synthetic_fixture": envelope.get("synthetic_fixture") is True,
         "updated_at": now_kst(),
+        **memo_fields,
     }
     if old and old.get("commit"):
         # 커밋은 했지만 push하지 못한 단위입니다. 같은 내용이면 그대로 두고, 다르면 동기화 단계가
@@ -758,6 +778,12 @@ def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: 
         names_bytes = names_file.read_bytes()
         if hashlib.sha256(names_bytes).hexdigest() != entry.get("security_names_sha256"):
             raise PublishError("security names input changed since the local step")
+    memo_bytes = None
+    if entry.get("operator_memo_path"):
+        memo_file = _regular_file(Path(entry["operator_memo_path"]), "operator memo")
+        memo_bytes = memo_file.read_bytes()
+        if hashlib.sha256(memo_bytes).hexdigest() != entry.get("operator_memo_sha256"):
+            raise PublishError("operator memo changed since the local step")
     try:
         return md.build_context(
             checkout,
@@ -769,6 +795,7 @@ def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: 
             log,
             security_names=names_bytes,
             names_notes=entry.get("security_names_notes"),
+            operator_memo=memo_bytes,
         )
     except md.InputError as exc:
         raise PublishError(f"cannot render from the journaled inputs: {exc}") from None
