@@ -4,9 +4,9 @@ Plan: ``my/milestones/kr/modeling/plan/20260927_october_plan/01_schedule.md`` §
 ``20260927_short_balance_correction.md`` §5.
 
 채택 config 의 ``flow_short_balance_qty`` · ``flow_short_balance_chg_20d`` 는 측정일 값을
-``lag1`` 만 밀어 쓴다. 잔고는 측정일 + 2영업일에 공개되므로 formation 시점에 아직 모르는 값이
-들어간다. 이 모듈은 그 두 컬럼만 ``LAG_SESSIONS`` 세션 더 미룬 ``feat_flow`` 를 **별도 lake
-root** 에 만든다.
+``lag1`` 만 밀어 쓴다. 잔고는 측정일 + 2~3세션 뒤 저녁에야 레이크에 들어오므로 formation
+시점에 아직 모르는 값이 들어간다. 이 모듈은 그 두 컬럼만 ``LAG_SESSIONS`` 세션 더 미룬
+``feat_flow`` 를 **별도 lake root** 에 만든다.
 
 * 공유 lake 의 ``feat_flow`` 는 건드리지 않는다. 나머지 마트는 전부 상대 경로 symlink 다
   (``isolated_lake`` 의 ``_e5`` 와 같은 방식).
@@ -29,9 +29,11 @@ from modeler.etl.config import DataRoot, LakeConfig
 from modeler.models._02_updown_prob.experiments import isolated_lake as iso
 from modeler.models._02_updown_prob.spec import SNAPSHOT_DATE, SOURCE, lake_config
 
-#: 정정 문서 §5 · 계획 4.5. A.0 이 실측으로 2 와 3 을 비교한다 — 값을 바꿀 때는 root 이름도 바꾼다.
-LAG_SESSIONS = 2
-ROOT_NAME = "_flow_lag2_v2"
+#: 정정 문서 §5 · 계획 4.5. 3 으로 정했다(사용자 결정 2026-10-07): 9월 이후 측정일 21건이 모두
+#: 3세션 안에 들어왔고 2세션 기준은 8건만 맞았다. 장 마감 전 적재는 0건이라 lag1 경로와 합쳐
+#: 측정일 D 값은 D+4 행부터 보인다(TRS 와 같다) — 03_probe §8.1. 값을 바꿀 때는 root 이름도 바꾼다.
+LAG_SESSIONS = 3
+ROOT_NAME = "_flow_lag3_v2"
 FLOW_MART = "feat_flow"
 
 

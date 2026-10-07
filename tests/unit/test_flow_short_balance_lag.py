@@ -166,6 +166,6 @@ def test_lagged_root_is_not_the_shared_root(monkeypatch, tmp_path) -> None:
     flow_lag_v2.lagged_root.cache_clear()
     try:
         assert flow_lag_v2.lagged_root().base == tmp_path / flow_lag_v2.ROOT_NAME
-        assert flow_lag_v2.LAG_SESSIONS == 2
+        assert flow_lag_v2.LAG_SESSIONS == 3
     finally:
         flow_lag_v2.lagged_root.cache_clear()
