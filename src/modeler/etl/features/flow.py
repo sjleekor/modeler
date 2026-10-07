@@ -103,6 +103,7 @@ def build_flow_sql(
     pit_view: str | None = None,
     quality_view: str | None = None,
     pivot_plan: str = PIVOT_PLAN_WINDOW,
+    short_balance_lag_sessions: int = 0,
 ) -> str:
     """SQL producing ``feat_flow`` (dedup -> wide pivot -> derived features).
 
@@ -112,9 +113,22 @@ def build_flow_sql(
     default) is the original text; ``argmin_pivot`` returns the same rows with a
     different text, so it is a :class:`~modeler.etl.mart.MartPlan`, never the cache
     contract.
+
+    ``short_balance_lag_sessions`` (KR 10월 계획 4.5) pushes the two baseline balance
+    columns, ``flow_short_balance_qty`` and ``flow_short_balance_chg_20d``, back by that
+    many sessions: row t then carries the balance *measured* at session t-n, which is
+    what was public by the close of t when the publication lag is n sessions. ``0`` (the
+    default) emits the text every frozen mart was written under, byte for byte. The other
+    balance columns (``flow_short_interest_ratio`` ...) are not touched — they have
+    their own availability gate. The shift counts market sessions, not rows: a ticker
+    with a missing flow row gets NULL rather than a value from the wrong day.
     """
     if pivot_plan not in PIVOT_PLANS:
         raise ValueError(f"unknown feat_flow pivot plan {pivot_plan!r}; expected {PIVOT_PLANS}")
+    if short_balance_lag_sessions < 0:
+        raise ValueError(
+            f"short_balance_lag_sessions must be >= 0, got {short_balance_lag_sessions}"
+        )
     dedup = build_dedup_sql(flow_view)
     if price_view is None:
         # Degraded path (no price/quality data available): keep every flow
@@ -201,6 +215,32 @@ def build_flow_sql(
             FROM dedup
             GROUP BY trade_date, ticker, market
         )"""
+    if short_balance_lag_sessions:
+        n = short_balance_lag_sessions
+        # Market-session number of each row (the flow table's own calendar). The frame
+        # [n PRECEDING, n PRECEDING] over that number is the row exactly n sessions back,
+        # or empty (NULL) when the ticker has no flow row on that session.
+        balance_lag_cte = f""",
+        balance_lag AS (
+            SELECT variants.*,
+                DENSE_RANK() OVER (ORDER BY trade_date) AS balance_sess_no
+            FROM variants
+        ),
+        balance_lagged AS (
+            SELECT balance_lag.* REPLACE (
+                MAX(flow_short_balance_qty) OVER wl AS flow_short_balance_qty,
+                MAX(flow_short_balance_chg_20d) OVER wl AS flow_short_balance_chg_20d
+            )
+            FROM balance_lag
+            WINDOW wl AS (
+                PARTITION BY ticker, market ORDER BY balance_sess_no
+                RANGE BETWEEN {n} PRECEDING AND {n} PRECEDING
+            )
+        )"""
+        final_source = "balance_lagged"
+    else:
+        balance_lag_cte = ""
+        final_source = "variants"
     return f"""
         WITH {wide_ctes},
         {session_cte},
@@ -333,7 +373,7 @@ def build_flow_sql(
         variants AS (
             SELECT ranked.*, {lag_columns}
             FROM ranked
-        )
+        ){balance_lag_cte}
         SELECT
             trade_date, ticker, market,
             flow_foreign_netbuy_sum_5d, flow_foreign_netbuy_sum_20d,
@@ -345,7 +385,7 @@ def build_flow_sql(
             flow_short_selling_volume, flow_short_selling_value, flow_short_balance_qty,
             {ratio_columns}, {lag_columns},
             short_balance_is_available, short_regime
-        FROM variants
+        FROM {final_source}
     """
 
 
@@ -359,6 +399,7 @@ def materialize_flow(
     quality_view: str | None = None,
     force: bool = False,
     pivot_plan: str = PIVOT_PLAN_WINDOW,
+    short_balance_lag_sessions: int = 0,
 ) -> str:
     """Build + register ``feat_flow`` mart view. Returns the view name.
 
@@ -369,9 +410,19 @@ def materialize_flow(
     cache contract stays the default text (``sql_hash`` unchanged); the metadata also
     carries ``plan`` / ``plan_hash`` and the mart is only reused by a caller asking for
     the same plan.
+
+    ``short_balance_lag_sessions > 0`` writes a different mart under the same name, so it
+    belongs in a lake root of its own (see ``experiments/flow_lag_v2``), never the shared
+    one — ``force`` is refused with it so a frozen ``feat_flow`` cannot be overwritten.
     """
+    if short_balance_lag_sessions and force:
+        raise ValueError(
+            "force=True with short_balance_lag_sessions would rebuild feat_flow in place; "
+            "use a separate lake root (experiments/flow_lag_v2) and no force"
+        )
     kwargs = dict(
         price_view=price_view, pit_view=pit_view, quality_view=quality_view,
+        short_balance_lag_sessions=short_balance_lag_sessions,
     )
     plan = None
     if pivot_plan != PIVOT_PLAN_WINDOW:
