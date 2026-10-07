@@ -68,7 +68,8 @@ def default_out() -> Path:
 
 
 def _find_summary(run_id: str, res_root: Path) -> dict:
-    hits = sorted(p for p in res_root.glob(f"*/{run_id}/summary.json"))
+    # ``smoke/``·``holdout/`` 에도 같은 run_id 폴더가 있다. 단계 폴더(E0~E5)만 본다 — t15_regen.find_run_dir 와 같다.
+    hits = sorted(p for p in res_root.glob(f"E[0-9]/{run_id}/summary.json"))
     if len(hits) != 1:
         raise T15Error(f"{run_id}: RES 아래 summary.json {len(hits)}개 {hits}")
     return json.loads(hits[0].read_text())
