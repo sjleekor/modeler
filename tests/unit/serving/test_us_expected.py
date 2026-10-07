@@ -92,7 +92,7 @@ def test_table_is_provisional_and_documents_its_rule():
     assert result["rule"] == us_expected.RULE_NAME
     assert result["collection_assumption"]["collection_time"] == "15:00"
     assert "sha256=" in result["source_reference"] and result["source_reference"]
-    assert result["calendar_sources"]["kr"]["holiday_csv_sha256"].startswith("3328e398")
+    assert result["calendar_sources"]["kr"]["holiday_csv_sha256"].startswith("9b62b595")
     assert result["generated_at"] == GENERATED.isoformat()
     assert table(date(2026, 10, 1), date(2026, 10, 9)) == result
 
@@ -110,9 +110,9 @@ def test_confirmed_needs_note_and_status_is_restricted():
 
 def test_outside_calendar_coverage_stops():
     with pytest.raises(ValueError, match="coverage"):
-        table(date(2025, 12, 1), date(2025, 12, 31))  # KR file covers only 2026
+        table(date(2025, 12, 1), date(2025, 12, 31))  # KR file coverage starts 2026
     with pytest.raises(ValueError, match="coverage"):
-        table(date(2027, 1, 4), date(2027, 1, 8))
+        table(date(2028, 1, 3), date(2028, 1, 7))  # KR file ends 2027
     with pytest.raises(ValueError, match="coverage"):
         table(date(2026, 1, 2), date(2026, 1, 2))  # E would be 2025-12-31, before NYSE coverage
     with pytest.raises(ValueError, match="start"):
@@ -144,7 +144,7 @@ def test_cli_build_and_failure_exit(tmp_path, capsys):
     assert us_expected.main(args) == 0
     assert json.loads(capsys.readouterr().out)["report_dates"] == 2
     assert us_expected.main(args) == 1  # exists
-    assert us_expected.main(["build", "--start", "2027-01-04", "--end", "2027-01-05",
+    assert us_expected.main(["build", "--start", "2028-01-03", "--end", "2028-01-04",
                              "--output", str(tmp_path / "x.json"), "--holiday-csv", str(CSV)]) == 1
     assert not (tmp_path / "x.json").exists()
 

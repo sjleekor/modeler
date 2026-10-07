@@ -37,13 +37,32 @@ def test_kr_csv_is_bounded_and_csat_exception_unknown(tmp_path):
     assert cal.session(date(2026, 11, 19)).confirmed is False
     assert cal.session(date(2026, 10, 1)).confirmed is True
     assert cal.session(date(2026, 9, 30)).confirmed is True
-    assert cal.is_session(date(2027, 1, 4)) is None
+    assert cal.is_session(date(2027, 1, 4)) is None  # outside the requested range
     first = SessionCalendar.from_manifest(
         krx_project_manifest(date(2026, 1, 1), date(2026, 1, 31), holiday_csv=csv)
     )
     assert first.session(date(2026, 1, 2)).confirmed is False
-    with pytest.raises(ValueError, match="bounded to 2026"):
-        krx_project_manifest(date(2026, 12, 1), date(2027, 1, 31), holiday_csv=csv)
+    with pytest.raises(ValueError, match="bounded to 2026-2027"):
+        krx_project_manifest(date(2026, 12, 1), date(2028, 1, 31), holiday_csv=csv)
+    with pytest.raises(ValueError, match="bounded to 2026-2027"):
+        krx_project_manifest(date(2025, 12, 31), date(2026, 1, 31), holiday_csv=csv)
+
+
+def test_kr_2027_provisional_closures_and_unconfirmed_hours():
+    csv = (Path(__file__).parents[4] / "collector" / "src" / "collector" / "kr" /
+           "infra" / "calendar" / "data" / "holidays_krx.csv")
+    manifest = krx_project_manifest(date(2026, 12, 1), date(2027, 12, 31), holiday_csv=csv)
+    assert manifest["source"]["holiday_source_status"].endswith("2027_provisional_pre_notice")
+    assert manifest["unconfirmed_dates"] == ["2027-01-04", "2027-11-18"]
+    cal = SessionCalendar.from_manifest(manifest)
+    for closed in ("2027-01-01", "2027-02-08", "2027-02-09", "2027-08-16", "2027-09-15",
+                   "2027-10-04", "2027-10-11", "2027-12-27", "2027-12-31"):
+        assert cal.is_session(date.fromisoformat(closed)) is False
+    assert cal.is_session(date(2027, 1, 4)) is True
+    assert cal.is_session(date(2027, 12, 30)) is True
+    # a 2026-only range keeps the 2026 status
+    only_2026 = krx_project_manifest(date(2026, 9, 1), date(2026, 12, 31), holiday_csv=csv)
+    assert only_2026["source"]["holiday_source_status"].endswith("primary_crosschecked")
 
 
 def test_calendar_manifest_rejects_conflicting_exception_evidence():

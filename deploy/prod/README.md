@@ -38,7 +38,7 @@ Cronicle API key는 별도 관리자 절차로 교체했습니다. 비밀 없는
 
 ## KR prepare 휴장일 CSV
 
-`kr_live_prepare`는 collector 패키지 데이터 `holidays_krx.csv`로 거래일을 계산합니다. frozen release는 `*.py`만 복사하므로 release 트리에서 돌릴 때는 CSV를 `--holidays-csv`로 넘겨야 합니다. CSV를 찾지 못하면 주말만 제외하고 계속하지 않고 멈춥니다. 사용한 달력은 prepare manifest의 `holiday_calendar`에 남습니다. 이 CSV는 2014년부터 2026-12-31까지만 있습니다. 2027년 이후 D는 CSV를 갱신하기 전까지 prepare가 멈춥니다. 2026년 안에 갱신하십시오. frozen release의 추론 경로(`adapters`→`kr_serving`·`us_daily`)는 이 CSV를 쓰지 않습니다.
+`kr_live_prepare`는 collector 패키지 데이터 `holidays_krx.csv`로 거래일을 계산합니다. frozen release는 `*.py`만 복사하므로 release 트리에서 돌릴 때는 CSV를 `--holidays-csv`로 넘겨야 합니다. CSV를 찾지 못하면 주말만 제외하고 계속하지 않고 멈춥니다. 사용한 달력은 prepare manifest의 `holiday_calendar`에 남습니다. 이 CSV는 2014년부터 2027-12-31까지 있습니다. 2027 행은 법정 공휴일 규칙으로 구하고 XKRX와 맞춰 본 잠정값입니다(2026-10-07, KRX 공고 전). 12월에 공고가 나오면 다시 대조하십시오. 2028년 이후 D는 CSV를 갱신하기 전까지 prepare가 멈춥니다. 2027년 안에 갱신하십시오. frozen release의 추론 경로(`adapters`→`kr_serving`·`us_daily`)는 이 CSV를 쓰지 않습니다.
 
 `kr_live_prepare --profile`은 `full`(기본, mart 12개 전부)과 `serving`(모델 피쳐와 품질 컬럼에 필요한 것만)을 고릅니다. `serving`은 vintage mart 둘을 만들지 않고 `feat_fin_scan_daily`를 요청한 컬럼(`fin_log_mcap`)만 담은 projection으로 만들며, 달력도 쓰지 않으므로 CSV 갱신에 막히지 않습니다. 고른 profile은 `_SUCCESS.json`의 `profile`과 `build_profile.json`에 남고, `kr_prepare`가 marker와 디스크의 mart가 맞는지 확인합니다. `full`에서 접수일이 달력 밖인 공시는 `--max-beyond-calendar-rows`(기본 500행)까지는 건수만 `_SUCCESS.json`의 `beyond_calendar`에 남기고 경고합니다. 넘으면 빌드가 멈춥니다.
 
@@ -211,7 +211,7 @@ evidence가 없거나 `failed`이거나 규칙이 다르거나 `legacy`면 지�
 
 ## US E 표와 native prepare 운영 연결 (제안, 활성화 전)
 
-**E 표.** `python -m modeler.serving.us_expected build --start D --end D --output <json>`이 `us-expected-source.v1` 파일을 만듭니다. 정책 초안 1(잠정)을 그대로 구현했습니다. `E(D)`는 D-1 15:00 KST(`sdc_daily_us` 시작)에 이미 닫힌 마지막 XNYS 세션이고, 닫힘 시각은 날짜별 정규장·조기폐장 close를 뉴욕 시간대로 계산합니다. 한국 거래일만 넣고 KR 휴장일은 뺍니다. 달력은 `calendar_sources`의 NYSE(2026\~2027)·KRX(2026) manifest입니다. 범위가 달력 밖이면 멈춥니다. `market_lag_limit_sessions`는 2입니다. 출력 파일에 규칙 이름, 생성 시각, 달력 manifest sha256, 수집 시각 가정(15:00 KST, derive 15:30)을 적습니다.
+**E 표.** `python -m modeler.serving.us_expected build --start D --end D --output <json>`이 `us-expected-source.v1` 파일을 만듭니다. 정책 초안 1(잠정)을 그대로 구현했습니다. `E(D)`는 D-1 15:00 KST(`sdc_daily_us` 시작)에 이미 닫힌 마지막 XNYS 세션이고, 닫힘 시각은 날짜별 정규장·조기폐장 close를 뉴욕 시간대로 계산합니다. 한국 거래일만 넣고 KR 휴장일은 뺍니다. 달력은 `calendar_sources`의 NYSE(2026\~2027)·KRX(2026\~2027, 2027은 잠정) manifest입니다. KRX manifest는 CSV sha256을 고정해 두므로 CSV를 고치면 `PINNED_KRX_HOLIDAY_SHA256`도 같이 바꿔야 합니다. 범위가 달력 밖이면 멈춥니다. `market_lag_limit_sessions`는 2입니다. 출력 파일에 규칙 이름, 생성 시각, 달력 manifest sha256, 수집 시각 가정(15:00 KST, derive 15:30)을 적습니다.
 
 `daily_inputs.select`는 `reviewed_status`가 `confirmed`인 파일만 읽습니다. 그래서 생성기는 기본값 `unreviewed`로 쓰고, 이 값이면 US는 `unavailable`로 닫힙니다. 정책을 사람이 확인한 뒤에만 `--reviewed-status confirmed --review-note "<누가 언제>"`로 다시 만드십시오. 같은 이름의 파일은 덮어쓰지 않습니다. 새 날짜 이름으로 만들어 겹치는 날짜 값이 이전 파일과 같은지 비교한 뒤 config의 `us_expected_source`를 바꿉니다. `select`는 D별로 이 파일의 sha를 고정하므로, D 09:30\~10:35에는 바꾸지 마십시오. 갱신은 월 1회 08:30 KST 제안(`market_briefing_us_expected_refresh`)입니다. KR 달력은 2026-12-31까지라 2027년 표는 휴장일 CSV를 갱신한 뒤에만 만들 수 있습니다.
 

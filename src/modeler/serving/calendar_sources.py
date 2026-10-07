@@ -1,8 +1,10 @@
 """Bounded KR/US session manifests with explicit provenance and exceptions.
 
 The US list is transcribed from NYSE's 2026/2027 equity calendar. The KR
-list uses the project's dated KRX holiday file through 2026 only. Unknown
-future KR dates are outside coverage rather than guessed from weekdays.
+list uses the project's dated KRX holiday file through 2027; 2027 is provisional
+(statutory rules cross-checked against exchange_calendars XKRX on 2026-10-07,
+before KRX's 2027 notice). Unknown future KR dates are outside coverage rather
+than guessed from weekdays.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from modeler.serving.calendars import SessionCalendar
 
 NYSE_SOURCE = "https://www.nyse.com/trade/hours-calendars"
 KRX_RULES_SOURCE = "https://global.krx.co.kr/contents/GLB/06/0602/0602020204/GLB0602020204T1.jsp"
-PINNED_KRX_HOLIDAY_SHA256 = "3328e39811ab5ed13aa297d02e5a65ce48c2a6ad0082b685a8dedc015eb04837"
+PINNED_KRX_HOLIDAY_SHA256 = "9b62b5956c9185773cdd999fad3306bbf35b2d34d0eb71ce31bdb8b9a6a10538"
 KASA_2026_SOURCE = "https://www.kasa.go.kr/prog/bbsArticle/BBSMSTR_000000000010/view.do?bbsId=BBSMSTR_000000000010&nttId=B000000001860Pe2zT3"
 KRX_2026_CALENDAR_SOURCE = "https://kind.krx.co.kr/external/dst/reference/11625/2026%20%EC%BD%94%EC%8A%A4%EB%8B%A5%EC%8B%9C%EC%9E%A5%20%EA%B3%B5%EC%8B%9C%EC%9D%BC%EC%A0%95%20%EC%BA%98%EB%A6%B0%EB%8D%94_vF.pdf"
 HOLIDAY_LAW_2026_SOURCE = "https://www.law.go.kr/LSW/lsLinkCommonInfo.do?lsJoLnkSeq=1033028569"
@@ -34,6 +36,19 @@ KR_HOLIDAYS_2026 = frozenset(date.fromisoformat(day) for day in (
     "2026-09-25", "2026-10-05", "2026-10-09", "2026-12-25",
     "2026-12-31",
 ))
+#: 2027 weekday closures, provisional until KRX publishes its 2027 notice (December).
+#: Lunar New Year 02-07 (Sun) -> 02-08 and substitute 02-09; Liberation Day 08-15 (Sun) -> 08-16;
+#: National Foundation Day 10-03 (Sun) -> 10-04; Hangeul Day 10-09 (Sat) -> 10-11;
+#: Christmas 12-25 (Sat) -> 12-27; year-end closure 12-31.
+KR_HOLIDAYS_2027 = frozenset(date.fromisoformat(day) for day in (
+    "2027-01-01", "2027-02-08", "2027-02-09", "2027-03-01",
+    "2027-05-05", "2027-05-13", "2027-08-16", "2027-09-14",
+    "2027-09-15", "2027-09-16", "2027-10-04", "2027-10-11",
+    "2027-12-27", "2027-12-31",
+))
+_KR_WEEKDAY_HOLIDAYS = {2026: KR_HOLIDAYS_2026, 2027: KR_HOLIDAYS_2027}
+#: First session of the year and CSAT day can open late; no exchange notice is on file.
+_KR_UNCONFIRMED_HOURS = frozenset({"2026-01-02", "2026-11-19", "2027-01-04", "2027-11-18"})
 
 _NYSE_HOLIDAYS = frozenset(date.fromisoformat(day) for day in (
     "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
@@ -144,31 +159,36 @@ def krx_project_manifest(
     """Read dated project holidays, requiring evidence for exceptional hours.
 
     The project file is only an integrity-pinned input. Its 2026 weekdays are
-    separately checked against government holidays and KRX market rules.
+    separately checked against government holidays and KRX market rules; 2027
+    weekdays are checked against the provisional statutory list above.
     Dated exceptional hours require their own exchange notice.
     """
-    if start < date(2026, 1, 1) or end > date(2026, 12, 31) or start > end:
-        raise ValueError("KR project holiday file coverage is bounded to 2026")
+    if start < date(2026, 1, 1) or end > date(2027, 12, 31) or start > end:
+        raise ValueError("KR project holiday file coverage is bounded to 2026-2027")
     raw = holiday_csv.read_bytes()
     holiday_sha = hashlib.sha256(raw).hexdigest()
     if holiday_sha != PINNED_KRX_HOLIDAY_SHA256:
-        raise ValueError("KR 2026 holiday CSV does not match the pinned complete file")
+        raise ValueError("KR 2026-2027 holiday CSV does not match the pinned complete file")
     with holiday_csv.open(newline="") as stream:
         holidays = {date.fromisoformat(row["date"]) for row in csv.DictReader(stream)}
-    actual_2026 = {day for day in holidays if day.year == 2026 and day.weekday() < 5}
-    if actual_2026 != KR_HOLIDAYS_2026:
-        raise ValueError("KR 2026 weekday closures differ from reviewed primary-source calendar")
+    for year, reviewed in _KR_WEEKDAY_HOLIDAYS.items():
+        actual = {day for day in holidays if day.year == year and day.weekday() < 5}
+        if actual != reviewed:
+            raise ValueError(f"KR {year} weekday closures differ from reviewed calendar")
     sessions = _weekdays(start, end, holidays)
     # Annual closures and regular hours have primary-source support. The
     # first trading day and CSAT can shift the opening hour separately.
-    unconfirmed = [day for day in sessions if day in {"2026-01-02", "2026-11-19"}]
+    unconfirmed = [day for day in sessions if day in _KR_UNCONFIRMED_HOURS]
     manifest = {
         "market": "KR", "timezone": "Asia/Seoul",
         "coverage_start": start.isoformat(), "coverage_end": end.isoformat(),
         "default_open_at": "09:00:00", "default_close_at": "15:30:00",
         "sessions": sessions, "overrides": [], "unconfirmed_dates": unconfirmed,
         "source": {"url": KRX_RULES_SOURCE, "holiday_csv_sha256": holiday_sha,
-                   "holiday_source_status": "project_derived_integrity_pinned_and_2026_weekday_dates_primary_crosschecked",
+                   "holiday_source_status": (
+                       "project_derived_integrity_pinned_2026_primary_crosschecked_2027_provisional_pre_notice"
+                       if end.year >= 2027 else
+                       "project_derived_integrity_pinned_and_2026_weekday_dates_primary_crosschecked"),
                    "checked_on": "2026-09-30",
                    "primary_sources": [KASA_2026_SOURCE, HOLIDAY_LAW_2026_SOURCE,
                                        JULY_HOLIDAY_2026_SOURCE, ELECTION_2026_SOURCE,
