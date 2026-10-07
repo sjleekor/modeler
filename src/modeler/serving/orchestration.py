@@ -121,13 +121,15 @@ def _run_lock(path: Path) -> Iterator[None]:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def _checked_file(path: Path, expected_sha256: str, *, root: Path | None = None) -> Path:
+def _checked_file(path: Path, expected_sha256: str, *,
+                  root: Path | tuple[Path, ...] | None = None) -> Path:
     if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
         raise ValueError("all pinned files require a SHA-256 hash")
     if path.is_symlink():
         raise ValueError("pinned files cannot be symlinks")
     resolved = path.resolve(strict=True)
-    if not resolved.is_file() or (root is not None and root not in resolved.parents):
+    roots = () if root is None else (root,) if isinstance(root, Path) else tuple(root)
+    if not resolved.is_file() or (roots and not any(item in resolved.parents for item in roots)):
         raise ValueError("pinned file is outside its allowed directory")
     if _sha256(resolved) != expected_sha256:
         raise ValueError("pinned file hash does not match")
@@ -138,7 +140,13 @@ def _prepared_metadata(job: InferenceJob, prepared_root: Path,
                        report_date: date, decision_at: datetime) -> dict[str, Any]:
     if job.market not in {"KR", "US"} or not IDENTIFIER.fullmatch(job.model_id):
         raise ValueError("invalid market/model identity")
-    root = prepared_root.resolve(strict=True)
+    # 운영 배치에서 prepared/us는 레이크 안 디렉터리로 가는 symlink입니다(provision_serving).
+    # select가 시장 디렉터리를 resolve해서 고르므로, 허용 root는 prepared와 그 시장 디렉터리 둘입니다.
+    # symlink 파일 자체를 거부하는 검사와 sha 검사는 그대로입니다.
+    root = (prepared_root.resolve(strict=True),)
+    market_dir = prepared_root / job.market.lower()
+    if market_dir.is_dir():
+        root += (market_dir.resolve(strict=True),)
     input_path = _checked_file(job.prepared_input, job.input_sha256, root=root)
     manifest_path = _checked_file(job.prepared_manifest, job.prepared_manifest_sha256, root=root)
     native_manifest_path = _checked_file(job.native_manifest, job.native_manifest_sha256, root=root)
