@@ -265,6 +265,17 @@ class TestContent(Base):
         self.assertIn("기준 세션 A: 2026-10-06", t)
         self.assertIn("순위용 점수 — 확률 아님", t)
 
+    def test_ranking_status_line(self):
+        want = "이 순위는 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B · 미국 A 0)"
+        self.assertEqual(bm.RANKING_STATUS, want)
+        for name in ("kr-stocks.md", "us-stocks.md"):
+            t = text(REPO, UNITS["normal"], name)
+            self.assertEqual(t.count(want), 1, name)
+            self.assertIn("> " + want + "\n", t)
+            self.assertLess(t.index(want), t.index("| 순위 |"))
+        # 순위가 없는 단위(실패)에는 넣지 않습니다
+        self.assertNotIn(want, text(REPO, UNITS["kr_unavail"], "kr-stocks.md"))
+
     def test_table_escape(self):
         t = text(REPO, UNITS["normal"], "kr-stocks.md")
         self.assertIn("샘플\\|기업<br>005", t)
