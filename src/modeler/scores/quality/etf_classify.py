@@ -41,8 +41,8 @@ AMBIGUITIES = {
     "정규화한 문자열이다. 별칭표(같은 지수의 다른 표기 합치기)는 비어 있다 — 지어내지 않았다.",
     "A09": "수익률 표기: 'Gross Return'은 TR로, 'Excess Return'은 ER(별도 값)로 읽는다. "
     "한 이름에 서로 다른 표기가 둘 이상이면 'ambiguous'로 두고 strict에서 보류한다.",
-    "A10": "만기형은 ISU_NM의 'YY-MM' 토큰으로만 판별한다. 'KIS 2604만기형' 같은 지수명 표기는 "
-    "이름 토큰이 없으면 잡지 않는다. 비교 그룹 키에는 만기를 넣지 않았다(사전등록에 없음).",
+    "A10": "(메인 확정) 만기형 = 이름 'YY-MM' 토큰 또는 마지막 거래일 IDX_IND_NM에 '만기'. "
+    "exclude_maturity 플래그로 E1 유니버스와 E2 비교 그룹 둘 다에서 뺀다.",
     "A11": "국내/해외형: 지수명 정규식 규칙(KR_CONTENT·FOREIGN_STRONG 등)과 소수의 명시 목록으로 "
     "읽었다. 사전등록은 '목록'을 말하지만 목록이 없어 규칙+명시 목록으로 만들었다. 국내·해외가 "
     "섞인 지수, TDF·혼합형, 제공자만 보이고 국가가 안 보이는 지수는 unknown이다.",
@@ -491,6 +491,11 @@ def classification_table(df: pl.DataFrame) -> pl.DataFrame:
                 "option_token_index": f.option_idx,
                 "maturity_yymm": f.maturity,
                 "is_maturity_type": bool(f.maturity),
+                "maturity_by_index_name": "만기" in (r["idx_ind_nm"] or ""),
+                # 만기형 = 이름 YY-MM 토큰 또는 마지막 거래일 IDX_IND_NM의 "만기". E1·E2에서 제외.
+                "exclude_maturity": bool(f.maturity) or ("만기" in (r["idx_ind_nm"] or "")),
+                # 국내/해외 unknown은 E1 국내형·해외형 판정에서 모두 제외(기록용).
+                "exclude_e1_region_unknown": ix["region"] == "unknown",
                 "pension_ineligible_candidate": f.pension_ineligible_candidate,
                 "return_type": ix["return_type"],
                 "return_token": ix["return_token"],

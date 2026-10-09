@@ -108,9 +108,16 @@ def distribution(df: pl.DataFrame, cls: pl.DataFrame) -> pl.DataFrame:
             f"{cls_map[r[0]]['idx_ind_nm']}|{_simple_token_key(cls_map[r[0]]['isu_nm'])}"
             for r in recs
         ]
-        full = [cls_map[r[0]]["group_key"] for r in recs]
+        full_incl_mat = [cls_map[r[0]]["group_key"] for r in recs]
+        full = [
+            None if cls_map[r[0]]["exclude_maturity"] else cls_map[r[0]]["group_key"] for r in recs
+        ]
         full_strict = [
-            None if cls_map[r[0]]["compare_hold_strict_rt"] else cls_map[r[0]]["group_key"]
+            (
+                None
+                if (cls_map[r[0]]["compare_hold_strict_rt"] or cls_map[r[0]]["exclude_maturity"])
+                else cls_map[r[0]]["group_key"]
+            )
             for r in recs
         ]
         # 국내형만(E1·E2 모두 국내형이 주력이므로 참고로 따로)
@@ -119,6 +126,7 @@ def distribution(df: pl.DataFrame, cls: pl.DataFrame) -> pl.DataFrame:
             ("repro_na", na),
             ("fixed_ga", fga),
             ("fixed_na", fna),
+            ("full_lenient_incl_maturity", full_incl_mat),
             ("full_lenient", full),
             ("full_strict_rt", full_strict),
         ):

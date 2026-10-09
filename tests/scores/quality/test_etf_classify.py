@@ -146,3 +146,21 @@ def test_distribution_counts_groups_by_year_first_trading_day():
     assert d["listed"] == 6
     assert (d["fixed_ga_g5"], d["fixed_ga_e5"]) == (1, 5)
     assert (d["repro_ga_g3"], d["repro_ga_e3"]) == (1, 5)
+
+
+def test_exclude_maturity_by_name_or_index_and_region_unknown_flag():
+    df = _frame(
+        [
+            ("20240102", "A", "TIGER 26-04 회사채액티브", "KIS 회사채 지수", "5"),
+            ("20240102", "B", "KODEX 회사채 액티브", "KIS 회사채2604만기형 지수", "5"),
+            ("20240102", "C", "KODEX 200", "코스피 200", "5"),
+            ("20240102", "D", "X 혼합", "Solactive Physical AI Index", "5"),
+        ]
+    )
+    c = {r["isu_cd"]: r for r in ec.classification_table(df).iter_rows(named=True)}
+    assert c["A"]["exclude_maturity"] and not c["A"]["maturity_by_index_name"]
+    assert c["B"]["exclude_maturity"] and c["B"]["maturity_by_index_name"]
+    assert not c["C"]["exclude_maturity"] and not c["C"]["exclude_e1_region_unknown"]
+    assert c["D"]["exclude_e1_region_unknown"]
+    d = er.distribution(df, ec.classification_table(df)).row(0, named=True)
+    assert d["full_lenient_held"] == 2 and d["full_lenient_incl_maturity_held"] == 0
