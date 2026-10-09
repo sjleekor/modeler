@@ -389,3 +389,76 @@ def test_stale_us_input_still_goes_through_the_serving_gate(tmp_path: Path) -> N
     r3_world.write_native(args["prepared_root"], "US", "2026-09-23", "2026-09-29T09:20:00+09:00")
     ok = select(**{**args, "output_root": args["output_root"] / "no-parity-claim"})
     assert ok["markets"]["US"]["status"] == "stale" and ok["markets"]["US"]["lag_sessions"] == 3
+
+
+# ---- 운영 배치: prepared/us가 prepared 밖 디렉터리로 가는 symlink (provision_serving) ----
+
+def _linked_us_world(tmp_path: Path) -> dict:
+    """prepared/kr은 실제 디렉터리, prepared/us는 레이크 쪽 디렉터리로 가는 symlink."""
+    args = _inputs(tmp_path)
+    lake_us = tmp_path / "lake" / "us_scoring_daily_v1" / "prepared"
+    lake_us.parent.mkdir(parents=True)
+    shutil.move(str(args["prepared_root"] / "us"), str(lake_us))
+    (args["prepared_root"] / "us").symlink_to(lake_us)
+    assert (args["prepared_root"] / "us").is_symlink()
+    assert not (args["prepared_root"] / "kr").is_symlink()
+    return args
+
+
+def _jobs_from(selected: dict, infer) -> list[InferenceJob]:
+    return [InferenceJob(market=raw["market"], model_id=raw["model_id"],
+            model_version=raw["model_version"], prepared_input=Path(raw["prepared_input"]),
+            input_sha256=raw["input_sha256"], prepared_manifest=Path(raw["prepared_manifest"]),
+            prepared_manifest_sha256=raw["prepared_manifest_sha256"],
+            native_manifest=Path(raw["native_manifest"]),
+            native_manifest_sha256=raw["native_manifest_sha256"],
+            bundle_path=Path(raw["bundle_path"]), bundle_sha256=raw["bundle_sha256"],
+            code_path=Path(raw["code_path"]), code_sha256=raw["code_sha256"],
+            code_files=tuple((Path(i["path"]), i["sha256"]) for i in raw["code_files"]),
+            infer=infer) for raw in selected["jobs"]]
+
+
+def _ok_infer(context):
+    report = report_template(market=context.market, report_date=context.report_date.isoformat(),
+        decision_at=context.decision_at, feature_asof_date=context.feature_asof_date,
+        model_id=context.model_id, model_version=context.model_version)
+    report["status"] = "partial"
+    report["synthetic_fixture"] = True
+    return report
+
+
+def test_run_accepts_us_inputs_behind_a_prepared_symlink(tmp_path: Path) -> None:
+    args = _linked_us_world(tmp_path)
+    selected = select(**args)
+    assert selected["status"] == "selected"
+    # select는 symlink를 푼 경로를 jobs에 쓰므로 US 파일은 prepared 바깥이다(결함 재현 조건).
+    us_input = Path(next(j["prepared_input"] for j in selected["jobs"] if j["market"] == "US"))
+    assert args["prepared_root"].resolve() not in us_input.parents
+    jobs = _jobs_from(selected, _ok_infer)
+    decision = datetime(2026, 9, 29, 10, tzinfo=SEOUL)
+    for job in jobs:
+        _prepared_metadata(job, args["prepared_root"], D, decision)
+    report = run_daily(report_date=D, decision_at=decision, prepared_root=args["prepared_root"],
+        run_root=tmp_path / "linked-run", jobs=jobs, fixture_mode=True, now=decision)
+    assert report["failures"] == []
+    assert len(report["markets"]) == 3
+
+
+def test_prepared_symlink_does_not_open_files_outside_the_market_directory(tmp_path: Path) -> None:
+    args = _linked_us_world(tmp_path)
+    selected = select(**args)
+    jobs = _jobs_from(selected, _ok_infer)
+    us = next(job for job in jobs if job.market == "US")
+    stray = tmp_path / "lake" / "other" / "features.parquet"
+    stray.parent.mkdir(parents=True)
+    shutil.copy(us.prepared_input, stray)
+    decision = datetime(2026, 9, 29, 10, tzinfo=SEOUL)
+    outside = InferenceJob(**{**us.__dict__, "prepared_input": stray})
+    with pytest.raises(ValueError, match="outside its allowed directory"):
+        _prepared_metadata(outside, args["prepared_root"], D, decision)
+    # symlink 파일 자체는 여전히 거부한다.
+    link = us.prepared_input.parent / "alias.parquet"
+    link.symlink_to(us.prepared_input)
+    aliased = InferenceJob(**{**us.__dict__, "prepared_input": link})
+    with pytest.raises(ValueError, match="symlink"):
+        _prepared_metadata(aliased, args["prepared_root"], D, decision)
