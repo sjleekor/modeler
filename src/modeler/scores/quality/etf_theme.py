@@ -37,6 +37,7 @@ CAT_THEME = "테마"
 CAT_STYLE = "스타일/대표지수"
 CAT_SINGLE = "단일종목"
 CAT_ASSET = "자산군"
+CAT_METHOD = "방법"
 
 AMBIGUITIES = {
     "T01": "사전에 넣는 기준은 '지금 상장(만기형 제외) ETF 3개 이상의 이름·지수명에 나옴'이다. "
@@ -53,6 +54,9 @@ AMBIGUITIES = {
     "T07": "연도별 상장 수는 현재(마지막 거래일) 이름 기준이다. 그해 첫 거래일에 "
     "first_trade_date<=그날<=last_trade_date 인 만기형 아닌 ETF를 센다. "
     "이름이 나중에 바뀐 ETF는 그 해의 이름과 다를 수 있다(etf_classify A14와 같은 문제).",
+    "T09": "AI가 종목 선정 방법인 지수(KRX K-AI 시리즈)는 AI 테마에서 빼고 '방법: AI 선정'으로 "
+    "따로 둔다. 방산에서는 '방어'(경기방어·방어배당)를 가린다. 그 밖에 잘못 걸리던 것 "
+    "(단독 'S&P', 은행CD, 우선증권, Dow Jones Target, SAMs SW, 달러·유로 단독)도 고쳤다.",
     "T08": "후보였지만 지금 상장 3개 미만이라 뺀 것(2026-10-10 실측): 건설 2, 음식료 1, "
     "사이버보안 1, 러셀 1. 맞는 ETF가 새로 생겨도 동결 후에는 사전을 못 고친다.",
 }
@@ -102,7 +106,13 @@ THEMES: tuple[Theme, ...] = (
         ("바이오매스",),
         True,
     ),
-    T("AI", CAT_THEME, ("ai", "인공지능", "artificial intelligence", "피지컬ai"), (), True),
+    T(
+        "AI",
+        CAT_THEME,
+        ("ai", "인공지능", "artificial intelligence", "피지컬ai"),
+        ("krx k-ai",),
+        True,
+    ),
     T(
         "2차전지",
         CAT_THEME,
@@ -126,7 +136,7 @@ THEMES: tuple[Theme, ...] = (
         "방산",
         CAT_THEME,
         ("방산", "방위", "국방", "defense", "defence", "aerospace & defense", "무기"),
-        (),
+        ("방어",),
         True,
     ),
     T(
@@ -161,7 +171,7 @@ THEMES: tuple[Theme, ...] = (
         ),
         (),
     ),
-    T("소프트웨어", CAT_THEME, ("소프트웨어", "software", "saas", "sw"), ()),
+    T("소프트웨어", CAT_THEME, ("소프트웨어", "software", "saas", "sw"), ("sams sw",)),
     T(
         "인터넷·플랫폼",
         CAT_THEME,
@@ -202,7 +212,7 @@ THEMES: tuple[Theme, ...] = (
         "금융",
         CAT_THEME,
         ("금융", "은행", "증권", "보험", "financ*", "bank*", "insurance", "핀테크", "fintech"),
-        ("금융채", "은행채", "증권사채", "통안채", "금융투자"),
+        ("금융채", "은행채", "증권사채", "통안채", "금융투자", "은행cd", "우선증권"),
     ),
     T(
         "자동차·전기차",
@@ -334,13 +344,15 @@ THEMES: tuple[Theme, ...] = (
     T("코스피·코스피200", CAT_STYLE, ("코스피", "kospi"), ()),
     T("코스닥", CAT_STYLE, ("코스닥", "kosdaq"), ()),
     T("KRX300·KRX", CAT_STYLE, ("krx300", "krx 300"), ()),
-    T("S&P500", CAT_STYLE, ("s&p500", "s&p 500", "snp500", "sp500", "s&p"), ()),
+    T("S&P500", CAT_STYLE, ("s&p500", "s&p 500", "snp500", "sp500"), ()),
     T("나스닥100·나스닥", CAT_STYLE, ("나스닥", "nasdaq*"), ()),
-    T("다우존스", CAT_STYLE, ("다우존스", "dow jones"), ()),
+    T("다우존스", CAT_STYLE, ("다우존스", "dow jones"), ("dow jones target",)),
     T("MSCI", CAT_STYLE, ("msci",), ()),
     T("차이나·항셍", CAT_STYLE, ("항셍", "hang seng", "csi", "차이나", "china", "중국"), ()),
     T("일본 대표지수", CAT_STYLE, ("topix", "nikkei", "닛케이", "일본"), ()),
     T("인도", CAT_STYLE, ("인도", "india*", "nifty"), ("인도네시아", "indonesia")),
+    # ---- 방법(종목 선정 방식이지 투자 테마가 아니다)
+    T("방법: AI 선정", CAT_METHOD, ("krx k-ai",), ()),
     # ---- 단일종목
     T("삼성전자", CAT_SINGLE, ("삼성전자",), ("삼성전자우",)),
     T("SK하이닉스", CAT_SINGLE, ("하이닉스", "hynix"), ()),
@@ -391,7 +403,7 @@ THEMES: tuple[Theme, ...] = (
     T(
         "달러·통화선물",
         CAT_ASSET,
-        ("달러선물", "달러", "엔선물", "엔화", "유로", "usd futures", "환율"),
+        ("달러선물", "엔선물", "유로선물", "usd futures", "환율"),
         (),
     ),
 )
@@ -506,6 +518,7 @@ def membership_table(cls: pl.DataFrame, listed_last_date: int = LISTED_LAST_DATE
                 "themes": "|".join(ths),
                 "theme_only": "|".join(t for t in ths if cat[t] == CAT_THEME),
                 "style_only": "|".join(t for t in ths if cat[t] == CAT_STYLE),
+                "method": "|".join(t for t in ths if cat[t] == CAT_METHOD),
                 "single_stock": "|".join(t for t in ths if cat[t] == CAT_SINGLE),
                 "asset_class": "|".join(t for t in ths if cat[t] == CAT_ASSET),
             }

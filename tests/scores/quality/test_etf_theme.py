@@ -61,6 +61,7 @@ EXAMPLES = {
     "차이나·항셍": ("TIGER 차이나항셍테크", ""),
     "일본 대표지수": ("ACE 일본Nikkei225", ""),
     "인도": ("KODEX 인도Nifty50", ""),
+    "방법: AI 선정": ("ACE K방산TOP5+", "KRX K-AI 방산TOP5+ 지수"),
     "삼성전자": ("KODEX 삼성전자단일종목레버리지", ""),
     "SK하이닉스": ("KODEX 하이닉스단일종목레버리지", ""),
     "테슬라": ("RISE 테슬라고정테크100", ""),
@@ -114,6 +115,43 @@ def test_exclude_token_masks_only_that_theme():
     assert "에너지" not in et.match_themes("TIGER Fn신재생에너지", "FnGuide 신재생에너지 지수")
 
 
+def test_ai_as_method_is_not_ai_theme():
+    r = et.match_themes("ACE K방산TOP5+", "KRX K-AI 방산TOP5+ 지수")
+    assert "AI" not in r and "방법: AI 선정" in r and "방산" in r
+    r = et.match_themes("ACE K바이오코스닥액티브", "KRX K-AI 바이오테크 코스닥 지수")
+    assert "AI" not in r and "의료·헬스케어" in r
+    # AI 산업을 뜻하는 것은 그대로 AI다.
+    for n, i in (
+        ("PLUS 글로벌저작권핵심기업액티브", "iSelect 미국AI지적재산 지수(PR)"),
+        ("X", "Solactive Global AI Humanoid Robotics"),
+        ("X", "KEDI 글로벌생성형AI 지수"),
+        ("X", "KEDI 글로벌 AI 클라우드 지수"),
+        ("X", "Akros U.S. AI Electricity SMR Index"),
+    ):
+        assert "AI" in et.match_themes(n, i)
+        assert "방법: AI 선정" not in et.match_themes(n, i)
+
+
+def test_defensive_style_is_not_defense_theme():
+    assert "방산" not in et.match_themes(
+        "KIWOOM 미국방어배당성장나스닥", "Nasdaq US Low Volatility"
+    )
+    assert "방산" not in et.match_themes("TIGER 경기방어", "코스피 200 경기방어소비재")
+    assert "방산" in et.match_themes("TIGER 미국방산TOP10", "Mirae Asset US Defense Top 10")
+    assert "방산" in et.match_themes("PLUS K방산", "FnGuide K-방위산업 지수")
+
+
+def test_other_false_hits_removed():
+    assert "S&P500" not in et.match_themes("KODEX 골드선물(H)", "S&P GSCI Gold Index(TR)")
+    assert "금융" not in et.match_themes("KODEX CD1년금리플러스", "KAP 1년은행 CD+추가금리 지수")
+    assert "금융" not in et.match_themes("RISE 미국고정배당우선증권", "Preferred Securities")
+    assert "소프트웨어" not in et.match_themes("ACE 삼성그룹섹터가중", "MKF SAMs SW")
+    assert "다우존스" not in et.match_themes("KIWOOM TDF2030", "Dow Jones Target 2030 Index")
+    assert "달러·통화선물" not in et.match_themes("TIGER 미국달러SOFR금리", "Solactive SOFR Index")
+    assert "달러·통화선물" not in et.match_themes("TIGER 유로스탁스50(H)", "EURO STOXX 50 Index")
+    assert "달러·통화선물" in et.match_themes("KODEX 미국달러선물", "미국달러선물지수")
+
+
 def test_spaces_and_case_normalised():
     assert "반도체" in et.match_themes("kodex 미국 반 도 체", "") or "반도체" in et.match_themes(
         "KODEX 미국 반도체", ""
@@ -135,6 +173,7 @@ def test_dictionary_rules():
         et.CAT_STYLE,
         et.CAT_SINGLE,
         et.CAT_ASSET,
+        et.CAT_METHOD,
     }
     assert len({t.name for t in et.THEMES}) == len(et.THEMES)
     assert all(t.include for t in et.THEMES)
