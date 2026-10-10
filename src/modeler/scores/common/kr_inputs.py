@@ -378,3 +378,25 @@ def load_kr_rates(
     if raw is None:
         return None
     return raw.select("date", pl.col("avail_date").alias("realtime_start"), "value")
+
+
+def load_kr_series_raw(
+    lake: KrLake, series_id: str, sessions: Sequence[date] = ()
+) -> pl.DataFrame | None:
+    """``date, value, avail_date`` (관측일당 한 행). 없으면 ``None``.
+
+    ``_load_series``의 공개 얇은 껍질이다(MRS 입력층용). 동작은 같다.
+    """
+    return _load_series(lake, series_id, sessions)
+
+
+def load_kr_series(
+    lake: KrLake, series_id: str, sessions: Sequence[date] = ()
+) -> pl.DataFrame | None:
+    """``date, value, available_at``(tz-aware UTC, 08:30 KST). 없으면 ``None``.
+
+    ``_load_series`` + ``_with_available_at`` 그대로다 — 관측일당 최신 fetched 행, 저장된
+    ``available_from_date``(없으면 다음 세션), 날짜순 누적 최댓값. 기존 함수 동작은 안 바꾼다.
+    """
+    raw = _load_series(lake, series_id, sessions)
+    return None if raw is None else _with_available_at(raw)
