@@ -123,7 +123,8 @@ CI_NOTES = {
 # 승인 대기 제안 판은 06 §4 ③·④ 사용자 승인 뒤 여기에 이름을 넣거나 ``--extra-records`` 로 켠다.
 # 이름이 들어 있을 때만 계산한다. 판정 규칙·기본 출력은 바뀌지 않는다.
 EXTRA_RECORD_NAMES = ("layer_literal", "pooled_cut", "g4_all_years")
-APPROVED_EXTRA_RECORDS: tuple[str, ...] = ()
+# 사용자 승인 2026-10-10 20:5x(06 §6 Q2 제안안대로, 승인본 interp_table_v1_approved.md sha256 701e36d2…).
+APPROVED_EXTRA_RECORDS: tuple[str, ...] = ("layer_literal", "pooled_cut", "g4_all_years")
 REC_RAW_ONLY = "raw_layer_only"  # §5.1 "층 섞지 않기" raw 한 층 단독 민감도
 REC_O4_CONT = "o4_continuous"  # §5.3 O4 연속 판(개발 구간은 o4_continuous_dev_t1)
 REC_O4_CONT_DEV = "o4_continuous_dev_t1"

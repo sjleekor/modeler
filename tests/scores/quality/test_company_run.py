@@ -620,7 +620,8 @@ def test_judgment_synthetic_with_env(tmp_path, monkeypatch):
     ia = r["manifest"]["interp_table_approved"]
     assert ia["path"] == str(ap) and ia["sha256"] == cr.sha256_file(ap)
     assert "o4_continuous" in res["records"] and "o4_continuous_dev_t1" not in res["records"]
-    assert res["extra_records_enabled"] == []
+    approved = [n for n in cr.EXTRA_RECORD_NAMES if n in cr.APPROVED_EXTRA_RECORDS]
+    assert res["extra_records_enabled"] == approved
 
 
 def test_judgment_refused_without_approved_interp_table(tmp_path, monkeypatch):
@@ -786,10 +787,12 @@ def test_dev_new_records_always_on_and_extra_off_by_default(dev_run):
     cc = pl.DataFrame(res["score_component_counts"])
     assert set(cc["component"]) == {"c1_n", "c2_n", "c3_n"} and set(cc["fy"]) == {2017, 2018}
     assert (out / "score_component_counts.tsv").exists()
-    # 켜지 않은 제안 판은 없다. 켠 목록은 빈 목록
+    # 제안 판은 승인 상수(APPROVED_EXTRA_RECORDS)에 든 것만 켜진다
+    approved = [n for n in cr.EXTRA_RECORD_NAMES if n in cr.APPROVED_EXTRA_RECORDS]
     for k in cr.EXTRA_RECORD_NAMES:
-        assert k not in rec
-    assert res["extra_records_enabled"] == [] and r["manifest"]["extra_records_enabled"] == []
+        assert (k in rec) == (k in approved)
+    assert res["extra_records_enabled"] == approved
+    assert r["manifest"]["extra_records_enabled"] == approved
     # 새 항목은 기존 cells_and_records.tsv가 아니라 새 표로
     old = (out / "cells_and_records.tsv").read_text()
     new = (out / "cells_and_records_extra.tsv").read_text()
