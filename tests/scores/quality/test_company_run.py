@@ -74,7 +74,7 @@ def make_misc(fs: pl.DataFrame, years, seed: int = 1) -> pl.DataFrame:
         rows.append(
             dict(
                 corp_code=corp, fy=fy, dps=d, dps_p1=d * rng.uniform(0.5, 1.5),
-                dps_p2=d * rng.uniform(0.5, 1.5), dps_src="common", dps_rcept_no=f"{fy}X",
+                dps_p2=d * rng.uniform(0.5, 1.5), dps_src="common", dps_rcept_no=f"{fy}X{corp}",
                 shares=sh, shares_p1=sh * rng.uniform(0.95, 1.05), shares_src="보통주",
                 retire=float(rng.integers(0, 2)), retire_p1=float(rng.integers(0, 2)),
                 capevt=ev, capevt_p1=evp, capevt_p2=False,
@@ -138,6 +138,16 @@ def make_sources(tmp_path, period: str, n: int = 150, with_outcomes: bool = True
         src.fs_prior_a = fs_main
         src.fs_latest, src.dps_latest = fsl, dps
         src.capevt_judgment, src.capevt_record = ev_j, ev_r
+        # 해석 표 대안 기록용 입력: 앞 8개 회사의 해당 연도 보고서가 multi, 전전기 행은 앵커 없이 결측
+        src.dps_multi = misc.filter(pl.col("corp_code") < "00000008").select(
+            "corp_code", pl.col("fy").alias("report_year"), pl.col("dps_rcept_no").alias("rcept_no"),
+            pl.lit(2, pl.Int64).alias("n_common_rows"),
+        )  # fmt: skip
+        src.opinions_anchor_off = ops.with_columns(
+            pl.when(pl.col("label_raw") == "전전기").then(None).otherwise(pl.col("fiscal_year"))
+            .alias("fiscal_year")
+        )  # fmt: skip
+        src.misc_latest = misc.with_columns((pl.col("shares_p1") * 1.1).alias("shares_p1"))
     return src
 
 
@@ -406,7 +416,18 @@ def test_dev_run_files_and_result(dev_run):
               "universe_spac_included", "f_vs_composite", "o1_fold_any_report"):  # fmt: skip
         assert k in rec, k
     assert "skipped" in rec["o4_relaxed"]  # dev는 t+3이 없어 건너뜀
-    assert len(rec["todo_interpretation_alternatives"]) == 2
+    assert "todo_interpretation_alternatives" not in rec
+    for k in (cr.REC_D3, cr.REC_D5, cr.REC_C3_LATEST):
+        assert k in rec and "skipped" not in rec[k], k
+    assert set(rec[cr.REC_D3]) >= {"c", "f_sum", "n_affected"}
+    assert set(rec[cr.REC_D3]["c"]) == {"O1", "O2", "O3", "O4"}
+    assert rec[cr.REC_D3]["n_affected"]["n_multi_reports"] == src.dps_multi.height
+    assert (
+        set(rec[cr.REC_D5]["c"]) == {"O1"}
+        and rec[cr.REC_D5]["n_affected"]["n_rows_became_null"] > 0
+    )
+    assert rec[cr.REC_C3_LATEST]["pit_violation"] is True and rec[cr.REC_C3_LATEST]["note"]
+    assert rec[cr.REC_C3_LATEST]["n_affected"]["shares_p1"]["n_value_changed"] > 0
     assert set(rec["circular_removed"]) == {"c_o2", "c_o3", "c_o4"}
     assert set(rec["circular_removed"]["c_o2"]) == {"O2"}
     assert rec["capevt_record"]["o3_excluded_capevt"]["record_list"] >= (
@@ -415,6 +436,72 @@ def test_dev_run_files_and_result(dev_run):
     # dev의 O4는 t+1
     assert "t+1" in res["o4_definition"]
     assert {s["fy"] for s in res["status_counts"] if s["outcome"] == "O4"} <= {2017, 2018}
+
+
+def test_dev_run_default_path_ignores_alt_inputs(dev_run, tmp_path):
+    """대안 입력을 없애도 판정 통계·16칸·분모 구성은 한 글자도 안 바뀐다(기록 항목만 건너뜀)."""
+    src, out, _ = dev_run
+    base = json.loads((out / "result.json").read_text())
+    bare = make_sources(tmp_path, "dev", n=170)
+    bare.dps_multi = bare.opinions_anchor_off = bare.misc_latest = None
+    out2 = tmp_path / "out2"
+    cr.run("dev", bare.lake, out2, sources=bare, n_boot=30, seed=7)
+    other = json.loads((out2 / "result.json").read_text())
+    assert all("skipped" in other["records"][k] for k in (cr.REC_D3, cr.REC_D5, cr.REC_C3_LATEST))
+    for k in base:
+        if k != "records":
+            assert base[k] == other[k], k
+    for k, v in base["records"].items():
+        if k not in (cr.REC_D3, cr.REC_D5, cr.REC_C3_LATEST):
+            assert other["records"][k] == v, k
+    for name in ("outcomes_summary.tsv", "by_year.tsv", "status_counts.tsv"):
+        assert (out / name).read_text() == (out2 / name).read_text(), name
+
+
+def test_dps_null_for_multi_panel_and_latest():
+    panel = pl.DataFrame(
+        {"corp_code": ["A", "B"], "fy": [2017, 2017], "dps_rcept_no": ["r1", "r2"],
+         "dps": [100.0, 50.0], "dps_p1": [90.0, 40.0], "dps_p2": [80.0, 30.0], "c": [1, 2]}
+    )  # fmt: skip
+    multi = pl.DataFrame({"rcept_no": ["r1"]})
+    out = cr.dps_null_for_multi(panel, multi)
+    assert out.row(0, named=True) == {
+        "corp_code": "A", "fy": 2017, "dps_rcept_no": "r1", "dps": None, "dps_p1": None,
+        "dps_p2": None, "c": 1,
+    }  # fmt: skip
+    assert out.row(1, named=True)["dps"] == 50.0 and out.row(1, named=True)["dps_p2"] == 30.0
+    lat = pl.DataFrame(
+        {"corp_code": ["A", "B"], "report_year": [2017, 2017], "rcept_no": ["r1", "r2"],
+         "dps_t": [100.0, 50.0], "dps_p1": [90.0, 40.0]}
+    )  # fmt: skip
+    o = cr.dps_latest_null_for_multi(lat, multi)
+    assert o["dps_t"].to_list() == [None, 50.0] and o["dps_p1"].to_list() == [None, 40.0]
+    # 대상이 없으면 그대로
+    none = cr.dps_null_for_multi(
+        panel, pl.DataFrame({"rcept_no": []}, schema={"rcept_no": pl.String})
+    )
+    assert none.equals(panel)
+
+
+def test_d5_and_c3_counts():
+    op = pl.DataFrame(
+        {"corp_code": ["A", "A", "A"], "rcept_no": ["r", "r", "q"], "row_ordinal": [0, 1, 0],
+         "fiscal_year": pl.Series([2020, 2019, 2018], dtype=pl.Int32),
+         "opinion_class": ["clean", None, "clean"]}
+    )  # fmt: skip
+    off = op.with_columns(pl.Series("fiscal_year", [2020, None, 2018], dtype=pl.Int32))
+    c = cr.d5_counts(op, off)
+    assert c["n_rows_became_null"] == 1 and c["n_rows_year_changed"] == 0
+    assert c["n_rows_became_null_with_opinion_class"] == 0 and c["n_reports_affected"] == 1
+    base = pl.DataFrame({"corp_code": ["A", "B"], "fy": [2017, 2017]}).with_columns(
+        *[pl.lit(None, pl.Float64).alias(k) for k in cr.MISC_VALUE_COLS]
+    ).with_columns(pl.Series("shares", [10.0, 20.0]))  # fmt: skip
+    late = base.with_columns(
+        pl.Series("shares", [10.0, 25.0]), pl.Series("dps", [1.0, None], dtype=pl.Float64)
+    )
+    cc = cr.c3_latest_counts(base, late)
+    assert cc["dps"] == {"n_filled_by_latest": 1, "n_value_changed": 0}
+    assert cc["shares"] == {"n_filled_by_latest": 0, "n_value_changed": 1}
 
 
 def test_dev_run_manifest(dev_run):

@@ -1,5 +1,6 @@
 """사전등록 §5.2·§5.3·정정 C-1 규칙마다 작은 합성 예시. 레이크 의존 시험은 없으면 건너뛴다."""
 
+import json
 import math
 import os
 from pathlib import Path
@@ -262,6 +263,33 @@ def test_anchor_max_without_dang_label():
     assert cm._anchor_period(["제10기(당기)", "제12기"]) == 10
     # 앵커가 여럿이면 그대로 None
     assert cm._anchor_period(["제10기(당기)", "제11기(당기)", "제12기"]) is None
+
+
+def test_audit_opinion_rows_anchor_max_arg(tmp_path):
+    """anchor_max 기본값은 지금과 같고, False면 (당기) 표시 없는 `제N기`는 연도가 None이다."""
+    d = tmp_path / "snapshot_date=2026-09-30" / "source=sj2_remote" / "dart_governance_raw"
+    d.mkdir(parents=True)
+    rows = []
+    for i, lab in enumerate(["제10기", "제9기", "제8기"]):
+        payload = json.dumps({"bsns_year": lab, "adt_opinion": "적정의견"})
+        rows.append({"corp_code": "A", "rcept_no": "R1", "bsns_year": 2015, "row_ordinal": i,
+                     "statement_type": "audit_opinion", "raw_payload": payload})  # fmt: skip
+    rows.append({"corp_code": "B", "rcept_no": "R2", "bsns_year": 2015, "row_ordinal": 0,
+                 "statement_type": "audit_opinion",
+                 "raw_payload": json.dumps({"bsns_year": "제10기(당기)", "adt_opinion": "적정"})
+                 })  # fmt: skip
+    pl.DataFrame(rows).with_columns(pl.col("bsns_year").cast(pl.Int32)).write_parquet(
+        d / "p.parquet"
+    )
+    default = cm.audit_opinion_rows(tmp_path, "2026-09-30")
+    assert default.equals(cm.audit_opinion_rows(tmp_path, "2026-09-30", anchor_max=True))
+    a = default.filter(pl.col("corp_code") == "A").sort("row_ordinal")
+    assert a["fiscal_year"].to_list() == [2015, 2014, 2013]
+    off = cm.audit_opinion_rows(tmp_path, "2026-09-30", anchor_max=False)
+    assert off.filter(pl.col("corp_code") == "A")["fiscal_year"].to_list() == [None, None, None]
+    # (당기) 앵커가 있는 보고서는 두 판이 같다
+    b = lambda df: df.filter(pl.col("corp_code") == "B")["fiscal_year"].to_list()  # noqa: E731
+    assert b(default) == b(off) == [2015]
 
 
 # ------------------------------------------------------------------ 액면 변경 해 (정정 C-2)

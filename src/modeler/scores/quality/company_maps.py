@@ -208,8 +208,13 @@ def opinion_fiscal_year(
     return _fiscal_year(label, report_year, _anchor_period(same_report_labels))
 
 
-def audit_opinion_rows(raw_root: str | Path, raw_snapshot: str) -> pl.DataFrame:
+def audit_opinion_rows(
+    raw_root: str | Path, raw_snapshot: str, *, anchor_max: bool = ANCHOR_MAX
+) -> pl.DataFrame:
     """``audit_opinion`` 행을 연도·분류와 함께 낸다.
+
+    ``anchor_max=False`` 는 최대 기수 앵커를 끈 판이다(해석 표 D5 대안, 기록용).
+    기본값은 지금과 같다.
 
     열: corp_code, rcept_no, report_year, row_ordinal, label_raw, fiscal_year, opinion_raw,
     opinion_norm, opinion_class.
@@ -233,7 +238,7 @@ def audit_opinion_rows(raw_root: str | Path, raw_snapshot: str) -> pl.DataFrame:
     )
     anchors: dict[str, int | None] = {}
     for rcept, labs in df.group_by("rcept_no").agg(pl.col("label_raw")).iter_rows():
-        anchors[rcept] = _anchor_period(labs)
+        anchors[rcept] = _anchor_period(labs, anchor_max)
     fy = [
         _fiscal_year(lab, int(ry), anchors[rc])
         for lab, ry, rc in zip(df["label_raw"], df["report_year"], df["rcept_no"], strict=True)

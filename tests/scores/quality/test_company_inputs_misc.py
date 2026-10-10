@@ -239,6 +239,42 @@ def test_build_misc_panel(raw, avail):
     assert r16["n_retire_pref_only"] == 1
 
 
+def test_select_versions_as_of_latest_picks_after_base():
+    rep = pl.DataFrame(
+        {"corp_code": ["A", "A", "B"], "report_year": pl.Series([2016] * 3, dtype=pl.Int32),
+         "rcept_no": ["r1", "r3", "r4"]}
+    )  # fmt: skip
+    avail = pl.DataFrame(
+        {"rcept_no": ["r1", "r3"], "avail_date": [date(2017, 3, 1), date(2018, 7, 2)]}
+    )
+    base, _ = m.select_versions(rep, avail, [2016])
+    assert base["rcept_no"].to_list() == ["r1"]
+    assert base.equals(m.select_versions(rep, avail, [2016], 0, "base")[0])
+    late, ex = m.select_versions(rep, avail, [2016], as_of="latest")
+    got = dict(zip(late["corp_code"].to_list(), late["rcept_no"].to_list(), strict=True))
+    assert got == {"A": "r3", "B": "r4"}  # B_t 뒤 정정본과 접수 목록에 없는 판본도 고른다
+    assert ex.height == 2
+    with pytest.raises(ValueError):
+        m.select_versions(rep, avail, [2016], as_of="x")
+
+
+def test_misc_panel_as_of_latest(raw, avail):
+    lake = Lake(root=raw, raw_snapshot=SNAP)
+    base = m.build_misc(lake, [2016, 2017], raw_root=raw, avail=avail)
+    assert base[0].equals(
+        m.build_misc(lake, [2016, 2017], raw_root=raw, avail=avail, as_of="base")[0]
+    )
+    assert base[1].equals(
+        m.build_misc(lake, [2016, 2017], raw_root=raw, avail=avail, as_of="base")[1]
+    )
+    late = m.build_misc(lake, [2016, 2017], raw_root=raw, avail=avail, as_of="latest")[0]
+    assert late.columns == m.PANEL_COLUMNS and late.height == base[0].height
+    a17 = late.filter((pl.col("corp_code") == "A") & (pl.col("fy") == 2017)).row(0, named=True)
+    # 기본판에서는 A17(B_t 뒤 정정)이 결측이었다
+    assert a17["dps"] == 120.0 and a17["shares"] == 1100 and a17["retire"] == 1
+    assert a17["dps_rcept_no"] == "A17"
+
+
 def test_event_flags_judgment_vs_record(raw, avail):
     lake = Lake(root=raw, raw_snapshot=SNAP)
     panel, _ = m.build_misc(lake, [2016, 2017, 2018], raw_root=raw, avail=avail)

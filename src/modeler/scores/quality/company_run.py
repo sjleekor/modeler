@@ -79,10 +79,13 @@ CI_CAPEVT_NO_MISC_FALSE = True  # CI-capevt-nomisc
 CELL_DIMS = {"C1": "c1", "C2": "c2", "C3": "c3", "F": "f_sum"}
 SCORE_COUNT_COLS = ("c1", "c2", "c3", "c", "f_sum", "f_ltb_req")  # checks: non-null 수만
 
-# 해석 표 대안 중 문면대로 둔 판 — 메인이 해석 표를 확정한 뒤 더한다(지금은 자리만).
-TODO_INTERPRETATION_ALTS = (
-    "차등배당 보고서를 문면대로 결측으로 둔 판(해석 표 D3 대안)",
-    "감사의견 최대 기수 앵커를 끈 판(해석 표 D5 대안)",
+# 해석 표 대안 기록용 항목 이름(§9, A4·P3: 판정 규칙은 그대로, 대안은 기록용 숫자로만 낸다).
+REC_D3 = "interp_d3_dps_multi_missing"
+REC_D5 = "interp_d5_anchor_max_off"
+REC_C3_LATEST = "record_c3_latest_version"
+C3_LATEST_NOTE = (
+    "PIT 위반 표시: 배당·주식수·자사주 판본을 B_t 기준일 없이 가장 늦은 판본(접수번호 최대)으로 골랐다. "
+    "B_t 뒤 정정본의 값이 들어가므로 판정에 쓰지 않는다. 해석 표 승인 때 사용자에게 제안할 결과 전 기록이다."
 )
 
 RAW_TABLES = (
@@ -398,6 +401,12 @@ class Sources:
     cov_fs: pl.DataFrame | None = None
     cov_misc: pl.DataFrame | None = None
     xbrl_cache: Path | None = None
+    # 해석 표 대안 기록용 입력(없으면 해당 항목은 건너뜀)
+    dps_multi: pl.DataFrame | None = (
+        None  # 보통주 행이 여럿이고 값이 다른 보고서: corp_code, report_year, rcept_no, n_common_rows
+    )
+    opinions_anchor_off: pl.DataFrame | None = None  # audit_opinion_rows(anchor_max=False)
+    misc_latest: pl.DataFrame | None = None  # misc_panel(as_of="latest")
 
 
 def default_xbrl_cache(lake: Lake) -> Path:
@@ -439,6 +448,10 @@ def load_sources(lake: Lake, period: str, *, xbrl_cache: Path | None = None) -> 
     src = Sources(
         lake=lake, years=years, fs_all=fs_all, misc=built[0], opinions=opinions, xbrl_cache=cache
     )
+    # 해석 표 대안 기록용 입력(판정 경로에는 안 쓴다)
+    src.dps_multi = dps_multi_reports(root, lake.raw_snapshot)
+    src.opinions_anchor_off = cm.audit_opinion_rows(root, lake.raw_snapshot, anchor_max=False)
+    src.misc_latest = mi.build_misc(lake, years, raw_root=root, avail=avail, as_of="latest")[0]
     if period == "checks":
         src.cov_fs = fi.coverage_from(inp, CHECK_YEARS)
         src.cov_misc = mi.coverage_misc(lake, years, raw_root=root, built=built)
@@ -451,6 +464,110 @@ def load_sources(lake: Lake, period: str, *, xbrl_cache: Path | None = None) -> 
         root, lake.raw_snapshot, sources=cm.RECORD_EVENT_SOURCES
     )
     return src
+
+
+# ================================================================ 5b. 해석 표 대안 (기록용)
+def dps_multi_reports(raw_root: Path, snap: str) -> pl.DataFrame:
+    """보통주 행이 여럿이고 값이 다른 사업보고서(``common_multi_value``)의 목록(해석 표 D3 대안용).
+
+    열: corp_code, report_year, rcept_no, n_common_rows."""
+    d = cm.dividend_per_report(raw_root, snap)
+    return d.filter(pl.col("common_multi_value")).select(
+        "corp_code", pl.col("report_year").cast(pl.Int32), "rcept_no", "n_common_rows"
+    )
+
+
+def dps_null_for_multi(panel: pl.DataFrame, multi: pl.DataFrame) -> pl.DataFrame:
+    """D3 문면판: dps_rcept_no가 multi 보고서인 행의 dps·dps_p1·dps_p2를 결측으로 둔다."""
+    bad = pl.col("dps_rcept_no").is_in(multi["rcept_no"].to_list())
+    return panel.with_columns(
+        *[
+            pl.when(bad).then(None).otherwise(pl.col(c)).alias(c)
+            for c in ("dps", "dps_p1", "dps_p2")
+        ]
+    )
+
+
+def dps_latest_null_for_multi(dps_lat_full: pl.DataFrame, multi: pl.DataFrame) -> pl.DataFrame:
+    """D3 문면판의 O3용 dps_latest: 같은 접수번호 행의 dps_t·dps_p1을 결측으로 둔다."""
+    bad = pl.col("rcept_no").is_in(multi["rcept_no"].to_list())
+    return dps_lat_full.with_columns(
+        *[pl.when(bad).then(None).otherwise(pl.col(c)).alias(c) for c in ("dps_t", "dps_p1")]
+    )
+
+
+def d3_counts(src: Sources) -> dict:
+    """D3 대상 개수(입력 존재 개수): multi 보고서 수·그 보고서의 보통주 행 수·패널·dps_latest에서 영향받은 수."""
+    if src.dps_multi is None:
+        return {"skipped": "dps_multi 입력 없음"}
+    m = src.dps_multi
+    ids = m["rcept_no"].to_list()
+    p = src.misc.filter(pl.col("dps_rcept_no").is_in(ids))
+    out = {
+        "n_multi_reports": m.height,
+        "n_multi_common_rows": int(m["n_common_rows"].sum() or 0),
+        "n_panel_corp_years": p.height,
+        "n_panel_corp_years_dps_non_null": int(p["dps"].is_not_null().sum()),
+    }
+    if src.dps_latest is not None:
+        out["n_dps_latest_rows"] = int(src.dps_latest["rcept_no"].is_in(ids).sum())
+    return out
+
+
+def d5_counts(opinions: pl.DataFrame, off: pl.DataFrame | None) -> dict:
+    """D5 영향 행 수(입력 존재 개수): 앵커를 끄면 ``fiscal_year`` 가 바뀌거나 결측이 되는 의견 행."""
+    if off is None:
+        return {"skipped": "opinions_anchor_off 입력 없음"}
+    keys = ["corp_code", "rcept_no", "row_ordinal"]
+    j = opinions.select(*keys, "fiscal_year", "opinion_class").join(
+        off.select(*keys, pl.col("fiscal_year").alias("fy_off")), on=keys, how="left"
+    )
+    chg = j.filter(
+        pl.col("fiscal_year").is_not_null() & (pl.col("fiscal_year") != pl.col("fy_off"))
+    )
+    nul = j.filter(pl.col("fiscal_year").is_not_null() & pl.col("fy_off").is_null())
+    return {
+        "n_rows": opinions.height,
+        "n_rows_year_changed": chg.height,
+        "n_rows_became_null": nul.height,
+        "n_rows_became_null_with_opinion_class": int(nul["opinion_class"].is_not_null().sum()),
+        "n_reports_affected": int(
+            pl.concat([chg, nul]).select("rcept_no").n_unique() if chg.height + nul.height else 0
+        ),
+    }
+
+
+MISC_VALUE_COLS = ("dps", "dps_p1", "dps_p2", "shares", "shares_p1", "retire", "retire_p1")
+
+
+def c3_latest_counts(base: pl.DataFrame, latest: pl.DataFrame | None) -> dict:
+    """C3 latest 영향 개수(입력 존재 개수): 열마다 값이 새로 생긴 corp-year 수와 값이 달라진 수."""
+    if latest is None:
+        return {"skipped": "misc_latest 입력 없음"}
+    keys = ["corp_code", "fy"]
+    j = base.select(*keys, *MISC_VALUE_COLS).join(
+        latest.select(*keys, *[pl.col(c).alias(f"{c}__l") for c in MISC_VALUE_COLS]),
+        on=keys,
+        how="full",
+        coalesce=True,
+    )
+    out: dict = {"n_corp_years_base": base.height, "n_corp_years_latest": latest.height}
+    for c in MISC_VALUE_COLS:
+        b, la = pl.col(c), pl.col(f"{c}__l")
+        out[c] = {
+            "n_filled_by_latest": int(j.filter(b.is_null() & la.is_not_null()).height),
+            "n_value_changed": int(j.filter(b.is_not_null() & la.is_not_null() & (b != la)).height),
+        }
+    return out
+
+
+def alt_input_counts(src: Sources) -> dict:
+    """세 대안의 입력 존재 개수. checks는 이것만 낸다(결과 변수·AUC 없이)."""
+    return {
+        REC_D3: d3_counts(src),
+        REC_D5: d5_counts(src.opinions, src.opinions_anchor_off),
+        REC_C3_LATEST: c3_latest_counts(src.misc, src.misc_latest),
+    }
 
 
 # ================================================================ 6. 디버깅 표본 (dev)
@@ -711,8 +828,73 @@ def compute_records(ctx: Ctx) -> dict:
         )
         rec[name] = _cells(ctx, {"c": link_all(sc_x, out_x, "c")})
 
-    rec["todo_interpretation_alternatives"] = list(TODO_INTERPRETATION_ALTS)
+    # (h) 해석 표 대안 셋(기록용, 판정 규칙은 그대로)
+    rec.update(_interpretation_alts(ctx))
     return rec
+
+
+def _interpretation_alts(ctx: Ctx) -> dict:
+    """해석 표 D3·D5 대안(문면판)과 C3 latest(PIT 위반) 기록. 입력이 없으면 ``skipped``."""
+    src, years, oi, sc = ctx.src, ctx.years, ctx.oi, ctx.scores
+    fs_main = src.fs_all.filter(pl.col("fy").is_in(years))
+    out: dict = {}
+
+    # D3: 보통주 행이 여럿이고 값이 다른 보고서의 DPS를 결측으로 둔 판
+    if src.dps_multi is None:
+        out[REC_D3] = {"skipped": "dps_multi 입력 없음"}
+    else:
+        panel_d3 = dps_null_for_multi(ctx.panel, src.dps_multi)
+        sc_d3 = cs.compute_scores(panel_d3)
+        out_d3 = dict(ctx.outcomes)
+        full = oi.dps_latest_full if oi.dps_latest_full is not None else None
+        if full is not None and "rcept_no" in full.columns:
+            lat = dps_latest_null_for_multi(full, src.dps_multi).select(oi.dps_latest.columns)
+            out_d3["O3"] = co.o3(oi.formation, lat, oi.capevt, years)
+        out[REC_D3] = {
+            "n_affected": d3_counts(src),
+            **_cells(
+                ctx, {"c": link_all(sc_d3, out_d3, "c"), "f_sum": link_all(sc_d3, out_d3, "f_sum")}
+            ),
+        }
+
+    # D5: 감사의견 최대 기수 앵커를 끈 판(점수는 기본 그대로, O1과 짝수 해 규칙만 다시)
+    if src.opinions_anchor_off is None:
+        out[REC_D5] = {"skipped": "opinions_anchor_off 입력 없음"}
+    else:
+        off = src.opinions_anchor_off
+        all_uni = (
+            src.fs_all.filter(pl.col("in_universe").fill_null(False))
+            .select("corp_code", pl.col("fy").cast(pl.Int64).alias("year"))
+            .unique()
+        )
+        rates, flags = opinion_rates_and_flags(all_uni, off)
+        demoted = demoted_formation_years(flags, ctx.o1_mode)
+        o1_off = co.o1(oi.formation, off, years, mode=ctx.o1_mode)
+        o1_off = o1_off.filter(~pl.col("fy").is_in(demoted))
+        out[REC_D5] = {
+            "n_affected": d5_counts(src.opinions, off),
+            "demoted_formation_years": demoted,
+            "default_demoted_formation_years": list(ctx.demoted_t),
+            "opinion_missing_rate": rates.to_dicts(),
+            "even_year_flags": flags.to_dicts(),
+            **_cells(ctx, {"c": {"O1": link_score(sc, o1_off, "c")}}),
+        }
+
+    # C3 latest: B_t 기준일 없이 가장 늦은 판본(PIT 위반 — 판정에 쓰지 않는 결과 전 기록)
+    if src.misc_latest is None:
+        out[REC_C3_LATEST] = {"skipped": "misc_latest 입력 없음", "pit_violation": True}
+    else:
+        sc_l = cs.compute_scores(assemble_panel(fs_main, src.misc_latest, capevt="judgment"))
+        out[REC_C3_LATEST] = {
+            "pit_violation": True,
+            "note": C3_LATEST_NOTE,
+            "n_affected": c3_latest_counts(src.misc, src.misc_latest),
+            **_cells(
+                ctx,
+                {"c": link_all(sc_l, ctx.outcomes, "c"), "c3": link_all(sc_l, ctx.outcomes, "c3")},
+            ),
+        }
+    return out
 
 
 # ================================================================ 8. dev·judgment 분석
@@ -951,6 +1133,7 @@ def run_checks(src: Sources, *, o1_info: dict) -> dict[str, object]:
     return {
         "tables": tables,
         "numbers": nums,
+        "alt_counts": alt_input_counts(src),
         "o1": {
             **o1_info,
             "demoted_formation_years": demoted_formation_years(flags, o1_info["mode"]),
@@ -1097,6 +1280,8 @@ def run(
             cm.write_tsv(df, written[name])
         written["prereg_numbers.json"] = out / "prereg_numbers.json"
         _write_json(written["prereg_numbers.json"], res["numbers"])
+        written["interp_alt_counts.json"] = out / "interp_alt_counts.json"
+        _write_json(written["interp_alt_counts.json"], res["alt_counts"])
         even = res["tables"]["even_year_flags.tsv"].to_dicts()
         o1_final = res["o1"]
     else:

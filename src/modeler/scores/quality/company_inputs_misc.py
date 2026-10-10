@@ -280,15 +280,25 @@ def parse_incnr(df: pl.DataFrame) -> pl.DataFrame:
 
 # ---------------------------------------------------------------- 판본 선택 (§5.1)
 def select_versions(
-    reports: pl.DataFrame, avail: pl.DataFrame, fys: Sequence[int], lag: int = 0
+    reports: pl.DataFrame,
+    avail: pl.DataFrame,
+    fys: Sequence[int],
+    lag: int = 0,
+    as_of: str = "base",
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """형성 연도 fy마다 (report_year = fy-lag) 보고서의 판본을 고른다.
+
+    ``as_of="latest"`` 는 기준일 없이 접수번호가 가장 큰(가장 늦은) 판본을 고른다.
+    B_t 뒤 정정본도 들어오는 PIT 위반 판이라 기록용 전용이다(해석 표 C3 제안 전 기록).
+    기본 ``"base"`` 는 아래와 같다.
 
     가용일 ≤ B_fy 인 판본 중 (가용일 내림, 접수번호 내림) 첫 행.
     접수 목록에 없는 접수번호는 가용하지
     않다(company_common CI-avail-missing). 반환: (picked, exist). picked는 reports 열 + fy,
     exist는 그 해 보고서가 어떤 판본이든 있는 (corp_code, fy).
     """
+    if as_of not in ("base", "latest"):
+        raise ValueError(f"as_of는 base·latest 중 하나입니다: {as_of!r}")
     a = avail.select("rcept_no", "avail_date")
     j = reports.join(a, on="rcept_no", how="left")
     picked, exist = [], []
@@ -297,12 +307,17 @@ def select_versions(
         exist.append(
             sub.select("corp_code").unique().with_columns(pl.lit(fy, pl.Int32).alias("fy"))
         )
-        ok = sub.filter(
-            pl.col("avail_date").is_not_null() & (pl.col("avail_date") <= base_date(fy))
-        )
-        ok = ok.sort(["avail_date", "rcept_no"], descending=True).unique(
-            subset="corp_code", keep="first", maintain_order=True
-        )
+        if as_of == "latest":
+            ok = sub.sort("rcept_no", descending=True).unique(
+                subset="corp_code", keep="first", maintain_order=True
+            )
+        else:
+            ok = sub.filter(
+                pl.col("avail_date").is_not_null() & (pl.col("avail_date") <= base_date(fy))
+            )
+            ok = ok.sort(["avail_date", "rcept_no"], descending=True).unique(
+                subset="corp_code", keep="first", maintain_order=True
+            )
         picked.append(ok.drop("avail_date").with_columns(pl.lit(fy, pl.Int32).alias("fy")))
     p = (
         pl.concat(picked)
@@ -333,9 +348,13 @@ def build_misc(
     *,
     raw_root: str | Path | None = None,
     avail: pl.DataFrame | None = None,
+    as_of: str = "base",
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """(패널, 진단). 진단 열: corp_code, fy, dps_after_base, shares_after_base, retire_after_base,
-    retire_pref_only (입력 존재 표시, coverage용)."""
+    retire_pref_only (입력 존재 표시, coverage용).
+
+    ``as_of="latest"`` 는 배당·주식수·자사주 판본을 기준일 없이 가장 늦은 판본으로 고른다(PIT 위반,
+    기록용). 기본값 ``"base"`` 는 B_t까지 가용한 판본이다."""
     fys = [int(y) for y in fys]
     guard_years(fys, "inputs")
     root = _root(lake, raw_root)
@@ -347,11 +366,11 @@ def build_misc(
     sh = share_reports(root, snap)
     tr = treasury_reports(root, snap)
 
-    d0, d_ex = select_versions(dv, avail, fys, 0)
-    s0, s_ex = select_versions(sh, avail, fys, 0)
-    s1, _ = select_versions(sh, avail, fys, 1)
-    t0, t_ex = select_versions(tr, avail, fys, 0)
-    t1, _ = select_versions(tr, avail, fys, 1)
+    d0, d_ex = select_versions(dv, avail, fys, 0, as_of)
+    s0, s_ex = select_versions(sh, avail, fys, 0, as_of)
+    s1, _ = select_versions(sh, avail, fys, 1, as_of)
+    t0, t_ex = select_versions(tr, avail, fys, 0, as_of)
+    t1, _ = select_versions(tr, avail, fys, 1, as_of)
 
     # 행 = 그 해(report_year = fy) 사업보고서가 어느 표든 있는 corp-fy (판본 가용 여부와 무관).
     keys = pl.concat([d_ex, s_ex, t_ex]).unique().sort("corp_code", "fy").select("corp_code", "fy")
@@ -423,10 +442,12 @@ def build_misc(
 
 
 def misc_panel(
-    lake: Lake, fys: Sequence[int], *, raw_root: str | Path | None = None
+    lake: Lake, fys: Sequence[int], *, raw_root: str | Path | None = None, as_of: str = "base"
 ) -> pl.DataFrame:
-    """배당·주식수·소각·사건 해 패널(열은 ``PANEL_COLUMNS``)."""
-    return build_misc(lake, fys, raw_root=raw_root)[0]
+    """배당·주식수·소각·사건 해 패널(열은 ``PANEL_COLUMNS``).
+
+    ``as_of="latest"`` 는 기록용 PIT 위반 판이다."""
+    return build_misc(lake, fys, raw_root=raw_root, as_of=as_of)[0]
 
 
 def dps_latest(lake: Lake, *, raw_root: str | Path | None = None) -> pl.DataFrame:
