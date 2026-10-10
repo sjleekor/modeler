@@ -64,7 +64,11 @@ from modeler.us.dataset import DirtyWorktreeError, git_commit
 logger = logging.getLogger(__name__)
 
 #: 승인된 구현 해석 표(04 문서)의 sha256. ``None``이면 실행은 항상 거부된다 (MI32).
-APPROVED_INTERP_SHA256: str | None = None
+#: 2026-10-10 22:1x 사용자 승인(04 §7 Q1, 예외 없음). 승인본 사본
+#: ``stock_data/kr/output/regime_score_provenance/interp_table_v1_approved.md``(읽기 전용)의 해시다.
+APPROVED_INTERP_SHA256: str | None = (
+    "81eed4e1a5bf58c04ae328c746754e05972b00e6cef7fffc88fcd031ca808685"
+)
 
 _KST = ZoneInfo("Asia/Seoul")
 EXIT_REFUSED = 2

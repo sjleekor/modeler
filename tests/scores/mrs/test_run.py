@@ -107,10 +107,12 @@ def test_refused_when_tree_dirty(tmp_path, monkeypatch):
     _assert_nothing_created(tmp_path)
 
 
-def test_real_cli_is_refused_without_approval(tmp_path, monkeypatch):
-    """상수가 None인 기본 상태: 어떤 인자로도 거부된다."""
+def test_real_cli_is_refused_without_approved_copy(tmp_path, monkeypatch):
+    """기본 상태(상수 = 승인본 해시): 승인본 사본·확인 날짜 없이는 거부된다."""
     monkeypatch.setenv("STOCK_DATA_ROOT", str(tmp_path))
-    assert mrs_run.APPROVED_INTERP_SHA256 is None
+    assert mrs_run.APPROVED_INTERP_SHA256 is not None
+    assert len(mrs_run.APPROVED_INTERP_SHA256) == 64
+    _no_compute(monkeypatch)
     assert mrs_run.main(["run", "--market", "all", "--kr-snapshot", KR_SNAP]) == 2
     _assert_nothing_created(tmp_path)
 
