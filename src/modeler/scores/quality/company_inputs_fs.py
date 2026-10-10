@@ -653,6 +653,16 @@ def _keys(cv: pl.DataFrame, fys: Sequence[int]) -> pl.DataFrame:
     )
 
 
+def _raw_only(cv: pl.DataFrame) -> pl.DataFrame:
+    """raw 후보만 남기고 vintage·XBRL 값 열(통화 포함)을 비운다(§5.1 raw 한 층 단독 민감도)."""
+    cols = [c for c in cv.columns if c.startswith(("v_", "x_", "xp1_", "xp2_"))]
+    return cv.filter(pl.col("in_raw")).with_columns(
+        *[pl.lit(None, dtype=cv.schema[c]).alias(c) for c in cols],
+        pl.lit(False).alias("in_vintage"),
+        pl.lit(False).alias("in_xbrl"),
+    )
+
+
 def _meta(u: pl.DataFrame) -> pl.DataFrame:
     return u.filter(pl.col("corp_code").is_not_null()).select(
         "corp_code", "stock_code", "market", "is_spac", "is_financial", "acc_mt", "in_universe_attr"
@@ -667,17 +677,32 @@ def build_panel(
     prior_source: str = "frmtrm",
     layer_fill: bool = CI_LAYER_FILL,
     use_xbrl_prior: bool = CI_USE_XBRL_PRIOR,
+    layers: str = "all",
+    cap_xbrl: bool = True,
     diag: bool = False,
     src: bool = False,
 ) -> pl.DataFrame:
-    """패널을 만든다. ``fs_panel`` 의 본체(읽기 단계 결과 재사용)."""
+    """패널을 만든다. ``fs_panel`` 의 본체(읽기 단계 결과 재사용).
+
+    ``layers="raw_only"`` 는 §5.1 raw 한 층 단독 민감도다: raw 후보(접수번호)만 두고 값·전기 값·
+    자본금·지급이자·통화를 raw에서만 읽는다(vintage·XBRL 안 씀, 가용일 규칙은 같다).
+    ``cap_xbrl=False`` 는 자본금을 XBRL로 대체하지 않는다(CI14 문면판, 기록용).
+    기본값(``"all"``·True)은 출력이 바뀌지 않는다.
+    """
+    if layers not in ("all", "raw_only"):
+        raise ValueError(f"layers는 'all'|'raw_only': {layers!r}")
     if as_of not in ("base", "latest"):
         raise ValueError(f"as_of는 'base'|'latest': {as_of!r}")
     if prior_source not in ("frmtrm", "t_minus_1_report"):
         raise ValueError(f"prior_source는 'frmtrm'|'t_minus_1_report': {prior_source!r}")
     fys = sorted(set(inp.fys if fys is None else fys))
     guard_years(fys, "inputs")
-    cv = resolve_values(inp.cv, layer_fill=layer_fill, use_xbrl_prior=use_xbrl_prior)
+    cv_in = inp.cv
+    if layers == "raw_only":
+        cv_in = _raw_only(cv_in)
+    if not cap_xbrl:
+        cv_in = cv_in.with_columns(pl.lit(None, dtype=pl.Float64).alias("x_cap"))
+    cv = resolve_values(cv_in, layer_fill=layer_fill, use_xbrl_prior=use_xbrl_prior)
     latest = as_of == "latest"
     p0 = pick_versions(cv, shift=0, latest=latest)
     keys = _keys(cv, fys)
@@ -799,6 +824,9 @@ def fs_panel(
     as_of: str = "base",
     prior_source: str = "frmtrm",
     use_xbrl_prior: bool = CI_USE_XBRL_PRIOR,
+    layer_fill: bool = CI_LAYER_FILL,
+    layers: str = "all",
+    cap_xbrl: bool = True,
     xbrl_cache: str | Path | None = None,
     inputs: FsInputs | None = None,
 ) -> pl.DataFrame:
@@ -809,10 +837,19 @@ def fs_panel(
     ``in_universe`` = 분모 속성(KOSPI·KOSDAQ·SPAC 아님·금융 아님·12월 결산) &
     그 fy에 판본 후보가 있음.
     판본이 가용하지 않은 corp-fy도 행은 남고 값은 전부 결측, ``layer="none"``.
+    ``layers``·``cap_xbrl``·``layer_fill`` 은 기록용 판(raw 한 층 단독·문면판)용이다.
+    기본값이면 출력은 그대로다.
     """
     inp = _inputs(lake, fys, inputs, xbrl_cache)
     return build_panel(
-        inp, fys, as_of=as_of, prior_source=prior_source, use_xbrl_prior=use_xbrl_prior
+        inp,
+        fys,
+        as_of=as_of,
+        prior_source=prior_source,
+        use_xbrl_prior=use_xbrl_prior,
+        layer_fill=layer_fill,
+        layers=layers,
+        cap_xbrl=cap_xbrl,
     )
 
 

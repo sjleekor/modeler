@@ -232,6 +232,49 @@ def test_raw_only_candidate_reads_raw_then_xbrl_and_cap_from_raw_then_xbrl():
     assert F.build_panel(_inputs(cv2), src=True)["src_cap"][0] == "raw"
 
 
+def test_layers_raw_only_reads_raw_only_and_default_unchanged():
+    """§5.1 raw 한 층 단독 민감도: raw 후보만, 값·전기·자본금·지급이자·통화를 raw에서만 읽는다."""
+    rc1, rc2 = "20250101000001", "20250101000002"
+    x = pl.DataFrame(
+        {"rcept_no": [rc1, rc2], "fy": [2024, 2024], "fs_div": ["CFS", "CFS"],
+         "x_rev": [4.0, 5.0], "x_cap": [7.0, 8.0], "xp1_ni": [11.0, 12.0]},
+        schema_overrides={"fy": pl.Int32},
+    )  # fmt: skip
+    # rc1: vintage+raw 둘 다, rc2: vintage만(raw에 없음)
+    cv = _cands(
+        v_rows=[
+            {"rcept_no": rc1, "v_ta": 1.0, "v_oi": 9.0, "v_currency": "USD"},
+            {"rcept_no": rc2, "v_ta": 2.0},
+        ],
+        r_rows=[{"rcept_no": rc1, "r_ta": 100.0, "r_currency": "KRW", "rp1_ni": 1.5}],
+        x=x,
+        avail=_avail({rc1: date(2025, 3, 3), rc2: date(2025, 3, 4)}),
+    )
+    base = F.build_panel(_inputs(cv))
+    assert base["rcept_no"].to_list() == [rc2] and base["layer"].to_list() == ["vintage"]
+    raw = F.build_panel(_inputs(cv), layers="raw_only", src=True)
+    assert raw["rcept_no"].to_list() == [rc1] and raw["layer"].to_list() == ["raw"]  # 후보도 raw만
+    assert raw["ta"][0] == 100.0 and raw["src_ta"][0] == "raw"
+    assert raw["oi"][0] is None  # vintage 값은 안 읽는다
+    assert raw["rev"][0] is None and raw["cap"][0] is None  # XBRL도 안 읽는다
+    assert raw["currency"][0] == "KRW"
+    assert raw["ni_p1"][0] == 1.5 and raw["prior_src"][0] == "raw"
+    with pytest.raises(ValueError):
+        F.build_panel(_inputs(cv), layers="x")
+
+
+def test_cap_xbrl_off_and_literal_flags():
+    rc = "20250101000001"
+    x = pl.DataFrame(
+        {"rcept_no": [rc], "fy": [2024], "fs_div": ["CFS"], "x_cap": [7.0], "x_rev": [4.0]},
+        schema_overrides={"fy": pl.Int32},
+    )
+    cv = _cands(r_rows=[{"rcept_no": rc, "r_ta": 100.0}], x=x, avail=_avail({rc: date(2025, 3, 3)}))
+    assert F.build_panel(_inputs(cv))["cap"][0] == 7.0  # 기본: XBRL 대체
+    off = F.build_panel(_inputs(cv), cap_xbrl=False)
+    assert off["cap"][0] is None and off["rev"][0] == 4.0  # 자본금만 끈다
+
+
 def test_ip_order_op_fin_inv_and_absolute_value():
     rc = "20250101000001"
     av = _avail({rc: date(2025, 3, 3)})

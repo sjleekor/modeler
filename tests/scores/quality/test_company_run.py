@@ -20,6 +20,15 @@ from modeler.scores.quality.company_common import JUDGMENT_ENV, Lake
 @pytest.fixture(autouse=True)
 def _no_env(monkeypatch):
     monkeypatch.delenv(JUDGMENT_ENV, raising=False)
+    monkeypatch.delenv(cr.INTERP_TABLE_ENV, raising=False)
+
+
+def _approve(tmp_path, monkeypatch, text="승인본 v1\n"):
+    """해석 표 승인본 사본을 만들고 환경변수로 가리킨다."""
+    p = tmp_path / "interp_table_v1_approved.md"
+    p.write_text(text, encoding="utf-8")
+    monkeypatch.setenv(cr.INTERP_TABLE_ENV, str(p))
+    return p
 
 
 # ---------------------------------------------------------------- 합성 자료
@@ -148,6 +157,17 @@ def make_sources(tmp_path, period: str, n: int = 150, with_outcomes: bool = True
             .alias("fiscal_year")
         )  # fmt: skip
         src.misc_latest = misc.with_columns((pl.col("shares_p1") * 1.1).alias("shares_p1"))
+        # 기록용 판 입력: raw 한 층 단독(앞 40개 회사는 행이 없음)·문면판(자본금을 비움)
+        src.fs_raw_only = fs_main.filter(pl.col("corp_code") >= "00000040").with_columns(
+            pl.lit("raw").alias("layer")
+        )
+        src.fs_literal = fs_main.with_columns(
+            pl.when(pl.col("corp_code") < "00000010")
+            .then(None)
+            .otherwise(pl.col("cap"))
+            .alias("cap")
+        )
+    src.availability_mismatch = {"vintage_rcept": 100, "vintage_mismatch": 3}
     return src
 
 
@@ -582,6 +602,7 @@ def test_empty_outcome_frame_does_not_break_judge():
 # ---------------------------------------------------------------- judgment (합성 자료, 환경변수 있음)
 def test_judgment_synthetic_with_env(tmp_path, monkeypatch):
     monkeypatch.setenv(JUDGMENT_ENV, "1")
+    ap = _approve(tmp_path, monkeypatch)
     src = make_sources(tmp_path, "judgment", n=130)
     out = tmp_path / "j"
     r = cr.run("judgment", src.lake, out, sources=src, n_boot=10, seed=3)
@@ -596,6 +617,48 @@ def test_judgment_synthetic_with_env(tmp_path, monkeypatch):
         and "skipped" not in res["records"]["o4_relaxed"]
     )
     assert r["manifest"]["period"] == "judgment"
+    ia = r["manifest"]["interp_table_approved"]
+    assert ia["path"] == str(ap) and ia["sha256"] == cr.sha256_file(ap)
+    assert "o4_continuous" in res["records"] and "o4_continuous_dev_t1" not in res["records"]
+    assert res["extra_records_enabled"] == []
+
+
+def test_judgment_refused_without_approved_interp_table(tmp_path, monkeypatch):
+    """환경변수(동결 확인)가 있어도 승인본 사본이 없으면 파일을 쓰기 전에 거부, 둘 다 있으면 진행."""
+
+    def boom(*a, **k):
+        raise AssertionError("읽기·계산 전에 멈춰야 합니다")
+
+    monkeypatch.setenv(JUDGMENT_ENV, "1")
+    lake = Lake(root=tmp_path / "lake")
+    out = tmp_path / "out_j"
+    monkeypatch.setattr(cr, "load_sources", boom)
+    with pytest.raises(PermissionError, match="interp_table_v1_approved.md"):
+        cr.run("judgment", lake, out)
+    assert not out.exists() and not (tmp_path / "lake").exists()
+    # 환경변수가 가리키는 파일이 없어도 거부, 메시지에 그 경로
+    monkeypatch.setenv(cr.INTERP_TABLE_ENV, str(tmp_path / "nope.md"))
+    with pytest.raises(PermissionError, match="nope.md"):
+        cr.run("judgment", lake, out)
+    monkeypatch.setenv("STOCK_DATA_ROOT", str(tmp_path / "lake2"))
+    assert cr.main(["--period", "judgment", "--out-dir", str(out)]) == 2
+    assert not out.exists()
+    monkeypatch.undo()
+    # dev는 거부하지 않고 manifest에 sha256 null로만 적는다
+    monkeypatch.delenv(cr.INTERP_TABLE_ENV, raising=False)
+    src = make_sources(tmp_path, "dev", n=60)
+    r = cr.run("dev", src.lake, tmp_path / "dv", sources=src, n_boot=5, seed=1)
+    ia = r["manifest"]["interp_table_approved"]
+    assert ia["sha256"] is None and ia["path"].endswith("interp_table_v1_approved.md")
+
+
+def test_default_interp_table_approved_path(tmp_path, monkeypatch):
+    lake = Lake(root=tmp_path, raw_snapshot="2026-09-30")
+    assert cr.default_interp_table_approved(lake) == (
+        tmp_path / "kr/output/quality_score_company_provenance/interp_table_v1_approved.md"
+    )
+    monkeypatch.setenv(cr.INTERP_TABLE_ENV, "/x/y.md")
+    assert str(cr.default_interp_table_approved(lake)) == "/x/y.md"
 
 
 def test_cli_dev_arguments(tmp_path, monkeypatch):
@@ -697,3 +760,187 @@ def test_checklist_c_written_by_checks_run(tmp_path):
     assert doc["status_counts"]["missing"] >= 1
     tsv = (out / "checklist_c.tsv").read_text().splitlines()
     assert tsv[0] == "item\tstatus\tvalue\tsource" and len(tsv) == 1 + len(cr.CHECKLIST_KEYS)
+
+
+# ---------------------------------------------------------------- 기록용 항목 넷 (항상 켬)
+def test_dev_new_records_always_on_and_extra_off_by_default(dev_run):
+    src, out, r = dev_run
+    res = json.loads((out / "result.json").read_text())
+    rec = res["records"]
+    # 1. raw 한 층 단독: 점수만 바꿔 O1~O4, 영향 개수
+    ro = rec["raw_layer_only"]
+    assert set(ro["c"]) == {"O1", "O2", "O3", "O4"} and "skipped" not in ro
+    na = ro["n_affected"]
+    assert na["n_scored_variant"] < na["n_scored_default"] and na["n_scored_default_only"] > 0
+    assert na["n_scored_both"] + na["n_scored_default_only"] == na["n_scored_default"]
+    # 2. O4 연속 판: 개발은 t+1만
+    assert "o4_continuous" not in rec and "o4_continuous_dev_t1" in rec
+    oc = rec["o4_continuous_dev_t1"]
+    assert oc["formation_years"] == [2017, 2018] and "t+1" in oc["definition"]
+    assert oc["n_rows"] > 0 and -1 <= oc["rho_pooled"] <= 1
+    assert oc["ci95"][0] <= oc["rho_pooled"] <= oc["ci95"][1] or oc["n_boot"] < 100
+    assert [y["fy"] for y in oc["by_year"]] == [2017, 2018]
+    # 3. 가용일 어긋남은 manifest에
+    assert r["manifest"]["availability_mismatch"] == {"vintage_rcept": 100, "vintage_mismatch": 3}
+    # 4. 쓴 성분 수: 값별 회사 수
+    cc = pl.DataFrame(res["score_component_counts"])
+    assert set(cc["component"]) == {"c1_n", "c2_n", "c3_n"} and set(cc["fy"]) == {2017, 2018}
+    assert (out / "score_component_counts.tsv").exists()
+    # 켜지 않은 제안 판은 없다. 켠 목록은 빈 목록
+    for k in cr.EXTRA_RECORD_NAMES:
+        assert k not in rec
+    assert res["extra_records_enabled"] == [] and r["manifest"]["extra_records_enabled"] == []
+    # 새 항목은 기존 cells_and_records.tsv가 아니라 새 표로
+    old = (out / "cells_and_records.tsv").read_text()
+    new = (out / "cells_and_records_extra.tsv").read_text()
+    assert "vintage_only:" in old and "raw_layer_only:" not in old
+    assert "raw_layer_only:" in new
+
+
+def test_o4_continuous_exact_values_and_exclusions():
+    from types import SimpleNamespace
+
+    corps = [f"c{i}" for i in range(6)]
+    # 점수 c가 ROE와 같은 순서인 해(2019): ρ = 1. c5는 t+2 te ≤ 0이라 제외, c4는 t+3 관측 없음
+    rows = [(c, 2019, float(10 * i)) for i, c in enumerate(corps)]
+    scores = pl.DataFrame(rows, schema=["corp_code", "fy", "c"], orient="row").with_columns(
+        pl.lit(True).alias("in_universe")
+    )
+    fl = []
+    for i, c in enumerate(corps):
+        for k in (1, 2, 3):
+            te = -1.0 if (c == "c5" and k == 2) else 100.0
+            if c == "c4" and k == 3:
+                continue
+            fl.append(
+                {"corp_code": c, "year": 2019 + k, "te": te, "cap": 1.0, "ni": float(i + 1) * 10}
+            )
+    ctx = SimpleNamespace(
+        period="judgment", years=[2019], scores=scores, seed=1, n_boot=50,
+        oi=SimpleNamespace(fs_latest=pl.DataFrame(fl)),
+    )  # fmt: skip
+    import os
+
+    os.environ[JUDGMENT_ENV] = "1"
+    try:
+        rec = cr.o4_continuous_record(ctx)
+    finally:
+        del os.environ[JUDGMENT_ENV]
+    assert rec["n_scored_candidates"] == 6 and rec["n_rows"] == 4  # c4·c5 제외
+    assert rec["rho_pooled"] == pytest.approx(1.0)
+    assert rec["by_year"] == [{"fy": 2019, "n": 4, "rho": pytest.approx(1.0)}]
+    assert rec["ci95"] == [pytest.approx(1.0), pytest.approx(1.0)] or rec["n_boot_nan"] > 0
+
+
+def test_o4_continuous_guards_judgment_years():
+    from types import SimpleNamespace
+
+    ctx = SimpleNamespace(period="judgment", years=[2019], scores=None, seed=1, n_boot=2, oi=None)
+    with pytest.raises(PermissionError):  # 확인 환경변수 없이는 결과 변수 계산 금지(§7.2)
+        cr.o4_continuous_record(ctx)
+
+
+# ---------------------------------------------------------------- 승인 대기 제안 판 (스위치)
+def test_extra_records_on_when_named(tmp_path):
+    src = make_sources(tmp_path, "dev", n=120)
+    out = tmp_path / "ex"
+    r = cr.run(
+        "dev", src.lake, out, sources=src, n_boot=10, seed=5,
+        extra_records=("layer_literal", "pooled_cut", "g4_all_years"),
+    )  # fmt: skip
+    res = json.loads((out / "result.json").read_text())
+    rec = res["records"]
+    assert res["extra_records_enabled"] == ["layer_literal", "pooled_cut", "g4_all_years"]
+    assert r["manifest"]["extra_records_enabled"] == res["extra_records_enabled"]
+    ll = rec["layer_literal"]
+    assert set(ll["c"]) == {"O1", "O2", "O3", "O4"} and ll["n_affected"]["n_scored_default"] > 0
+    assert ll["n_affected"]["n_scored_both"] > 0 and "definition" in ll
+    pc = rec["pooled_cut"]
+    assert pc["cut"] == "pooled" and set(pc) >= {"O1", "O2", "O3", "O4"}
+    assert pc["O2"]["quintiles"]["cut"] == "pooled" and pc["O2"]["capture"]["20"]["cut"] == "pooled"
+    assert "pass" in pc["O2"]["g3"]
+    g4 = rec["g4_all_years"]
+    assert (
+        g4["O2"]["all"]["denominator_rule"] == "all"
+        and g4["O2"]["default"]["denominator_rule"] == "counted"
+    )
+    assert g4["O2"]["all"]["denominator"] == g4["O2"]["all"]["n_years"]
+    # 기본 판정 통계는 그대로(켜도 판정 규칙·기본 출력 불변)
+    out0 = tmp_path / "ex0"
+    cr.run("dev", src.lake, out0, sources=src, n_boot=10, seed=5)
+    base = json.loads((out0 / "result.json").read_text())
+    for k in ("judge", "cells", "status_counts", "o1"):
+        assert base[k] == res[k], k
+    for name in ("outcomes_summary.tsv", "by_year.tsv", "cells_and_records.tsv"):
+        assert (out0 / name).read_text() == (out / name).read_text(), name
+    # 알 수 없는 이름은 거부
+    with pytest.raises(ValueError):
+        cr.run("dev", src.lake, tmp_path / "bad", sources=src, extra_records=("nope",))
+
+
+def test_approved_extra_records_constant_and_cli(tmp_path, monkeypatch):
+    src = make_sources(tmp_path, "dev", n=80)
+    monkeypatch.setattr(cr, "APPROVED_EXTRA_RECORDS", ("pooled_cut",))
+    r = cr.run(
+        "dev", src.lake, tmp_path / "a", sources=src, n_boot=5, extra_records=("g4_all_years",)
+    )
+    rec = r["result"]["result"]["records"]
+    assert "pooled_cut" in rec and "g4_all_years" in rec and "layer_literal" not in rec
+    # CLI: 쉼표 목록을 읽고 모르는 이름은 종료 코드 2(argparse)
+    seen = {}
+
+    def fake_run(period, lake, out_dir, **kw):
+        seen.update(kw)
+        return {"out_dir": tmp_path, "manifest": {"o1": {"mode": "fallback", "n_even_year_reports": 0},
+                                                   "elapsed_sec": 1, "peak_rss_mb": 2},
+                "result": {"result": {"judge": {"order": []}}}}  # fmt: skip
+
+    monkeypatch.setattr(cr, "run", fake_run)
+    monkeypatch.setenv("STOCK_DATA_ROOT", str(tmp_path))
+    assert cr.main(["--extra-records", "layer_literal, pooled_cut"]) == 0
+    assert seen["extra_records"] == ("layer_literal", "pooled_cut")
+    with pytest.raises(SystemExit) as e:
+        cr.main(["--extra-records", "nope"])
+    assert e.value.code == 2
+
+
+# ---------------------------------------------------------------- checks: 가용일·성분 수·승인본
+def test_checks_new_files_and_checklist_items(tmp_path, monkeypatch):
+    src = make_sources(tmp_path, "checks", n=40, with_outcomes=False)
+    out = tmp_path / "chk2"
+    ap = _approve(tmp_path, monkeypatch)
+    r = cr.run("checks", src.lake, out, sources=src, n_boot=5)
+    am = json.loads((out / "availability_mismatch.json").read_text())
+    assert am == {"vintage_rcept": 100, "vintage_mismatch": 3}
+    assert r["manifest"]["availability_mismatch"] == am
+    cc = pl.read_csv(out / "score_component_counts.tsv", separator="\t")
+    assert cc.columns == ["fy", "component", "n_components", "n_corps"]
+    assert set(cc["fy"]) == set(cr.CHECK_YEARS) and set(cc["component"]) == {"c1_n", "c2_n", "c3_n"}
+    # in_universe 행 수와 맞는다: 연도·성분마다 n_corps 합 = n_universe_rows
+    si = pl.read_csv(out / "score_inputs.tsv", separator="\t")
+    tot = (
+        cc.group_by("fy", "component")
+        .agg(pl.col("n_corps").sum())
+        .filter(pl.col("component") == "c1_n")
+    )
+    assert tot.sort("fy")["n_corps"].to_list() == si.sort("fy")["n_universe_rows"].to_list()
+    nums = (
+        json.loads((out / "prereg_numbers.json").read_text())
+        if (out / "prereg_numbers.json").exists()
+        else {}
+    )
+    assert "vintage_mismatch" not in nums  # prereg_numbers.json은 그대로
+    doc = json.loads((out / "checklist_c.json").read_text())
+    by = {i["item"]: i for i in doc["items"]}
+    assert (
+        by["availability_mismatch"]["status"] == "ok" and by["availability_mismatch"]["value"] == am
+    )
+    assert by["interp_table_approved"]["status"] == "check"
+    assert by["interp_table_approved"]["value"] == {"path": str(ap), "sha256": cr.sha256_file(ap)}
+    # 승인본이 없으면 missing (checks는 거부하지 않는다)
+    monkeypatch.setenv(cr.INTERP_TABLE_ENV, str(tmp_path / "none.md"))
+    out2 = tmp_path / "chk3"
+    cr.run("checks", src.lake, out2, sources=src, n_boot=5)
+    by2 = {i["item"]: i for i in json.loads((out2 / "checklist_c.json").read_text())["items"]}
+    assert by2["interp_table_approved"]["status"] == "missing"
+    assert by2["interp_table_approved"]["value"]["sha256"] is None

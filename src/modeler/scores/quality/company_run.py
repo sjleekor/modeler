@@ -31,7 +31,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+import numpy as np
 import polars as pl
+from scipy.stats import rankdata
 
 from modeler.scores.quality import company_inputs_fs as fi
 from modeler.scores.quality import company_inputs_misc as mi
@@ -47,6 +49,7 @@ from modeler.scores.quality.company_common import (
     PREREG_REL,
     Lake,
     TradingCalendar,
+    availability_mismatch_counts,
     base_date,
     default_prereg,
     filing_availability,
@@ -115,6 +118,38 @@ CI_NOTES = {
     "CI-sample-seed": "디버깅 표본의 시드는 실행 시드(--seed)와 같다",
     "CI-checks-scores": "checks의 점수 입력 수는 compute_scores를 돌려 non-null만 센다",
 }
+
+# ---- 기록용 판(§5.1·§5.2·§5.3에 등록된 넷, 항상 켬)과 승인 대기 제안 판(스위치로 꺼 둠)
+# 승인 대기 제안 판은 06 §4 ③·④ 사용자 승인 뒤 여기에 이름을 넣거나 ``--extra-records`` 로 켠다.
+# 이름이 들어 있을 때만 계산한다. 판정 규칙·기본 출력은 바뀌지 않는다.
+EXTRA_RECORD_NAMES = ("layer_literal", "pooled_cut", "g4_all_years")
+APPROVED_EXTRA_RECORDS: tuple[str, ...] = ()
+REC_RAW_ONLY = "raw_layer_only"  # §5.1 "층 섞지 않기" raw 한 층 단독 민감도
+REC_O4_CONT = "o4_continuous"  # §5.3 O4 연속 판(개발 구간은 o4_continuous_dev_t1)
+REC_O4_CONT_DEV = "o4_continuous_dev_t1"
+# 새 기록 항목 이름: cells_and_records.tsv(기존 파일)에는 안 넣고 새 표 cells_and_records_extra.tsv로 낸다.
+NEW_RECORD_NAMES = (REC_RAW_ONLY, REC_O4_CONT, REC_O4_CONT_DEV, *EXTRA_RECORD_NAMES)
+CI_NOTES_RECORDS = {
+    "CI-raw-only": (
+        "raw 한 층 단독: raw 접수번호 후보만, 당기·전기·자본금·지급이자·통화를 raw에서만 읽고 "
+        "판본 규칙(B_t 가용일·연결 우선)은 같다. 결과 변수는 기본 판 그대로, 점수만 바꾼다"
+    ),
+    "CI-o4-cont": (
+        "O4 연속 판: 점수 c와 t+1~t+3 실현 평균 ROE(ni/te, 각 해 가장 늦게 알려진 판본)의 스피어만 "
+        "순위 상관. 세 해 모두 관측이고 각 해 te > 0인 행만(아니면 제외). 형성 ni ≤ 0 제외는 적용하지 "
+        "않았다(§5.3 문면에 없음). 개발 구간은 t+1 ROE만(§5.4). 구간은 회사 단위 클러스터 부트스트랩"
+    ),
+    "CI-extra-records": (
+        "승인 대기 제안 판(layer_literal·pooled_cut·g4_all_years)은 켠 이름만 계산한다. "
+        "layer_literal = layer_fill 끔 + XBRL 전기 값 끔 + 자본금 XBRL 대체 끔(CI11·CI13·CI14 문면)"
+    ),
+}
+
+# 해석 표 승인본 사본(06 §6). 판정 구간은 이 파일이 있어야 시작한다.
+INTERP_TABLE_ENV = "QUALITY_C_INTERP_TABLE"
+INTERP_TABLE_NAME = "interp_table_v1_approved.md"
+INTERP_TABLE_DIR = "quality_score_company_provenance"
+COMPONENT_COLS = ("c1_n", "c2_n", "c3_n")  # §5.2 C1 "쓴 성분 수"
 
 PANEL_FLAG_COLS = (
     "capevt",
@@ -427,6 +462,10 @@ class Sources:
     )
     opinions_anchor_off: pl.DataFrame | None = None  # audit_opinion_rows(anchor_max=False)
     misc_latest: pl.DataFrame | None = None  # misc_panel(as_of="latest")
+    # 기록용 판 입력(없으면 해당 항목은 건너뜀)
+    fs_raw_only: pl.DataFrame | None = None  # build_panel(layers="raw_only"), 실행 연도
+    fs_literal: pl.DataFrame | None = None  # layer_literal 판(켠 때만), 실행 연도
+    availability_mismatch: dict | None = None  # availability_mismatch_counts (§5.1 가용일)
 
 
 def default_xbrl_cache(lake: Lake) -> Path:
@@ -451,7 +490,13 @@ def raw_root_of(lake: Lake) -> Path:
     return Path(lake.root) / "kr" / "raw" / "raw_postgres"
 
 
-def load_sources(lake: Lake, period: str, *, xbrl_cache: Path | None = None) -> Sources:
+def load_sources(
+    lake: Lake,
+    period: str,
+    *,
+    xbrl_cache: Path | None = None,
+    extra_records: Sequence[str] = (),
+) -> Sources:
     """레이크를 읽어 ``Sources`` 를 만든다. 결과 변수는 만들지 않는다.
 
     재무 후보는 한 번만 읽는다(``load_inputs``). 기준 패널은 FY2015~2025 전부(통화·분모·의견 결측 비율용),
@@ -462,12 +507,14 @@ def load_sources(lake: Lake, period: str, *, xbrl_cache: Path | None = None) -> 
     root = raw_root_of(lake)
     inp = fi.load_inputs(lake, CHECK_YEARS, xbrl_cache=cache)
     fs_all = fi.build_panel(inp, CHECK_YEARS)
-    avail = filing_availability(lake, TradingCalendar.from_lake(lake))
+    cal = TradingCalendar.from_lake(lake)
+    avail = filing_availability(lake, cal)
     built = mi.build_misc(lake, years, raw_root=root, avail=avail)
     opinions = cm.audit_opinion_rows(root, lake.raw_snapshot)
     src = Sources(
         lake=lake, years=years, fs_all=fs_all, misc=built[0], opinions=opinions, xbrl_cache=cache
     )
+    src.availability_mismatch = availability_mismatch_counts(lake, cal)
     # 해석 표 대안 기록용 입력(판정 경로에는 안 쓴다)
     src.dps_multi = dps_multi_reports(root, lake.raw_snapshot)
     src.opinions_anchor_off = cm.audit_opinion_rows(root, lake.raw_snapshot, anchor_max=False)
@@ -477,6 +524,11 @@ def load_sources(lake: Lake, period: str, *, xbrl_cache: Path | None = None) -> 
         src.cov_misc = mi.coverage_misc(lake, years, raw_root=root, built=built)
         return src
     src.fs_prior_a = fi.build_panel(inp, years, prior_source="t_minus_1_report")
+    src.fs_raw_only = fi.build_panel(inp, years, layers="raw_only")
+    if "layer_literal" in extra_records:
+        src.fs_literal = fi.build_panel(
+            inp, years, layer_fill=False, use_xbrl_prior=False, cap_xbrl=False
+        )
     src.fs_latest = fi.fs_latest(lake, FS_LATEST_YEARS, inputs=inp)
     src.dps_latest = mi.dps_latest(lake, raw_root=root)
     src.capevt_judgment = cm.share_event_flags(root, lake.raw_snapshot)
@@ -739,6 +791,7 @@ class Ctx:
     demoted_t: list[int]
     seed: int
     n_boot: int
+    extra_records: tuple[str, ...] = ()
 
 
 def _cells(ctx: Ctx, named: dict[str, dict[str, pl.DataFrame]]) -> dict:
@@ -835,6 +888,9 @@ def compute_records(ctx: Ctx) -> dict:
     sc_v = cs.compute_scores(pv)
     rec["vintage_only"] = _cells(ctx, {"c": link_all(sc_v, ctx.outcomes, "c")})
 
+    # (f2) raw 한 층 단독 민감도(§5.1): 점수만 raw 한 층으로 다시 만든다
+    rec[REC_RAW_ONLY] = _layer_variant(ctx, src.fs_raw_only, "fs_raw_only", "CI-raw-only")
+
     # (g) 금융업 포함·비12월 포함·SPAC 포함: 그 조건만 풀어 점수와 결과를 다시 만든다
     for name, expr in _universe_variants(ctx.panel).items():
         pvar = ctx.panel.with_columns(expr.alias("in_universe"))
@@ -850,7 +906,158 @@ def compute_records(ctx: Ctx) -> dict:
 
     # (h) 해석 표 대안 셋(기록용, 판정 규칙은 그대로)
     rec.update(_interpretation_alts(ctx))
+
+    # (i) O4 연속 판(§5.3, m에 안 셈)
+    rec[REC_O4_CONT_DEV if dev else REC_O4_CONT] = o4_continuous_record(ctx)
+
+    # (j) 승인 대기 제안 판: 이름이 켜져 있을 때만
+    on = set(ctx.extra_records)
+    if "layer_literal" in on:
+        rec["layer_literal"] = _layer_variant(ctx, src.fs_literal, "fs_literal", "CI-extra-records")
+        rec["layer_literal"][
+            "definition"
+        ] = "CI11 layer_fill=False · CI13 use_xbrl_prior=False · CI14 자본금 XBRL 대체 끔"
+    if "pooled_cut" in on:
+        rec["pooled_cut"] = pooled_cut_record(ctx)
+    if "g4_all_years" in on:
+        rec["g4_all_years"] = g4_all_years_record(ctx)
     return rec
+
+
+def _scored_keys(scores: pl.DataFrame) -> set[tuple[str, int]]:
+    d = scores.filter(pl.col("in_universe") & pl.col("c").is_not_null()).select(
+        "corp_code", pl.col("fy").cast(pl.Int64)
+    )
+    return set(d.iter_rows())
+
+
+def _layer_variant(ctx: Ctx, fs: pl.DataFrame | None, name: str, note: str) -> dict:
+    """재무 입력을 다른 층 규칙으로 읽은 판: 점수만 바꾸고 결과 변수는 기본 판 그대로.
+
+    영향 개수 = 점수(c)가 있는 corp-fy 수(기본 판 대 이 판, 둘 다·한쪽만)."""
+    if fs is None:
+        return {"skipped": f"{name} 입력 없음"}
+    fs_main = fs.filter(pl.col("fy").is_in(ctx.years))
+    sc = cs.compute_scores(assemble_panel(fs_main, ctx.src.misc, capevt="judgment"))
+    base, var = _scored_keys(ctx.scores), _scored_keys(sc)
+    return {
+        "note": CI_NOTES_RECORDS[note],
+        "n_affected": {
+            "n_scored_default": len(base),
+            "n_scored_variant": len(var),
+            "n_scored_both": len(base & var),
+            "n_scored_default_only": len(base - var),
+            "n_scored_variant_only": len(var - base),
+        },
+        **_cells(ctx, {"c": link_all(sc, ctx.outcomes, "c")}),
+    }
+
+
+def pooled_cut_record(ctx: Ctx) -> dict:
+    """5분위·포착률을 풀링 점수 순위(``cut="pooled"``)로 다시 낸 기록용 표(CI70). 등급 계산에는 안 쓴다."""
+    out: dict = {"cut": "pooled", "note": "기록용 G3 값만. 판정 등급은 연도 안 순위(기본) 기준"}
+    for o, fr in link_all(ctx.scores, ctx.outcomes, "c").items():
+        d, _ = cj._clean(fr)
+        cap = {f"{int(round(f * 100))}": cj.capture(d, f, cut="pooled") for f in cj.CAPTURE_FRACS}
+        out[o] = {
+            "quintiles": cj.quintile_rates(d, cut="pooled"),
+            "capture": cap,
+            "g3": cj.g3_gate(cap["20"]["lift"]),
+        }
+    return out
+
+
+def g4_all_years_record(ctx: Ctx) -> dict:
+    """G4 분모를 판정 연도 전체(``denom="all"``)로 둔 기록용 결과(CI74). 기본 판과 같이 낸다."""
+    out: dict = {
+        "denominator_rule": "all",
+        "note": "기록용. 판정 등급은 사건 10건 이상인 해가 분모(기본)",
+    }
+    for o, fr in link_all(ctx.scores, ctx.outcomes, "c").items():
+        d, _ = cj._clean(fr)
+        by = cj.yearly_auc(d)
+        out[o] = {"all": cj.g4_gate(by, denom="all"), "default": cj.g4_gate(by, denom="counted")}
+    return out
+
+
+def _spearman(x: np.ndarray, y: np.ndarray) -> float:
+    if len(x) < 3:
+        return float("nan")
+    rx, ry = rankdata(x), rankdata(y)
+    if rx.std() == 0 or ry.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def o4_continuous_record(ctx: Ctx) -> dict:
+    """§5.3 O4 연속 판(기록용, m에 안 센다): 점수 c와 t+1~t+3 실현 평균 ROE의 스피어만 순위 상관.
+
+    ROE = ni/te(각 해 가장 늦게 알려진 판본 ``fs_latest``). 세 해 모두 관측이고 각 해 te > 0인 행만
+    남긴다(아니면 제외, # CI-o4-cont). 개발 구간은 §5.4에 따라 t+1 ROE만 쓴다. 판정 형성 연도는
+    2019~2022. 구간은 회사 단위 클러스터 부트스트랩 95% 백분위(시드·B는 판정과 같다)."""
+    dev = ctx.period == "dev"
+    ks = (1,) if dev else (1, 2, 3)
+    fys = [y for y in ctx.years if dev or y in O4_JUDGMENT_YEARS]
+    guard_years(fys, "outcome")
+    fl = ctx.oi.fs_latest.unique(subset=["corp_code", "year"], keep="last", maintain_order=True)
+    roe_cols = []
+    df = ctx.scores.filter(
+        pl.col("in_universe") & pl.col("c").is_not_null() & pl.col("fy").is_in(fys)
+    ).select("corp_code", pl.col("fy").cast(pl.Int64), pl.col("c").cast(pl.Float64))
+    for k in ks:
+        r = fl.select(
+            "corp_code",
+            (pl.col("year") - k).cast(pl.Int64).alias("fy"),
+            pl.when(pl.col("te") > 0).then(pl.col("ni") / pl.col("te")).alias(f"roe_t{k}"),
+        )  # CI-o4-cont: te ≤ 0·결측이면 그 해 관측 없음 → 행 제외
+        df = df.join(r, on=["corp_code", "fy"], how="left")
+        roe_cols.append(f"roe_t{k}")
+    n_all = df.height
+    df = df.drop_nulls(roe_cols).filter(
+        pl.all_horizontal([pl.col(c).is_finite() for c in roe_cols])
+    )
+    df = df.with_columns(pl.mean_horizontal(roe_cols).alias("roe_mean")).sort("corp_code", "fy")
+    x, y = df["c"].to_numpy(), df["roe_mean"].to_numpy()
+    by_year = [
+        {
+            "fy": int(fy),
+            "n": g.height,
+            "rho": _spearman(g["c"].to_numpy(), g["roe_mean"].to_numpy()),
+        }
+        for (fy,), g in sorted(df.group_by("fy"), key=lambda t: t[0][0])
+    ]
+    boot = np.full(max(ctx.n_boot, 0), np.nan)
+    corp = df["corp_code"].to_numpy()
+    if df.height:
+        uniq, inv = np.unique(corp, return_inverse=True)
+        rng = np.random.default_rng(ctx.seed)
+        k_c = len(uniq)
+        rows = np.arange(df.height)
+        for b in range(len(boot)):
+            cnt = np.bincount(rng.integers(0, k_c, size=k_c), minlength=k_c)
+            idx = np.repeat(rows, cnt[inv])
+            boot[b] = _spearman(x[idx], y[idx])
+    fin = boot[np.isfinite(boot)]
+    return {
+        "note": CI_NOTES_RECORDS["CI-o4-cont"],
+        "definition": f"스피어만 ρ(점수 c, t+{ks[0]}"
+        + (f"~t+{ks[-1]}" if len(ks) > 1 else "")
+        + " 평균 ROE)",
+        "formation_years": fys,
+        "n_scored_candidates": n_all,
+        "n_rows": df.height,
+        "n_corps": int(df["corp_code"].n_unique()) if df.height else 0,
+        "rho_pooled": _spearman(x, y) if df.height else float("nan"),
+        "ci95": (
+            [float(np.quantile(fin, 0.025)), float(np.quantile(fin, 0.975))]
+            if len(fin)
+            else [float("nan"), float("nan")]
+        ),
+        "n_boot": int(len(boot)),
+        "n_boot_nan": int(len(boot) - len(fin)),
+        "seed": ctx.seed,
+        "by_year": by_year,
+    }
 
 
 def _interpretation_alts(ctx: Ctx) -> dict:
@@ -917,8 +1124,45 @@ def _interpretation_alts(ctx: Ctx) -> dict:
     return out
 
 
+def score_component_counts(scores: pl.DataFrame) -> pl.DataFrame:
+    """§5.2 C1·C2·C3의 쓴 성분 수(c1_n·c2_n·c3_n)가 값별로 몇 개 회사인지(분모 안, 연도별).
+
+    입력 존재 개수다. 점수 값·분포가 아니다. 열: fy, component, n_components(null 가능), n_corps."""
+    u = scores.filter(pl.col("in_universe"))
+    parts = [
+        u.group_by("fy", pl.col(c).cast(pl.Int64).alias("n_components"))
+        .agg(pl.len().cast(pl.Int64).alias("n_corps"))
+        .with_columns(pl.lit(c).alias("component"))
+        .select("fy", "component", "n_components", "n_corps")
+        for c in COMPONENT_COLS
+        if c in u.columns
+    ]
+    if not parts:
+        return pl.DataFrame(
+            schema={
+                "fy": pl.Int64,
+                "component": pl.String,
+                "n_components": pl.Int64,
+                "n_corps": pl.Int64,
+            }
+        )
+    return (
+        pl.concat(parts)
+        .with_columns(pl.col("fy").cast(pl.Int64))
+        .sort("fy", "component", "n_components", nulls_last=True)
+    )
+
+
 # ================================================================ 8. dev·judgment 분석
-def analyze(src: Sources, period: str, *, o1_info: dict, seed: int, n_boot: int) -> dict:
+def analyze(
+    src: Sources,
+    period: str,
+    *,
+    o1_info: dict,
+    seed: int,
+    n_boot: int,
+    extra_records: Sequence[str] = (),
+) -> dict:
     """점수 → 결과 → 판정 통계·16칸·기록용 비교. dev·judgment 공통.
 
     판정 구간 보호는 ``link_score``·결과 함수의 ``guard_years`` 가 맡는다(§7.2)."""
@@ -954,8 +1198,9 @@ def analyze(src: Sources, period: str, *, o1_info: dict, seed: int, n_boot: int)
         n_boot=n_boot,
     )
     ctx = Ctx(
-        src, period, years, panel, scores, oi, outcomes, o1_info["mode"], demoted, seed, n_boot
-    )
+        src, period, years, panel, scores, oi, outcomes, o1_info["mode"], demoted, seed, n_boot,
+        tuple(extra_records),
+    )  # fmt: skip
     records = compute_records(ctx)
     records["f_vs_composite"] = {
         o: {
@@ -987,6 +1232,9 @@ def analyze(src: Sources, period: str, *, o1_info: dict, seed: int, n_boot: int)
         "even_year_flags": flags.to_dicts(),
         "currency_note": oi.currency_note,
         "ci": CI_NOTES,
+        "ci_records": CI_NOTES_RECORDS,
+        "extra_records_enabled": list(extra_records),
+        "score_component_counts": score_component_counts(scores).to_dicts(),
     }
     samples = (
         build_dev_samples(panel=panel, scores=scores, outcomes=outcomes, oi=oi, seed=seed)
@@ -1052,18 +1300,26 @@ def result_tables(result: dict) -> dict[str, pl.DataFrame]:
         for y in s["by_year"]:
             byyear.append({"outcome": o, **y})
     recs = _flatten_cells("cell:", result["cells"])
+    recs_new: list[dict] = []
     for name, rec in result["records"].items():
         if isinstance(rec, dict):
-            recs += _flatten_cells(
-                f"{name}:", {k: v for k, v in rec.items() if isinstance(v, dict)}
-            )
-    return {
+            flat = _flatten_cells(f"{name}:", {k: v for k, v in rec.items() if isinstance(v, dict)})
+            (recs_new if name in NEW_RECORD_NAMES else recs).extend(flat)
+    tables = {
         "outcomes_summary.tsv": pl.DataFrame(rows),
         "by_year.tsv": pl.DataFrame(byyear),
         "cells_and_records.tsv": pl.DataFrame(recs),
         "status_counts.tsv": pl.DataFrame(result["status_counts"]),
         "unobserved_scored.tsv": pl.DataFrame(result["unobserved_scored"]),
     }
+    # 새 기록 항목은 기존 표 대신 새 표로 낸다(기존 파일 바이트 불변)
+    if recs_new:
+        tables["cells_and_records_extra.tsv"] = pl.DataFrame(recs_new)
+    if result.get("score_component_counts"):
+        tables["score_component_counts.tsv"] = pl.DataFrame(
+            result["score_component_counts"], infer_schema_length=None
+        )
+    return tables
 
 
 # ================================================================ 9. checks (입력 존재만)
@@ -1142,6 +1398,7 @@ def run_checks(src: Sources, *, o1_info: dict) -> dict[str, object]:
         "score_inputs.tsv": score_input_counts(scores),
         "opinion_missing_rate.tsv": rates,
         "even_year_flags.tsv": flags,
+        "score_component_counts.tsv": score_component_counts(scores),
     }
     nums: dict = {}
     if src.cov_fs is not None:
@@ -1154,6 +1411,7 @@ def run_checks(src: Sources, *, o1_info: dict) -> dict[str, object]:
         "tables": tables,
         "numbers": nums,
         "alt_counts": alt_input_counts(src),
+        "availability_mismatch": src.availability_mismatch,
         "o1": {
             **o1_info,
             "demoted_formation_years": demoted_formation_years(flags, o1_info["mode"]),
@@ -1195,6 +1453,8 @@ CHECKLIST_KEYS = (
     "uv_lock_sha256",
     "prereg_sha256",
     "judgment_prep_doc_sha256",
+    "interp_table_approved",
+    "availability_mismatch",
     "xbrl_cache",
 )
 
@@ -1232,6 +1492,7 @@ def build_checklist_c(
     maps_dir: str | Path | None,
     xbrl_cache: Path | None,
     prereg: Path | None,
+    availability: dict | None = None,
 ) -> list[dict]:
     """사전등록 §12.4 C 확인표를 항목별 ``{item, value, status, source}`` 로 만든다.
 
@@ -1411,6 +1672,22 @@ def build_checklist_c(
     else:
         add(_ci("judgment_prep_doc_sha256", None, "missing", str(doc)))
 
+    # 해석 표 승인본 사본(06 §6): sha256을 사용자 승인 기록과 대조한다
+    ia = interp_table_approved_info(lake)
+    if ia["sha256"]:
+        add(_ci("interp_table_approved", ia, "check",
+                f"{ia['path']}: 사용자 승인 기록과 sha256 대조 (승인 여부는 코드가 알 수 없다)"))  # fmt: skip
+    else:
+        add(_ci("interp_table_approved", ia, "missing",
+                f"{ia['path']} 없음 (판정 구간은 이 사본이 있어야 시작한다)"))  # fmt: skip
+
+    # §5.1 가용일 어긋남 건수(vintage available_from ≠ rcept_dt 다음 거래일 등, 입력 존재)
+    if availability:
+        add(_ci("availability_mismatch", availability, "ok",
+                "company_common.availability_mismatch_counts (§5.1 가용일 기록, 건수만)"))  # fmt: skip
+    else:
+        add(_missing("availability_mismatch", "company_common.availability_mismatch_counts"))
+
     # XBRL 캐시
     xp = Path(xbrl_cache) if xbrl_cache else default_xbrl_cache(lake)
     if xp.exists():
@@ -1420,6 +1697,18 @@ def build_checklist_c(
     else:
         add(_ci("xbrl_cache", {"path": str(xp), "sha256": None}, "missing", str(xp)))
     return items
+
+
+def default_interp_table_approved(lake: Lake) -> Path:
+    """해석 표 승인본 사본 경로. 환경변수 ``QUALITY_C_INTERP_TABLE``, 없으면
+    ``<lake>/kr/output/quality_score_company_provenance/interp_table_v1_approved.md``."""
+    v = os.environ.get(INTERP_TABLE_ENV)
+    return Path(v) if v else lake.output_dir(INTERP_TABLE_DIR) / INTERP_TABLE_NAME
+
+
+def interp_table_approved_info(lake: Lake) -> dict:
+    p = default_interp_table_approved(lake)
+    return {"path": str(p), "sha256": sha256_file(p) if p.is_file() else None}
 
 
 def cm_default_maps_dir(lake: Lake) -> Path:
@@ -1507,6 +1796,8 @@ def build_manifest(
         },
         # 해석 표 v1 문서(06). 승인본 sha256과 대조는 사람이 한다(07 §4 ⑧).
         "judgment_prep_doc": _doc_info((my_root() / PREREG_REL).parent / JUDGMENT_PREP_DOC),
+        # 승인본 사본(없으면 sha256 null). 판정 구간은 없으면 시작하지 않는다.
+        "interp_table_approved": interp_table_approved_info(lake),
         "bootstrap": {"seed": args.get("seed"), "n_boot": args.get("n_boot")},
         "uv_lock_sha256": sha256_file(uv) if uv.exists() else None,
         "args": args,
@@ -1552,6 +1843,7 @@ def run(
     args: dict | None = None,
     sources: Sources | None = None,
     maps_dir: str | Path | None = None,
+    extra_records: Sequence[str] = (),
 ) -> dict:
     """한 기간을 실행하고 ``out_dir`` 에 결과를 쓴다. 쓴 파일 경로 dict를 돌려준다.
 
@@ -1564,13 +1856,28 @@ def run(
         raise PermissionError(
             f"판정 구간 실행은 사전등록 동결 확인 뒤 환경변수 {JUDGMENT_ENV}를 설정해야 합니다 (§7.2)."
         )
+    # 해석 표 승인본 사본이 없으면 판정 구간도 아무 파일 쓰기 전에 멈춘다(06 §6). dev·checks는 거부 안 함.
+    if period == "judgment" and not interp_table_approved_info(lake)["sha256"]:
+        raise PermissionError(
+            "판정 구간 실행은 해석 표 승인본 사본이 있어야 합니다(06 §6): "
+            f"{default_interp_table_approved(lake)} (환경변수 {INTERP_TABLE_ENV}로 경로를 바꿀 수 있습니다)."
+        )
+    unknown = sorted(set(extra_records) - set(EXTRA_RECORD_NAMES))
+    if unknown:
+        raise ValueError(f"알 수 없는 --extra-records 이름: {unknown} (가능: {EXTRA_RECORD_NAMES})")
+    # 상수(승인된 판)와 합친다. 이름 순서는 EXTRA_RECORD_NAMES 순.
+    enabled = tuple(
+        n for n in EXTRA_RECORD_NAMES if n in set(APPROVED_EXTRA_RECORDS) | set(extra_records)
+    )
     guard_years(PERIOD_YEARS[period], "inputs" if period == "checks" else "link")
     t0 = time.time()
     out = Path(out_dir) if out_dir else default_out_dir(lake, period)
     src = (
         sources
         if sources is not None
-        else load_sources(lake, period, xbrl_cache=Path(xbrl_cache) if xbrl_cache else None)
+        else load_sources(
+            lake, period, xbrl_cache=Path(xbrl_cache) if xbrl_cache else None, extra_records=enabled
+        )
     )
     o1_fys = DEV_YEARS if period == "dev" else JUDGMENT_YEARS  # checks는 판정 구간 기준
     o1_info = decide_o1_mode(src.opinions, o1_mode, o1_fys)
@@ -1590,6 +1897,8 @@ def run(
         _write_json(written["prereg_numbers.json"], res["numbers"])
         written["interp_alt_counts.json"] = out / "interp_alt_counts.json"
         _write_json(written["interp_alt_counts.json"], res["alt_counts"])
+        written["availability_mismatch.json"] = out / "availability_mismatch.json"
+        _write_json(written["availability_mismatch.json"], res["availability_mismatch"])
         even = res["tables"]["even_year_flags.tsv"].to_dicts()
         o1_final = res["o1"]
         # §12.4 C 확인표(새 파일만 더한다)
@@ -1601,10 +1910,11 @@ def run(
             maps_dir=maps_dir,
             xbrl_cache=src.xbrl_cache,
             prereg=Path(prereg) if prereg else None,
+            availability=src.availability_mismatch,
         )
         written.update(write_checklist_c(items, out, lake))
     else:
-        res = analyze(src, period, o1_info=o1_info, seed=seed, n_boot=n_boot)
+        res = analyze(src, period, o1_info=o1_info, seed=seed, n_boot=n_boot, extra_records=enabled)
         out.mkdir(parents=True, exist_ok=True)
         written["result.json"] = out / "result.json"
         _write_json(written["result.json"], res["result"])
@@ -1616,6 +1926,8 @@ def run(
             cm.write_tsv(res["samples"], written["dev_samples.tsv"])
         even = res["result"]["even_year_flags"]
         o1_final = res["result"]["o1"]
+    extra["availability_mismatch"] = src.availability_mismatch
+    extra["extra_records_enabled"] = list(enabled)
     man = build_manifest(
         period=period,
         lake=lake,
@@ -1669,7 +1981,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="checks 의 확인표가 볼 매핑표 디렉터리(기본 kr/output/quality_score_company_maps_<raw_snapshot>)",
     )
+    ap.add_argument(
+        "--extra-records",
+        default="",
+        help=f"승인 대기 제안 판을 켠다(쉼표로 구분, 상수 APPROVED_EXTRA_RECORDS와 합침). 가능: {','.join(EXTRA_RECORD_NAMES)}",
+    )
     a = ap.parse_args(argv)
+    extra_names = tuple(n.strip() for n in a.extra_records.split(",") if n.strip())
+    bad = sorted(set(extra_names) - set(EXTRA_RECORD_NAMES))
+    if bad:
+        ap.error(f"알 수 없는 --extra-records 이름: {bad} (가능: {list(EXTRA_RECORD_NAMES)})")
     lake = Lake.from_env(raw_snapshot=a.raw_snapshot, derived_snapshot=a.derived_snapshot)
     try:
         r = run(
@@ -1683,6 +2004,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             prereg=a.prereg,
             args=vars(a),
             maps_dir=a.maps_dir,
+            extra_records=extra_names,
         )
     except PermissionError as e:
         print(f"거부: {e}", file=sys.stderr)
