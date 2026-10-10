@@ -27,8 +27,11 @@ from modeler.serving.orchestration import (
     US_PARITY_EVIDENCE_SCHEMA,
     US_PARITY_MODELS,
     US_PARITY_SCORE_EQUIVALENT,
+    US_PARITY_V2_CRITERIA,
+    US_PARITY_V2_PASSED,
     us_native_block_reason,
     us_parity_failures,
+    us_parity_v2_failures,
 )
 from modeler.serving.schema import report_template, validate_report
 from modeler.us.features import FAMILY_ORDER as BASE_FAMILIES
@@ -1259,8 +1262,16 @@ def financial_code_hash() -> str:
     return digest.hexdigest()
 
 
-def validate_parity_evidence(evidence_path: Path) -> dict[str, Any]:
-    """Load a parity evidence JSON and require a passing, current-code, rule-A result."""
+def validate_parity_evidence(
+    evidence_path: Path, *, universe_version: str = "v1", universe_v2_rule_version: str | None = None
+) -> dict[str, Any]:
+    """Load a parity evidence JSON and require a passing, current-code, rule-A result.
+
+    ``universe_version="v2"`` also needs a passed ``universe_v2`` block made with the same
+    ``rule_version`` as the ``universe_daily_v2`` completion the caller is about to read, so a
+    collector rule change forces a new parity run.  ``v1`` is unchanged.
+    """
+    validate_universe_version(universe_version)
     evidence = json.loads(evidence_path.read_text())
     if evidence.get("status") != US_PARITY_SCORE_EQUIVALENT:
         raise ValueError("parity evidence status가 score_equivalent가 아닙니다")
@@ -1271,6 +1282,16 @@ def validate_parity_evidence(evidence_path: Path) -> dict[str, Any]:
     failures = us_parity_failures(evidence)
     if failures:
         raise ValueError(f"parity evidence가 gate 기준을 넘지 못했습니다: {failures}")
+    if universe_version == "v2":
+        block = evidence.get("universe_v2")
+        if not isinstance(block, dict):
+            raise ValueError("v2 서빙에는 universe_v2 절이 있는 parity evidence가 필요합니다 (parity-check --universe-version v2)")
+        if block.get("status") != US_PARITY_V2_PASSED or us_parity_v2_failures(block):
+            raise ValueError("parity evidence의 universe_v2 절이 통과하지 못했습니다")
+        if not universe_v2_rule_version or block.get("rule_version") != universe_v2_rule_version:
+            raise ValueError(
+                "parity evidence의 universe_v2 rule_version이 prepare가 쓸 completion과 다릅니다: "
+                f"{block.get('rule_version')!r} != {universe_v2_rule_version!r}")
     return evidence
 
 
@@ -1292,7 +1313,9 @@ def prepare_daily_features(scoring_date: date, *, diagnostic_only: bool = False,
             raise ValueError("score_equivalent parity cannot be combined with diagnostic_only")
         if not raw_feature_parity_evidence:
             raise ValueError("score_equivalent parity requires evidence")
-        validate_parity_evidence(Path(raw_feature_parity_evidence))
+        if universe_version == "v1":
+            validate_parity_evidence(Path(raw_feature_parity_evidence))
+        # v2는 evidence의 rule_version을 completion과 대조해야 해서 아래에서 검사한다.
     if raw_feature_parity_status == "failed" and not diagnostic_only:
         raise ValueError("failed raw feature parity requires diagnostic_only")
     if raw_feature_parity_status == "failed" and not raw_feature_parity_evidence:
@@ -1320,6 +1343,11 @@ def prepare_daily_features(scoring_date: date, *, diagnostic_only: bool = False,
     if universe_version == "v2":
         v2_revision = revisions[UNIVERSE_V2_TABLE]
         v2_check = verify_universe_v2_completion(root, v2_revision)
+        if raw_feature_parity_status == US_PARITY_SCORE_EQUIVALENT:
+            assert raw_feature_parity_evidence
+            validate_parity_evidence(
+                Path(raw_feature_parity_evidence), universe_version="v2",
+                universe_v2_rule_version=v2_check["rule_version"])
         universe_v2_fields = {
             "universe_version": "v2",
             "universe_v2_snapshot_date": v2_revision,
@@ -1739,11 +1767,152 @@ def _sha_or_none(path: Path) -> str | None:
     return sha256_file(path) if path.is_file() else None
 
 
-def run_parity_check(
-    *, lake_root: Path, frozen_root: Path, bundle_root: Path, rule: str, output: Path
+def _golden_features(
+    panel_lake: UsLake, base_lake: UsLake, flow_lake: UsLake, rule: str, universe_version: str
+) -> pl.DataFrame:
+    """The six golden sessions: panel from ``panel_lake``, base families from the base map,
+    flow families from the flow map (the frozen datasets were built the same way)."""
+    kwargs = {} if universe_version == "v1" else {"universe_version": universe_version}
+    panels = [build_daily_panel(panel_lake, day, **kwargs) for day in sorted(GOLDEN_DATES)]
+    features = pl.concat(panels).sort(["date", "symbol"])
+    features = _add_base_families(features, base_lake, rule)
+    for _name, add_family in FLOW_FAMILIES:
+        features = add_family(features, flow_lake)
+    return features.sort(["date", "symbol"])
+
+
+def _null_rate(frame: pl.DataFrame, name: str) -> float | None:
+    return float(frame[name].is_null().mean()) if frame.height else None
+
+
+def _universe_v2_block(
+    *, data_root: DataRoot, base_map: dict[str, str], base_lake: UsLake, flow_lake: UsLake,
+    rule: str, frozen: pl.DataFrame, revision: str,
 ) -> dict[str, Any]:
-    """Score-level equivalence gate for the 11 financial features (label-free, read-only)."""
+    """The ``universe_v2`` evidence block: golden dates rebuilt with v2 members vs the frozen set.
+
+    Gated (G1-G4, see ``US_PARITY_V2_CRITERIA``): v2 members equal ``universe_daily_v2``
+    ``in_universe`` read independently; the 42 non-financial features and ``price_ge_5`` are
+    identical on the common keys; every key missing on either side is explained by v2 membership.
+    Financial diffs, per-feature null rates and the v1-only / v2-only breakdowns are recorded only.
+    """
+    check = verify_universe_v2_completion(data_root, revision)
+    part = data_root.derived / "snapshots" / UNIVERSE_V2_TABLE / f"snapshot_date={revision}" / "part.parquet"
+    v2_lake = PinnedUsLake(data_root, {**base_map, UNIVERSE_V2_TABLE: revision})
+    features = _golden_features(v2_lake, base_lake, flow_lake, rule, "v2")
+
+    # Independent read of the sealed part file (PIT rows only), not through the panel code.
+    raw = pl.scan_parquet(part)
+    if "view" in raw.collect_schema().names():
+        raw = raw.filter(pl.col("view") == "pit")
+    v2_rows = (
+        raw.with_columns(pl.col("date").cast(pl.Date))
+        .filter(pl.col("date").is_in(list(GOLDEN_DATES)))
+        .select("date", "symbol", "security_type", "in_universe", "exclusion_reason")
+        .collect()
+    )
+    keys = ["date", "symbol"]
+    common_v2 = features.join(frozen.select(keys), on=keys, how="semi").sort(keys)
+    common_frozen = frozen.join(features.select(keys), on=keys, how="semi").sort(keys)
+    non_financial = tuple(name for name in FEATURES if name not in FINANCIAL_FEATURES)
+    keys_ok, nf_diffs = _count_cell_diffs(common_v2, common_frozen, non_financial, exact=False)
+    _ok, fin_diffs = _count_cell_diffs(common_v2, common_frozen, FINANCIAL_FEATURES, exact=False)
+
+    per_date: list[dict[str, Any]] = []
+    v1_only_total: dict[tuple[str, str], int] = {}
+    v2_only_total: dict[str, int] = {}
+    for day in sorted(GOLDEN_DATES):
+        rows = v2_rows.filter(pl.col("date") == day)
+        members_df = rows.filter(pl.col("in_universe"))
+        members = set(members_df["symbol"].to_list())
+        panel_syms = set(features.filter(pl.col("date") == day)["symbol"].to_list())
+        frozen_syms = set(frozen.filter(pl.col("date") == day)["symbol"].to_list())
+        actual_frozen_only, actual_v2_only = frozen_syms - panel_syms, panel_syms - frozen_syms
+        d_v2 = common_v2.filter(pl.col("date") == day)
+        d_fr = common_frozen.filter(pl.col("date") == day)
+        mismatch_rows = sum(
+            1 for a, b in zip(d_v2["price_ge_5"].to_list(), d_fr["price_ge_5"].to_list()) if a != b)
+        info = {
+            (r["symbol"]): (r["security_type"] or "(null)", r["exclusion_reason"] or "(null)")
+            for r in rows.iter_rows(named=True)
+        }
+        v1_only: dict[str, int] = {}
+        for sym in actual_frozen_only:
+            kind, why = info.get(sym, ("(no v2 row)", "(no v2 row)"))
+            key = f"{kind} | {why}"
+            v1_only[key] = v1_only.get(key, 0) + 1
+            v1_only_total[(kind, why)] = v1_only_total.get((kind, why), 0) + 1
+        v2_only: dict[str, int] = {}
+        for sym in actual_v2_only:
+            kind = info.get(sym, ("(no v2 row)", ""))[0]
+            v2_only[kind] = v2_only.get(kind, 0) + 1
+            v2_only_total[kind] = v2_only_total.get(kind, 0) + 1
+        per_date.append({
+            "date": day.isoformat(),
+            "v2_rows": len(panel_syms),
+            "common_keys": len(panel_syms & frozen_syms),
+            "v1_only": len(actual_frozen_only),
+            "v2_only": len(actual_v2_only),
+            "g1_missing_symbols": len(members - panel_syms),
+            "g1_extra_symbols": len(panel_syms - members),
+            "g1_duplicate_symbols": members_df.height - len(members),
+            "g3_eligible_mismatch_rows": mismatch_rows,
+            "g4_unexplained_frozen_only": len(actual_frozen_only ^ (frozen_syms - members)),
+            "g4_unexplained_v2_only": len(actual_v2_only ^ (members - frozen_syms)),
+            "v1_only_by_security_type_exclusion_reason": dict(sorted(v1_only.items())),
+            "v2_only_by_security_type": dict(sorted(v2_only.items())),
+        })
+
+    only_v2 = features.join(frozen.select(keys), on=keys, how="anti")
+    null_rates = {
+        name: {"common": _null_rate(common_v2, name), "v2_only": _null_rate(only_v2, name)}
+        for name in FEATURES
+    }
+    block: dict[str, Any] = {
+        "criteria": dict(US_PARITY_V2_CRITERIA),
+        "snapshot_date": revision,
+        "completion_sha256": check["completion_sha256"],
+        "rule_version": check["rule_version"],
+        "input_snapshots": check["input_snapshots"],
+        "source_files": fingerprint_source_snapshots(data_root, {UNIVERSE_V2_TABLE: revision}),
+        "per_date": per_date,
+        "non_financial": {
+            "keys_equal": keys_ok, "features": len(non_financial),
+            "common_keys": common_v2.height, "diff_cells": sum(nf_diffs.values()),
+            "diff_by_feature": nf_diffs,
+        },
+        "v1_only_breakdown": [
+            {"security_type": k, "exclusion_reason": w, "rows": n}
+            for (k, w), n in sorted(v1_only_total.items(), key=lambda kv: (-kv[1], kv[0]))
+        ],
+        "v2_only_breakdown": [
+            {"security_type": k, "rows": n}
+            for k, n in sorted(v2_only_total.items(), key=lambda kv: (-kv[1], kv[0]))
+        ],
+        "financial_vs_frozen_on_common_diff_cells": fin_diffs,
+        "null_rates": {"common_rows": common_v2.height, "v2_only_rows": only_v2.height,
+                       "by_feature": null_rates},
+    }
+    block["failures"] = us_parity_v2_failures(block)
+    block["status"] = "failed" if block["failures"] else US_PARITY_V2_PASSED
+    return block
+
+
+def run_parity_check(
+    *, lake_root: Path, frozen_root: Path, bundle_root: Path, rule: str, output: Path,
+    universe_version: str = "v1", universe_v2_revision: str | None = None,
+) -> dict[str, Any]:
+    """Score-level equivalence gate for the 11 financial features (label-free, read-only).
+
+    ``universe_version="v2"`` keeps the v1 section as is (code parity against the frozen
+    features) and adds a ``universe_v2`` block (``_universe_v2_block``).  The evidence status is
+    ``score_equivalent`` only when both pass.  ``universe_v2_revision`` pins the
+    ``universe_daily_v2`` snapshot (default: the newest in the lake).
+    """
     check_rule(rule)
+    validate_universe_version(universe_version)
+    if universe_v2_revision is not None and universe_version != "v2":
+        raise ValueError("universe_v2_revision은 universe_version=v2에서만 쓸 수 있습니다")
     if output.exists():
         raise FileExistsError(f"parity evidence 경로가 이미 있어 덮지 않습니다: {output}")
     base_manifest_path = frozen_root / "us_features_v2" / "manifest.json"
@@ -1765,12 +1934,7 @@ def run_parity_check(
     }
 
     # 1) six golden sessions rebuilt from the frozen source map with the requested rule.
-    panels = [build_daily_panel(base_lake, day) for day in sorted(GOLDEN_DATES)]
-    features = pl.concat(panels).sort(["date", "symbol"])
-    features = _add_base_families(features, base_lake, rule)
-    for _name, add_family in FLOW_FAMILIES:
-        features = add_family(features, flow_lake)
-    features = features.sort(["date", "symbol"])
+    features = _golden_features(base_lake, base_lake, flow_lake, rule, "v1")
     frozen, frozen_hashes = read_frozen_golden_features(frozen_root)
 
     non_financial = tuple(name for name in FEATURES if name not in FINANCIAL_FEATURES)
@@ -1872,6 +2036,12 @@ def run_parity_check(
         "financial_vs_frozen_diff_cells": fin_vs_frozen,
         "models": models,
     }
+    if universe_version == "v2":
+        revision = universe_v2_revision or UsLake(data_root).latest_snapshot(UNIVERSE_V2_TABLE).isoformat()
+        evidence["universe_version"] = "v2"
+        evidence["universe_v2"] = _universe_v2_block(
+            data_root=data_root, base_map=base_map, base_lake=base_lake, flow_lake=flow_lake,
+            rule=rule, frozen=frozen, revision=revision)
     failures = us_parity_failures(evidence)
     if not bundle_matches_frozen:
         failures.append("bundle golden source differs from frozen inputs")
@@ -1920,6 +2090,10 @@ def main(argv: list[str] | None = None) -> int:
     parity.add_argument("--lake-root", required=True, help="US lake 루트 (derived/snapshots 상위)")
     parity.add_argument("--frozen-root", required=True)
     parity.add_argument("--bundle-root", required=True, help="lightgbm/ridge bundle 상위 경로")
+    parity.add_argument("--universe-version", choices=list(UNIVERSE_VERSIONS), default="v1",
+                        help="v2면 v1 대조에 universe_v2 절(G1-G4)을 더한다 (v2 서빙 prepare에 필요)")
+    parity.add_argument("--universe-v2-revision",
+                        help="v2 절이 pin할 universe_daily_v2 snapshot_date (기본: 최신)")
     bundle = subparsers.add_parser("bundle", help="원본 모델과 frozen feature golden을 감싼 bundle 생성")
     bundle.add_argument("--frozen-root", required=True)
     bundle.add_argument("--source-model-root", required=True)
@@ -1969,9 +2143,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"selection: {path}")
         return 0
     if args.command == "parity-check":
+        if args.universe_v2_revision:
+            if args.universe_version != "v2":
+                parser.error("--universe-v2-revision requires --universe-version v2")
+            try:
+                date.fromisoformat(args.universe_v2_revision)
+            except ValueError:
+                parser.error("--universe-v2-revision must be YYYY-MM-DD")
         evidence = run_parity_check(
             lake_root=Path(args.lake_root), frozen_root=Path(args.frozen_root),
             bundle_root=Path(args.bundle_root), rule=args.rule, output=Path(args.output),
+            universe_version=args.universe_version,
+            universe_v2_revision=args.universe_v2_revision,
         )
         print(f"parity-check: status={evidence['status']} rule={evidence['rule']} output={args.output}")
         if evidence["failures"]:

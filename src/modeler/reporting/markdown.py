@@ -111,6 +111,7 @@ SELECT_REASON_KO = {
     "us_calendar_unavailable": "US 달력이 직전 완료 세션을 정하지 못했습니다",
     "native_fixture_mode_mismatch": "prepare 입력의 fixture 표시가 실행 모드와 다릅니다",
     "kr_prepared_newer_than_k": "KR prepare 입력의 기준일이 K보다 늦어 쓰지 않았습니다",
+    "us_universe_version_mismatch": "US 유니버스 버전이 설정과 다른 준비 입력",
 }
 SELECT_STATUS_KO = {"unavailable": "고른 입력 없음", "ok": "정상", "stale": "자료 지연"}
 
