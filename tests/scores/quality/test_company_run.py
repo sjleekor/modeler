@@ -261,8 +261,15 @@ def test_decide_o1_mode_auto():
     odd = cr.decide_o1_mode(_ops([2017, 2019, 2021]))
     assert odd["mode"] == "fallback" and odd["n_even_year_reports"] == 0
     assert odd["n_odd_year_reports"] == 6 and odd["reports_by_bsns_year"]["2019"] == 2
-    full = cr.decide_o1_mode(_ops([2017, 2018, 2019]))
+    # 개발 구간(2017·2018)은 짝수 해 2018만 필요
+    full = cr.decide_o1_mode(_ops([2017, 2018, 2019]), fys=cr.DEV_YEARS)
     assert full["mode"] == "full" and full["n_even_year_reports"] == 2
+    assert full["needed_even_years"] == [2018] and full["missing_even_years"] == []
+    # 판정 구간은 2020·2022·2024 모두 있어야 full — 일부 연도만 백필되면 fallback(CI-o1-auto)
+    part = cr.decide_o1_mode(_ops([2019, 2020, 2021, 2022, 2023]))
+    assert part["mode"] == "fallback" and part["missing_even_years"] == [2024]
+    allj = cr.decide_o1_mode(_ops([2019, 2020, 2021, 2022, 2023, 2024, 2025]))
+    assert allj["mode"] == "full" and allj["needed_even_years"] == [2020, 2022, 2024]
     assert odd["requested"] == "auto"
     # 강제 지정은 근거만 남기고 따른다
     forced = cr.decide_o1_mode(_ops([2017, 2019]), "full")
@@ -635,3 +642,58 @@ def test_table_info_and_default_paths(tmp_path):
     assert cr.default_xbrl_cache(lake) == (
         tmp_path / "kr/output/quality_score_company_cache_2026-09-30/xbrl_values.parquet"
     )
+
+
+# ---------------------------------------------------------------- §12.4 C 확인표 (W8)
+def test_checklist_c_has_all_keys_and_missing_without_dirs(tmp_path):
+    lake = Lake(root=tmp_path / "nolake", raw_snapshot="2026-10-18", derived_snapshot="2026-10-17")
+    o1 = cr.decide_o1_mode(make_outcome_sources(5)[2])
+    items = cr.build_checklist_c(
+        lake, o1_info=o1, even_flags=[], numbers={}, maps_dir=tmp_path / "nomaps",
+        xbrl_cache=None, prereg=tmp_path / "nofile.md",
+    )  # fmt: skip
+    by = {i["item"]: i for i in items}
+    assert set(cr.CHECKLIST_KEYS) <= set(by)
+    assert all(set(i) == {"item", "value", "status", "source"} for i in items)
+    assert all(i["status"] in {"ok", "check", "missing"} for i in items)
+    for k in ("raw_snapshot", "derived_snapshot", "raw_success_marker", "derived_success_marker",
+              "calendar_last_day", "receipt_last_date", "universe_spac", "maps_manifest_sha256",
+              "maps_new_strings", "par_change_summary", "prereg_numbers_summary", "prereg_sha256",
+              "xbrl_cache"):  # fmt: skip
+        assert by[k]["status"] == "missing", k
+    assert by["o1_mode"]["value"]["mode"] == "fallback"
+    assert by["modeler_git_head"]["status"] in {"ok", "missing"}
+
+
+def test_checklist_c_written_by_checks_run(tmp_path):
+    src = make_sources(tmp_path, "checks", n=40, with_outcomes=False)
+    src.cov_fs = pl.DataFrame(
+        {"fy": [2019], "scope": ["all"], "item": ["raw_only_corp_years"], "n": [5]}
+    )
+    src.cov_misc = pl.DataFrame({"fy": [2019], "n_rows": [10], "dps_null_share": [0.1]})
+    maps = tmp_path / "maps"
+    maps.mkdir()
+    (maps / "manifest.json").write_text(
+        json.dumps({"rules_version": "x", "raw_snapshot": "2026-09-30", "module_sha256": "y",
+                    "stats": {"par_change_check": {"n_par_changed_corp_years": 3}}})
+    )  # fmt: skip
+    (maps / "compare_summary.json").write_text(
+        json.dumps({"n_new_strings_total": 2, "n_class_changed_total": 0,
+                    "old_raw_snapshot": "2026-09-30", "rules_version": {"same": True}})
+    )  # fmt: skip
+    out = tmp_path / "chk"
+    r = cr.run("checks", src.lake, out, sources=src, n_boot=5, maps_dir=maps)
+    assert {"checklist_c.json", "checklist_c.tsv"} <= {p.name for p in out.iterdir()}
+    assert "checklist_c.json" in r["manifest"]["outputs"]
+    doc = json.loads((out / "checklist_c.json").read_text())
+    by = {i["item"]: i for i in doc["items"]}
+    assert set(cr.CHECKLIST_KEYS) <= set(by)
+    assert by["maps_new_strings"]["status"] == "check"  # 새 문자열 2건
+    assert by["maps_new_strings"]["value"]["n_new_strings_total"] == 2
+    assert by["maps_rules_version"]["status"] == "check"  # 코드의 규칙 버전과 다르다
+    assert by["par_change_summary"]["status"] == "ok"
+    assert by["prereg_numbers_summary"]["value"]["raw_only_corp_years"] == {"all": 5}
+    assert by["raw_snapshot"]["status"] == "missing"  # 합성 레이크에는 디렉터리가 없다
+    assert doc["status_counts"]["missing"] >= 1
+    tsv = (out / "checklist_c.tsv").read_text().splitlines()
+    assert tsv[0] == "item\tstatus\tvalue\tsource" and len(tsv) == 1 + len(cr.CHECKLIST_KEYS)

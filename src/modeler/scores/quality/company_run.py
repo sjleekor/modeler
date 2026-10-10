@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import resource
+import subprocess
 import sys
 import time
 from collections.abc import Sequence
@@ -43,12 +44,15 @@ from modeler.scores.quality.company_common import (
     JUDGMENT_ENV,
     JUDGMENT_YEARS,
     O4_JUDGMENT_YEARS,
+    PREREG_REL,
     Lake,
     TradingCalendar,
+    base_date,
     default_prereg,
     filing_availability,
     git_head,
     guard_years,
+    my_root,
     sha256_file,
 )
 
@@ -102,7 +106,9 @@ RAW_TABLES = (
 DERIVED_TABLES = ("stock_metric_vintage_fact", "dim_trading_calendar")
 
 CI_NOTES = {
-    "CI-o1-auto": f"짝수 사업연도 감사의견 보고서 {O1_AUTO_MIN_EVEN_REPORTS}건 이상이면 full",
+    "CI-o1-auto": (
+        f"O1에 필요한 짝수 사업연도마다 감사의견 보고서 {O1_AUTO_MIN_EVEN_REPORTS}건 이상이면 full"
+    ),
     "CI-ccy-nearest": f"O3 통화: 같은 해, 없으면 가장 가까운 해({CI_CCY_TIE}), 없으면 null",
     "CI-capevt-nomisc": "misc 행이 없는 corp-fy의 사건 해 표시는 False",
     "CI-record-key": "기록용 항목은 record_cells의 차원 칸 이름으로 낸다",
@@ -261,11 +267,20 @@ def outcome_inputs(
 
 
 # ================================================================ 3. O1 모드·짝수 해 규칙
-def decide_o1_mode(opinions: pl.DataFrame, requested: str = "auto") -> dict:
+def o1_needed_even_years(fys) -> list[int]:
+    """O1에 짝수 해 감사의견이 필요한 사업연도: 형성 연도 t 중 짝수 t(제외 판단용)와 짝수 t+1(결과)."""
+    fys = [int(y) for y in fys]
+    return sorted({t + 1 for t in fys if (t + 1) % 2 == 0} | {t for t in fys if t % 2 == 0})
+
+
+def decide_o1_mode(opinions: pl.DataFrame, requested: str = "auto", fys=JUDGMENT_YEARS) -> dict:
     """O1 모드를 정한다(§5.3 R03·§12.4 C). 근거로 짝수·홀수 사업연도 보고서 수를 남긴다.
 
-    ``auto``: raw ``dart_governance_raw`` 감사의견 보고서 중 ``bsns_year`` 가 짝수인 것이
-    ``O1_AUTO_MIN_EVEN_REPORTS`` 건 이상이면 full(짝수 해 백필이 들어옴), 아니면 fallback.
+    ``auto``(CI-o1-auto): 그 구간의 O1에 필요한 짝수 사업연도(``o1_needed_even_years(fys)`` —
+    판정 구간이면 2020·2022·2024, 개발 구간이면 2018) **하나하나에** raw ``dart_governance_raw``
+    감사의견 보고서가 ``O1_AUTO_MIN_EVEN_REPORTS`` 건 이상 있으면 full, 하나라도 비면 fallback.
+    사전등록 R03 "백필이 끝났으면 6개 연도 규칙"을 연도별로 읽은 것이다(일부 연도만 백필되면
+    끝나지 않은 것으로 봄). 연도 안의 부분 백필은 짝수 해 3%p 내림 규칙이 따로 잡는다.
     """
     if requested not in ("auto", "full", "fallback"):
         raise ValueError(f"o1 모드는 auto·full·fallback 중 하나입니다: {requested!r}")
@@ -276,17 +291,22 @@ def decide_o1_mode(opinions: pl.DataFrame, requested: str = "auto") -> dict:
     }
     n_even = sum(n for y, n in by.items() if y % 2 == 0)
     n_odd = sum(n for y, n in by.items() if y % 2 == 1)
+    needed = o1_needed_even_years(fys)
+    missing = [y for y in needed if by.get(y, 0) < O1_AUTO_MIN_EVEN_REPORTS]
     mode = requested
     if requested == "auto":
-        mode = "full" if n_even >= O1_AUTO_MIN_EVEN_REPORTS else "fallback"
+        mode = "full" if needed and not missing else "fallback"
     return {
         "requested": requested,
         "mode": mode,
         "n_even_year_reports": n_even,
         "n_odd_year_reports": n_odd,
         "reports_by_bsns_year": {str(k): v for k, v in by.items()},
+        "needed_even_years": needed,
+        "missing_even_years": missing,
         "auto_min_even_reports": O1_AUTO_MIN_EVEN_REPORTS,
-        "rule": "§5.3 R03: 짝수 해 백필이 들어왔으면 full(6개 연도), 아니면 fallback(2020·2022·2024)",
+        "rule": "§5.3 R03: 필요한 짝수 해마다 백필 보고서가 있으면 full(6개 연도), 아니면 "
+        "fallback(2020·2022·2024)",
     }
 
 
@@ -1142,6 +1162,285 @@ def run_checks(src: Sources, *, o1_info: dict) -> dict[str, object]:
     }
 
 
+# ================================================================ 9b. §12.4 C 확인표 (checks)
+CHECKLIST_NAME = "checklist_c"
+JUDGMENT_PREP_DOC = "06_company_judgment_prep.md"  # 해석 표 문서(사전등록과 같은 디렉터리)
+CHECKLIST_KEYS = (
+    "raw_snapshot",
+    "derived_snapshot",
+    "raw_success_marker",
+    "derived_success_marker",
+    "even_year_opinion_reports",
+    "o1_mode",
+    "even_year_demotion_t",
+    "calendar_last_day",
+    "receipt_last_date",
+    "universe_kospi_kosdaq_codes",
+    "universe_mapped",
+    "universe_spac",
+    "universe_financial",
+    "universe_non_december",
+    "universe_konex_other_in_denominator",
+    "universe_outside_denominator_corp_cls",
+    "maps_dir",
+    "maps_manifest_sha256",
+    "maps_rules_version",
+    "maps_module_sha256",
+    "maps_new_strings",
+    "par_change_summary",
+    "prereg_numbers_summary",
+    "modeler_git_head",
+    "modeler_worktree_clean",
+    "code_sha256",
+    "uv_lock_sha256",
+    "prereg_sha256",
+    "judgment_prep_doc_sha256",
+    "xbrl_cache",
+)
+
+
+def _ci(item: str, value, status: str, source: str) -> dict:
+    return {"item": item, "value": value, "status": status, "source": source}
+
+
+def _missing(item: str, source: str, err: object = None) -> dict:
+    return _ci(item, None if err is None else f"{type(err).__name__}: {err}", "missing", source)
+
+
+def _numbers_summary(nums: dict) -> dict:
+    """prereg_numbers 요약: 연도별 값을 합치거나(개수) 범위로(비율) 줄인다."""
+    out: dict = {}
+    for k, v in nums.items():
+        if not isinstance(v, dict):
+            continue
+        if v and all(isinstance(x, dict) for x in v.values()):  # scope -> {fy: n}
+            out[k] = {sc: sum(d.values()) for sc, d in sorted(v.items())}
+        elif k.endswith("share") or "ratio" in k:
+            xs = [x for x in v.values() if x is not None]
+            out[k] = {"min": min(xs), "max": max(xs)} if xs else {}
+        else:
+            out[k] = sum(x for x in v.values() if x is not None)
+    return out
+
+
+def build_checklist_c(
+    lake: Lake,
+    *,
+    o1_info: dict,
+    even_flags: list[dict],
+    numbers: dict,
+    maps_dir: str | Path | None,
+    xbrl_cache: Path | None,
+    prereg: Path | None,
+) -> list[dict]:
+    """사전등록 §12.4 C 확인표를 항목별 ``{item, value, status, source}`` 로 만든다.
+
+    status: ``ok``(맞음) · ``check``(사람이 봐야 함) · ``missing``(찾지 못함). 항목 하나를 못 구해도
+    나머지는 계속한다. 승인 여부는 코드가 알 수 없어 문서 항목은 ``check`` 로 남긴다.
+    """
+    here = Path(__file__).resolve()
+    repo = here.parents[4]
+    items: list[dict] = []
+    add = items.append
+    raw_d = lake.raw_dir("stock_master").parent
+    der_d = lake.derived_dir("dim_trading_calendar").parent  # snapshot/source 디렉터리
+
+    add(_ci("raw_snapshot", lake.raw_snapshot, "ok" if raw_d.is_dir() else "missing", str(raw_d)))
+    add(
+        _ci(
+            "derived_snapshot",
+            lake.derived_snapshot,
+            "ok" if der_d.is_dir() else "missing",
+            str(der_d),
+        )
+    )
+
+    # 성공 표식
+    mk = raw_d / "_manifests" / "_SUCCESS.json"
+    add(_ci("raw_success_marker", mk.exists(), "ok" if mk.exists() else "missing", str(mk)))
+    dm = [der_d / "_manifests" / "_SUCCESS.json", der_d / "_SUCCESS.json", der_d / "_SUCCESS"]
+    found = next((m for m in dm if m.exists()), None)
+    if found is not None:
+        add(_ci("derived_success_marker", True, "ok", str(found)))
+    else:
+        tabs = {t: lake.derived_dir(t).is_dir() and any(lake.derived_dir(t).rglob("*.parquet"))
+                for t in DERIVED_TABLES}  # fmt: skip
+        meta = {t: (lake.derived_dir(t) / "_cache_metadata.json").exists() for t in DERIVED_TABLES}
+        add(_ci(
+            "derived_success_marker",
+            {"marker_file": False, "files_exist": tabs, "cache_metadata_exist": meta},
+            "ok" if all(tabs.values()) else "missing",
+            f"{der_d}: _SUCCESS 표식이 없어 표 파일 존재로 대신했다 (compute_all 은 표마다 _cache_metadata.json 을 남긴다)",
+        ))  # fmt: skip
+
+    # 짝수 해 감사의견 백필·O1 모드·3%p 내림
+    add(_ci("even_year_opinion_reports", {
+        "n_even_year_reports": o1_info["n_even_year_reports"],
+        "n_odd_year_reports": o1_info["n_odd_year_reports"],
+        "reports_by_bsns_year": o1_info["reports_by_bsns_year"],
+    }, "ok", "raw dart_governance_raw 감사의견 보고서, 짝수 사업연도(§5.3 R03)"))  # fmt: skip
+    add(_ci("o1_mode", {"requested": o1_info["requested"], "mode": o1_info["mode"],
+                        "rule": o1_info["rule"]}, "ok", "decide_o1_mode (auto 판단과 같은 함수)"))  # fmt: skip
+    demoted = demoted_formation_years(pl.DataFrame(even_flags) if even_flags else
+                                      pl.DataFrame({"t": [], "demote": []}), o1_info["mode"])  # fmt: skip
+    cand = sorted(int(f["t"]) for f in even_flags if f.get("demote"))
+    add(_ci("even_year_demotion_t", {"demoted_t": demoted, "candidate_t_by_gap": cand, "flags": even_flags},
+            "ok" if even_flags else "missing",
+            "even_year_flags.tsv: demoted_t = 이 O1 모드에서 실제로 내림(full 에서만), candidate_t_by_gap = 모드와 상관없이 격차 3%p 초과"))  # fmt: skip
+
+    # 달력·접수 목록
+    base_max = base_date(max(JUDGMENT_YEARS))
+    try:
+        last = TradingCalendar.from_lake(lake).last_day
+        add(_ci("calendar_last_day", {"last_day": last.isoformat(), "base_date_max": base_max.isoformat()},
+                "ok" if last >= base_max else "check", "derived dim_trading_calendar 마지막 날 >= 기준일 최대"))  # fmt: skip
+    except Exception as e:  # noqa: BLE001
+        add(_missing("calendar_last_day", "derived dim_trading_calendar", e))
+    try:
+        rd = pl.scan_parquet(lake.raw_glob("dart_filing_receipt_raw")).select(
+            pl.col("rcept_dt").max()).collect().item()  # fmt: skip
+        add(_ci("receipt_last_date", {"last_date": None if rd is None else rd.isoformat()},
+                "ok" if rd is not None and rd >= base_max else "check",
+                "raw dart_filing_receipt_raw rcept_dt 최댓값"))  # fmt: skip
+    except Exception as e:  # noqa: BLE001
+        add(_missing("receipt_last_date", "raw dart_filing_receipt_raw", e))
+
+    # 분모 규칙
+    src_u = "company_inputs_fs.universe_report (§12.4 C 분모 규칙 확인)"
+    try:
+        u = fi.universe_report(lake)
+        add(_ci("universe_kospi_kosdaq_codes", {
+            "codes": u["stock_master_tickers_kospi_kosdaq"],
+            "dup_across_markets": u["stock_master_dup_tickers_across_markets"],
+            "other_markets": u["stock_master_other_markets"]}, "ok", src_u))  # fmt: skip
+        add(_ci("universe_mapped", {"mapped_to_corp_code": u["mapped_to_corp_code"],
+                                    "unmapped_to_corp_code": u["unmapped_to_corp_code"],
+                                    "unmapped_by_status": u["unmapped_by_status"]}, "ok", src_u))  # fmt: skip
+        add(_ci("universe_spac", u["spac_tickers"], "ok", src_u))
+        add(_ci("universe_financial", u["financial_corps"], "ok", src_u))
+        add(_ci("universe_non_december", u["non_december_corps"], "ok", src_u))
+        ne = {"N": u["denominator_corps_with_cls_N"], "E": u["denominator_corps_with_cls_E"]}
+        add(_ci("universe_konex_other_in_denominator", ne,
+                "ok" if ne["N"] == 0 else "check",
+                src_u + ": 분모는 stock_master 규칙이다. 코넥스(N)가 0이어야 한다. E 는 값만 적는다(분모 안 corp_cls 분포는 universe_outside_denominator_corp_cls)"))  # fmt: skip
+        add(_ci("universe_outside_denominator_corp_cls", {
+            "n_corps": u["raw_fs_corps_outside_denominator"],
+            "by_corp_cls": u["raw_fs_corps_outside_by_corp_cls"],
+            "universe_by_corp_cls": u["universe_corps_by_corp_cls"]}, "ok", src_u))  # fmt: skip
+    except Exception as e:  # noqa: BLE001
+        for k in CHECKLIST_KEYS:
+            if k.startswith("universe_"):
+                add(_missing(k, src_u, e))
+
+    # 매핑표
+    md = Path(maps_dir) if maps_dir else cm_default_maps_dir(lake)
+    mf = md / "manifest.json"
+    src_m = f"{md}"
+    if mf.exists():
+        mm = json.loads(mf.read_text(encoding="utf-8"))
+        add(
+            _ci(
+                "maps_dir",
+                str(md),
+                "ok",
+                "--maps-dir (기본 kr/output/quality_score_company_maps_<raw_snapshot>)",
+            )
+        )
+        add(_ci("maps_manifest_sha256", sha256_file(mf), "ok", str(mf)))
+        same_v = mm.get("rules_version") == cm.RULES_VERSION
+        add(_ci("maps_rules_version", {"manifest": mm.get("rules_version"), "code": cm.RULES_VERSION,
+                                       "raw_snapshot": mm.get("raw_snapshot")},
+                "ok" if same_v and mm.get("raw_snapshot") == lake.raw_snapshot else "check", str(mf)))  # fmt: skip
+        cmp_py = here.parent / "company_maps.py"
+        same_m = mm.get("module_sha256") == sha256_file(cmp_py)
+        add(_ci("maps_module_sha256", {"manifest": mm.get("module_sha256"), "now": sha256_file(cmp_py)},
+                "ok" if same_m else "check", "매핑표 manifest 의 module_sha256 와 지금 company_maps.py"))  # fmt: skip
+        cs_p = md / cm.COMPARE_SUMMARY_NAME
+        if cs_p.exists():
+            cj_ = json.loads(cs_p.read_text(encoding="utf-8"))
+            tot, chg = cj_.get("n_new_strings_total"), cj_.get("n_class_changed_total")
+            add(_ci("maps_new_strings", {"old_raw_snapshot": cj_.get("old_raw_snapshot"),
+                                         "n_new_strings_total": tot, "n_class_changed_total": chg,
+                                         "same_rules_version": cj_["rules_version"]["same"]},
+                    "ok" if tot == 0 and chg == 0 else "check", str(cs_p)))  # fmt: skip
+        else:
+            add(_missing("maps_new_strings", f"{cs_p} 없음 (company_maps --compare-to 로 만든다)"))
+        pcs = mm.get("stats", {}).get("par_change_check")
+        add(_ci("par_change_summary", pcs, "ok" if pcs else "missing", f"{mf} stats.par_change_check (주식병합 확인)"))  # fmt: skip
+    else:
+        for k in ("maps_dir", "maps_manifest_sha256", "maps_rules_version", "maps_module_sha256",
+                  "maps_new_strings", "par_change_summary"):  # fmt: skip
+            add(
+                _ci(
+                    k,
+                    str(md) if k == "maps_dir" else None,
+                    "missing",
+                    f"{src_m}: manifest.json 없음",
+                )
+            )
+
+    # 접수번호 단위 입력 존재 개수
+    add(_ci("prereg_numbers_summary", _numbers_summary(numbers) if numbers else None,
+            "ok" if numbers else "missing", "prereg_numbers.json 요약(연도 합계·비율 범위, 사건 수 아님)"))  # fmt: skip
+
+    # 코드
+    head = git_head(repo)
+    add(_ci("modeler_git_head", head, "ok" if head else "missing", f"git -C {repo} rev-parse HEAD"))
+    try:
+        r = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True,
+                           text=True, timeout=30, check=True)  # fmt: skip
+        dirty = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        add(_ci("modeler_worktree_clean", {"clean": not dirty, "n_dirty": len(dirty), "dirty": dirty[:20]},
+                "ok" if not dirty else "check", f"git -C {repo} status --porcelain"))  # fmt: skip
+    except Exception as e:  # noqa: BLE001
+        add(_missing("modeler_worktree_clean", f"git -C {repo} status --porcelain", e))
+    add(_ci("code_sha256", {q.name: sha256_file(q) for q in sorted(here.parent.glob("company_*.py"))},
+            "ok", "company_*.py"))  # fmt: skip
+    uv = repo / "uv.lock"
+    add(_ci("uv_lock_sha256", sha256_file(uv) if uv.exists() else None,
+            "ok" if uv.exists() else "missing", str(uv)))  # fmt: skip
+
+    # 문서
+    pp = Path(prereg) if prereg else default_prereg()
+    add(_ci("prereg_sha256", sha256_file(pp) if pp.exists() else None,
+            "ok" if pp.exists() else "missing", str(pp)))  # fmt: skip
+    doc = (my_root() / PREREG_REL).parent / JUDGMENT_PREP_DOC
+    if doc.exists():
+        add(_ci("judgment_prep_doc_sha256", sha256_file(doc), "check",
+                f"{doc}: 사용자 승인 기록과 sha256 대조 (승인 여부는 코드가 알 수 없다)"))  # fmt: skip
+    else:
+        add(_ci("judgment_prep_doc_sha256", None, "missing", str(doc)))
+
+    # XBRL 캐시
+    xp = Path(xbrl_cache) if xbrl_cache else default_xbrl_cache(lake)
+    if xp.exists():
+        add(_ci("xbrl_cache", {"path": str(xp), "sha256": sha256_file(xp)},
+                "ok" if lake.raw_snapshot in str(xp) else "check",
+                "이 raw snapshot 의 캐시인지는 경로의 snapshot 날짜로 본다"))  # fmt: skip
+    else:
+        add(_ci("xbrl_cache", {"path": str(xp), "sha256": None}, "missing", str(xp)))
+    return items
+
+
+def cm_default_maps_dir(lake: Lake) -> Path:
+    return lake.output_dir(f"quality_score_company_maps_{lake.raw_snapshot}")
+
+
+def write_checklist_c(items: list[dict], out: Path, lake: Lake) -> dict[str, Path]:
+    """``checklist_c.json``·``checklist_c.tsv`` 를 쓴다."""
+    counts = {st: sum(1 for i in items if i["status"] == st) for st in ("ok", "check", "missing")}
+    jp, tp = out / f"{CHECKLIST_NAME}.json", out / f"{CHECKLIST_NAME}.tsv"
+    _write_json(jp, {"checklist": "사전등록 §12.4 C", "raw_snapshot": lake.raw_snapshot,
+                     "derived_snapshot": lake.derived_snapshot, "status_counts": counts,
+                     "items": items})  # fmt: skip
+    lines = ["item\tstatus\tvalue\tsource"]
+    for i in items:
+        val = json.dumps(cj._jsonable(i["value"]), ensure_ascii=False, default=str)
+        lines.append("\t".join(cm._esc(x) for x in (i["item"], i["status"], val, i["source"])))
+    tp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {jp.name: jp, tp.name: tp}
+
+
 # ================================================================ 10. manifest (§12.2)
 def _peak_rss_mb() -> float:
     ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -1206,6 +1505,8 @@ def build_manifest(
             "path": str(prereg_p) if prereg_p else None,
             "sha256": sha256_file(prereg_p) if prereg_p and prereg_p.exists() else None,
         },
+        # 해석 표 v1 문서(06). 승인본 sha256과 대조는 사람이 한다(07 §4 ⑧).
+        "judgment_prep_doc": _doc_info((my_root() / PREREG_REL).parent / JUDGMENT_PREP_DOC),
         "bootstrap": {"seed": args.get("seed"), "n_boot": args.get("n_boot")},
         "uv_lock_sha256": sha256_file(uv) if uv.exists() else None,
         "args": args,
@@ -1223,9 +1524,14 @@ def build_manifest(
 
 
 # ================================================================ 11. 실행
+def _doc_info(p: Path) -> dict:
+    return {"path": str(p), "sha256": sha256_file(p) if p.exists() else None}
+
+
 def _write_json(path: Path, obj) -> None:
     path.write_text(
-        json.dumps(cj._jsonable(obj), ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        json.dumps(cj._jsonable(obj), ensure_ascii=False, indent=2, default=str, sort_keys=True),
+        encoding="utf-8",
     )
 
 
@@ -1245,6 +1551,7 @@ def run(
     prereg: str | Path | None = None,
     args: dict | None = None,
     sources: Sources | None = None,
+    maps_dir: str | Path | None = None,
 ) -> dict:
     """한 기간을 실행하고 ``out_dir`` 에 결과를 쓴다. 쓴 파일 경로 dict를 돌려준다.
 
@@ -1265,7 +1572,8 @@ def run(
         if sources is not None
         else load_sources(lake, period, xbrl_cache=Path(xbrl_cache) if xbrl_cache else None)
     )
-    o1_info = decide_o1_mode(src.opinions, o1_mode)
+    o1_fys = DEV_YEARS if period == "dev" else JUDGMENT_YEARS  # checks는 판정 구간 기준
+    o1_info = decide_o1_mode(src.opinions, o1_mode, o1_fys)
     cli = dict(args or {"period": period, "seed": seed, "n_boot": n_boot, "o1_mode": o1_mode})
     cli.setdefault("seed", seed)
     cli.setdefault("n_boot", n_boot)
@@ -1284,6 +1592,17 @@ def run(
         _write_json(written["interp_alt_counts.json"], res["alt_counts"])
         even = res["tables"]["even_year_flags.tsv"].to_dicts()
         o1_final = res["o1"]
+        # §12.4 C 확인표(새 파일만 더한다)
+        items = build_checklist_c(
+            lake,
+            o1_info=o1_info,
+            even_flags=even,
+            numbers=res["numbers"],
+            maps_dir=maps_dir,
+            xbrl_cache=src.xbrl_cache,
+            prereg=Path(prereg) if prereg else None,
+        )
+        written.update(write_checklist_c(items, out, lake))
     else:
         res = analyze(src, period, o1_info=o1_info, seed=seed, n_boot=n_boot)
         out.mkdir(parents=True, exist_ok=True)
@@ -1345,6 +1664,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--n-boot", type=int, default=cj.N_BOOT)
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--prereg", default=None)
+    ap.add_argument(
+        "--maps-dir",
+        default=None,
+        help="checks 의 확인표가 볼 매핑표 디렉터리(기본 kr/output/quality_score_company_maps_<raw_snapshot>)",
+    )
     a = ap.parse_args(argv)
     lake = Lake.from_env(raw_snapshot=a.raw_snapshot, derived_snapshot=a.derived_snapshot)
     try:
@@ -1358,6 +1682,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             xbrl_cache=a.xbrl_cache,
             prereg=a.prereg,
             args=vars(a),
+            maps_dir=a.maps_dir,
         )
     except PermissionError as e:
         print(f"거부: {e}", file=sys.stderr)

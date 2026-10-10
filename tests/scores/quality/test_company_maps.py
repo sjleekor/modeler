@@ -356,3 +356,126 @@ def test_share_event_years_par_change(tmp_path):
     fj = cm.share_event_flags(div, "2026-09-30")
     assert sorted(zip(fj["corp_code"], fj["year"], strict=True)) == [("A", 2017)]
     assert cap is not None
+
+
+# ------------------------------------------------------------------ 매핑표 비교 (W8)
+def _write_fake_maps(d: Path, *, opinions, knds, events, ses, snapshot="2026-09-30", ver="v1"):
+    d.mkdir(parents=True, exist_ok=True)
+    cm.write_tsv(
+        pl.DataFrame(
+            opinions, schema=["opinion_raw", "opinion_norm", "opinion_class"], orient="row"
+        ),
+        d / "opinion_map.tsv",
+    )
+    cm.write_tsv(
+        pl.DataFrame(
+            knds, schema=["stock_knd", "knd_norm", "knd_class", "n_reports"], orient="row"
+        ),
+        d / "stock_knd_map.tsv",
+    )
+    cm.write_tsv(
+        pl.DataFrame(events, schema=["event_type", "in_list"], orient="row"),
+        d / "capital_event_types.tsv",
+    )
+    if ses is not None:
+        cm.write_tsv(
+            pl.DataFrame(ses, schema=["se_raw", "se_norm", "knd_class"], orient="row"),
+            d / "share_count_se_map.tsv",
+        )
+    (d / "manifest.json").write_text(
+        json.dumps({"rules_version": ver, "raw_snapshot": snapshot, "module_sha256": "x"})
+    )
+
+
+def _fake_pair(tmp_path):
+    old, new = tmp_path / "old", tmp_path / "new"
+    _write_fake_maps(
+        old,
+        opinions=[("적정", "적정", "clean"), ("옛 의견\n줄바꿈", "옛의견줄바꿈", None)],
+        knds=[("보통주", "보통주", "common", 5)],
+        events=[("무상증자", True)],
+        ses=[("보통주", "보통주", "common"), ("우선주", "우선주", "excluded")],
+    )
+    _write_fake_maps(
+        new,
+        opinions=[
+            ("적정", "적정", "clean"),
+            ("한정 (주1)", "한정", "non_clean"),  # 새 문자열
+        ],
+        knds=[("보통주", "보통주", "excluded", 5), ("신종 보통", "신종보통", "common", 1)],
+        events=[("무상증자", True), ("신규유형", False)],
+        ses=[("보통주", "보통주", "common"), ("신보통주", "신보통주", "common")],
+        snapshot="2026-10-18",
+    )
+    return new, old
+
+
+def test_compare_maps_catches_new_removed_and_class_change(tmp_path):
+    new, old = _fake_pair(tmp_path)
+    rows, s = cm.compare_maps(new, old)
+    key = {(r["kind"], r["change"], r["raw"]) for r in rows}
+    assert ("opinion", "new", "한정 (주1)") in key
+    assert s["opinion"]["n_new_strings"] == 1 and s["opinion"]["n_removed_strings"] == 1
+    assert s["opinion"]["n_new_by_class"] == {"non_clean": 1}
+    # 같은 원문인데 분류가 바뀌면 따로 잡는다(new 가 아니다)
+    assert ("stock_knd", "class_changed", "보통주") in key
+    assert s["stock_knd"]["n_class_changed"] == 1 and s["stock_knd"]["n_new_strings"] == 1
+    assert s["capital_event_type"]["n_new_strings"] == 1
+    assert s["share_count_se"]["n_new_strings"] == 1 and s["share_count_se"]["n_new_common"] == 1
+    assert s["share_count_se"]["n_removed_strings"] == 1
+    assert s["n_new_strings_total"] == 4 and s["n_class_changed_total"] == 1
+    assert s["old_raw_snapshot"] == "2026-09-30" and s["new_raw_snapshot"] == "2026-10-18"
+    assert s["rules_version"]["same"] is True and s["module_sha256"]["same"] is True
+    # 건수 열이 없다(§7.2): 비교 행은 문자열·분류뿐
+    assert set(rows[0]) == set(cm.COMPARE_COLUMNS)
+
+
+def test_compare_maps_same_maps_zero(tmp_path):
+    new, old = _fake_pair(tmp_path)
+    _, s = cm.compare_maps(old, old)
+    assert s["n_new_strings_total"] == 0 and s["n_class_changed_total"] == 0
+    assert all(s[k]["n_removed_strings"] == 0 for k in ("opinion", "stock_knd", "share_count_se"))
+
+
+def test_compare_maps_old_without_se_map_is_unavailable(tmp_path):
+    new, old = _fake_pair(tmp_path)
+    (old / "share_count_se_map.tsv").unlink()
+    _, s = cm.compare_maps(new, old)  # raw_root 가 없어 다시 만들 수 없다
+    assert s["share_count_se"]["available"] is False
+    assert s["share_count_se"]["old_source"] == "unavailable"
+
+
+def test_compare_maps_old_without_se_map_recomputed_from_raw(tmp_path):
+    new, old = _fake_pair(tmp_path)
+    (old / "share_count_se_map.tsv").unlink()
+    d = cm.table_dir(tmp_path / "raw", "2026-09-30", "dart_share_count_raw")
+    d.mkdir(parents=True)
+    pl.DataFrame(
+        {"reprt_code": ["11011", "11011", "11012"], "se": ["보통주", "우선주", "기타"]}
+    ).write_parquet(d / "p.parquet")
+    _, s = cm.compare_maps(new, old, raw_root=tmp_path / "raw")
+    se = s["share_count_se"]
+    assert se["old_source"] == "recomputed_from_raw" and se["n_new_strings"] == 1  # 11011 만
+    assert se["n_removed_strings"] == 1
+
+
+def test_write_compare_files_and_cli(tmp_path):
+    new, old = _fake_pair(tmp_path)
+    tsv, sp, _ = cm.write_compare(new, old)
+    assert tsv.name == "compare_to_2026-09-30.tsv" and sp.name == "compare_summary.json"
+    assert json.loads(sp.read_text())["n_new_strings_total"] == 4
+    head, *body = tsv.read_text().splitlines()
+    assert head.split("\t") == list(cm.COMPARE_COLUMNS) and len(body) == 7
+
+
+def test_share_count_se_map_common_check(tmp_path):
+    d = cm.table_dir(tmp_path, "2026-09-30", "dart_share_count_raw")
+    d.mkdir(parents=True)
+    pl.DataFrame(
+        {"reprt_code": ["11011"] * 4, "se": ["보통주", " 우선주 ", "합계", None]}
+    ).write_parquet(d / "p.parquet")
+    m = cm.share_count_se_map(tmp_path, "2026-09-30")
+    assert dict(zip(m["se_raw"], m["knd_class"], strict=True)) == {
+        "보통주": "common", " 우선주 ": "excluded", "합계": "other",
+    }  # fmt: skip
+    assert cm.share_count_se_map(tmp_path, "1999-01-01").height == 0  # 표 없음 → 빈 표

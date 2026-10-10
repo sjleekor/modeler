@@ -512,7 +512,8 @@ def capital_events_and_anomalies(
         .group_by("corp_code", "date_raw", "event_type", "qty", "reason", "in_list")
         .agg(pl.col("rcept_no").min())
         .select("corp_code", "rcept_no", "date_raw", "event_type", "qty", "reason", "in_list")
-        .sort("corp_code", "date_raw", "event_type")
+        # 행 순서를 결정적으로(매핑표 sha256이 실행마다 같게 — 메인 검증 10-10)
+        .sort("corp_code", "date_raw", "event_type", "qty", "reason", "in_list", "rcept_no")
     )
     ev = (
         df.filter(pl.col("in_list") & pl.col("reason").is_null())
@@ -859,6 +860,33 @@ def dps_multi_value_reports(
     )
 
 
+def share_count_se_map(raw_root: str | Path, raw_snapshot: str) -> pl.DataFrame:
+    """발행주식수 표 ``se`` 값 전부와 정규화·``classify_stock_knd`` 분류(사업보고서 11011 기준).
+
+    열: se_raw, se_norm, knd_class. 건수 열이 없다. 표가 없으면 빈 표다.
+    """
+    schema = {"se_raw": pl.String, "se_norm": pl.String, "knd_class": pl.String}
+    if not input_files(raw_root, raw_snapshot, "dart_share_count_raw"):
+        return pl.DataFrame(schema=schema)
+    se = (
+        _scan(raw_root, raw_snapshot, "dart_share_count_raw")
+        .filter(pl.col("reprt_code") == DIVIDEND_REPRT_CODE)
+        .select(pl.col("se").alias("se_raw"))
+        .unique()
+        .collect()
+        .drop_nulls("se_raw")
+    )
+    vals = sorted(se["se_raw"].to_list())
+    return pl.DataFrame(
+        {
+            "se_raw": vals,
+            "se_norm": [normalize_knd(v) for v in vals],
+            "knd_class": [classify_stock_knd(v) for v in vals],
+        },
+        schema=schema,
+    )
+
+
 def build_maps(raw_root: str | Path, raw_snapshot: str, out_dir: Path) -> dict:
     """매핑표 파일과 manifest 를 쓰고 manifest dict 를 돌려준다."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -902,6 +930,13 @@ def build_maps(raw_root: str | Path, raw_snapshot: str, out_dir: Path) -> dict:
         "n_nonnumeric_cell_strings": len(unparsed),
     }
 
+    sem = share_count_se_map(raw_root, raw_snapshot)
+    files["share_count_se_map.tsv"] = sem
+    stats["share_count_se"] = {
+        "n_distinct_values": sem.height,
+        "n_values_by_class": {str(k): v for k, v in sem.group_by("knd_class").len().iter_rows()},
+    }
+
     types = capital_event_type_table(raw_root, raw_snapshot)
     ev, anomalies = capital_events_and_anomalies(raw_root, raw_snapshot)
     files["capital_event_types.tsv"] = types
@@ -943,7 +978,12 @@ def build_maps(raw_root: str | Path, raw_snapshot: str, out_dir: Path) -> dict:
         hashes[name] = sha256_file(p)
 
     inputs: dict[str, dict] = {}
-    for tbl in ("dart_governance_raw", "dart_shareholder_return_raw", "dart_capital_change_raw"):
+    for tbl in (
+        "dart_governance_raw",
+        "dart_shareholder_return_raw",
+        "dart_capital_change_raw",
+        "dart_share_count_raw",
+    ):
         fl = input_files(raw_root, raw_snapshot, tbl)
         listing = "\n".join(
             f"{f.relative_to(table_dir(raw_root, raw_snapshot, tbl))}:{f.stat().st_size}"
@@ -986,11 +1026,171 @@ CI_NOTES = {
 }
 
 
+# ================================================================ 7. 이전 snapshot 매핑표 비교 (W8)
+COMPARE_SUMMARY_NAME = "compare_summary.json"
+COMPARE_COLUMNS = ("kind", "change", "raw", "norm", "class_new", "class_old", "norm_old")
+
+
+def read_tsv_rows(path: Path) -> list[dict[str, str]]:
+    """``write_tsv`` 로 쓴 TSV를 문자열 dict 목록으로 읽는다. 셀은 이스케이프된 그대로 둔다."""
+    lines = path.read_text(encoding="utf-8").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if not lines:
+        return []
+    head = lines[0].split("\t")
+    return [dict(zip(head, ln.split("\t"), strict=False)) for ln in lines[1:]]
+
+
+# (종류, 파일, 원문 열, 정규화 열, 분류 열)
+_COMPARE_SPECS = (
+    ("opinion", "opinion_map.tsv", "opinion_raw", "opinion_norm", "opinion_class"),
+    ("stock_knd", "stock_knd_map.tsv", "stock_knd", "knd_norm", "knd_class"),
+    ("capital_event_type", "capital_event_types.tsv", "event_type", None, "in_list"),
+    ("share_count_se", "share_count_se_map.tsv", "se_raw", "se_norm", "knd_class"),
+)
+
+
+def _load_map(d: Path, spec, *, raw_root: Path | None, raw_snapshot: str | None):
+    """(원문 → (정규화, 분류) dict, 출처). 이전 디렉터리에 se 표가 없으면 raw에서 다시 만든다."""
+    kind, fname, c_raw, c_norm, c_cls = spec
+    p = d / fname
+    if p.exists():
+        rows = read_tsv_rows(p)
+        src = "map_file"
+    elif kind == "share_count_se" and raw_root is not None and raw_snapshot:
+        df = share_count_se_map(raw_root, raw_snapshot)
+        if df.height == 0:
+            return None, "unavailable"
+        rows = [
+            {c_raw: r[0], c_norm: r[1], c_cls: r[2]}
+            for r in df.iter_rows()  # 이스케이프를 파일과 맞춘다
+        ]
+        rows = [{k: _esc(v) for k, v in r.items()} for r in rows]
+        src = "recomputed_from_raw"
+    else:
+        return None, "unavailable"
+    return {r[c_raw]: (r.get(c_norm, "") if c_norm else "", r.get(c_cls, "")) for r in rows}, src
+
+
+def compare_maps(
+    new_dir: str | Path, old_dir: str | Path, *, raw_root: str | Path | None = None
+) -> tuple[list[dict[str, str]], dict]:
+    """새 매핑표 디렉터리를 이전 것과 견준다(문자열·값 **종류**만. 사건 수는 내지 않는다, §7.2).
+
+    돌려주는 것은 (비교 행 목록, 요약 dict). 행 열은 :data:`COMPARE_COLUMNS`:
+    ``change`` 는 ``new``(새로 생긴 문자열)·``removed``(사라짐)·
+    ``class_changed``(같은 원문인데 분류가 다름 — 규칙 코드가 같으면 0이어야 한다)·
+    ``norm_changed``(분류는 같고 정규화만 다름).
+    이전 디렉터리에 ``share_count_se_map.tsv`` 가 없으면 이전 manifest의 raw snapshot으로 raw에서
+    다시 만든다(``raw_root`` 가 있고 그 snapshot 이 있을 때).
+    """
+    nd, od = Path(new_dir), Path(old_dir)
+    nman = json.loads((nd / "manifest.json").read_text(encoding="utf-8"))
+    oman = json.loads((od / "manifest.json").read_text(encoding="utf-8"))
+    rr = Path(raw_root) if raw_root else None
+    rows: list[dict[str, str]] = []
+    out: dict = {}
+    for spec in _COMPARE_SPECS:
+        kind = spec[0]
+        new, nsrc = _load_map(nd, spec, raw_root=rr, raw_snapshot=nman.get("raw_snapshot"))
+        old, osrc = _load_map(od, spec, raw_root=rr, raw_snapshot=oman.get("raw_snapshot"))
+        if new is None or old is None:
+            out[kind] = {"available": False, "new_source": nsrc, "old_source": osrc}
+            continue
+        n_new = n_removed = n_cls = n_norm = 0
+        new_by_class: Counter = Counter()
+        for raw in sorted(new):
+            norm, cls = new[raw]
+            if raw not in old:
+                n_new += 1
+                new_by_class[cls] += 1
+                rows.append(_cmp_row(kind, "new", raw, norm, cls, "", ""))
+            else:
+                onorm, ocls = old[raw]
+                if cls != ocls:
+                    n_cls += 1
+                    rows.append(_cmp_row(kind, "class_changed", raw, norm, cls, ocls, onorm))
+                elif norm != onorm:
+                    n_norm += 1
+                    rows.append(_cmp_row(kind, "norm_changed", raw, norm, cls, ocls, onorm))
+        for raw in sorted(set(old) - set(new)):
+            onorm, ocls = old[raw]
+            n_removed += 1
+            rows.append(_cmp_row(kind, "removed", raw, onorm, "", ocls, onorm))
+        out[kind] = {
+            "available": True,
+            "new_source": nsrc,
+            "old_source": osrc,
+            "n_strings_new_snapshot": len(new),
+            "n_strings_old_snapshot": len(old),
+            "n_new_strings": n_new,
+            "n_new_by_class": dict(sorted(new_by_class.items())),
+            "n_removed_strings": n_removed,
+            "n_class_changed": n_cls,
+            "n_norm_changed": n_norm,
+        }
+    if out["share_count_se"].get("available"):
+        out["share_count_se"]["n_new_common"] = sum(
+            1 for r in rows if r["kind"] == "share_count_se" and r["change"] == "new"
+            and r["class_new"] == "common"
+        )  # fmt: skip
+    nm, om = nman.get("module_sha256"), oman.get("module_sha256")
+    avail = [v for v in out.values() if v.get("available")]
+    summary = {
+        "new_dir": str(nd),
+        "old_dir": str(od),
+        "new_raw_snapshot": nman.get("raw_snapshot"),
+        "old_raw_snapshot": oman.get("raw_snapshot"),
+        "rules_version": {
+            "new": nman.get("rules_version"),
+            "old": oman.get("rules_version"),
+            "same": nman.get("rules_version") == oman.get("rules_version"),
+        },
+        "module_sha256": {"new": nm, "old": om, "same": nm == om},
+        **out,
+        "n_new_strings_total": sum(v["n_new_strings"] for v in avail),
+        "n_class_changed_total": sum(v["n_class_changed"] for v in avail),
+        "note": "문자열·값 종류 수만 센다. 연도별·사건 건수는 내지 않는다(§7.2).",
+    }
+    return rows, summary
+
+
+def _cmp_row(kind, change, raw, norm, cls_new, cls_old, norm_old) -> dict[str, str]:
+    return {
+        "kind": kind, "change": change, "raw": raw, "norm": norm,
+        "class_new": cls_new, "class_old": cls_old, "norm_old": norm_old,
+    }  # fmt: skip
+
+
+def write_compare(
+    new_dir: str | Path, old_dir: str | Path, *, raw_root: str | Path | None = None
+) -> tuple[Path, Path, dict]:
+    """:func:`compare_maps` 결과를 새 디렉터리에 쓴다. (tsv 경로, summary 경로, summary)."""
+    rows, summary = compare_maps(new_dir, old_dir, raw_root=raw_root)
+    nd = Path(new_dir)
+    old_snap = summary["old_raw_snapshot"] or Path(old_dir).name.rsplit("_", 1)[-1]
+    tsv = nd / f"compare_to_{old_snap}.tsv"
+    # 셀은 이미 이스케이프된 문자열이라 그대로 잇는다.
+    lines = ["\t".join(COMPARE_COLUMNS)] + ["\t".join(r[c] for c in COMPARE_COLUMNS) for r in rows]
+    tsv.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    summary["compare_tsv"] = tsv.name
+    sp = nd / COMPARE_SUMMARY_NAME
+    sp.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return tsv, sp, summary
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--raw-snapshot", required=True, help="raw snapshot 날짜 YYYY-MM-DD")
     ap.add_argument("--raw-root", default=None, help="기본 <STOCK_DATA_ROOT>/kr/raw/raw_postgres")
     ap.add_argument("--out-dir", default=None)
+    ap.add_argument(
+        "--compare-to",
+        default=None,
+        help="이전 snapshot 매핑표 디렉터리. 새 매핑표를 만든 뒤 compare_to_<이전>.tsv·"
+        "compare_summary.json 을 같은 출력 디렉터리에 쓴다(W8)",
+    )
     args = ap.parse_args(argv)
     raw_root = Path(args.raw_root) if args.raw_root else default_raw_root()
     out_dir = (
@@ -1001,6 +1201,17 @@ def main(argv: list[str] | None = None) -> int:
     manifest = build_maps(raw_root, args.raw_snapshot, out_dir)
     print(json.dumps(manifest["stats"], ensure_ascii=False, indent=2, default=str))
     print(f"출력: {out_dir}")
+    if args.compare_to:
+        tsv, _, summ = write_compare(out_dir, args.compare_to, raw_root=raw_root)
+        brief = {
+            k: summ[k]
+            for k in (
+                "old_raw_snapshot", "rules_version", "module_sha256",
+                "n_new_strings_total", "n_class_changed_total",
+            )
+        }  # fmt: skip
+        print(json.dumps(brief, ensure_ascii=False, indent=2))
+        print(f"비교: {tsv}")
     return 0
 
 
