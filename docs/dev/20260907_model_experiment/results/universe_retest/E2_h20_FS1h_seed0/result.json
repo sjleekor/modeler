@@ -1,0 +1,132 @@
+{
+  "verdict": "B\u2032",
+  "verdict_reason": "E=0.002644 > 0 \uc774\uc9c0\ub9cc I=-0.013384, S=-0.012602 \uc911 \ud558\ub098\uac00 0 \uc774\ud558",
+  "gate_u": {
+    "e": 0.002643805689860544,
+    "e_prime": 0.002643805689860544,
+    "i": -0.013383508855256777,
+    "s": -0.012602062147376128,
+    "d": -0.31569486093122967,
+    "d_longest_rebalances": 13,
+    "n_rebalances_e": 14,
+    "n_rebalances_i": 14,
+    "turnover_base": 0.4423076923076923,
+    "turnover_tradable": 0.4423076923076923,
+    "n_obs_base": 96250,
+    "n_obs_tradable": 96250,
+    "verdict": "B",
+    "verdict_reason": "E=0.002644 > 0 \uc774\uc9c0\ub9cc I=-0.013384, S=-0.012602 \uc911 \ud558\ub098\uac00 0 \uc774\ud558"
+  },
+  "records": {
+    "u_eqw_minus_idx_gross": -0.016027314545117344,
+    "ex_largest_rebalance": {
+      "E_U": {
+        "mean": 0.0028333661294209834,
+        "mean_ex_max": -0.002065488687875097,
+        "max_date": "2026-06-30",
+        "max_value": 0.06651847875427003,
+        "n": 14
+      },
+      "I_U": {
+        "mean": -0.013193948415696335,
+        "mean_ex_max": -0.026145161026579815,
+        "max_date": "2026-06-30",
+        "max_value": 0.15517181552578885,
+        "n": 14
+      }
+    },
+    "gross": {
+      "E_U": 0.005297651843706698,
+      "I_U": -0.010729662701410623,
+      "S_U": -0.009948215993529973
+    },
+    "E_U_old_bench": 0.025393413640840988,
+    "D_U_vs_u_eqw": {
+      "max_drawdown": -0.08342563269780379,
+      "longest_rebalances": 5
+    },
+    "D_U_vs_index": {
+      "max_drawdown": -0.31569486093122967,
+      "longest_rebalances": 13
+    },
+    "price_contamination": {
+      "pairs": 0,
+      "worst_multiple": 1.0,
+      "n_rebalances": 14
+    },
+    "price_contamination_tradable_reference": {
+      "pairs": 2,
+      "worst_multiple": 1.89811320754717,
+      "n_rebalances": 14
+    },
+    "u_rows": 96250,
+    "u_names_per_day_median": 350.0
+  },
+  "definition_check": {
+    "E_runner": 0.008136627915012924,
+    "E_literal": 0.008175513279861556,
+    "E_prime_runner": 0.0070094230030329574,
+    "E_prime_literal": 0.00799000072077459,
+    "E_same_sign": true,
+    "E_prime_same_sign": true,
+    "needs_correction_block": false
+  },
+  "formation_record_1": {
+    "label_rows_differing_from_label_daily": 2848928,
+    "fold_1": {
+      "e": 0.0028589886899100646,
+      "i": 0.00042473487920267634,
+      "s": -0.00513839238956393,
+      "d": -0.08156967734891918,
+      "n_rebalances_i": 13
+    },
+    "fold_2": {
+      "e": 0.002797306441818182,
+      "i": 0.005822876150707554,
+      "s": 0.007668885091519441,
+      "d": -0.01727882055655483,
+      "n_rebalances_i": 13
+    },
+    "fold_3": {
+      "e": -0.0016091275712094436,
+      "i": -0.005260673006568926,
+      "s": -0.0002075546453735983,
+      "d": -0.07037317242212981,
+      "n_rebalances_i": 13
+    },
+    "fold_4": {
+      "e": -0.0006792243590336687,
+      "i": 0.0010139120127618338,
+      "s": 0.004313028447761918,
+      "d": -0.029658895204782598,
+      "n_rebalances_i": 13
+    },
+    "fold_5": {
+      "e": 0.0016697122998036336,
+      "i": 0.007793162401425558,
+      "s": 0.006791363622367153,
+      "d": -0.027382262130553836,
+      "n_rebalances_i": 13
+    },
+    "pooled": {
+      "e": 0.0016745115271409347,
+      "i": 0.0026764043416166463,
+      "s": 0.0026897785253421967,
+      "d": -0.09250989402723919,
+      "n_rebalances_i": 65
+    }
+  },
+  "provenance": {
+    "git_sha": "093a6c1",
+    "code_hash": "a59adab6c37524a7",
+    "model_code_hash": "ca6de636bef153d5",
+    "frozen_tag": "kr-universe-retest-frozen",
+    "frozen_tag_commit": "29045d5fa6cfc2cc05bfd960a876bf43ed27db58",
+    "adopted_run": "E2_h20_FS1h_seed0",
+    "holdout_predictions": "/Users/whishaw/wss_p/modeler/../stock_data/kr/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/FS1h_h20_lag1_rank_idxbench__holdout/predictions_holdout__E2_h20_FS1h_seed0.parquet",
+    "label_daily": "/Users/whishaw/wss_p/modeler/../stock_data/kr/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/FS1h_h20_lag1_rank_idxbench__holdout/label_daily.parquet",
+    "marts": "/Users/whishaw/wss_p/modeler/../stock_data/kr/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/FS1h_h20_lag1_rank_idxbench__holdout",
+    "formation_predictions": "/Users/whishaw/wss_p/modeler/../stock_data/kr/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/FS1h_h20_lag1_rank/predictions_valid__E2_h20_FS1h_seed0.parquet",
+    "refit": false
+  }
+}
