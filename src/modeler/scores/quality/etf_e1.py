@@ -71,6 +71,8 @@ HALVES = {
     "dev": {"first": (2011, 2012), "second": (2013, 2014)},  # 규정 아님, 기록용
 }
 REGIONS = ("domestic", "foreign")
+# I26: 선행 분포의 경보 사슬이 쓰는 점수의 끝 월말. 개발은 개발 구간 끝, 판정은 자료 끝 달 직전 월말.
+CHAIN_END = {"dev": PERIODS["dev"][1], "judgment": LAST_MONTH_END}
 
 
 # ---------------------------------------------------------------- 구간 보호
@@ -151,6 +153,7 @@ def monthly_scores(
     panel: ep.Panel,
     life: pl.DataFrame,
     last_month_end: date = LAST_MONTH_END,
+    include_maturity: bool = False,
 ) -> pl.DataFrame:
     """월말 E1 점수. 대상 ETF-월마다 한 행(결과를 보지 않는다).
 
@@ -164,6 +167,9 @@ def monthly_scores(
     ``e1_pct`` = e1을 같은 풀에서 다시 백분위로. ``alert`` = ``e1_pct`` ≤ 10(I11),
     ``baseline_alert`` = ``pct_netasst`` ≤ 10(I12). ``corr_gap`` = 상관 − 0.9(액티브 0.7), 기록용.
     풀 밖 행은 점수 칸이 null이고 ``alert`` 도 null이다(점수 없음).
+
+    ``include_maturity=True``(기록용 민감도, 사전등록 §9)이면 만기형 ETF도 대상과 풀에 넣는다. 기본값에서는
+    결과가 이 인자가 없던 때와 같다.
     """
     mn = ep.month_end_netassets(panel, life)
     meta = life.select(
@@ -179,7 +185,7 @@ def monthly_scores(
         .filter(
             (pl.col("month_end") <= last_month_end)
             & ep.listed_one_year_expr()
-            & ~pl.col("exclude_maturity")
+            & (True if include_maturity else ~pl.col("exclude_maturity"))
             & ~pl.col("pension_ineligible_candidate")
             & pl.col("region").is_in(list(REGIONS))
         )
@@ -244,11 +250,12 @@ def formation_month_end(last_date: date, month_end_dates: list[date], horizon_mo
     return month_end_dates[i - 1] if i > 0 else None
 
 
-def event_etfs(life: pl.DataFrame) -> pl.DataFrame:
-    """I13 사건 후보: ``status == "disappeared"`` 이고 만기형·연금 부적격·region unknown 아님."""
+def event_etfs(life: pl.DataFrame, include_maturity: bool = False) -> pl.DataFrame:
+    """I13 사건 후보: ``status == "disappeared"`` 이고 만기형·연금 부적격·region unknown 아님.
+    ``include_maturity=True`` 이면 만기형도 넣는다(기록용 민감도)."""
     return life.filter(
         (pl.col("status") == "disappeared")
-        & ~pl.col("exclude_maturity").fill_null(False)
+        & (True if include_maturity else ~pl.col("exclude_maturity").fill_null(False))
         & ~pl.col("pension_ineligible_candidate").fill_null(False)
         & pl.col("region").is_in(list(REGIONS))
     )
@@ -264,15 +271,19 @@ def _events_scored(
     panel: ep.Panel,
     period: str,
     horizon_months: int,
+    include_maturity: bool = False,
+    chain_end: date | None = None,
 ) -> pl.DataFrame:
     """구간 안 사건마다 한 행: L, F, 점수 유무, 경보, 기준선 경보, 선행 개월 수(I20).
-    점수는 구간 끝(``PERIODS[period]`` 끝)까지의 월말만 쓴다."""
+    사건의 F·점수는 구간(``PERIODS[period]``) 안만 쓴다. 선행 분포의 경보 사슬은 ``chain_end``(기본
+    ``CHAIN_END[period]``, I26)까지의 월말 점수를 쓴다."""
     lo, hi = PERIODS[period]
+    chain_hi = CHAIN_END[period] if chain_end is None else chain_end
     me = panel.month_ends["date"].to_list()
     me_idx = {d: i for i, d in enumerate(me)}
-    ev = event_etfs(life)
+    ev = event_etfs(life, include_maturity)
     rows = []
-    s = scores.filter((pl.col("month_end") >= lo) & (pl.col("month_end") <= hi))
+    s = scores.filter((pl.col("month_end") >= lo) & (pl.col("month_end") <= chain_hi))
     s_ev = s.filter(pl.col("isu_cd").is_in(ev["isu_cd"].to_list()))
     sdict: dict[tuple[str, date], tuple[bool, bool | None, bool | None, float | None]] = {
         (r[0], r[1]): (r[2], r[3], r[4], r[5])
@@ -288,9 +299,9 @@ def _events_scored(
         # I20: L 전(L보다 앞선) 마지막 점수 월말에서 거꾸로 이어지는 연속 경보
         prior = [d for d in me if d < L]
         last_true_before_L = prior[-1] if prior else None
-        usable = [d for d in prior if d <= hi]
+        usable = [d for d in prior if d <= chain_hi]
         lead = None
-        cens = bool(last_true_before_L is not None and last_true_before_L > hi)
+        cens = bool(last_true_before_L is not None and last_true_before_L > chain_hi)
         j = None
         for k in range(len(usable) - 1, -1, -1):
             if sdict_get_pool(sdict, r["isu_cd"], usable[k]):
@@ -421,18 +432,22 @@ def outcome_stats(
     horizon_months: int = 6,
     *,
     panel: ep.Panel,
+    include_maturity: bool = False,
+    chain_end: date | None = None,
 ) -> dict:
     """사건과 점수를 이어 유형별(domestic·foreign) 통계를 낸다(§11.3). 구간 보호가 걸려 있다.
 
     돌려주는 dict: ``events``(사건 표 DataFrame), ``by_region``(유형별 통계 dict),
     ``n_events_out_of_period``. 통계 칸: 사건 수·점수 있음/없음·비율·적중률·점수 없는 사건을 미적중으로
     센 적중률·기준선 적중률·차이·FAR(점수·기준선)·선행 분포(I20)·전반/후반(I08).
+    ``include_maturity``(기록용)면 만기형도 사건에 넣는다(점수도 ``include_maturity=True`` 로 만든 것을 넘길 것).
+    ``chain_end``(I26)는 선행 분포의 경보 사슬이 쓰는 점수의 끝 월말, 기본 ``CHAIN_END[period]``.
     """
     lo, hi = _guard(period)
-    events = _events_scored(scores, life, panel, period, horizon_months)
+    events = _events_scored(scores, life, panel, period, horizon_months, include_maturity, chain_end)
     far = far_months(scores, life, panel, period)
     me = panel.month_ends["date"].to_list()
-    all_ev = event_etfs(life)
+    all_ev = event_etfs(life, include_maturity)
     n_all = {
         r: int((all_ev["region"] == r).sum()) for r in REGIONS
     }
@@ -487,8 +502,10 @@ class BootResult:
 
 
 def p_value(boot_hit: np.ndarray, null: float = HIT_NULL) -> float:
-    """I02: (부트스트랩 적중률 ≤ null 개수 + 1) ÷ (B + 1). nan은 세지 않는다(B는 전체 반복 수)."""
+    """I02·I25: (부트스트랩 적중률 ≤ null 개수 + 1) ÷ (B + 1). nan 회차(점수 있는 사건이 하나도 안 뽑힌 회차)는
+    분자와 B에서 모두 뺀다(E2의 ``p_value`` 와 같은 방식)."""
     a = np.asarray(boot_hit, dtype=float)
+    a = a[~np.isnan(a)]
     return float(((a <= null).sum() + 1) / (len(a) + 1))
 
 
@@ -506,12 +523,13 @@ def bootstrap(
     panel: ep.Panel,
     b: int = BOOTSTRAP_B,
     seed: int = BOOTSTRAP_SEED,
+    include_maturity: bool = False,
 ) -> dict[str, BootResult]:
     """ETF 복원 추출 b회(I14). 유형별로 따로, 같은 난수 흐름(domestic → foreign)으로 돌린다.
     ETF 집합 = 그 유형의 점수 있는 사건 ETF ∪ FAR 분모에 한 달이라도 있는 ETF.
     적중률은 뽑힌 사건 ETF로, FAR는 뽑힌 ETF의 ETF-월로 센다. 판정 구간 보호가 걸려 있다."""
     _guard(period)
-    events = _events_scored(scores, life, panel, period, horizon_months)
+    events = _events_scored(scores, life, panel, period, horizon_months, include_maturity)
     far = far_months(scores, life, panel, period)
     rng = np.random.default_rng(seed)
     out: dict[str, BootResult] = {}
@@ -574,6 +592,8 @@ def _boot_summary(br: BootResult) -> dict:
             "lower_alpha_0.025": lower_bound(a, 0.025),
         }
     res["p_hit_le_0.30"] = p_value(br.arrays["hit"])
+    res["p_n_nan_rounds"] = int(np.isnan(br.arrays["hit"]).sum())  # I25: p값에서 빠진 회차 수
+    res["p_b_used"] = int((~np.isnan(br.arrays["hit"])).sum())
     return res
 
 
