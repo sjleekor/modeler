@@ -23,6 +23,7 @@ from .orchestration import (
 )
 
 SEOUL = ZoneInfo("Asia/Seoul")
+US_UNIVERSE_VERSIONS = ("v1", "v2")  # ops.json us_universe_version (missing = v1)
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 NATIVE_NAMES = {"KR": ("feature_panel.parquet", "prepare_manifest.json"),
                 "US": ("features.parquet", "manifest.json")}
@@ -254,7 +255,8 @@ def select(*, report_date: date, selected_at: datetime, prepared_root: Path,
            output_root: Path, release_manifest: Path, kr_calendar_path: Path,
            us_calendar_path: Path, us_expected_path: Path,
            mode: str = "scheduled",
-           market_sector: dict[str, Path] | None = None) -> dict[str, Any]:
+           market_sector: dict[str, Path] | None = None,
+           us_universe_version: str = "v1") -> dict[str, Any]:
     """Select only producer-complete inputs; never infer E from observed A.
 
     ``mode`` is ``scheduled`` (the 09:30 event, D 09:30 through 10:00) or ``run_fallback`` (the run
@@ -264,9 +266,14 @@ def select(*, report_date: date, selected_at: datetime, prepared_root: Path,
     ``market_sector`` (``{"kr": <KR data root>, "us": <US data root>}``) also pins the market-sector
     inputs into ``ms-selection.json`` with the same rule.  A failure there never fails the
     selection: the section alone ends up ``failed`` and the units still run.
+
+    ``us_universe_version`` (ops ``us_universe_version``, default ``v1``) is the universe the US
+    native must have been prepared with; a native without the field counts as ``v1``.
     """
     if mode not in SELECTION_MODES:
         raise ValueError("selection mode must be scheduled or run_fallback")
+    if us_universe_version not in US_UNIVERSE_VERSIONS:
+        raise ValueError("us_universe_version must be v1 or v2")
     prepared = prepared_root.resolve(strict=True)
     output_root.mkdir(parents=True, exist_ok=True)
     output = output_root.resolve(strict=True)
@@ -276,14 +283,16 @@ def select(*, report_date: date, selected_at: datetime, prepared_root: Path,
         return _select_once(report_date=report_date, selected_at=selected_at,
             prepared_root=prepared, output_root=output, release_manifest=release_manifest,
             kr_calendar_path=kr_calendar_path, us_calendar_path=us_calendar_path,
-            us_expected_path=us_expected_path, mode=mode, market_sector=market_sector)
+            us_expected_path=us_expected_path, mode=mode, market_sector=market_sector,
+            us_universe_version=us_universe_version)
 
 
 def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Path,
                  output_root: Path, release_manifest: Path, kr_calendar_path: Path,
                  us_calendar_path: Path, us_expected_path: Path,
                  mode: str = "scheduled",
-                 market_sector: dict[str, Path] | None = None) -> dict[str, Any]:
+                 market_sector: dict[str, Path] | None = None,
+                 us_universe_version: str = "v1") -> dict[str, Any]:
     target = output_root / report_date.isoformat()
     if target.is_dir():
         state = _load(target / "selection-state.json")
@@ -357,6 +366,8 @@ def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Pat
               "us_calendar_sha256": _hash(us_calendar_path) if us_calendar_path.is_file() else None,
               "us_expected_source_sha256": _hash(us_expected_path) if us_expected_path.is_file() else None,
               "synthetic_fixture": fixture_mode, "jobs": [], "markets": {}}
+    if us_universe_version != "v1":  # a v1 selection keeps exactly the keys it always had
+        result["us_universe_version"] = us_universe_version
     for market, calendar, native_root in (
             ("KR", calendars["KR"], prepared_root / "kr"),
             ("US", calendars.get("US"), prepared_root / "us")):
@@ -368,6 +379,9 @@ def _select_once(*, report_date: date, selected_at: datetime, prepared_root: Pat
         for candidate in _candidates(native_root, market, cutoff):
             if bool(candidate["native"].get("synthetic_fixture", False)) != fixture_mode:
                 reason = "native_fixture_mode_mismatch"
+                continue
+            if market == "US" and candidate["native"].get("universe_version", "v1") != us_universe_version:
+                reason = "us_universe_version_mismatch"
                 continue
             if market == "KR" and (k_day is None or candidate["asof"] > k_day):
                 # K보다 이른 prepared는 stale로 고릅니다(변경 3). K보다 늦은 것은 쓰지 않습니다.
@@ -496,12 +510,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--kr-calendar", type=Path, required=True)
     parser.add_argument("--us-calendar", type=Path, required=True)
     parser.add_argument("--us-expected-source", type=Path, required=True)
+    parser.add_argument("--us-universe-version", choices=list(US_UNIVERSE_VERSIONS), default="v1")
     args = parser.parse_args(argv)
     try:
         result = select(report_date=args.report_date, selected_at=datetime.now(SEOUL),
             prepared_root=args.prepared_root, output_root=args.output_root,
             release_manifest=args.release_manifest, kr_calendar_path=args.kr_calendar,
-            us_calendar_path=args.us_calendar, us_expected_path=args.us_expected_source)
+            us_calendar_path=args.us_calendar, us_expected_path=args.us_expected_source,
+            us_universe_version=args.us_universe_version)
         print(json.dumps({"status": result["status"], "report_date": result["report_date"],
                           "job_count": len(result["jobs"])}, sort_keys=True))
         return 0 if result["status"] in {"selected", "holiday", "partial"} else 1
