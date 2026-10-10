@@ -39,10 +39,7 @@ from modeler.scores.quality import etf_panel as ep
 E1_VERSION = "quality-score-v0/etf_e1/1"
 
 DEFAULT_OUT_REL = "kr/output/quality_score_etf_dev_20261010/e1"
-DEFAULT_INTERP_TABLE = (
-    "/private/tmp/claude-501/-Users-whishaw-wss-p-my/b1cc46eb-1957-4b1b-b4b5-6208b7ec737c/"
-    "scratchpad/interp_table_v1.md"
-)
+DEFAULT_INTERP_TABLE = ep.INTERP_TABLE_REL  # 상대 경로. 실제 경로는 ep.default_interp_table()
 
 # ---- 처음 고른 값(사전등록 §11.2~11.4)과 해석 표 값. 코드에 이름을 붙여 둔다.
 NETASST_FLOOR_WON = 5e9  # §11.2: 순자산 거리 log(월말 순자산 ÷ 50억 원)
@@ -719,7 +716,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--period", choices=["dev"], required=True, help="이 CLI는 개발 구간만 돈다")
     ap.add_argument("--input", default=str(root / ep.DEFAULT_INPUT_REL))
     ap.add_argument("--out-dir", default=str(root / DEFAULT_OUT_REL))
-    ap.add_argument("--interp-table", default=os.environ.get("QUALITY_E_INTERP_TABLE", DEFAULT_INTERP_TABLE))
+    ap.add_argument("--interp-table", default=ep.default_interp_table())
     a = ap.parse_args(argv)
 
     out = Path(a.out_dir)

@@ -46,6 +46,13 @@ def test_synthetic_token_and_account_memo():
     assert tc.account_memo(False, False) == ""
 
 
+def test_bond_mix_display_token():
+    assert tc.bond_mix_display("KODEX 삼성그룹채권혼합") is True
+    assert tc.bond_mix_display("KODEX 200") is False
+    assert tc.bond_mix_display(None) is False
+    assert "bond_mix_display" in tc.CARD_COLUMNS
+
+
 def test_recent_252_session_window(tmp_path):
     n = 300
     days = weekdays(date(2024, 1, 1), n)
@@ -159,3 +166,20 @@ def test_card_e1_judgment_column_and_md_header(tmp_path):
     md = tc.render_user_theme_md(cards, date(2026, 9, 30), date(2026, 10, 8))
     assert "국내형 E1은 동결 규칙으로 판정해 D였습니다" in md and "유지" in md
     assert "E2 괴리 판정 A(같은 비교 그룹 안 이듬해 괴리 순위 상관) — 테마 상품에는 참고로만" in md
+
+
+def test_bond_mix_column_summary_and_md(tmp_path):
+    cards, _ = _tiny_cards(tmp_path)
+    assert "bond_mix_display" in cards.columns
+    # 임시 카드의 한 행 이름을 채권혼합으로 바꿔 요약·표시를 본다(판정 칸은 그대로)
+    cards2 = cards.with_columns(
+        pl.when(pl.col("isu_cd") == "AAA")
+        .then(pl.lit("KODEX 반도체채권혼합"))
+        .otherwise(pl.col("isu_nm"))
+        .alias("isu_nm")
+    ).with_columns(pl.col("isu_nm").str.contains(tc.BOND_MIX_TOKEN).alias("bond_mix_display"))
+    s = tc.build_summary(cards2).filter(pl.col("theme") == "반도체").row(0, named=True)
+    assert s["n_bond_mix"] == 1
+    md = tc.render_user_theme_md(cards2, date(2026, 9, 30), date(2026, 10, 8))
+    assert "채권혼합 상품은 주식 비중이 절반 안팎이라 테마 노출이 묽습니다(표시만, 사전은 그대로)" in md
+    assert "| 합성 | 채권혼합 |" in md

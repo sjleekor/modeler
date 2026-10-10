@@ -59,13 +59,10 @@ DEFAULT_OUT_REL_DEV = "kr/output/quality_score_etf_dev_20261010/judge"
 DEFAULT_OUT_REL_JUDGMENT = "kr/output/quality_score_etf_judgment_20261010_frozen"
 DEFAULT_KIND_REL = "kr/output/quality_score_etf_inputs_20261010/kind/kind_etf_delisting.csv"
 DEFAULT_KIND_WINDOWS_REL = "kr/output/quality_score_etf_inputs_20261010/kind/kind_query_windows.csv"
-DEFAULT_INTERP_TABLE = (
-    "/Users/whishaw/wss_p/stock_data/kr/output/quality_score_etf_judgment_20261010/"
-    "provenance/interp_table_v1_approved.md"
-)
+DEFAULT_INTERP_TABLE = ep.INTERP_TABLE_REL  # 상대 경로. 실제 경로는 ep.default_interp_table()
 INTERP_TABLE_SHA256 = "29c89969b8f5d467f2c998110eb8de00afb237de240fe2aad76abc7d07d728b1"
-DEFAULT_PREREG = e2.DEFAULT_PREREG
-UV_LOCK = "/Users/whishaw/wss_p/modeler/.claude/worktrees/quality-score-v0/uv.lock"
+DEFAULT_PREREG = ep.PREREG_REL  # 상대 경로. 실제 경로는 ep.default_prereg()
+UV_LOCK = str(ep.repo_root() / "uv.lock")
 
 # ---- 처음 고른 숫자(§11.4)와 해석 표 값
 HOLM_ALPHAS = (0.025, 0.05)  # I18: p가 작은 가설부터 단계 α
@@ -560,8 +557,8 @@ def run(
     root = Path(os.environ.get("STOCK_DATA_ROOT", "../stock_data"))
     input_path = input_path or str(root / ep.DEFAULT_INPUT_REL)
     kind_csv = kind_csv or str(root / DEFAULT_KIND_REL)
-    interp_table = interp_table or os.environ.get("QUALITY_E_INTERP_TABLE", DEFAULT_INTERP_TABLE)
-    prereg = prereg or DEFAULT_PREREG
+    interp_table = interp_table or ep.default_interp_table()
+    prereg = prereg or ep.default_prereg()
     if out_dir is None:
         rel = DEFAULT_OUT_REL_DEV if period == "dev" else DEFAULT_OUT_REL_JUDGMENT
         out_dir = str(root / rel)

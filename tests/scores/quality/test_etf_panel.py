@@ -2,6 +2,7 @@
 
 import csv
 from datetime import date, timedelta
+from pathlib import Path
 
 from modeler.scores.quality import etf_panel as ep
 
@@ -199,3 +200,39 @@ def test_listed_one_year_expr_matches_scalar():
     got = df.with_columns(ep.listed_one_year_expr().alias("ok"))
     for r in got.iter_rows(named=True):
         assert r["ok"] == ep.is_listed_one_year(r["month_end"], r["first_date"])
+
+
+# ---------------------------------------------------------------- 경로: 환경변수로 받고 코드에 절대 경로가 없다
+def test_default_paths_follow_env(monkeypatch):
+    for k in ("STOCK_DATA_ROOT", "MY_ROOT", "QUALITY_INTERP_TABLE", "QUALITY_E_INTERP_TABLE", "QUALITY_PREREG"):
+        monkeypatch.delenv(k, raising=False)
+    assert ep.default_interp_table() == str(Path("../stock_data") / ep.INTERP_TABLE_REL)
+    assert ep.default_prereg() == str(Path("../my") / ep.PREREG_REL)
+    monkeypatch.setenv("STOCK_DATA_ROOT", "/x/sd")
+    monkeypatch.setenv("MY_ROOT", "/x/my")
+    assert ep.default_interp_table() == "/x/sd/" + ep.INTERP_TABLE_REL
+    assert ep.default_prereg() == "/x/my/" + ep.PREREG_REL
+    monkeypatch.setenv("QUALITY_INTERP_TABLE", "/y/t.md")
+    monkeypatch.setenv("QUALITY_PREREG", "/y/p.md")
+    assert ep.default_interp_table() == "/y/t.md"
+    assert ep.default_prereg() == "/y/p.md"
+
+
+def test_repo_root_has_uv_lock():
+    assert (ep.repo_root() / "uv.lock").exists()
+
+
+def test_no_absolute_local_paths_in_quality_code():
+    import re
+    from pathlib import Path as P
+
+    pat = re.compile("/private" + "/tmp|/Users" + "/whishaw|claude" + "-501")
+    bad = []
+    for d in (P(ep.__file__).parent, P(__file__).parent):
+        for f in d.glob("*.py"):
+            if f.name == P(__file__).name:
+                continue
+            for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+                if pat.search(line):
+                    bad.append(f"{f.name}:{i}")
+    assert not bad, bad

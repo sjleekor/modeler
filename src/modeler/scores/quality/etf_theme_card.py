@@ -20,6 +20,9 @@
   ``ACC_TRDVAL`` 중앙값, 괴리율은 ``daily_gap`` 의 \\|종가 − NAV\\| ÷ NAV 일평균이다.
 - **합성 표시(``synthetic_display``)**: 동결 파서에 합성 칸이 없다. 카드에 보이려고 이름에 ``합성`` 이
   있으면 참으로 둘 뿐이며 **판정에 쓰지 않는다.**
+- **채권혼합 표시(``bond_mix_display``)**: ``synthetic_display`` 와 같은 방식이다. 마지막 거래일 이름
+  (``ISU_NM``)에 ``채권혼합`` 이 있으면 참으로 둘 뿐이며 **판정에 쓰지 않는다**(동결 테마 사전은 그대로).
+  채권혼합 상품은 주식 비중이 절반 안팎이라 테마 노출이 묽다는 점을 카드에서 알아보게 하는 표시다.
 - 총보수는 원천이 정해지지 않아 전부 ``원천 미정``.
 """
 
@@ -49,6 +52,7 @@ MONTH_END = date(2026, 9, 30)  # E1 기준 월말(자료 끝 달은 월말로 �
 DESC_WINDOW_SESSIONS = 252  # 설명값 창: 자료 끝까지 최근 252거래일
 FEE_PLACEHOLDER = "원천 미정"
 SYNTHETIC_TOKEN = "합성"  # 표시용. 판정에 안 씀
+BOND_MIX_TOKEN = "채권혼합"  # 표시용. 판정에 안 씀
 
 # 점수 없는 이유(§ 작업 지시)
 R_NEW = "상장 1년 미만"
@@ -85,7 +89,7 @@ CARD_COLUMNS = [
     "theme", "category", "required_by_user",
     "isu_cd", "isu_nm", "first_date",
     "base_index", "idx_ind_nm", "region", "active", "hedge",
-    "synthetic_display", "option", "multiplier",
+    "synthetic_display", "bond_mix_display", "option", "multiplier",
     "pension_eligible_candidate", "account_memo",
     "e1_month_end", "e1_pct", "e1_alert", "e1_type", "e1_no_score_reason", "e1_foreign_record_only",
     "e1_judgment",
@@ -101,6 +105,11 @@ FORBIDDEN_COLUMN_WORDS = ("ret", "return", "수익", "close", "clsprc", "price",
 def synthetic_display(isu_nm: str | None) -> bool:
     """이름에 ``합성`` 이 있으면 참. 카드 표시용이며 판정에 안 쓴다."""
     return SYNTHETIC_TOKEN in (isu_nm or "")
+
+
+def bond_mix_display(isu_nm: str | None) -> bool:
+    """이름에 ``채권혼합`` 이 있으면 참. 카드 표시용이며 판정에 안 쓴다."""
+    return BOND_MIX_TOKEN in (isu_nm or "")
 
 
 def account_memo(pension_ineligible: bool, synthetic: bool) -> str:
@@ -276,6 +285,7 @@ def build_cards(
                     "active": r["active"],
                     "hedge": r["hedge"],
                     "synthetic_display": syn,
+                    "bond_mix_display": bond_mix_display(r["isu_nm"]),
                     "option": r["option"],
                     "multiplier": r["multiplier"],
                     "pension_eligible_candidate": not r["pension_ineligible_candidate"],
@@ -314,6 +324,7 @@ def build_summary(cards: pl.DataFrame) -> pl.DataFrame:
     aggs = [
         pl.len().alias("n_listed"),
         pl.col("pension_eligible_candidate").sum().alias("n_pension_eligible"),
+        pl.col("bond_mix_display").sum().alias("n_bond_mix"),
         pl.col("e1_pct").is_not_null().sum().alias("n_e1_scored"),
         (pl.col("e1_alert") == True).sum().alias("n_alert"),  # noqa: E712
         *[
@@ -362,6 +373,8 @@ def render_user_theme_md(cards: pl.DataFrame, month_end: date, end_date: date) -
         f"E1 판정 표시: 국내형 E1은 동결 규칙으로 판정해 D였습니다(2026-10-10, 사용자 결정: 유지 — 설명값으로 계속 씁니다). "
         f"해외형은 순자산 하나로 매긴 기록용입니다. {E2_JUDGMENT_NOTE}.",
         "",
+        "채권혼합 상품은 주식 비중이 절반 안팎이라 테마 노출이 묽습니다(표시만, 사전은 그대로).",
+        "",
     ]
     for th in [t.name for t in et.THEMES if t.required]:
         sub = cards.filter(pl.col("theme") == th)
@@ -372,9 +385,9 @@ def render_user_theme_md(cards: pl.DataFrame, month_end: date, end_date: date) -
             "",
             f"상장 {sub.height} · 적격 {elig.height} · 경보 {n_alert}",
             "",
-            "| 상품 | 기초지수 | 국내/해외 | 액티브 | 환헤지 | 합성 | E1 백분위/경보 또는 없는 이유 "
+            "| 상품 | 기초지수 | 국내/해외 | 액티브 | 환헤지 | 합성 | 채권혼합 | E1 백분위/경보 또는 없는 이유 "
             "| 순자산(억 원) | 거래대금 중앙값(억 원) | 괴리율(%) |",
-            "|---|---|---|---|---|---|---|---:|---:|---:|",
+            "|---|---|---|---|---|---|---|---|---:|---:|---:|",
         ]
         for r in elig.iter_rows(named=True):
             na = "" if r["netasst_won"] is None else f"{r['netasst_won'] / 1e8:,.1f}"
@@ -383,6 +396,7 @@ def render_user_theme_md(cards: pl.DataFrame, month_end: date, end_date: date) -
             lines.append(
                 f"| {_md(r['isu_cd'])} {_md(r['isu_nm'])} | {_md(r['idx_ind_nm'])} | {_md(r['region'])} "
                 f"| {_yn(r['active'])} | {_md(r['hedge'])} | {_yn(r['synthetic_display'])} "
+                f"| {_yn(r['bond_mix_display'])} "
                 f"| {_md(_e1_cell(r))} | {na} | {tv} | {gp} |"
             )
         lines.append("")

@@ -40,6 +40,39 @@ import polars as pl
 from modeler.scores.quality import etf_classify as ec
 
 DEFAULT_INPUT_REL = "kr/output/etf_krx_research_pull_20261009/etf_daily_2010_20261008.csv.gz"
+
+# ---- 경로 (코드에 절대 경로를 박지 않는다: 환경변수로 받고 기본값만 상대 경로)
+INTERP_TABLE_REL = "kr/output/quality_score_etf_judgment_20261010/provenance/interp_table_v1_approved.md"
+PREREG_REL = "milestones/common/scores/20261010_quality_score/01_preregistration.md"
+
+
+def stock_data_root() -> Path:
+    return Path(os.environ.get("STOCK_DATA_ROOT", "../stock_data"))
+
+
+def my_root() -> Path:
+    return Path(os.environ.get("MY_ROOT", "../my"))
+
+
+def default_interp_table() -> str:
+    """해석 표 경로. ``QUALITY_INTERP_TABLE``(옛 이름 ``QUALITY_E_INTERP_TABLE``) > ``STOCK_DATA_ROOT``/상대 경로."""
+    env = os.environ.get("QUALITY_INTERP_TABLE") or os.environ.get("QUALITY_E_INTERP_TABLE")
+    return env or str(stock_data_root() / INTERP_TABLE_REL)
+
+
+def default_prereg() -> str:
+    """사전등록 경로. ``QUALITY_PREREG`` > ``MY_ROOT``(기본 ``../my``)/상대 경로."""
+    return os.environ.get("QUALITY_PREREG") or str(my_root() / PREREG_REL)
+
+
+def repo_root() -> Path:
+    """이 모듈 위치에서 올라가며 ``uv.lock`` 이 있는 저장소 루트를 찾는다(없으면 4단계 위)."""
+    here = Path(__file__).resolve()
+    for d in here.parents:
+        if (d / "uv.lock").exists():
+            return d
+    return here.parents[4]
+
 DEFAULT_OUT_REL = "kr/output/quality_score_etf_inputs_20261010/panel_checks"
 
 PANEL_VERSION = "quality-score-v0/etf_panel/1"

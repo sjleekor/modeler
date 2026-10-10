@@ -63,13 +63,8 @@ SECTION6_REIMPL = {"ge5_etf_years_2015_2024": 495, "ge3_etf_years_2015_2024": 94
 
 DEFAULT_INPUT_REL = ep.DEFAULT_INPUT_REL
 DEFAULT_OUT_REL = "kr/output/quality_score_etf_dev_20261010/e2"
-DEFAULT_INTERP_TABLE = (
-    "/private/tmp/claude-501/-Users-whishaw-wss-p-my/b1cc46eb-1957-4b1b-b4b5-6208b7ec737c/"
-    "scratchpad/interp_table_v1.md"
-)
-DEFAULT_PREREG = (
-    "/Users/whishaw/wss_p/my/milestones/common/scores/20261010_quality_score/01_preregistration.md"
-)
+DEFAULT_INTERP_TABLE = ep.INTERP_TABLE_REL  # 상대 경로. 실제 경로는 ep.default_interp_table()
+DEFAULT_PREREG = ep.PREREG_REL  # 상대 경로. 실제 경로는 ep.default_prereg()
 
 
 # ---------------------------------------------------------------- 보호
@@ -735,8 +730,8 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(os.environ.get("STOCK_DATA_ROOT", "../stock_data"))
     ap.add_argument("--input", default=str(root / DEFAULT_INPUT_REL))
     ap.add_argument("--out-dir", default=str(root / DEFAULT_OUT_REL))
-    ap.add_argument("--interp-table", default=DEFAULT_INTERP_TABLE)
-    ap.add_argument("--prereg", default=DEFAULT_PREREG)
+    ap.add_argument("--interp-table", default=ep.default_interp_table())
+    ap.add_argument("--prereg", default=ep.default_prereg())
     ap.add_argument("--period", choices=["dev"], required=True, help="이 CLI는 개발 구간만 돈다")
     a = ap.parse_args(argv)
     res = run_dev(a)
