@@ -152,16 +152,49 @@ def test_stop_clause_text():
     d = {"grade_rule": "D", "grade": "D"}
     a = {"grade_rule": "A", "grade": "A"}
     c = {"grade_rule": "C", "grade": "C"}
-    s = j.stop_clause(d, a)
-    assert s["fired"] and s["text"] == "중단 조건 충족 — 사용자 확인 대기" and s["which"] == ["E1 국내형"]
-    s = j.stop_clause(a, d)
-    assert s["fired"] and s["which"] == ["E2 괴리"]
-    assert j.stop_clause(d, d)["which"] == ["E1 국내형", "E2 괴리"]
-    s = j.stop_clause(c, a)
-    assert not s["fired"] and s["text"] is None
+    s = j.stop_clause(d)
+    assert s["fired"] and s["text"] == "중단 조건 충족 — 사용자 확인 대기" and s["which"] == ["E2 괴리"]
+    assert not j.stop_clause(a)["fired"]
+    s = j.stop_clause(c)
+    assert not s["fired"] and s["text"] is None and s["which"] == []
     # 표본 부족(등급 없음)이어도 규칙상 D면 해당, 비고를 남긴다
-    s = j.stop_clause({"grade_rule": "D", "grade": None}, a)
+    s = j.stop_clause({"grade_rule": "D", "grade": None})
     assert s["fired"] and s["note"]
+
+
+def test_stop_clause_ignores_e1():
+    """정정 E-1: E1 국내형은 기록용이라 중단 조항 인자에 아예 들어가지 않는다."""
+    import inspect
+
+    assert list(inspect.signature(j.stop_clause).parameters) == ["e2_gate"]
+
+
+# ---------------------------------------------------------------- 정정 E-1
+def test_correction_constants():
+    assert j.CORRECTION_ID == "E-1"
+    assert j.JUDGMENT_FAMILY == ("H_E2",)
+    assert j.E2_ALPHA == 0.025
+    assert j.INTERP_TABLE_SHA256 == "29c89969b8f5d467f2c998110eb8de00afb237de240fe2aad76abc7d07d728b1"
+    assert j.DEFAULT_INTERP_TABLE.endswith("interp_table_v1_approved.md")
+    assert j.DEFAULT_OUT_REL_JUDGMENT == "kr/output/quality_score_etf_judgment_20261010"
+
+
+def test_single_family_holm_uses_alpha_0025_and_strict_positive():
+    ok = lambda x: x > j.E2_G2_LOWER
+    seen = []
+
+    def bound(a):
+        seen.append(a)
+        return 0.05
+
+    r = j.holm_combine([{"name": "H_E2", "p": 0.01, "bound_fn": bound, "bound_ok": ok}], alphas=(j.E2_ALPHA,))
+    assert list(r) == ["H_E2"] and seen == [0.025]
+    assert r["H_E2"]["stage_alpha"] == 0.025 and r["H_E2"]["rejected"]
+    r = j.holm_combine([_item("H_E2", 0.01, {0.025: 0.0}, ok)], alphas=(j.E2_ALPHA,))
+    assert not r["H_E2"]["rejected"]  # 하한 = 0은 기각 아님
+    # α를 0.05로 풀어 기각되는 경우도 0.025에서는 안 된다(문턱을 풀지 않는다)
+    r = j.holm_combine([_item("H_E2", 0.01, {0.025: -0.01, 0.05: 0.02}, ok)], alphas=(j.E2_ALPHA,))
+    assert not r["H_E2"]["rejected"]
 
 
 # ---------------------------------------------------------------- KIND 일치
@@ -365,3 +398,63 @@ def test_outcome_stats_include_maturity_counts_maturity_events():
     b1 = e1.bootstrap(sc, life, "dev", 6, panel=t1.PN, b=50, include_maturity=True)["domestic"]
     b0 = e1.bootstrap(sc, life, "dev", 6, panel=t1.PN, b=50)["domestic"]
     assert np.nanmin(b0.arrays["hit"]) == 1.0 and np.nanmin(b1.arrays["hit"]) == 0.0
+
+
+# ---------------------------------------------------------------- 정정 E-1: 순자산 단독 전체 풀
+def test_netasst_full_pool_includes_corr_missing_and_alerts(fixture_scored):
+    pn, life = fixture_scored
+    full = e1.monthly_scores_netasst_full(pn, life)
+    old = e1.monthly_scores(pn, life)
+    assert list(full.columns) == list(old.columns)
+    assert set(full["region"].unique()) == {"domestic"}  # 해외형은 안 낸다
+    m = date(2023, 12, 29)
+    d = full.filter(pl.col("month_end") == m)
+    pool = d.filter(pl.col("in_pool"))
+    # 순자산 있는 국내형 대상 전부(상관 유무 무관). DZ는 순자산 0 → 풀 밖
+    assert set(pool["isu_cd"]) == {"D1", "D2", "D3", "D4", "A1", "YNG"}
+    assert not d.filter(pl.col("isu_cd") == "DZ")["in_pool"][0]
+    assert pool["pool_size"].unique().to_list() == [6]
+    p = {r["isu_cd"]: r for r in pool.iter_rows(named=True)}
+    assert p["A1"]["pct_netasst"] == 0.0 and p["D4"]["pct_netasst"] == 100.0
+    assert p["YNG"]["pct_netasst"] == pytest.approx(20.0)
+    for r in p.values():
+        assert r["e1"] == r["e1_pct"] == r["pct_netasst"]
+        assert r["alert"] == r["baseline_alert"] == (r["pct_netasst"] <= 10)
+        assert r["corr"] is None and r["pct_corr"] is None and r["corr_gap"] is None
+    assert p["A1"]["alert"] is True and p["YNG"]["alert"] is False
+
+
+def test_netasst_full_pool_keeps_etf_with_missing_corr(tmp_path):
+    """기초지수 종가가 비어 상관이 결측인 ETF도 풀에 있다 — 옛 점수는 풀 밖이다(정정 E-1 사유)."""
+    days = t1.weekdays(date(2022, 1, 3), date(2023, 12, 29))
+    rows = t1.build_rows(days, t1.SPEC)
+    for r in rows:
+        if r["ISU_CD"] == "D4":
+            r["OBJ_STKPRC_IDX"] = ""
+    pn = t1.make_panel(tmp_path, rows)
+    life = e1.ep.lifecycle(pn)
+    m = date(2023, 12, 29)
+    full = e1.monthly_scores_netasst_full(pn, life).filter(pl.col("month_end") == m)
+    old = e1.monthly_scores(pn, life).filter(pl.col("month_end") == m)
+    f = full.filter(pl.col("isu_cd") == "D4").row(0, named=True)
+    o = old.filter(pl.col("isu_cd") == "D4").row(0, named=True)
+    assert f["in_pool"] and f["pct_netasst"] == 100.0
+    assert not o["in_pool"]
+    assert full.filter(pl.col("in_pool")).height == old.filter(pl.col("in_pool") & (pl.col("region") == "domestic")).height + 1
+
+
+def test_netasst_full_feeds_outcome_stats_and_bootstrap(fixture_scored):
+    pn, life = fixture_scored
+    full = e1.monthly_scores_netasst_full(pn, life)
+    # 사건이 없는 합성 패널이라도 호출은 돼야 한다(구간 보호는 dev)
+    st = e1.outcome_stats(full, life, "dev", 6, panel=pn)
+    assert "domestic" in st["by_region"]
+    bt = e1.bootstrap(full, life, "dev", 6, panel=pn, b=20, seed=1)
+    assert "domestic" in bt
+
+
+def test_netasst_full_default_behavior_of_existing_scores_unchanged(fixture_scored):
+    pn, life = fixture_scored
+    a = e1.monthly_scores(pn, life)
+    e1.monthly_scores_netasst_full(pn, life)
+    assert a.equals(e1.monthly_scores(pn, life))

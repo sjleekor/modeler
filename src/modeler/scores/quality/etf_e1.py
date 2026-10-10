@@ -241,6 +241,71 @@ def monthly_scores(
     return out.sort(["month_end", "isu_cd"])
 
 
+def monthly_scores_netasst_full(
+    panel: ep.Panel,
+    life: pl.DataFrame,
+    last_month_end: date = LAST_MONTH_END,
+    include_maturity: bool = False,
+) -> pl.DataFrame:
+    """정정 E-1(2026-10-10 승인) 기록용 점수: "E1 국내형 순자산 단독, 전체 풀". 국내형만 낸다.
+
+    사유: 기초지수 종가(``OBJ_STKPRC_IDX``)가 사라진 ETF에서 생애 내내 비어 있어(룩어헤드) 상관 결측 여부로
+    정해지는 풀이 미래 폐지에 따라 달라진다. 그래서 풀 = 월말에 순자산이 있는 국내형 대상 ETF 전부다
+    (상관계수 유무와 무관, 지수 종가를 쓰지 않는다). 대상 조건(상장 1년·만기형·부적격·region)은
+    ``monthly_scores`` 와 같다. ``pct_netasst`` 는 그 풀 전체의 백분위, ``e1 = e1_pct = pct_netasst``,
+    ``alert = baseline_alert = pct_netasst <= 10``. 상관 관련 칸(``n_pairs``·``corr``·``corr_gap``·``pct_corr``)은
+    null. 칸 구조는 ``monthly_scores`` 와 같아 ``outcome_stats``·``bootstrap`` 에 그대로 넣을 수 있다."""
+    mn = ep.month_end_netassets(panel, life)
+    meta = life.select(
+        "isu_cd",
+        "first_date",
+        pl.col("exclude_maturity").fill_null(False),
+        pl.col("pension_ineligible_candidate").fill_null(False),
+        "region",
+        pl.col("active").fill_null(False),
+    )
+    g = (
+        mn.join(meta, on="isu_cd")
+        .filter(
+            (pl.col("month_end") <= last_month_end)
+            & ep.listed_one_year_expr()
+            & (True if include_maturity else ~pl.col("exclude_maturity"))
+            & ~pl.col("pension_ineligible_candidate")
+            & (pl.col("region") == "domestic")
+        )
+        .select("isu_cd", "month_end", "day_idx", "region", "active", "netasst")
+    )
+    g = g.with_columns(
+        pl.when(pl.col("netasst").is_not_null())
+        .then((pl.col("netasst") / NETASST_FLOOR_WON).log())
+        .otherwise(None)
+        .alias("log_netasst_dist"),
+        pl.lit(None, dtype=pl.Int64).alias("n_pairs"),
+        pl.lit(None, dtype=pl.Float64).alias("corr"),
+        pl.lit(None, dtype=pl.Float64).alias("corr_gap"),
+        pl.col("netasst").is_not_null().alias("in_pool"),
+    )
+    pool = g.filter(pl.col("in_pool")).with_columns(
+        percentile_expr("netasst", ["month_end"]).alias("pct_netasst"),
+        pl.len().over("month_end").alias("pool_size"),
+    )
+    pool = pool.with_columns(
+        pl.col("pct_netasst").alias("e1"),
+        pl.col("pct_netasst").alias("e1_pct"),
+        (pl.col("pct_netasst") <= ALERT_PCT).alias("alert"),
+        (pl.col("pct_netasst") <= ALERT_PCT).alias("baseline_alert"),
+        pl.lit(None, dtype=pl.Float64).alias("pct_corr"),
+    ).select(
+        "isu_cd", "month_end", "pct_netasst", "pct_corr", "pool_size", "e1", "e1_pct", "alert", "baseline_alert"
+    )
+    out = g.join(pool, on=["isu_cd", "month_end"], how="left").select(
+        "isu_cd", "month_end", "day_idx", "region", "active", "netasst", "log_netasst_dist",
+        "n_pairs", "corr", "corr_gap", "in_pool", "pool_size", "pct_netasst", "pct_corr", "e1",
+        "e1_pct", "alert", "baseline_alert",
+    )
+    return out.sort(["month_end", "isu_cd"])
+
+
 # ---------------------------------------------------------------- 사건(I13)·형성 월말(I01)
 def formation_month_end(last_date: date, month_end_dates: list[date], horizon_months: int) -> date | None:
     """I01: L에서 달력 ``horizon_months`` 개월을 뺀 날 이하의 가장 늦은 월말 거래일. 없으면 None.
