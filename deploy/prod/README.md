@@ -202,10 +202,12 @@ gate는 `python -m modeler.serving.us_daily parity-check --rule det_a --output <
 
 | 검사 | 기준 |
 |---|---|
-| G1 | 만든 v2 멤버 = `universe_daily_v2`의 `in_universe` 심볼(봉인된 part 파일을 따로 읽음) |
+| G1 | 만든 서빙 멤버 = `universe_daily_v2`의 `in_universe` 심볼에서 ADR을 뺀 것(봉인된 part 파일을 따로 읽음). 날짜별로 뺀 ADR 행 수를 `excluded_security_type_rows`에 적음 |
 | G2 | 동결 키와 v2 키의 교집합에서 비재무 42개가 셀 단위로 같음 (v1 비재무 기준과 같은 비교·허용오차) |
 | G3 | 교집합에서 `price_ge_5` 동일 |
-| G4 | 동결에만 있는 키는 모두 v2 비멤버, v2에만 있는 키는 모두 동결에 없는 v2 멤버 |
+| G4 | 동결에만 있는 키는 모두 서빙 비멤버, v2에만 있는 키는 모두 동결에 없는 서빙 멤버 |
+
+**서빙 v2는 ADR을 뺍니다(사용자 결정 2026-10-10, 규칙 이름 `v2-minus-adr`).** 서빙 멤버는 `universe_daily_v2`의 `in_universe` 멤버에서 `security_type == "adr"`를 뺀 것입니다. ADR은 재무·MIDAS 주문흐름이 v1의 펀드·채권·우선주처럼 거의 비어 있고, 탐색 모델이 ADR 없는 v1 패널로 학습돼서 측정 A5에서 LightGBM 상위 100의 17개가 ADR이었습니다. 서빙에만 적용하며 연구·forward v2 정의(ADR 포함, `modeler.us.panel.build_panel`)는 그대로입니다. `security_type`이 null인 멤버는 ADR이 아니므로 남깁니다. 규칙은 `us_daily.UNIVERSE_V2_SERVING_RULE`·`SERVING_V2_EXCLUDED_SECURITY_TYPES`이고, v2 prepare의 `prep_hash`와 manifest에 `universe_v2_serving_rule`·`universe_v2_excluded_security_types`로 적힙니다. evidence의 `universe_v2` 절에도 `serving_rule`·`excluded_security_types`가 적히고, 현재 상수와 다르거나 없으면 `us_parity_v2_failures`와 `validate_parity_evidence`가 거부합니다(ADR 제외 이전에 만든 v2 evidence는 쓸 수 없고 다시 돌려야 합니다).
 
 점수·순위 비교는 v2에 적용하지 않습니다(모델 입력이 유니버스 안 순위 변환이라서). 행 수, v1에만 있는 행(`security_type`·`exclusion_reason`별)과 v2에만 있는 행(`security_type`별), 교집합의 재무 11개 차이 셀, 피쳐별 null 비율은 기록만 하고 판정하지 않습니다. v1 절과 v2 절이 모두 통과해야 `status`가 `score_equivalent`입니다. **v2 서빙 prepare(`us_universe_version` = `v2`)에는 통과한 `universe_v2` 절이 있는 evidence가 필요하고, 그 절의 `rule_version`이 prepare가 읽을 `universe_daily_v2` completion의 `rule_version`과 같아야 합니다.** collector의 v2 규칙이 바뀌면 parity를 다시 돌립니다. v1 모드 evidence에는 `universe_v2` 절이 없고 모양도 그대로입니다.
 

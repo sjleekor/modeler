@@ -19,6 +19,8 @@ from test_daily_inputs import _hash, _inputs, _write
 from modeler.serving import us_daily
 from modeler.serving.daily_inputs import select
 from modeler.serving.us_daily import (
+    SERVING_V2_EXCLUDED_SECURITY_TYPES,
+    UNIVERSE_V2_SERVING_RULE,
     _monthly_membership,
     collect_pinned_revisions,
     latest_complete_session,
@@ -66,14 +68,17 @@ def _v1(rows: list[tuple]) -> pl.DataFrame:
     )
 
 
-def _v2(rows: list[tuple[str, bool]], *, view: list[str] | None = None) -> pl.DataFrame:
+def _v2(rows: list[tuple], *, view: list[str] | None = None) -> pl.DataFrame:
+    """rows: (symbol, in_universe[, security_type]) -- security_type defaults to ``common``."""
     frame = pl.DataFrame(
         {
             "date": [MONTH_FIRST] * len(rows),
             "symbol": [r[0] for r in rows],
             "security_id": [f"id-{i}" for i in range(len(rows))],
+            "security_type": [r[2] if len(r) > 2 else "common" for r in rows],
             "in_universe": [r[1] for r in rows],
-        }
+        },
+        schema_overrides={"security_type": pl.String},
     )
     return frame.with_columns(pl.Series("view", view)) if view is not None else frame
 
@@ -123,6 +128,33 @@ def test_v2_membership_takes_v2_symbols_with_v1_attributes() -> None:
     out = members.filter(pl.col("symbol") == "OUT").row(0, named=True)
     assert out["cik"] == 4 and out["sic2"] == "20"
     assert members["date"].unique().to_list() == [date(2026, 10, 2)]
+
+
+def test_v2_membership_excludes_adr_only_in_v2_and_keeps_other_types_and_null() -> None:
+    assert SERVING_V2_EXCLUDED_SECURITY_TYPES == ("adr",)
+    assert UNIVERSE_V2_SERVING_RULE == "v2-minus-adr"
+    v2 = _v2([("AAA", True, "common"), ("BBB", True, "reit"), ("NEWV2", True, "common_equity"),
+              ("ADR1", True, "adr"), ("ADR2", True, "adr"), ("NULLT", True, None),
+              ("OUTADR", False, "adr"), ("OUT", False, "common")])
+    lake = _lake(v2, _v1(V1_ROWS + [("ADR1", True, 9, "3571", 9)]))
+    v2_members = _monthly_membership(lake, date(2026, 10, 2), "v2")
+    assert sorted(v2_members["symbol"].to_list()) == ["AAA", "BBB", "NEWV2", "NULLT"]
+    # v1 is untouched: it ignores universe_daily_v2 and its own ADR-like rows stay
+    v1_members = _monthly_membership(lake, date(2026, 10, 2), "v1")
+    assert sorted(v1_members["symbol"].to_list()) == ["AAA", "ADR1", "BBB", "ONLYV1"]
+    # a month made only of ADRs is empty after the exclusion
+    with pytest.raises(ValueError, match="비었습니다"):
+        _monthly_membership(_lake(_v2([("ADR1", True, "adr")])), date(2026, 10, 2), "v2")
+
+
+def test_research_panel_v2_still_includes_adr() -> None:
+    """The serving rule must not leak into the research/forward v2 definition (D2)."""
+    from modeler.us import panel
+
+    v2 = _v2([("AAA", True, "common"), ("ADR1", True, "adr")])
+    lake = _lake(v2, _v1(V1_ROWS + [("ADR1", True, 9, "3571", 9)]))
+    members = panel._members_v2(lake, [MONTH_FIRST]).collect()
+    assert sorted(members["symbol"].to_list()) == ["AAA", "ADR1"]
 
 
 def test_v2_membership_reads_the_first_session_of_the_month_only() -> None:
@@ -349,7 +381,10 @@ def test_v2_prepare_records_the_v2_snapshot_and_changes_the_prep_id(
     assert entry["sha256"] == sha256_file(v2_part)
     only_v2 = set(v2) - set(v1)
     assert only_v2 == {"universe_version", "universe_v2_snapshot_date", "universe_v2_completion_sha256",
-                       "universe_v2_rule_version", "universe_v2_input_snapshot_sha256"}
+                       "universe_v2_rule_version", "universe_v2_input_snapshot_sha256",
+                       "universe_v2_serving_rule", "universe_v2_excluded_security_types"}
+    assert v2["universe_v2_serving_rule"] == "v2-minus-adr"
+    assert v2["universe_v2_excluded_security_types"] == ["adr"]
 
 
 def test_v2_prepare_stops_on_a_bad_v2_completion(tmp_path: Path, monkeypatch) -> None:

@@ -21,6 +21,8 @@ from modeler.reporting.markdown import SELECT_REASON_KO
 from modeler.serving import us_daily
 from modeler.serving.orchestration import (
     US_PARITY_CRITERIA,
+    SERVING_V2_EXCLUDED_SECURITY_TYPES,
+    UNIVERSE_V2_SERVING_RULE,
     US_PARITY_V2_CRITERIA,
     us_parity_failures,
     us_parity_v2_failures,
@@ -49,9 +51,11 @@ def _block(**overrides) -> dict:
         "snapshot_date": REVISION,
         "completion_sha256": "a" * 64,
         "rule_version": RULE_VERSION,
+        "serving_rule": UNIVERSE_V2_SERVING_RULE,
+        "excluded_security_types": list(SERVING_V2_EXCLUDED_SECURITY_TYPES),
         "per_date": [
             {
-                "date": d.isoformat(), "v2_rows": 10, "common_keys": 9, "v1_only": 1, "v2_only": 1,
+                "date": d.isoformat(), "v2_rows": 10, "excluded_security_type_rows": 2, "common_keys": 9, "v1_only": 1, "v2_only": 1,
                 "g1_missing_symbols": 0, "g1_extra_symbols": 0, "g1_duplicate_symbols": 0,
                 "g3_eligible_mismatch_rows": 0, "g4_unexplained_frozen_only": 0,
                 "g4_unexplained_v2_only": 0,
@@ -104,6 +108,10 @@ def _set(path: tuple, value):
     (_set(("per_date", 3, "common_keys"), 0), "common_keys"),
     (_set(("criteria", "g2_non_financial_diff_cells"), 5), "criteria differ from code constants"),
     (_set(("rule_version",), ""), "rule_version"),
+    (_set(("serving_rule",), "v2"), "serving_rule"),
+    (_set(("serving_rule",), None), "serving_rule"),
+    (_set(("excluded_security_types",), []), "excluded_security_types"),
+    (_set(("excluded_security_types",), ["adr", "reit"]), "excluded_security_types"),
     (_set(("completion_sha256",), "short"), "completion_sha256"),
     (_set(("snapshot_date",), None), "snapshot_date"),
     (_set(("per_date",), []), "per_date missing"),
@@ -158,6 +166,20 @@ def test_validate_v2_requires_a_passed_block_with_the_same_rule_version(tmp_path
     with pytest.raises(ValueError, match="gate 기준"):
         validate_parity_evidence(
             _write(tmp_path, failed_numbers, "num.json"),
+            universe_version="v2", universe_v2_rule_version=RULE_VERSION)
+
+    # evidence made under a different (or no) serving rule is rejected
+    for key, value in (("serving_rule", "v2"), ("excluded_security_types", [])):
+        other = _with_block(**{key: value})
+        with pytest.raises(ValueError, match="gate 기준"):
+            validate_parity_evidence(
+                _write(tmp_path, other, f"{key}.json"),
+                universe_version="v2", universe_v2_rule_version=RULE_VERSION)
+    old = _with_block()
+    del old["universe_v2"]["serving_rule"]
+    with pytest.raises(ValueError, match="gate 기준"):
+        validate_parity_evidence(
+            _write(tmp_path, old, "old.json"),
             universe_version="v2", universe_v2_rule_version=RULE_VERSION)
 
     with pytest.raises(ValueError, match="rule_version"):
@@ -275,6 +297,7 @@ def test_block_passes_and_records_counts_breakdowns_and_null_rates(tmp_path: Pat
     assert block["non_financial"]["diff_cells"] == 0 and block["non_financial"]["common_keys"] == 12
     assert {(b["security_type"], b["exclusion_reason"]): b["rows"] for b in block["v1_only_breakdown"]} == {
         ("etf", "fund_name"): 6, ("adr", "adr"): 6, ("(no v2 row)", "(no v2 row)"): 6}
+    assert block["serving_rule"] == "v2-minus-adr" and block["excluded_security_types"] == ["adr"]
     assert block["v2_only_breakdown"] == [{"security_type": "common", "rows": 6}]
     fin = block["financial_vs_frozen_on_common_diff_cells"]
     assert fin[FIN[0]] == 6 and fin[FIN[1]] == 6 and sum(fin.values()) == 12
@@ -282,6 +305,29 @@ def test_block_passes_and_records_counts_breakdowns_and_null_rates(tmp_path: Pat
     assert (nulls["common_rows"], nulls["v2_only_rows"]) == (12, 6)
     assert nulls["by_feature"][FEATURES[0]] == {"common": 0.5, "v2_only": 0.0}
     json.dumps(block)  # serializable as is
+
+
+def test_block_g1_g4_use_serving_members_so_adr_members_are_excluded(tmp_path: Path, monkeypatch) -> None:
+    root = _v2_root(tmp_path, ["AAA", "BBB"], {})
+    part = root.derived / "snapshots" / UNIVERSE_V2_TABLE / f"snapshot_date={REVISION}" / "part.parquet"
+    table = pl.read_parquet(part)
+    adr = table.filter(pl.col("symbol") == "AAA").with_columns(
+        pl.lit("ADRX").alias("symbol"), pl.lit("adr").alias("security_type"))
+    pl.concat([table, adr]).write_parquet(part)
+    marker = part.parent / "completion.json"
+    marker.write_text(json.dumps({**json.loads(marker.read_text()), "snapshot_sha256": sha256_file(part)}))
+    frozen = _frame(["AAA", "BBB", "ADRX"])  # v1 frozen set holds the ADR member
+    block = _build_block(monkeypatch, root, _frame(["AAA", "BBB"]), frozen)
+    assert block["status"] == "passed", block["failures"]
+    for d in block["per_date"]:
+        assert d["excluded_security_type_rows"] == 1
+        assert (d["v1_only"], d["g1_extra_symbols"], d["g4_unexplained_frozen_only"]) == (1, 0, 0)
+    assert block["v1_only_breakdown"] == [
+        {"security_type": "adr", "exclusion_reason": "(null)", "rows": 6}]
+    # a panel that still carries the ADR fails G1 (extra) and G4 (v2-only unexplained)
+    bad = _build_block(monkeypatch, root, _frame(["AAA", "BBB", "ADRX"]), _frame(["AAA", "BBB"]))
+    assert {"g1_members", "g4_key_accounting"} <= set(bad["failures"])
+    assert bad["per_date"][0]["g1_extra_symbols"] == 1
 
 
 def test_block_g2_fails_on_a_non_financial_cell_on_common_keys(tmp_path: Path, monkeypatch) -> None:

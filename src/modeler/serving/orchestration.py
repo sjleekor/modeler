@@ -603,6 +603,14 @@ US_PARITY_V2_CRITERIA: dict[str, int] = {
 }
 US_PARITY_V2_PASSED = "passed"
 
+# 서빙 v2 멤버십 규칙(사용자 결정 2026-10-10, 측정 A5): v2 서빙은 `universe_daily_v2`의
+# in_universe 멤버에서 ADR을 뺀다. ADR은 재무·MIDAS 주문흐름이 v1의 펀드·채권·우선주처럼
+# 95~99% 비고, 탐색 모델이 ADR 없는 v1 패널로 학습돼 A5에서 LightGBM 상위 100의 17개가 ADR이었다.
+# 서빙에만 적용한다. 연구·forward v2 정의(D2, `modeler.us.panel.build_panel`)는 ADR을 포함한 채 그대로다.
+# parity evidence의 v2 절에 이 규칙이 적히고, 다른 규칙으로 만든 evidence는 거부된다.
+SERVING_V2_EXCLUDED_SECURITY_TYPES: tuple[str, ...] = ("adr",)
+UNIVERSE_V2_SERVING_RULE = "v2-minus-adr"
+
 
 def us_parity_v2_failures(block: Any) -> list[str]:
     """Re-derive the v2 block's pass/fail (G1-G4) from its recorded numbers."""
@@ -619,6 +627,10 @@ def us_parity_v2_failures(block: Any) -> list[str]:
         failures.append("completion_sha256")
     if not (isinstance(block.get("rule_version"), str) and block["rule_version"]):
         failures.append("rule_version")
+    if block.get("serving_rule") != UNIVERSE_V2_SERVING_RULE:
+        failures.append("serving_rule")
+    if block.get("excluded_security_types") != list(SERVING_V2_EXCLUDED_SECURITY_TYPES):
+        failures.append("excluded_security_types")
     per_date = block.get("per_date")
     if not isinstance(per_date, list) or len(per_date) != c["golden_dates"]:
         failures.append("per_date missing")
