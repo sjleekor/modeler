@@ -394,25 +394,77 @@ def export_frozen_model_bundles(
     return exported
 
 
-def _monthly_membership(lake: UsLake, scoring_date: date) -> pl.DataFrame:
-    """Use the first-session member list for that month, without rejudging it daily."""
+UNIVERSE_VERSIONS = ("v1", "v2")
+UNIVERSE_V2_TABLE = "universe_daily_v2"
+
+
+def validate_universe_version(universe_version: str) -> str:
+    """Only ``v1`` (``universe_daily``) and ``v2`` (``universe_daily_v2``) exist."""
+    if universe_version not in UNIVERSE_VERSIONS:
+        raise ValueError(f"universe_version은 {UNIVERSE_VERSIONS} 중 하나여야 합니다: {universe_version!r}")
+    return universe_version
+
+
+_MEMBER_COLUMNS = ("symbol", "cik", "sic", "mcap_rank", "adv_20d", "exchange")
+
+
+def _monthly_membership(
+    lake: UsLake, scoring_date: date, universe_version: str = "v1"
+) -> pl.DataFrame:
+    """Use the first-session member list for that month, without rejudging it daily.
+
+    ``v2`` takes the member symbols from ``universe_daily_v2`` (PIT rows only) and the other
+    columns from the v1 ``universe_daily`` row of the same date and symbol, as the research panel
+    does (``panel._members_v2``).  A v2 member without a v1 row keeps null attributes.
+    """
+    validate_universe_version(universe_version)
     month_start = scoring_date.replace(day=1)
     first_sessions = month_first_trading_days(lake, month_start, scoring_date)
     if not first_sessions:
         raise ValueError(f"거래 캘린더에 {scoring_date:%Y-%m} 세션이 없습니다")
     membership_date = first_sessions[-1]
-    members = (
-        lake.scan("universe_daily")
-        .filter((pl.col("date") == membership_date) & pl.col("in_universe"))
-        .select("symbol", "cik", "sic", "mcap_rank", "adv_20d", "exchange")
-        .with_columns(
-            pl.when(pl.col("sic").is_not_null())
-            .then(pl.col("sic").str.slice(0, 2))
-            .otherwise(None)
-            .alias("sic2")
+    if universe_version == "v1":
+        members = (
+            lake.scan("universe_daily")
+            .filter((pl.col("date") == membership_date) & pl.col("in_universe"))
+            .select(*_MEMBER_COLUMNS)
+            .with_columns(
+                pl.when(pl.col("sic").is_not_null())
+                .then(pl.col("sic").str.slice(0, 2))
+                .otherwise(None)
+                .alias("sic2")
+            )
+            .collect()
         )
-        .collect()
-    )
+    else:
+        v2 = lake.scan(UNIVERSE_V2_TABLE)
+        if "view" in v2.collect_schema().names():
+            v2 = v2.filter(pl.col("view") == "pit")
+        v2_members = (
+            v2.filter((pl.col("date") == membership_date) & pl.col("in_universe"))
+            .select("symbol")
+            .collect()
+        )
+        if v2_members.is_empty():
+            raise ValueError(f"월간 유니버스(v2)가 비었습니다: {membership_date}")
+        if v2_members["symbol"].n_unique() != v2_members.height:
+            raise ValueError(f"월간 유니버스(v2)에 중복 심볼이 있습니다: {membership_date}")
+        attributes = (
+            lake.scan("universe_daily")
+            .filter(pl.col("date") == membership_date)
+            .select(*_MEMBER_COLUMNS)
+        )
+        members = (
+            v2_members.lazy()
+            .join(attributes, on="symbol", how="left")
+            .with_columns(
+                pl.when(pl.col("sic").is_not_null())
+                .then(pl.col("sic").str.slice(0, 2))
+                .otherwise(None)
+                .alias("sic2")
+            )
+            .collect()
+        )
     if members.is_empty():
         raise ValueError(f"월간 유니버스가 비었습니다: {membership_date}")
     if members["symbol"].n_unique() != members.height:
@@ -421,7 +473,11 @@ def _monthly_membership(lake: UsLake, scoring_date: date) -> pl.DataFrame:
 
 
 def build_daily_panel(
-    lake: UsLake, scoring_date: date, *, decision_at: datetime | None = None
+    lake: UsLake,
+    scoring_date: date,
+    *,
+    decision_at: datetime | None = None,
+    universe_version: str = "v1",
 ) -> pl.DataFrame:
     """Build the requested completed-session panel from monthly membership and PIT prices."""
     calendar_row = (
@@ -440,7 +496,7 @@ def build_daily_panel(
         if session_close >= decision_at.astimezone(_EASTERN_TZ):
             raise ValueError(f"decision_at 전에 장이 끝나지 않은 세션입니다: {scoring_date}")
 
-    members = _monthly_membership(lake, scoring_date)
+    members = _monthly_membership(lake, scoring_date, universe_version)
     raw = (
         lake.scan("prices_daily")
         .filter(pl.col("date") == scoring_date)
@@ -487,6 +543,7 @@ def build_daily_features(
     *,
     decision_at: datetime | None = None,
     financial_selection_rule: str = SERVING_FINANCIAL_RULE,
+    universe_version: str = "v1",
 ) -> pl.DataFrame:
     """Build the frozen 53 features for one completed US session; labels are never opened."""
     return build_daily_features_for_dates(
@@ -494,6 +551,7 @@ def build_daily_features(
         [scoring_date],
         decision_at_by_date={scoring_date: decision_at},
         financial_selection_rule=financial_selection_rule,
+        universe_version=universe_version,
     )
 
 
@@ -515,13 +573,17 @@ def build_daily_features_for_dates(
     *,
     decision_at_by_date: dict[date, datetime | None] | None = None,
     financial_selection_rule: str = SERVING_FINANCIAL_RULE,
+    universe_version: str = "v1",
 ) -> pl.DataFrame:
     """Build multiple feature-only sessions together so each source scan is shared."""
+    validate_universe_version(universe_version)
     if not scoring_dates or len(set(scoring_dates)) != len(scoring_dates):
         raise ValueError("scoring_dates는 비어 있지 않고 중복이 없어야 합니다")
     decision_at_by_date = decision_at_by_date or {}
     panels = [
-        build_daily_panel(lake, day, decision_at=decision_at_by_date.get(day))
+        build_daily_panel(
+            lake, day, decision_at=decision_at_by_date.get(day), universe_version=universe_version
+        )
         for day in sorted(scoring_dates)
     ]
     features = pl.concat(panels).sort(["date", "symbol"])
@@ -998,7 +1060,9 @@ def fingerprint_source_snapshots(root: DataRoot, revisions: dict[str, str]) -> d
 UNIVERSE_INPUT_TABLES = ("prices_daily", "listing_snapshots", "filings_sub", "midas_security_daily")
 
 
-def collect_pinned_revisions(root: DataRoot, lake: UsLake) -> dict[str, str]:
+def collect_pinned_revisions(
+    root: DataRoot, lake: UsLake, universe_version: str = "v1"
+) -> dict[str, str]:
     """Snapshot of every table to read: the newest, except the universe inputs.
 
     The universe inputs are pinned to the snapshots the newest ``universe_daily`` completion
@@ -1009,8 +1073,15 @@ def collect_pinned_revisions(root: DataRoot, lake: UsLake) -> dict[str, str]:
     are the same, so there is no look-ahead; the cost is that a prices snapshot newer than the
     universe cannot be used until the universe is rebuilt from it (``latest_complete_session``
     then falls back to the session both cover).  The verification itself is unchanged.
+
+    ``universe_version="v2"`` also pins the newest ``universe_daily_v2`` snapshot.  The v1 tables
+    stay as above: v2 only supplies the member symbols, the other columns come from v1.  ``v1``
+    returns exactly the revisions it always did.
     """
+    validate_universe_version(universe_version)
     revisions = collect_source_revision(lake)
+    if universe_version == "v2":
+        revisions[UNIVERSE_V2_TABLE] = lake.latest_snapshot(UNIVERSE_V2_TABLE).isoformat()
     marker = (root.derived / "snapshots" / "universe_daily" /
               f"snapshot_date={revisions['universe_daily']}" / "completion.json")
     try:
@@ -1030,32 +1101,44 @@ def collect_pinned_revisions(root: DataRoot, lake: UsLake) -> dict[str, str]:
     return revisions
 
 
-def latest_complete_session(as_of: date, *, root: DataRoot | None = None) -> dict[str, Any]:
+def latest_complete_session(
+    as_of: date, *, root: DataRoot | None = None, universe_version: str = "v1"
+) -> dict[str, Any]:
     """The newest XNYS session <= ``as_of`` that prices and universe both cover (A').
 
     Reads the same pinned snapshots ``prepare_daily_features`` will use, so a session returned here
-    can be prepared.  ``resolved`` is None when the lake covers no session at all.
+    can be prepared.  ``resolved`` is None when the lake covers no session at all.  With
+    ``universe_version="v2"`` the ``universe_daily_v2`` last date also bounds A' and is returned as
+    ``universe_v2_max`` (a stalled v2 build then shows up as ``stale``).
     """
+    validate_universe_version(universe_version)
     root = root or DataRoot.resolve(market="us")
-    lake = PinnedUsLake(root, collect_pinned_revisions(root, UsLake(root)))
+    lake = PinnedUsLake(root, collect_pinned_revisions(root, UsLake(root), universe_version))
 
     def newest(table: str) -> date | None:
         value = lake.scan_raw(table).select(pl.col("date").max()).collect().item()
         return value.date() if isinstance(value, datetime) else value
 
     prices_max, universe_max = newest("prices_daily"), newest("universe_daily")
+    v2_max = newest(UNIVERSE_V2_TABLE) if universe_version == "v2" else None
     resolved = None
-    if prices_max is not None and universe_max is not None:
+    if (prices_max is not None and universe_max is not None
+            and (universe_version == "v1" or v2_max is not None)):
         bound = min(as_of, prices_max, universe_max)
+        if v2_max is not None:
+            bound = min(bound, v2_max)
         resolved = (
             lake.scan("trading_calendar")
             .filter((pl.col("exchange") == "XNYS") & (pl.col("date") <= bound))
             .select(pl.col("date").max()).collect().item())
-    return {"requested": as_of.isoformat(), "prices_max": prices_max.isoformat() if prices_max else None,
-            "universe_max": universe_max.isoformat() if universe_max else None,
-            "resolved": resolved.isoformat() if resolved else None,
-            "stale": bool(resolved and resolved < as_of),
-            "pinned_inputs": {t: lake.snapshots[t] for t in UNIVERSE_INPUT_TABLES}}
+    found = {"requested": as_of.isoformat(), "prices_max": prices_max.isoformat() if prices_max else None,
+             "universe_max": universe_max.isoformat() if universe_max else None,
+             "resolved": resolved.isoformat() if resolved else None,
+             "stale": bool(resolved and resolved < as_of),
+             "pinned_inputs": {t: lake.snapshots[t] for t in UNIVERSE_INPUT_TABLES}}
+    if universe_version == "v2":
+        found["universe_v2_max"] = v2_max.isoformat() if v2_max else None
+    return found
 
 
 def verify_universe_completion(root: DataRoot, revision: str,
@@ -1095,6 +1178,40 @@ def verify_universe_completion(root: DataRoot, revision: str,
         if not path.is_file() or sha256_file(path) != expected_hash:
             raise ValueError("US universe ticker source changed")
     return sha256_file(marker)
+
+
+def verify_universe_v2_completion(root: DataRoot, revision: str) -> dict[str, Any]:
+    """Check the ``universe_daily_v2`` snapshot the daily serving reads.
+
+    v2 only supplies the member symbols, so the integrity of the part file it was sealed with is
+    what a rerun needs.  The seven input tables are not hashed again; the completion record names
+    them and they are copied to the manifest.  Returns ``completion_sha256``, ``rule_version`` and
+    ``input_snapshot_sha256`` / ``input_snapshots`` for it.
+    """
+    part = root.derived / "snapshots" / UNIVERSE_V2_TABLE / f"snapshot_date={revision}" / "part.parquet"
+    marker = part.parent / "completion.json"
+    if not part.is_file() or not marker.is_file() or part.is_symlink() or marker.is_symlink():
+        raise ValueError("US universe_daily_v2 requires a completed snapshot (part.parquet and completion.json)")
+    record = json.loads(marker.read_text())
+    if (record.get("schema_version") != 1 or record.get("table") != UNIVERSE_V2_TABLE
+            or record.get("snapshot_date") != revision
+            or record.get("snapshot_sha256") != sha256_file(part)):
+        raise ValueError("US universe_daily_v2 completion does not match its snapshot")
+    if record.get("unjudged_months") != []:
+        raise ValueError("US universe_daily_v2 has unjudged months")
+    rule_version = record.get("rule_version")
+    if not isinstance(rule_version, str) or not rule_version:
+        raise ValueError("US universe_daily_v2 completion has no rule_version")
+    input_hashes = record.get("input_snapshot_sha256")
+    input_snapshots = record.get("input_snapshots")
+    if not isinstance(input_hashes, dict) or not isinstance(input_snapshots, dict):
+        raise ValueError("US universe_daily_v2 completion does not identify its input snapshots")
+    return {
+        "completion_sha256": sha256_file(marker),
+        "rule_version": rule_version,
+        "input_snapshot_sha256": dict(input_hashes),
+        "input_snapshots": dict(input_snapshots),
+    }
 
 
 def model_paths(root: DataRoot) -> tuple[dict[str, Path], dict[str, Path]]:
@@ -1159,8 +1276,15 @@ def validate_parity_evidence(evidence_path: Path) -> dict[str, Any]:
 
 def prepare_daily_features(scoring_date: date, *, diagnostic_only: bool = False,
                            raw_feature_parity_status: str = "unverified",
-                           raw_feature_parity_evidence: str | None = None) -> Path:
-    """Build an immutable native artifact keyed only by A and its input/code identity."""
+                           raw_feature_parity_evidence: str | None = None,
+                           universe_version: str = "v1") -> Path:
+    """Build an immutable native artifact keyed only by A and its input/code identity.
+
+    ``universe_version="v2"`` takes the members from ``universe_daily_v2`` (see
+    ``_monthly_membership``) and records the v2 snapshot in the prep hash and manifest.  With the
+    default ``v1`` nothing changes: same inputs, same hash, same manifest keys.
+    """
+    validate_universe_version(universe_version)
     if raw_feature_parity_status not in {"passed", US_PARITY_SCORE_EQUIVALENT, "failed", "unverified"}:
         raise ValueError("invalid raw feature parity status")
     if raw_feature_parity_status == US_PARITY_SCORE_EQUIVALENT:
@@ -1184,12 +1308,29 @@ def prepare_daily_features(scoring_date: date, *, diagnostic_only: bool = False,
     prepare_started_at = datetime.now().astimezone()
     root = DataRoot.resolve(market="us")
     live_lake = UsLake(root)
-    revisions = collect_pinned_revisions(root, live_lake)
+    revisions = (
+        collect_pinned_revisions(root, live_lake)
+        if universe_version == "v1"
+        else collect_pinned_revisions(root, live_lake, universe_version)
+    )
     source_snapshot_files = fingerprint_source_snapshots(root, revisions)
     universe_completion_sha256 = verify_universe_completion(
         root, revisions["universe_daily"], revisions)
+    universe_v2_fields: dict[str, Any] = {}
+    if universe_version == "v2":
+        v2_revision = revisions[UNIVERSE_V2_TABLE]
+        v2_check = verify_universe_v2_completion(root, v2_revision)
+        universe_v2_fields = {
+            "universe_version": "v2",
+            "universe_v2_snapshot_date": v2_revision,
+            "universe_v2_completion_sha256": v2_check["completion_sha256"],
+            "universe_v2_rule_version": v2_check["rule_version"],
+            "universe_v2_input_snapshot_sha256": v2_check["input_snapshot_sha256"],
+        }
     lake = PinnedUsLake(root, revisions)
-    features = build_daily_features(lake, scoring_date, financial_selection_rule=financial_rule)
+    features = build_daily_features(
+        lake, scoring_date, financial_selection_rule=financial_rule,
+        universe_version=universe_version)
     if fingerprint_source_snapshots(root, revisions) != source_snapshot_files:
         raise ValueError("US source snapshot changed during daily feature preparation")
     if raw_feature_parity_evidence and sha256_file(Path(raw_feature_parity_evidence)) != parity_evidence_sha256:
@@ -1202,6 +1343,7 @@ def prepare_daily_features(scoring_date: date, *, diagnostic_only: bool = False,
             "source_revision": revisions,
             "source_snapshot_files": source_snapshot_files,
             "universe_completion_sha256": universe_completion_sha256,
+            **universe_v2_fields,
             "diagnostic_only": diagnostic_only,
             "raw_feature_parity_status": raw_feature_parity_status,
             "raw_feature_parity_evidence": raw_feature_parity_evidence,
@@ -1243,6 +1385,7 @@ def prepare_daily_features(scoring_date: date, *, diagnostic_only: bool = False,
         "source_revision": revisions,
         "source_snapshot_files": source_snapshot_files,
         "universe_completion_sha256": universe_completion_sha256,
+        **universe_v2_fields,
         "diagnostic_only": diagnostic_only,
         "raw_feature_parity_status": raw_feature_parity_status,
         "raw_feature_parity_evidence": raw_feature_parity_evidence,
@@ -1749,6 +1892,8 @@ def main(argv: list[str] | None = None) -> int:
     prepare = subparsers.add_parser("prepare", help="일일 derived 이후 daily feature를 미리 저장")
     prepare.add_argument("--as-of", required=True, help="완료된 XNYS 세션 (YYYY-MM-DD)")
     prepare.add_argument("--diagnostic-only", action="store_true", help="운영 선택을 금지한 진단 준비")
+    prepare.add_argument("--universe-version", choices=list(UNIVERSE_VERSIONS), default="v1",
+                         help="멤버십 원천: v1=universe_daily(기본), v2=universe_daily_v2")
     prepare.add_argument("--raw-feature-parity-evidence", help="failed 또는 score_equivalent parity 근거 JSON 경로")
     prepare.add_argument(
         "--raw-feature-parity-status", choices=[US_PARITY_SCORE_EQUIVALENT],
@@ -1757,6 +1902,8 @@ def main(argv: list[str] | None = None) -> int:
     resolve = subparsers.add_parser(
         "resolve-session", help="레이크가 덮는 가장 최근 완결 세션 A'(<= as-of)를 찍는다")
     resolve.add_argument("--as-of", required=True, help="기대 세션 A (YYYY-MM-DD)")
+    resolve.add_argument("--universe-version", choices=list(UNIVERSE_VERSIONS), default="v1",
+                         help="v2면 universe_daily_v2 최대일도 A' 상한에 넣는다")
     select = subparsers.add_parser("select", help="D 09:30에 native US A를 선택해 freshness 고정")
     select.add_argument("--prepared-manifest", required=True)
     select.add_argument("--report-date", required=True)
@@ -1794,11 +1941,13 @@ def main(argv: list[str] | None = None) -> int:
             diagnostic_only=args.diagnostic_only,
             raw_feature_parity_status=status,
             raw_feature_parity_evidence=args.raw_feature_parity_evidence,
+            universe_version=args.universe_version,
         )
         print(f"prepared: {manifest}")
         return 0
     if args.command == "resolve-session":
-        found = latest_complete_session(date.fromisoformat(args.as_of))
+        found = latest_complete_session(
+            date.fromisoformat(args.as_of), universe_version=args.universe_version)
         print(json.dumps(found, sort_keys=True), file=sys.stderr)
         if found["resolved"] is None:
             return 3

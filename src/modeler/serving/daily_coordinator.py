@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 from modeler.reporting.site import PRIVATE_MANIFEST_NAME, PrivateViewBuilder, _read_tree
 from modeler.serving.schema import report_template
 
-from .daily_inputs import MS_ENTRYPOINT, _release_market_sector, select
+from .daily_inputs import MS_ENTRYPOINT, US_UNIVERSE_VERSIONS, _release_market_sector, select
 from .orchestration import combine_reports, selection_summary
 from .runtime_contract import verify_runtime
 
@@ -177,6 +177,8 @@ def _config(path: Path) -> dict[str, Any]:
         for other in others:
             if private == other or private in other.parents or other in private.parents:
                 raise ValueError("private_projection_root must not overlap the run root or the reports checkout")
+    if config.get("us_universe_version", "v1") not in US_UNIVERSE_VERSIONS:
+        raise ValueError("us_universe_version must be v1 or v2")
     if not isinstance(config.get("publisher_enabled"), bool):
         raise ValueError("publisher_enabled must be explicit")
     if not isinstance(config.get("external_verification_enabled"), bool):
@@ -261,7 +263,8 @@ def select_stage(config: dict[str, Any], day: date, now: datetime, *,
         release_manifest=_absolute(config, "release_manifest"),
         kr_calendar_path=_absolute(config, "kr_calendar"),
         us_calendar_path=_absolute(config, "us_calendar"),
-        us_expected_path=_absolute(config, "us_expected_source"), mode=mode)
+        us_expected_path=_absolute(config, "us_expected_source"), mode=mode,
+        us_universe_version=config.get("us_universe_version", "v1"))
 
 
 def ensure_selection(config: dict[str, Any], day: date, now: datetime) -> dict[str, Any]:
