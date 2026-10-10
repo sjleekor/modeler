@@ -49,7 +49,10 @@ def stock_data_root() -> Path:
 
 
 def my_root() -> Path:
-    """환경변수 ``MY_ROOT``(기본 ``../my``) — 문서 저장소. ETF 쪽 ``etf_panel.my_root`` 와 같은 관례."""
+    """환경변수 ``MY_ROOT``(기본 ``../my``) — 문서 저장소.
+
+    ETF 쪽 ``etf_panel.my_root`` 와 같은 관례.
+    """
     return Path(os.environ.get("MY_ROOT", "../my"))
 
 

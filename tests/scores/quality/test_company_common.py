@@ -1,7 +1,6 @@
 """company_common 시험. 레이크가 없으면 데이터 시험은 건너뛴다."""
 
 from datetime import date
-from pathlib import Path
 
 import polars as pl
 import pytest
