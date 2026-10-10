@@ -137,3 +137,25 @@ def test_build_cards_end_to_end(tmp_path):
     md = tc.render_user_theme_md(cards, date(2026, 9, 30), date(2026, 10, 8))
     assert "## 반도체" in md and "상장 3 · 적격 2" in md
     assert "KODEX 반도체레버리지" not in md  # 적격 후보만 표에 넣는다
+
+
+def test_e1_judgment_label():
+    assert tc.e1_judgment_label(True, "domestic") == "국내형 판정 D(2026-10-10, 사용자 결정: 유지 — 설명값)"
+    assert tc.e1_judgment_label(True, "foreign") == "해외형 기록용(순자산 단독)"
+    assert tc.e1_judgment_label(False, "domestic") == ""
+    assert tc.e1_judgment_label(True, None) == ""
+
+
+def test_card_e1_judgment_column_and_md_header(tmp_path):
+    cards, _ = _tiny_cards(tmp_path)
+    assert "e1_judgment" in cards.columns
+    for r in cards.iter_rows(named=True):
+        if r["e1_pct"] is None:
+            assert r["e1_judgment"] == ""
+        elif r["e1_type"] == "domestic":
+            assert r["e1_judgment"] == tc.E1_JUDGMENT_DOMESTIC
+        else:
+            assert r["e1_judgment"] == tc.E1_JUDGMENT_FOREIGN
+    md = tc.render_user_theme_md(cards, date(2026, 9, 30), date(2026, 10, 8))
+    assert "국내형 E1은 동결 규칙으로 판정해 D였습니다" in md and "유지" in md
+    assert "E2 괴리 판정 A(같은 비교 그룹 안 이듬해 괴리 순위 상관) — 테마 상품에는 참고로만" in md

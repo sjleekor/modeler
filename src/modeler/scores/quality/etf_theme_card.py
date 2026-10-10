@@ -60,6 +60,24 @@ R_NETASST = "순자산 없음"
 R_OTHER = "점수 없음(기타)"
 NO_SCORE_REASONS = (R_NEW, R_CORR, R_MATURITY, R_PENSION, R_REGION, R_NETASST)
 
+E1_JUDGMENT_DOMESTIC = "국내형 판정 D(2026-10-10, 사용자 결정: 유지 — 설명값)"
+E1_JUDGMENT_FOREIGN = "해외형 기록용(순자산 단독)"
+E2_JUDGMENT_NOTE = (
+    "E2 괴리 판정 A(같은 비교 그룹 안 이듬해 괴리 순위 상관) — 테마 상품에는 참고로만"
+)
+
+
+def e1_judgment_label(has_score: bool, e1_type: str | None) -> str:
+    """E1 판정 표시(정정 E-1 재분류, 동결 규칙 판정). 점수 없는 행은 빈 값."""
+    if not has_score:
+        return ""
+    if e1_type == "domestic":
+        return E1_JUDGMENT_DOMESTIC
+    if e1_type == "foreign":
+        return E1_JUDGMENT_FOREIGN
+    return ""
+
+
 MEMO_NOT_ALLOWED = "연금저축·IRP 불가"
 MEMO_SYNTHETIC = "IRP 제한 가능"
 
@@ -70,6 +88,7 @@ CARD_COLUMNS = [
     "synthetic_display", "option", "multiplier",
     "pension_eligible_candidate", "account_memo",
     "e1_month_end", "e1_pct", "e1_alert", "e1_type", "e1_no_score_reason", "e1_foreign_record_only",
+    "e1_judgment",
     "netasst_won", "trdval_median_252", "gap_mean_252", "n_days_252", "n_gap_days_252",
     "fee",
 ]  # fmt: skip
@@ -267,6 +286,7 @@ def build_cards(
                     "e1_type": r["e1_type"] if has_score else None,
                     "e1_no_score_reason": reason,
                     "e1_foreign_record_only": bool(has_score and r["region"] == "foreign"),
+                    "e1_judgment": e1_judgment_label(has_score, r["e1_type"]),
                     "netasst_won": r["netasst"],
                     "trdval_median_252": r["trdval_median_252"],
                     "gap_mean_252": r["gap_mean_252"],
@@ -338,6 +358,9 @@ def render_user_theme_md(cards: pl.DataFrame, month_end: date, end_date: date) -
         f"{DESC_WINDOW_SESSIONS}거래일입니다. 사전등록 §11.5 설명용 기록이며 판정이 아닙니다. "
         "수익률·유망성·테마 사이 비교는 넣지 않았습니다. 총보수는 원천 미정입니다. "
         "KRX 약관상 외부에 올리지 않습니다.",
+        "",
+        f"E1 판정 표시: 국내형 E1은 동결 규칙으로 판정해 D였습니다(2026-10-10, 사용자 결정: 유지 — 설명값으로 계속 씁니다). "
+        f"해외형은 순자산 하나로 매긴 기록용입니다. {E2_JUDGMENT_NOTE}.",
         "",
     ]
     for th in [t.name for t in et.THEMES if t.required]:

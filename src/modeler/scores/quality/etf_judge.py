@@ -1,20 +1,21 @@
 """ETF 품질 점수 부분 E 판정 결합 — Holm 결합·게이트·등급·기록용 결과·manifest
 (사전등록 20261010_quality_score §6·§9·§10·§11.3·§11.4·§12.2, 구현 해석 표 v1 I02·I09·I13·I18·I25·I26).
 
-E1(``etf_e1``)과 E2(``etf_e2``) 통계 모듈을 묶는다.
+E1(``etf_e1``)과 E2(``etf_e2``) 통계 모듈을 묶는다. 판정 가설은 둘(E 가족, Holm m = 2, 단측)이다.
 
-**정정 E-1 (2026-10-10 15:46 사용자 승인, 결과 전).** 사유: KRX 일별 사본의 기초지수 종가에 룩어헤드가 있어
-(사라진 ETF 256개 중 109개는 생애 내내 비어 있고 상장 중 1,172개 중에는 1개뿐) 과거 시점 E1 국내형 풀이 미래
-폐지에 따라 달라진다. 그래서 **판정 가설은 H_E2 하나**(E2 괴리, lenient, 그룹 크기 5 이상, p = ``etf_e2.p_value``,
-α = 등록 때의 Holm 첫 단계 값 0.025, 문턱을 풀지 않음)이고, **E1 국내형은 기록용**(``records.e1_domestic_frozen``,
-등급·중단 조항 대상 아님)이다. 룩어헤드 없는 기록용 비교 ``records.e1_domestic_netasst_full``(순자산 단독, 전체 풀)을
-더했다. G1·G3·등급 규칙은 그대로다.
+- H_E1: E1 국내형, 선행 6개월. p = ``etf_e1.p_value``(귀무 적중률 0.30).
+- H_E2: E2 괴리, lenient, 그룹 크기 5 이상. p = ``etf_e2.p_value``(ρ ≤ 0).
+
+**정정 E-1 재분류(2026-10-10 16:01 사용자).** 판정 변경 부분(E1 국내형을 판정에서 빼고 E2 하나로 판정)은
+철회했다. 판정 규칙을 바꾸는 항목은 정정 블록으로 못 하고 다음 사전등록으로 넘긴다(02_rules A4·00_plan P3).
+그래서 동결 규칙대로 판정한다. 룩어헤드 기록과 'E1 국내형 순자산 단독 전체 풀'(``records.e1_domestic_netasst_full``)은
+결과 전 기록용(P3 범위)이다. E1 국내형은 기초지수 종가 룩어헤드가 있는 입력으로 계산된 판정이다(02 문서 §5).
 
     STOCK_DATA_ROOT=../stock_data PYTHONPATH=src python -m modeler.scores.quality.etf_judge --period dev
 
 경로는 환경변수 ``STOCK_DATA_ROOT`` 로 받는다(기본 ``../stock_data``). 개발 구간 산출물은
 ``kr/output/quality_score_etf_dev_20261010/judge/``, 판정 구간은
-``kr/output/quality_score_etf_judgment_<실행일 YYYYMMDD>/`` 이다.
+``kr/output/quality_score_etf_judgment_20261010_frozen/`` 이다.
 
 **판정 구간 보호.** ``run("judgment")`` 는 환경변수 ``QUALITY_E_JUDGMENT_CONFIRMED`` 가 비어 있지 않을 때만
 돈다. 그 값은 manifest에 그대로 적는다.
@@ -44,20 +45,23 @@ from modeler.scores.quality import etf_e1 as e1
 from modeler.scores.quality import etf_e2 as e2
 from modeler.scores.quality import etf_panel as ep
 
-JUDGE_VERSION = "quality-score-v0/etf_judge/2-E1"
-CORRECTION_ID = "E-1"
-JUDGMENT_FAMILY = ("H_E2",)  # 정정 E-1: 판정 가설은 E2 괴리 하나
-E2_ALPHA = 0.025  # 정정 E-1: 등록 때의 Holm 첫 단계 α, 문턱을 풀지 않는다
-CORRECTION_NOTE = "정정 E-1 적용: 판정 가설 = E2 괴리(α 0.025), E1 국내형은 기록용"
+JUDGE_VERSION = "quality-score-v0/etf_judge/3-frozen"
+CORRECTION_ID = "E-1R"
+JUDGMENT_FAMILY = ("H_E1", "H_E2")  # 동결 규칙: 판정 가설 둘, Holm m = 2
+CORRECTION_NOTE = (
+    "정정 E-1 재분류(10-10 16:01 사용자): 판정 변경 부분 철회, 동결 규칙으로 판정. "
+    "룩어헤드 기록과 'E1 국내형 순자산 단독 전체 풀'은 결과 전 기록용(P3)"
+)
+LOOKAHEAD_NOTE = "룩어헤드 주의: E1 국내형은 기초지수 종가 룩어헤드가 있는 입력으로 계산된 판정이다(02 문서 §5 참조)"
 JUDGMENT_ENV = e1.JUDGMENT_ENV
 
 DEFAULT_OUT_REL_DEV = "kr/output/quality_score_etf_dev_20261010/judge"
-DEFAULT_OUT_REL_JUDGMENT = "kr/output/quality_score_etf_judgment_20261010"
+DEFAULT_OUT_REL_JUDGMENT = "kr/output/quality_score_etf_judgment_20261010_frozen"
 DEFAULT_KIND_REL = "kr/output/quality_score_etf_inputs_20261010/kind/kind_etf_delisting.csv"
 DEFAULT_KIND_WINDOWS_REL = "kr/output/quality_score_etf_inputs_20261010/kind/kind_query_windows.csv"
 DEFAULT_INTERP_TABLE = (
-    "/private/tmp/claude-501/-Users-whishaw-wss-p-my/b1cc46eb-1957-4b1b-b4b5-6208b7ec737c/"
-    "scratchpad/interp_table_v1_approved.md"
+    "/Users/whishaw/wss_p/stock_data/kr/output/quality_score_etf_judgment_20261010/"
+    "provenance/interp_table_v1_approved.md"
 )
 INTERP_TABLE_SHA256 = "29c89969b8f5d467f2c998110eb8de00afb237de240fe2aad76abc7d07d728b1"
 DEFAULT_PREREG = e2.DEFAULT_PREREG
@@ -227,18 +231,21 @@ def e2_gates(stats: dict, holm_res: dict) -> dict:
     }
 
 
-def stop_clause(e2_gate: dict) -> dict:
-    """§10(정정 E-1): E2 괴리가 D이면 "중단 조건 충족 — 사용자 확인 대기"를 적는다(스스로 멈추지 않음).
-    E1 국내형은 기록용이라 보지 않는다. D는 규칙을 그대로 적용한 값(``grade_rule``)이다.
-    표본 부족으로 등급이 없어도 규칙상 D면 해당한다."""
-    fired = e2_gate["grade_rule"] == "D"
+def stop_clause(e1_gate: dict, e2_gate: dict) -> dict:
+    """§10: E1 국내형 또는 E2 괴리가 D이면 "중단 조건 충족 — 사용자 확인 대기"를 적는다(스스로 멈추지 않음).
+    D는 규칙을 그대로 적용한 값(``grade_rule``)이다. 표본 부족으로 등급이 없어도 규칙상 D면 해당한다."""
+    which = []
+    if e1_gate["grade_rule"] == "D":
+        which.append("E1 국내형")
+    if e2_gate["grade_rule"] == "D":
+        which.append("E2 괴리")
     return {
-        "fired": fired,
-        "text": STOP_TEXT if fired else None,
-        "which": ["E2 괴리"] if fired else [],
-        "note": "표본 부족(등급 없음)으로 규칙상 D인 경우 포함"
-        if fired and e2_gate["grade"] is None
-        else None,
+        "fired": bool(which),
+        "text": STOP_TEXT if which else None,
+        "which": which,
+        "note": "표본 부족(등급 없음)으로 규칙상 D인 경우 포함" if any(
+            g["grade"] is None and g["grade_rule"] == "D" for g in (e1_gate, e2_gate)
+        ) else None,
     }
 
 
@@ -556,11 +563,7 @@ def run(
     interp_table = interp_table or os.environ.get("QUALITY_E_INTERP_TABLE", DEFAULT_INTERP_TABLE)
     prereg = prereg or DEFAULT_PREREG
     if out_dir is None:
-        rel = (
-            DEFAULT_OUT_REL_DEV
-            if period == "dev"
-            else DEFAULT_OUT_REL_JUDGMENT.format(today=date.today().strftime("%Y%m%d"))
-        )
+        rel = DEFAULT_OUT_REL_DEV if period == "dev" else DEFAULT_OUT_REL_JUDGMENT
         out_dir = str(root / rel)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -570,9 +573,16 @@ def run(
     r1 = run_e1(panel, life, period, b, seed)
     r2 = run_e2(panel, life, period, b, seed)
 
-    # ---- 판정 가설(정정 E-1: E2 괴리 하나, α 0.025)
+    # ---- 판정 가설 둘과 Holm
+    hit6 = r1["boots"][6]["domestic"].arrays["hit"]
     gap_boot = r2["boots"]["main"]
     items = [
+        {
+            "name": H_E1,
+            "p": e1.p_value(hit6),
+            "bound_fn": lambda a: _e1_lower(hit6, a),
+            "bound_ok": lambda x: x >= E1_G2_LOWER,
+        },
         {
             "name": H_E2,
             "p": e2.p_value(gap_boot) if np.isfinite(gap_boot).any() else 1.0,
@@ -580,35 +590,16 @@ def run(
             "bound_ok": lambda x: x > E2_G2_LOWER,
         },
     ]
-    hres = holm_combine(items, alphas=(E2_ALPHA,))
+    hres = holm_combine(items)
+    hres[H_E1]["null"] = e1.HIT_NULL
+    hres[H_E1]["n_nan_rounds"] = int(np.isnan(hit6).sum())
     hres[H_E2]["null"] = 0.0
     hres[H_E2]["n_nan_rounds"] = int(np.sum(~np.isfinite(gap_boot)))
-    assert tuple(hres) == JUDGMENT_FAMILY
 
-    g_e2 = e2_gates(r2["stats"]["main"], hres[H_E2])
-    stop = stop_clause(g_e2)
-
-    # ---- E1 국내형: 동결 식 그대로, 기록용(등급·중단 조항에 안 들어간다)
-    hit6 = r1["boots"][6]["domestic"].arrays["hit"]
     st_dom = r1["horizons"]["6"]["stats"]["domestic"]
-    b025, b05 = _e1_lower(hit6, 0.025), _e1_lower(hit6, 0.05)
-    rec_holm = {
-        "rejected": bool(not math.isnan(b025) and b025 >= E1_G2_LOWER),
-        "holm_lower_bound": b025,
-        "status": "기록용(정정 E-1), α 0.025 하한",
-    }
-    e1_frozen = {
-        "label": "기록용(정정 E-1)",
-        "note": "동결 식 그대로 계산. 등급·중단 조항 대상 아님. 사유: 기초지수 종가 룩어헤드로 풀이 미래 폐지에 따라 달라짐",
-        "p": e1.p_value(hit6),
-        "null": e1.HIT_NULL,
-        "n_nan_rounds": int(np.isnan(hit6).sum()),
-        "lower_bound_alpha_0.025": b025,
-        "lower_bound_alpha_0.05": b05,
-        "rejected_alpha_0.025": rec_holm["rejected"],
-        "rejected_alpha_0.05": bool(not math.isnan(b05) and b05 >= E1_G2_LOWER),
-        "gates": e1_gates(st_dom, rec_holm),
-    }
+    g_e1 = e1_gates(st_dom, hres[H_E1])
+    g_e2 = e2_gates(r2["stats"]["main"], hres[H_E2])
+    stop = stop_clause(g_e1, g_e2)
 
     # ---- KIND 일치
     kind = load_kind(kind_csv)
@@ -647,20 +638,20 @@ def run(
     created = datetime.now().isoformat(timespec="seconds")
     summary = {
         "version": JUDGE_VERSION,
-        "correction": {"id": CORRECTION_ID, "note": CORRECTION_NOTE, "judgment_family": list(JUDGMENT_FAMILY), "e2_alpha": E2_ALPHA},
+        "correction": {"id": CORRECTION_ID, "note": CORRECTION_NOTE, "lookahead_note": LOOKAHEAD_NOTE, "judgment_family": list(JUDGMENT_FAMILY)},
         "period": period,
         "created_at": created,
         "e1_formation_range": [str(d) for d in e1.PERIODS[period]],
         "e2_formation_years": r2["formation_years"],
         "bootstrap": {"b": b, "seed": seed},
-        "holm": {"alphas": [E2_ALPHA], "m": 1, "rule": "하한(α 0.025 분위수)이 문턱을 넘으면 기각(정정 E-1: E2 괴리 하나)"},
+        "holm": {"alphas": list(HOLM_ALPHAS), "m": 2, "rule": "하한(단계 α 분위수)이 문턱을 넘으면 기각, p 작은 쪽부터"},
         "hypotheses": hres,
+        "e1_domestic": g_e1,
         "e2_gap": g_e2,
         "stop_clause": stop,
         "records": {
-            "e1_domestic_frozen": e1_frozen,
             "e1_domestic_netasst_full": {
-                "label": "기록용(정정 E-1): E1 국내형 순자산 단독, 전체 풀(상관 유무 무관, 지수 종가 안 씀). 순자산 백분위 ≤ 10 경보",
+                "label": "기록용(정정 E-1R, P3): E1 국내형 순자산 단독, 전체 풀(상관 유무 무관, 지수 종가 안 씀). 순자산 백분위 ≤ 10 경보",
                 "horizons": r1["netasst_full_horizons"],
                 "leave_one_formation_year_out": r1["netasst_full_loyo"],
                 "pool_sizes": r1["netasst_full_pool_sizes"],
@@ -718,7 +709,7 @@ def run(
             "id": CORRECTION_ID,
             "note": CORRECTION_NOTE,
             "judgment_family": list(JUDGMENT_FAMILY),
-            "e2_alpha": E2_ALPHA,
+            "lookahead_note": LOOKAHEAD_NOTE,
             "interp_table_expected_sha256": INTERP_TABLE_SHA256,
             "interp_table_sha256_matches": bool(
                 Path(interp_table).exists() and _sha256(interp_table) == INTERP_TABLE_SHA256
@@ -754,6 +745,7 @@ def render_md(s: dict) -> str:
         f"# 부분 E 판정 결합 ({s['period']})\n",
         f"{s['created_at']} · {s['version']} · B {s['bootstrap']['b']} · 시드 {s['bootstrap']['seed']}\n",
         f"**{s['correction']['note']}** (정정 {s['correction']['id']})\n",
+        f"{s['correction']['lookahead_note']}\n",
     ]
     h = s["hypotheses"]
     o.append("## 가설·Holm\n")
@@ -761,25 +753,21 @@ def render_md(s: dict) -> str:
         ["가설", "p", "Holm 단계", "단계 α", "하한 α", "Holm 하한", "상태", "기각", "nan 회차"],
         [[k, v["p"], v["stage"], v["stage_alpha"], v["bound_alpha"], v["holm_lower_bound"], v["status"], v["rejected"], v["n_nan_rounds"]] for k, v in h.items()],
     ))
-    g2 = s["e2_gap"]
-    o.append("## 게이트·등급 (판정 가설: E2 괴리)\n")
+    g1, g2 = s["e1_domestic"], s["e2_gap"]
+    o.append("## 게이트·등급\n")
     o.append(_table(
-        ["부분", "G1 값", "G1", "G2 점추정", "G2 Holm 하한", "G2", "G3", "규칙 등급", "등급", "목적"],
-        [["E2 괴리", g2["g1"]["pooled_etf_years"], g2["g1"]["status"], g2["g2"]["weighted_rho"], g2["g2"]["holm_lower_bound"], g2["g2"]["pass"],
-          f"{g2['g3']['n_pos_years']}/{g2['g3']['n_years']} → {g2['g3']['pass']}", g2["grade_rule"], g2["grade"], g2["purpose"]]],
+        ["부분", "G1 값", "G1", "G2 점추정", "G2 Holm 하한", "G2", "G3", "점수 없는 비율", "규칙 등급", "등급", "목적"],
+        [
+            ["E1 국내형", g1["g1"]["n_scored"], g1["g1"]["status"], g1["g2"]["hit_rate"], g1["g2"]["holm_lower_bound"], g1["g2"]["pass"],
+             f"{_f(g1['g3']['first_half_hit_rate'])} / {_f(g1['g3']['second_half_hit_rate'])} → {g1['g3']['pass']}", g1["unscored_share"], g1["grade_rule"], g1["grade"], g1["purpose"]],
+            ["E2 괴리", g2["g1"]["pooled_etf_years"], g2["g1"]["status"], g2["g2"]["weighted_rho"], g2["g2"]["holm_lower_bound"], g2["g2"]["pass"],
+             f"{g2['g3']['n_pos_years']}/{g2['g3']['n_years']} → {g2['g3']['pass']}", "-", g2["grade_rule"], g2["grade"], g2["purpose"]],
+        ],
     ))
     sc = s["stop_clause"]
-    o.append(f"중단 조항(E2 괴리만): {sc['text'] or '해당 없음'} {sc['which']}\n")
-    fz = s["records"]["e1_domestic_frozen"]
-    g1 = fz["gates"]
-    o.append("## E1 국내형 — 기록용(정정 E-1, 동결 식 그대로, 등급·중단 조항 없음)\n")
-    o.append(_table(
-        ["p", "하한 α0.025", "하한 α0.05", "G1 값", "G1", "적중률", "G2(참고)", "G3(참고)", "점수 없는 비율", "규칙 등급(참고)"],
-        [[fz["p"], fz["lower_bound_alpha_0.025"], fz["lower_bound_alpha_0.05"], g1["g1"]["n_scored"], g1["g1"]["status"], g1["g2"]["hit_rate"], g1["g2"]["pass"],
-          f"{_f(g1['g3']['first_half_hit_rate'])} / {_f(g1['g3']['second_half_hit_rate'])} → {g1['g3']['pass']}", g1["unscored_share"], g1["grade_rule"]]],
-    ))
+    o.append(f"중단 조항: {sc['text'] or '해당 없음'} {sc['which']}\n")
     nf = s["records"]["e1_domestic_netasst_full"]
-    o.append("## E1 국내형 순자산 단독, 전체 풀 — 기록용(정정 E-1)\n")
+    o.append("## E1 국내형 순자산 단독, 전체 풀 — 기록용(정정 E-1R, P3)\n")
     rows = []
     for hz, v in nf["horizons"].items():
         st = v["stats"]["domestic"]
@@ -794,7 +782,7 @@ def render_md(s: dict) -> str:
         rows.append([hz, ld.get("n"), ld.get("mean"), ld.get("median"), ld.get("p25"), ld.get("p75"), ld.get("max"), ld.get("n_zero"), ld.get("n_1_2"), ld.get("n_3_5"), ld.get("n_6_11"), ld.get("n_ge_12")])
     o.append("선행 분포\n")
     o.append(_table(["개월", "n", "평균", "중앙", "p25", "p75", "최대", "0", "1-2", "3-5", "6-11", "12+"], rows))
-    o.append("## E1 선행 기간별 통계 (기록용)\n")
+    o.append("## E1 선행 기간별 통계\n")
     rows = []
     for hz, v in s["records"]["e1"]["horizons"].items():
         for reg, st in v["stats"].items():

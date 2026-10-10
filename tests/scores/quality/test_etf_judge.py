@@ -152,49 +152,59 @@ def test_stop_clause_text():
     d = {"grade_rule": "D", "grade": "D"}
     a = {"grade_rule": "A", "grade": "A"}
     c = {"grade_rule": "C", "grade": "C"}
-    s = j.stop_clause(d)
-    assert s["fired"] and s["text"] == "중단 조건 충족 — 사용자 확인 대기" and s["which"] == ["E2 괴리"]
-    assert not j.stop_clause(a)["fired"]
-    s = j.stop_clause(c)
-    assert not s["fired"] and s["text"] is None and s["which"] == []
+    s = j.stop_clause(d, a)
+    assert s["fired"] and s["text"] == "중단 조건 충족 — 사용자 확인 대기" and s["which"] == ["E1 국내형"]
+    s = j.stop_clause(a, d)
+    assert s["fired"] and s["which"] == ["E2 괴리"]
+    assert j.stop_clause(d, d)["which"] == ["E1 국내형", "E2 괴리"]
+    s = j.stop_clause(c, a)
+    assert not s["fired"] and s["text"] is None
     # 표본 부족(등급 없음)이어도 규칙상 D면 해당, 비고를 남긴다
-    s = j.stop_clause({"grade_rule": "D", "grade": None})
+    s = j.stop_clause({"grade_rule": "D", "grade": None}, a)
     assert s["fired"] and s["note"]
 
 
-def test_stop_clause_ignores_e1():
-    """정정 E-1: E1 국내형은 기록용이라 중단 조항 인자에 아예 들어가지 않는다."""
+# ---------------------------------------------------------------- 정정 E-1 재분류(동결 규칙 판정)
+def test_correction_constants_frozen_rules():
+    assert j.CORRECTION_ID == "E-1R"
+    assert j.JUDGMENT_FAMILY == ("H_E1", "H_E2")
+    assert j.HOLM_ALPHAS == (0.025, 0.05)
+    assert not hasattr(j, "E2_ALPHA")
+    assert j.INTERP_TABLE_SHA256 == "29c89969b8f5d467f2c998110eb8de00afb237de240fe2aad76abc7d07d728b1"
+    assert j.DEFAULT_INTERP_TABLE.endswith("provenance/interp_table_v1_approved.md")
+    assert "private/tmp" not in j.DEFAULT_INTERP_TABLE
+    assert j.DEFAULT_OUT_REL_JUDGMENT == "kr/output/quality_score_etf_judgment_20261010_frozen"
+    assert j.JUDGE_VERSION == "quality-score-v0/etf_judge/3-frozen"
+
+
+def test_correction_note_text():
+    n = j.CORRECTION_NOTE
+    assert "정정 E-1 재분류(10-10 16:01 사용자)" in n
+    assert "판정 변경 부분 철회, 동결 규칙으로 판정" in n
+    assert "룩어헤드 기록과 'E1 국내형 순자산 단독 전체 풀'은 결과 전 기록용(P3)" in n
+    assert "룩어헤드" in j.LOOKAHEAD_NOTE and "02 문서 §5" in j.LOOKAHEAD_NOTE
+
+
+def test_two_family_holm_two_stages():
+    ok1 = lambda x: x >= j.E1_G2_LOWER
+    ok2 = lambda x: x > j.E2_G2_LOWER
+    r = j.holm_combine(
+        [
+            _item("H_E1", 0.001, {0.025: 0.31, 0.05: 0.31}, ok1),
+            _item("H_E2", 0.02, {0.025: 0.0, 0.05: 0.01}, ok2),
+        ]
+    )
+    assert list(r) == list(j.JUDGMENT_FAMILY)
+    assert r["H_E1"]["stage"] == 1 and r["H_E1"]["stage_alpha"] == 0.025 and r["H_E1"]["rejected"]
+    assert r["H_E2"]["stage"] == 2 and r["H_E2"]["stage_alpha"] == 0.05 and r["H_E2"]["rejected"]
+
+
+def test_render_md_has_correction_and_lookahead_lines():
     import inspect
 
-    assert list(inspect.signature(j.stop_clause).parameters) == ["e2_gate"]
-
-
-# ---------------------------------------------------------------- 정정 E-1
-def test_correction_constants():
-    assert j.CORRECTION_ID == "E-1"
-    assert j.JUDGMENT_FAMILY == ("H_E2",)
-    assert j.E2_ALPHA == 0.025
-    assert j.INTERP_TABLE_SHA256 == "29c89969b8f5d467f2c998110eb8de00afb237de240fe2aad76abc7d07d728b1"
-    assert j.DEFAULT_INTERP_TABLE.endswith("interp_table_v1_approved.md")
-    assert j.DEFAULT_OUT_REL_JUDGMENT == "kr/output/quality_score_etf_judgment_20261010"
-
-
-def test_single_family_holm_uses_alpha_0025_and_strict_positive():
-    ok = lambda x: x > j.E2_G2_LOWER
-    seen = []
-
-    def bound(a):
-        seen.append(a)
-        return 0.05
-
-    r = j.holm_combine([{"name": "H_E2", "p": 0.01, "bound_fn": bound, "bound_ok": ok}], alphas=(j.E2_ALPHA,))
-    assert list(r) == ["H_E2"] and seen == [0.025]
-    assert r["H_E2"]["stage_alpha"] == 0.025 and r["H_E2"]["rejected"]
-    r = j.holm_combine([_item("H_E2", 0.01, {0.025: 0.0}, ok)], alphas=(j.E2_ALPHA,))
-    assert not r["H_E2"]["rejected"]  # 하한 = 0은 기각 아님
-    # α를 0.05로 풀어 기각되는 경우도 0.025에서는 안 된다(문턱을 풀지 않는다)
-    r = j.holm_combine([_item("H_E2", 0.01, {0.025: -0.01, 0.05: 0.02}, ok)], alphas=(j.E2_ALPHA,))
-    assert not r["H_E2"]["rejected"]
+    src = inspect.getsource(j.render_md)
+    assert "lookahead_note" in src and "correction" in src
+    assert "e1_domestic_frozen" not in inspect.getsource(j.run)
 
 
 # ---------------------------------------------------------------- KIND 일치
