@@ -28,6 +28,8 @@ from modeler.serving.orchestration import (
     US_PARITY_MODELS,
     US_PARITY_SCORE_EQUIVALENT,
     US_PARITY_V2_CRITERIA,
+    SERVING_V2_EXCLUDED_SECURITY_TYPES,
+    UNIVERSE_V2_SERVING_RULE,
     US_PARITY_V2_PASSED,
     us_native_block_reason,
     us_parity_failures,
@@ -408,6 +410,12 @@ def validate_universe_version(universe_version: str) -> str:
     return universe_version
 
 
+def serving_v2_keep_expr() -> pl.Expr:
+    """True for rows the v2 serving universe keeps: not an excluded type (null type is kept)."""
+    col = pl.col("security_type")
+    return col.is_null() | ~col.is_in(list(SERVING_V2_EXCLUDED_SECURITY_TYPES))
+
+
 _MEMBER_COLUMNS = ("symbol", "cik", "sic", "mcap_rank", "adv_20d", "exchange")
 
 
@@ -419,6 +427,10 @@ def _monthly_membership(
     ``v2`` takes the member symbols from ``universe_daily_v2`` (PIT rows only) and the other
     columns from the v1 ``universe_daily`` row of the same date and symbol, as the research panel
     does (``panel._members_v2``).  A v2 member without a v1 row keeps null attributes.
+    Serving only (user decision 2026-10-10, ``UNIVERSE_V2_SERVING_RULE``): members whose
+    ``security_type`` is in ``SERVING_V2_EXCLUDED_SECURITY_TYPES`` (ADR) are dropped; a null
+    ``security_type`` is kept (it is not an ADR; none exist among in_universe rows as of
+    2026-10-06).  The research panel keeps ADRs.
     """
     validate_universe_version(universe_version)
     month_start = scoring_date.replace(day=1)
@@ -445,6 +457,7 @@ def _monthly_membership(
             v2 = v2.filter(pl.col("view") == "pit")
         v2_members = (
             v2.filter((pl.col("date") == membership_date) & pl.col("in_universe"))
+            .filter(serving_v2_keep_expr())
             .select("symbol")
             .collect()
         )
@@ -1292,6 +1305,12 @@ def validate_parity_evidence(
             raise ValueError(
                 "parity evidence의 universe_v2 rule_version이 prepare가 쓸 completion과 다릅니다: "
                 f"{block.get('rule_version')!r} != {universe_v2_rule_version!r}")
+        if (block.get("serving_rule") != UNIVERSE_V2_SERVING_RULE
+                or block.get("excluded_security_types") != list(SERVING_V2_EXCLUDED_SECURITY_TYPES)):
+            raise ValueError(
+                "parity evidence의 서빙 유니버스 규칙이 현재 규칙과 다릅니다: "
+                f"{block.get('serving_rule')!r}/{block.get('excluded_security_types')!r} != "
+                f"{UNIVERSE_V2_SERVING_RULE!r}/{list(SERVING_V2_EXCLUDED_SECURITY_TYPES)!r}")
     return evidence
 
 
@@ -1353,6 +1372,8 @@ def prepare_daily_features(scoring_date: date, *, diagnostic_only: bool = False,
             "universe_v2_snapshot_date": v2_revision,
             "universe_v2_completion_sha256": v2_check["completion_sha256"],
             "universe_v2_rule_version": v2_check["rule_version"],
+            "universe_v2_serving_rule": UNIVERSE_V2_SERVING_RULE,
+            "universe_v2_excluded_security_types": list(SERVING_V2_EXCLUDED_SECURITY_TYPES),
             "universe_v2_input_snapshot_sha256": v2_check["input_snapshot_sha256"],
         }
     lake = PinnedUsLake(root, revisions)
@@ -1791,8 +1812,9 @@ def _universe_v2_block(
 ) -> dict[str, Any]:
     """The ``universe_v2`` evidence block: golden dates rebuilt with v2 members vs the frozen set.
 
-    Gated (G1-G4, see ``US_PARITY_V2_CRITERIA``): v2 members equal ``universe_daily_v2``
-    ``in_universe`` read independently; the 42 non-financial features and ``price_ge_5`` are
+    Gated (G1-G4, see ``US_PARITY_V2_CRITERIA``): serving members (v2 ``in_universe`` minus
+    ``SERVING_V2_EXCLUDED_SECURITY_TYPES``, i.e. ``UNIVERSE_V2_SERVING_RULE``) equal the sealed part
+    file's ``in_universe`` rows minus the excluded types, read independently; the 42 non-financial features and ``price_ge_5`` are
     identical on the common keys; every key missing on either side is explained by v2 membership.
     Financial diffs, per-feature null rates and the v1-only / v2-only breakdowns are recorded only.
     """
@@ -1823,7 +1845,9 @@ def _universe_v2_block(
     v2_only_total: dict[str, int] = {}
     for day in sorted(GOLDEN_DATES):
         rows = v2_rows.filter(pl.col("date") == day)
-        members_df = rows.filter(pl.col("in_universe"))
+        in_rows = rows.filter(pl.col("in_universe"))
+        members_df = in_rows.filter(serving_v2_keep_expr())
+        excluded_rows = in_rows.height - members_df.height
         members = set(members_df["symbol"].to_list())
         panel_syms = set(features.filter(pl.col("date") == day)["symbol"].to_list())
         frozen_syms = set(frozen.filter(pl.col("date") == day)["symbol"].to_list())
@@ -1850,6 +1874,7 @@ def _universe_v2_block(
         per_date.append({
             "date": day.isoformat(),
             "v2_rows": len(panel_syms),
+            "excluded_security_type_rows": excluded_rows,
             "common_keys": len(panel_syms & frozen_syms),
             "v1_only": len(actual_frozen_only),
             "v2_only": len(actual_v2_only),
@@ -1873,6 +1898,8 @@ def _universe_v2_block(
         "snapshot_date": revision,
         "completion_sha256": check["completion_sha256"],
         "rule_version": check["rule_version"],
+        "serving_rule": UNIVERSE_V2_SERVING_RULE,
+        "excluded_security_types": list(SERVING_V2_EXCLUDED_SECURITY_TYPES),
         "input_snapshots": check["input_snapshots"],
         "source_files": fingerprint_source_snapshots(data_root, {UNIVERSE_V2_TABLE: revision}),
         "per_date": per_date,
