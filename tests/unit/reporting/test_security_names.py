@@ -22,6 +22,8 @@ from modeler.reporting import security_names as sn
 from modeler.serving import daily_coordinator as dc
 
 DAY = dt.date(2026, 10, 7)
+# v1 listing만 있는 합성 레이크는 v2 listing이 없어 v1 규칙으로 되돌아가고, 그 사유가 남습니다.
+V1_FALLBACK = "listing_snapshots_v2가 레이크에 없어 v1 이름 규칙으로 판정함"
 D1 = "2026-10-07"
 
 
@@ -225,7 +227,7 @@ def test_from_roots_builds_both_markets_and_reports_counts(tmp_path: Path) -> No
     write_stock_master(tmp_path / "kr", [("005930", "삼성전자")])
     env = envelope(D1, ["AAA", "BBB", "MISSING"], ["005930", "000660"])
     built = sn.from_roots(env, us_root=tmp_path / "us", kr_root=tmp_path / "kr")
-    assert built.notes == {}
+    assert built.notes == {"US": V1_FALLBACK}
     assert built.counts == {"US": (2, 3), "KR": (1, 2)}
     assert set(md.load_security_names(built.raw)) == {"US", "KR"}
 
@@ -245,7 +247,7 @@ def test_from_roots_keeps_going_when_a_source_is_missing_or_unreadable(tmp_path:
     write_listing(tmp_path / "us", LISTING)
     built = sn.from_roots(env, us_root=tmp_path / "us", kr_root=tmp_path / "no-kr")
     assert set(md.load_security_names(built.raw)) == {"US"}
-    assert built.notes == {"KR": "KR raw snapshot의 stock_master가 없음"}
+    assert built.notes == {"KR": "KR raw snapshot의 stock_master가 없음", "US": V1_FALLBACK}
     # 깨진 parquet는 예외 이름만 사유에 적고 경로는 적지 않습니다
     listing = next((tmp_path / "us/derived/snapshots/listing_snapshots").iterdir())
     (listing / "part.parquet").write_bytes(b"not parquet")
@@ -375,7 +377,7 @@ def test_local_step_adds_the_kind_column_and_pins_the_names_input(
         assert record["security_names_path"] == str(names_file)
         digest = pr.hashlib.sha256(names_file.read_bytes()).hexdigest()
         assert record["security_names_sha256"] == digest
-        assert record["security_names_notes"] is None
+        assert record["security_names_notes"] == {"US": V1_FALLBACK}
     # 서버 경로를 이름 입력이나 단위에 싣지 않습니다
     assert str(tmp_path) not in names_file.read_text(encoding="utf-8")
     assert all(str(tmp_path) not in text for text in files.values())

@@ -597,9 +597,16 @@ def _safe_str(value: object) -> str:
 # 판정 규칙과 알려진 오탐·미탐은 06 문서 "1안 결과"에 있습니다. 규칙을 바꾸면 거기도 고칩니다.
 # ---------------------------------------------------------------------------
 SECURITY_NAMES_SCHEMA = "security-names.v1"
+# v2: US 블록이 `kind_by: security_master`면 종목마다 `kind`(마스터로 정함)가 있습니다.
+# v1 파일(이름 규칙 판정)도 그대로 읽고 그릴 수 있어야 합니다(옛 단위를 고정 바이트로 다시 그림).
+SECURITY_NAMES_SCHEMA_V2 = "security-names.v2"
+SECURITY_NAMES_SCHEMAS = (SECURITY_NAMES_SCHEMA, SECURITY_NAMES_SCHEMA_V2)
+KIND_BY_MASTER = "security_master"
 KIND_COMMON = "보통주"
 KIND_UNKNOWN = "확인 안 됨"
-KIND_ORDER = ("채권형", "우선주", "SPAC", "리츠", "펀드")
+KIND_ADR = "ADR"
+KIND_OTHER = "기타"
+KIND_ORDER = ("채권형", "우선주", "SPAC", "리츠", "펀드", KIND_ADR, KIND_OTHER)
 
 # US: listing_snapshots.security_name. 위에서부터 먼저 걸리는 규칙이 이깁니다.
 US_BOND_RE = re.compile(
@@ -694,16 +701,22 @@ def classify_kr(symbol: str, name: str | None) -> str:
     return KIND_COMMON
 
 
-def load_security_names(raw: bytes | None) -> dict:
-    """`security-names.v1` 입력을 {시장: {"source", "basis", "symbols"}}로 읽습니다.
+KNOWN_KINDS = frozenset(KIND_ORDER + (KIND_COMMON, KIND_UNKNOWN))
 
-    `symbols`는 {코드: {"name": str|None, "current": bool}}입니다. `current`가 false면
+
+def load_security_names(raw: bytes | None) -> dict:
+    """`security-names.v1`·`v2` 입력을 {시장: {"source", "basis", "symbols"}}로 읽습니다.
+
+    `symbols`는 {코드: {"name": str|None, "current": bool}}입니다. v1은 `current`가 false면
     그 갈래의 마지막 상장 목록에 없던 심볼이라 이름이 낡았을 수 있어 종류를 판정하지 않습니다.
+    v2의 US 블록이 `kind_by: security_master`면 블록에 `kind_source`·`master_kind`가 더해지고
+    종목마다 `kind`가 있습니다(없거나 모르는 값이면 `확인 안 됨`). 종류는 이름 낡음과 무관합니다.
     """
     if raw is None:
         return {}
     data = load_json_bytes(raw, "증권 이름 입력")
-    if data.get("schema") != SECURITY_NAMES_SCHEMA:
+    schema = data.get("schema")
+    if schema not in SECURITY_NAMES_SCHEMAS:
         raise InputError(f"증권 이름 입력의 schema가 {SECURITY_NAMES_SCHEMA}가 아닙니다.")
     markets = data.get("markets")
     if not isinstance(markets, dict):
@@ -715,6 +728,11 @@ def load_security_names(raw: bytes | None) -> dict:
             continue
         if not isinstance(block, dict) or not isinstance(block.get("symbols"), dict):
             raise InputError(f"증권 이름 입력의 {market}.symbols가 객체가 아닙니다.")
+        master_kind = (
+            market == "US"
+            and schema == SECURITY_NAMES_SCHEMA_V2
+            and block.get("kind_by") == KIND_BY_MASTER
+        )
         symbols = {}
         for sym, info in block["symbols"].items():
             if not isinstance(sym, str) or not isinstance(info, dict):
@@ -723,11 +741,17 @@ def load_security_names(raw: bytes | None) -> dict:
                 "name": info["name"] if isinstance(info.get("name"), str) else None,
                 "current": info.get("current") is not False,
             }
+            if master_kind:
+                kind = info.get("kind")
+                symbols[sym]["kind"] = kind if kind in KNOWN_KINDS else KIND_UNKNOWN
         out[market] = {
             "source": _safe_str(block.get("source")),
             "basis": _safe_str(block.get("basis")),
             "symbols": symbols,
         }
+        if master_kind:
+            out[market]["master_kind"] = True
+            out[market]["kind_source"] = _safe_str(block.get("kind_source"))
     return out
 
 
@@ -740,6 +764,8 @@ def row_kind(market: str, row: dict, names: dict) -> str:
         if name is None and info and info["current"]:
             name = info["name"]
         return classify_kr(symbol, name)
+    if (names.get("US") or {}).get("master_kind"):
+        return info["kind"] if info else KIND_UNKNOWN  # 증권 마스터가 정한 종류
     if not info or not info["current"]:
         return classify_us(symbol, None)  # 이름이 없거나 낡았습니다
     return classify_us(symbol, info["name"])
@@ -755,6 +781,8 @@ def attach_kinds(sec: dict, market: str, names: dict) -> None:
         m["kinds"] = [row_kind(market, row, names) for row in m["rows"]]
     sec["show_kind"] = any(k != KIND_UNKNOWN for m in sec["models"] for k in m["kinds"])
     sec["names"] = names.get(market)
+    if (names.get(market) or {}).get("master_kind"):
+        sec["kind_master"] = True
 
 
 def kinds_of(m: dict) -> list:
@@ -778,6 +806,14 @@ def kind_count_line(kinds: list) -> str:
 
 KIND_NOTE = (
     "`종류`는 이름으로 판정한 표시입니다. 순위와 점수는 그대로입니다. "
+    "판정 기준은 [데이터 상태](data-status.md#증권-종류)에 있습니다."
+)
+KIND_NOTE_MASTER = (
+    "`종류`는 증권 마스터로 판정한 표시입니다. 순위와 점수는 그대로입니다. "
+    "판정 기준은 [데이터 상태](data-status.md#증권-종류)에 있습니다."
+)
+KIND_NOTE_MIXED = (
+    "`종류`는 KR은 이름으로, US는 증권 마스터로 판정한 표시입니다. 순위와 점수는 그대로입니다. "
     "판정 기준은 [데이터 상태](data-status.md#증권-종류)에 있습니다."
 )
 KIND_OMITTED = "종류를 판정할 이름 원천이 이 단위에 없어 `종류` 열을 생략했습니다."
@@ -1426,7 +1462,10 @@ def render_us(ctx: dict) -> tuple[list, dict]:
             "",
         ]
     if shown_rows:
-        lines += [KIND_NOTE if sec.get("show_kind") else KIND_OMITTED, ""]
+        if not sec.get("show_kind"):
+            lines += [KIND_OMITTED, ""]
+        else:
+            lines += [KIND_NOTE_MASTER if sec.get("kind_master") else KIND_NOTE, ""]
     for m in sec["models"]:
         lines += render_us_model(ctx, m, show_name, sec.get("show_kind", False))
     lines += ["LightGBM과 Ridge의 점수는 서로 합치거나 비교하지 않습니다.", "", DISCLAIMER, ""]
@@ -1728,6 +1767,24 @@ US_KIND_RULES = (
 )
 
 
+US_MASTER_KIND_RULES = (
+    "증권 마스터(collector `security_master`)의 US 순위 세션 시점 유효 행으로 정함. "
+    "먼저 걸리는 것이 이김. "
+    "보통주·ADR·리츠: 마스터가 보통주 유니버스에 넣는 종목(`include`) 중 증권 유형이 각각 "
+    "보통주·ADR·리츠. SPAC: 발행사 종류 spac. 펀드: 발행사 종류 bdc·registered_fund, "
+    "또는 증권 유형 fund·trust·etf. 채권형: bond·etn. 우선주: preferred. "
+    "기타: warrant·right·unit·test, 또는 판정 사유가 발행사 이름 비보통주·발행사만 접미. "
+    "마스터에 없거나 판정 못 한 종목(unknown·f6k_only)은 확인 안 됨"
+)
+US_MASTER_KIND_INTRO = (
+    "순위 표의 `종류`는 KR은 이름으로, US는 증권 마스터로 판정한 표시입니다. 순위와 점수는 "
+    "바꾸지 않습니다. KR은 이름만 보므로 틀릴 수 있고, 이름 원천에 없는 종목은 `확인 안 됨`입니다. "
+    "US는 `universe_daily_v2`(US 순위 세션이 속한 달의 첫 세션)의 증권 식별자로 마스터를 "
+    "찾으며, 찾지 못한 종목은 `확인 안 됨`입니다. "
+    "`ADR`은 탐색 모델이 학습에서 뺀 종류라 따로 보입니다."
+)
+
+
 def kind_status_lines(ctx: dict) -> list:
     """데이터 상태의 `증권 종류` 절. 이름 원천과 판정 기준을 적습니다."""
     rows = []
@@ -1749,12 +1806,17 @@ def kind_status_lines(ctx: dict) -> list:
             source, basis = "envelope 순위 행의 이름", "-"
         if market == "KR" and names:
             source = "envelope 순위 행의 이름, 없으면 " + source
+        if market == "US" and sec.get("kind_master"):
+            source = f"{source}. 종류: {c(names['kind_source'] or '증권 마스터')}"
+            rules = US_MASTER_KIND_RULES
         rows.append([market, source, basis, rules])
     return (
         [
             "## 증권 종류",
             "",
-            "순위 표의 `종류`는 이름으로 판정한 표시입니다. 순위와 점수는 바꾸지 않습니다. "
+            US_MASTER_KIND_INTRO
+            if ctx["us"].get("kind_master") and ctx["us"].get("show_kind")
+            else "순위 표의 `종류`는 이름으로 판정한 표시입니다. 순위와 점수는 바꾸지 않습니다. "
             "이름만 보므로 틀릴 수 있습니다. 예를 들어 이름에 펀드 표시가 없는 폐쇄형 펀드는 "
             "`보통주`로 남고, 이름 원천에 없는 종목은 `확인 안 됨`입니다.",
             "",
@@ -2187,7 +2249,10 @@ def render_summary(ctx: dict) -> tuple[list, dict]:
         "",
     ]
     if kr.get("show_kind") or us.get("show_kind"):
-        lines += [KIND_NOTE, ""]
+        if not (us.get("show_kind") and us.get("kind_master")):
+            lines += [KIND_NOTE, ""]
+        else:
+            lines += [KIND_NOTE_MIXED if kr.get("show_kind") else KIND_NOTE_MASTER, ""]
     lines += [DISCLAIMER, ""]
     meta_extra = {
         "data_asof": all_data_asof(ctx),
@@ -3416,7 +3481,7 @@ def main(argv: list | None = None) -> int:
     parser.add_argument(
         "--security-names",
         type=Path,
-        help="security-names.v1 JSON (순위 표 종류 열의 이름 원천. 없으면 KR 행 이름만 씀)",
+        help="security-names.v1·v2 JSON (순위 표 종류 열의 이름 원천. 없으면 KR 행 이름만 씀)",
     )
     parser.add_argument("--release", help="서빙 release id")
     parser.add_argument("--generated-at", help="ISO 시각(시간대 포함). 없으면 지금")
