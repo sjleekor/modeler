@@ -231,10 +231,13 @@ def _identity_date(universe: Path, day: dt.date) -> tuple[dt.date | None, bool]:
     """(M, 달 첫 세션 여부). D의 달에서 D 이하인 가장 이른 날짜, 없으면 D 이하 가장 최근 날짜."""
     import polars as pl
 
-    dates = pl.concat(
-        [pl.read_parquet(f, columns=["date"]).unique() for f in _parquet_files(universe)]
-    )["date"]
-    upto = dates.filter(dates <= day)
+    upto = (
+        pl.scan_parquet(_parquet_files(universe))
+        .select("date")
+        .filter(pl.col("date") <= day)
+        .unique()
+        .collect()["date"]
+    )
     if upto.len() == 0:
         return None, False
     in_month = upto.filter((upto.dt.year() == day.year) & (upto.dt.month() == day.month))
@@ -243,10 +246,41 @@ def _identity_date(universe: Path, day: dt.date) -> tuple[dt.date | None, bool]:
     return upto.max(), False
 
 
+def us_session_date(envelope: dict) -> tuple[dt.date | None, str | None]:
+    """US 순위 세션 A: US 시장 항목들의 `feature_asof_date`. (A, 사유).
+
+    값이 하나로 모이지 않으면(없음·서로 다름·형식 오류) A는 None이고 사유를 돌려줍니다.
+    """
+    found: set[dt.date] = set()
+    for market in envelope.get("markets") or []:
+        if isinstance(market, dict) and market.get("market") == "US":
+            raw = market.get("feature_asof_date")
+            if raw is None:
+                continue
+            try:
+                found.add(dt.date.fromisoformat(str(raw)))
+            except ValueError:
+                return None, "US 순위의 feature_asof_date를 읽을 수 없어 report_date로 대신함"
+    if len(found) == 1:
+        return next(iter(found)), None
+    if not found:
+        return None, "US 순위에 feature_asof_date가 없어 report_date로 대신함"
+    return None, "US 순위의 feature_asof_date가 서로 달라 report_date로 대신함"
+
+
 def us_names_master(
-    listing_v2: Path, universe: Path | None, master: Path | None, symbols: set[str], day: dt.date
+    listing_v2: Path,
+    universe: Path | None,
+    master: Path | None,
+    symbols: set[str],
+    day: dt.date,
+    kind_day: dt.date | None = None,
+    kind_notes: tuple[str, ...] = (),
 ) -> tuple[dict, dict]:
     """US v2 블록과 통계. 이름은 listing_v2, 종류는 universe_daily_v2 → security_master입니다.
+
+    이름은 `day`(report_date) 이전 최신 행이고, 종류는 `kind_day`(US 순위 세션 A, 없으면 `day`)
+    기준입니다: 식별자는 A가 속한 달의 첫 세션, 마스터는 A 시점 유효 행입니다.
 
     `universe`·`master`가 None이면(레이크에 없음) 종류는 전부 확인 안 됨이고 통계 notes에 적습니다.
     """
@@ -254,7 +288,8 @@ def us_names_master(
 
     base = us_names(listing_v2, symbols, day, table="listing_snapshots_v2")
     names = base["symbols"]
-    notes: list[str] = []
+    kd = kind_day or day
+    notes: list[str] = list(kind_notes)
     sec_ids: dict[str, str] = {}
     ambiguous = 0
     identity, first_session = None, False
@@ -262,21 +297,19 @@ def us_names_master(
     if universe is None or master is None:
         notes.append("증권 마스터 입력(universe_daily_v2·security_master)이 레이크에 없음")
     else:
-        identity, first_session = _identity_date(universe, day)
+        identity, first_session = _identity_date(universe, kd)
         if identity is None:
-            notes.append(f"universe_daily_v2에 {day} 이전 날짜가 없음")
+            notes.append(f"universe_daily_v2에 {kd} 이전 날짜가 없음")
         else:
             if not first_session:
                 notes.append(
-                    f"universe_daily_v2에 {day:%Y-%m} 날짜가 없어 가장 최근 {identity}로 대신함"
+                    f"universe_daily_v2에 {kd:%Y-%m} 날짜가 없어 가장 최근 {identity}로 대신함"
                 )
-            rows = pl.concat(
-                [
-                    pl.read_parquet(f, columns=["date", "symbol", "security_id"]).filter(
-                        (pl.col("date") == identity) & pl.col("symbol").is_in(sorted(symbols))
-                    )
-                    for f in _parquet_files(universe)
-                ]
+            rows = (
+                pl.scan_parquet(_parquet_files(universe))
+                .select("date", "symbol", "security_id")
+                .filter((pl.col("date") == identity) & pl.col("symbol").is_in(sorted(symbols)))
+                .collect()
             )
             per_symbol: dict[str, set] = {}
             for sym, sid in zip(rows["symbol"], rows["security_id"], strict=True):
@@ -295,16 +328,16 @@ def us_names_master(
     masters: dict[str, dict] = {}
     if master is not None and sec_ids:
         ids = sorted(set(sec_ids.values()))
-        frame = pl.concat(
-            [
-                pl.read_parquet(f).filter(pl.col("security_id").is_in(ids))
-                for f in _parquet_files(master)
-            ]
+        frame = (
+            pl.scan_parquet(_parquet_files(master))
+            .filter(pl.col("security_id").is_in(ids))
+            .filter(
+                (pl.col("valid_from") <= kd)
+                & (pl.col("valid_to").is_null() | (pl.col("valid_to") > kd))
+            )
+            .collect()
+            .sort(["security_id", "valid_from"], maintain_order=True)
         )
-        frame = frame.filter(
-            (pl.col("valid_from") <= day)
-            & (pl.col("valid_to").is_null() | (pl.col("valid_to") > day))
-        ).sort(["security_id", "valid_from"], maintain_order=True)
         for row in frame.iter_rows(named=True):
             masters[row["security_id"]] = (
                 row  # 같은 id가 여럿이면 valid_from이 가장 늦은 행이 남습니다
@@ -335,7 +368,7 @@ def us_names_master(
     if identity is not None:
         parts.append(f"universe_daily_v2{_snapshot_label(universe)} 기준일 {identity}")
     if master is not None and identity is not None:
-        parts.append(f"security_master{_snapshot_label(master)} {day} 시점 유효 행")
+        parts.append(f"security_master{_snapshot_label(master)} {kd} 시점 유효 행")
     kind_source = "US 레이크 " + " → ".join(parts) if parts else "증권 마스터 없음"
     if rule_version:
         kind_source += f", rule_version {rule_version}"
@@ -346,6 +379,7 @@ def us_names_master(
         "ambiguous_v2": ambiguous,
         "no_master_row": no_master,
         "no_name": sum(1 for s in symbols if (names.get(s) or {}).get("name") is None),
+        "kind_date": kd.isoformat(),
         "identity_date": identity.isoformat() if identity else None,
         "month_first_session": first_session,
         "notes": notes,
@@ -389,18 +423,28 @@ def _report_date(envelope: dict) -> dt.date:
         raise NamesError("envelope의 report_date를 읽을 수 없음") from None
 
 
-def _us_block(us_root: Path, symbols: set[str], day: dt.date) -> tuple[dict, dict | None]:
-    """root에서 US 블록과 통계를 만듭니다. v2 listing이 없으면 v1 방식이고 통계는 None입니다."""
+def _us_block(
+    us_root: Path, symbols: set[str], day: dt.date, envelope: dict | None = None
+) -> tuple[dict, dict | None, str | None]:
+    """root에서 US 블록·통계·사유를 만듭니다.
+
+    v2 listing이 없으면 v1 이름 규칙 방식이고 통계는 None, 사유에 되돌아갔다고 적습니다.
+    """
     listing_v2 = find_us_v2_snapshot(us_root, "listing_snapshots_v2")
     if listing_v2 is None:
-        return us_names(find_us_listing(us_root), symbols, day), None
-    return us_names_master(
+        note = "listing_snapshots_v2가 레이크에 없어 v1 이름 규칙으로 판정함"
+        return us_names(find_us_listing(us_root), symbols, day), None, note
+    kind_day, why = us_session_date(envelope) if envelope is not None else (None, None)
+    block, stats = us_names_master(
         listing_v2,
         find_us_v2_snapshot(us_root, "universe_daily_v2"),
         find_us_v2_snapshot(us_root, "security_master"),
         symbols,
         day,
+        kind_day,
+        (why,) if why else (),
     )
+    return block, stats, None
 
 
 def build_security_names(
@@ -423,7 +467,7 @@ def build_security_names(
         markets["US"] = us_names(us_listing, symbols["US"], day)
         schema = SECURITY_NAMES_SCHEMA
     elif us_root is not None:
-        markets["US"], _stats = _us_block(us_root, symbols["US"], day)
+        markets["US"], _stats, _note = _us_block(us_root, symbols["US"], day, envelope)
     if kr_stock_master is not None:
         markets["KR"] = kr_names(kr_stock_master, symbols["KR"])
     return {"schema": schema, "report_date": day.isoformat(), "markets": markets}
@@ -476,7 +520,9 @@ def from_roots(envelope: dict, *, us_root: Path | None, kr_root: Path | None) ->
             continue
         try:
             if market == "US":
-                block, us_stats = _us_block(root, symbols["US"], day)
+                block, us_stats, us_note = _us_block(root, symbols["US"], day, envelope)
+                if us_note:
+                    notes["US"] = us_note
                 if us_stats is not None:
                     stats["US"] = us_stats
                     if us_stats["notes"]:

@@ -143,11 +143,12 @@ def _lake_with_all_kinds(tmp_path: Path) -> tuple[Path, list[str]]:
     return root, symbols
 
 
-def _envelope(symbols: list[str]) -> dict:
-    return {
-        "report_date": DAY,
-        "markets": [{"market": "US", "rankings": [{"symbol": s} for s in symbols]}],
-    }
+def _envelope(symbols: list[str], report: str = DAY, asof: str | None = DAY) -> dict:
+    """report_date=report, US 순위 세션(feature_asof_date)=asof(None이면 필드 없음)."""
+    market = {"market": "US", "rankings": [{"symbol": s} for s in symbols]}
+    if asof is not None:
+        market["feature_asof_date"] = asof
+    return {"report_date": report, "markets": [market]}
 
 
 def test_from_roots_maps_every_row_of_the_table(tmp_path: Path) -> None:
@@ -203,7 +204,7 @@ def test_identity_date_is_the_first_session_of_the_month(tmp_path: Path) -> None
     assert block.notes == {}
     # D가 첫 세션 전(10-01 이전, 달 안에 날짜 없음)이면 가장 최근 날짜로 대신하고 적습니다.
     early = sn.from_roots(
-        {**_envelope(["AAA"]), "report_date": "2026-09-30"}, us_root=root, kr_root=None
+        _envelope(["AAA"], "2026-09-30", "2026-09-30"), us_root=root, kr_root=None
     )
     assert early.stats["US"]["identity_date"] == "2026-09-30"  # 9월 첫 세션은 없어 9-30이 첫 날짜
     # 달 안에 D 이하 날짜가 없는 경우: 10-01이 D보다 뒤
@@ -214,9 +215,7 @@ def test_identity_date_is_the_first_session_of_the_month(tmp_path: Path) -> None
         master=master,
         listing=[("2026-09-30", "x", "AAA", "A")],
     )
-    got = sn.from_roots(
-        {**_envelope(["AAA"]), "report_date": "2026-10-01"}, us_root=root2, kr_root=None
-    )
+    got = sn.from_roots(_envelope(["AAA"], "2026-10-01", "2026-10-01"), us_root=root2, kr_root=None)
     assert got.stats["US"]["identity_date"] == "2026-09-30"
     assert got.stats["US"]["month_first_session"] is False
     assert "가장 최근 2026-09-30" in got.notes["US"]
@@ -245,7 +244,7 @@ def test_master_valid_to_is_exclusive_and_latest_valid_from_wins(tmp_path: Path)
     assert symbols["BBB"]["kind"] == "펀드"
     # valid_to가 D보다 하루 뒤면 아직 유효합니다
     earlier = sn.from_roots(
-        {**_envelope(["AAA"]), "report_date": "2026-10-04"}, us_root=root, kr_root=None
+        _envelope(["AAA"], "2026-10-04", "2026-10-04"), us_root=root, kr_root=None
     )
     assert json.loads(earlier.raw)["markets"]["US"]["symbols"]["AAA"]["kind"] == "기타"
 
@@ -358,6 +357,76 @@ def test_without_v2_tables_the_builder_falls_back_or_notes(tmp_path: Path) -> No
     loaded = md.load_security_names(built.raw)
     assert "master_kind" not in loaded["US"] and built.stats == {}
     assert md.row_kind("US", {"symbol": "AAA"}, loaded) == "보통주"
+
+
+def test_kind_uses_the_us_session_not_the_report_date(tmp_path: Path) -> None:
+    """report_date는 새 달(10-01)인데 US 세션 A가 지난 달(09-30)이면 A의 달·시점으로 정합니다."""
+    root = tmp_path / "us"
+    universe = [
+        ("2026-09-01", "AAA", "AAA#old"),  # A의 달(9월) 첫 세션
+        ("2026-09-30", "AAA", "AAA#late"),
+        ("2026-10-01", "AAA", "AAA#new"),  # report_date의 달 첫 세션
+    ]
+    master = [
+        master_row("AAA#old", valid_to="2026-10-01", security_type="warrant"),
+        master_row("AAA#late", security_type="bond"),
+        master_row("AAA#new", include=True),
+    ]
+    write_lake(root, universe=universe, master=master, listing=[("2026-09-30", "x", "AAA", "A")])
+    built = sn.from_roots(
+        _envelope(["AAA"], "2026-10-01", "2026-09-30"), us_root=root, kr_root=None
+    )
+    stats = built.stats["US"]
+    assert stats["kind_date"] == "2026-09-30" and stats["identity_date"] == "2026-09-01"
+    assert json.loads(built.raw)["markets"]["US"]["symbols"]["AAA"]["kind"] == "기타"
+    assert "2026-09-30 시점 유효 행" in json.loads(built.raw)["markets"]["US"]["kind_source"]
+    assert built.notes == {}
+    # 같은 report_date에서 A가 10-01이면 10월 첫 세션 식별자를 씁니다
+    same = sn.from_roots(_envelope(["AAA"], "2026-10-01", "2026-10-01"), us_root=root, kr_root=None)
+    assert json.loads(same.raw)["markets"]["US"]["symbols"]["AAA"]["kind"] == "보통주"
+    # 마스터 유효 시점도 A입니다: A=09-30이면 AAA#old의 valid_to(10-01) 전이라 유효
+    assert same.stats["US"]["kind_date"] == "2026-10-01"
+
+
+def test_missing_or_disagreeing_feature_asof_falls_back_to_report_date(tmp_path: Path) -> None:
+    root = tmp_path / "us"
+    write_lake(
+        root,
+        universe=[("2026-10-01", "AAA", "AAA#1")],
+        master=[master_row("AAA#1", include=True)],
+        listing=[("2026-10-05", "x", "AAA", "A")],
+    )
+    missing = sn.from_roots(_envelope(["AAA"], asof=None), us_root=root, kr_root=None)
+    assert missing.stats["US"]["kind_date"] == DAY
+    assert "feature_asof_date가 없어 report_date로 대신함" in missing.notes["US"]
+    env = _envelope(["AAA"], asof="2026-10-02")
+    env["markets"].append({**env["markets"][0], "feature_asof_date": "2026-10-05"})
+    disagree = sn.from_roots(env, us_root=root, kr_root=None)
+    assert disagree.stats["US"]["kind_date"] == DAY
+    assert "서로 달라 report_date로 대신함" in disagree.notes["US"]
+    bad = sn.from_roots(_envelope(["AAA"], asof="not-a-date"), us_root=root, kr_root=None)
+    assert "읽을 수 없어" in bad.notes["US"]
+    # 한 쪽만 값이 있고 다른 US 항목은 null이면 그 값을 씁니다
+    env2 = _envelope(["AAA"], asof="2026-10-02")
+    env2["markets"].append({**env2["markets"][0], "feature_asof_date": None})
+    ok = sn.from_roots(env2, us_root=root, kr_root=None)
+    assert ok.stats["US"]["kind_date"] == "2026-10-02" and ok.notes == {}
+
+
+def test_missing_listing_v2_adds_a_note(tmp_path: Path) -> None:
+    old = tmp_path / "old"
+    v1 = old / "derived/snapshots/listing_snapshots/snapshot_date=2026-09-18"
+    v1.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "as_of": [_d("2026-10-01")],
+            "kind": ["nasdaqlisted"],
+            "symbol": ["AAA"],
+            "security_name": ["Alpha Inc. Common Stock"],
+        }
+    ).write_parquet(v1 / "part.parquet")
+    built = sn.from_roots(_envelope(["AAA"]), us_root=old, kr_root=None)
+    assert built.notes == {"US": "listing_snapshots_v2가 레이크에 없어 v1 이름 규칙으로 판정함"}
 
 
 # --- 렌더러 ------------------------------------------------------------------------------------

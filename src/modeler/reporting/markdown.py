@@ -1864,7 +1864,8 @@ US_KIND_RULES = (
 
 
 US_MASTER_KIND_RULES = (
-    "증권 마스터(collector `security_master`)의 D 시점 유효 행으로 정함. 먼저 걸리는 것이 이김. "
+    "증권 마스터(collector `security_master`)의 US 순위 세션 시점 유효 행으로 정함. "
+    "먼저 걸리는 것이 이김. "
     "보통주·ADR·리츠: 마스터가 보통주 유니버스에 넣는 종목(`include`) 중 증권 유형이 각각 "
     "보통주·ADR·리츠. SPAC: 발행사 종류 spac. 펀드: 발행사 종류 bdc·registered_fund, "
     "또는 증권 유형 fund·trust·etf. 채권형: bond·etn. 우선주: preferred. "
@@ -1874,8 +1875,9 @@ US_MASTER_KIND_RULES = (
 US_MASTER_KIND_INTRO = (
     "순위 표의 `종류`는 KR은 이름으로, US는 증권 마스터로 판정한 표시입니다. 순위와 점수는 "
     "바꾸지 않습니다. KR은 이름만 보므로 틀릴 수 있고, 이름 원천에 없는 종목은 `확인 안 됨`입니다. "
-    "US는 `유니버스 v2` 멤버십(달 첫 세션)의 증권 식별자로 마스터를 찾으며, 찾지 못한 종목은 "
-    "`확인 안 됨`입니다. `ADR`은 탐색 모델이 학습에서 뺀 종류라 따로 보입니다."
+    "US는 `universe_daily_v2`(US 순위 세션이 속한 달의 첫 세션)의 증권 식별자로 마스터를 "
+    "찾으며, 찾지 못한 종목은 `확인 안 됨`입니다. "
+    "`ADR`은 탐색 모델이 학습에서 뺀 종류라 따로 보입니다."
 )
 
 
