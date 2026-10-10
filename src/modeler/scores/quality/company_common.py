@@ -48,6 +48,20 @@ def stock_data_root() -> Path:
     return Path(os.environ.get("STOCK_DATA_ROOT", "../stock_data"))
 
 
+def my_root() -> Path:
+    """환경변수 ``MY_ROOT``(기본 ``../my``) — 문서 저장소. ETF 쪽 ``etf_panel.my_root`` 와 같은 관례."""
+    return Path(os.environ.get("MY_ROOT", "../my"))
+
+
+PREREG_REL = "milestones/common/scores/20261010_quality_score/01_preregistration.md"
+
+
+def default_prereg() -> Path:
+    """사전등록 문서 경로. 환경변수 ``QUALITY_PREREG``, 없으면 ``my_root()/PREREG_REL``."""
+    v = os.environ.get("QUALITY_PREREG")
+    return Path(v) if v else my_root() / PREREG_REL
+
+
 @dataclass(frozen=True)
 class Lake:
     """raw·파생 snapshot 날짜를 따로 받는다. 판정은 raw 2026-10-18로 돈다."""

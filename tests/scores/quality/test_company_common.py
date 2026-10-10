@@ -8,7 +8,7 @@ import pytest
 
 from modeler.scores.quality import company_common as cc
 
-LAKE_ROOT = Path("/Users/whishaw/wss_p/stock_data")
+LAKE_ROOT = cc.stock_data_root()
 needs_lake = pytest.mark.skipif(
     not (LAKE_ROOT / "kr/derived/feature/snapshot_date=2026-09-29").is_dir()
     or not (LAKE_ROOT / "kr/raw/raw_postgres/snapshot_date=2026-09-30").is_dir(),

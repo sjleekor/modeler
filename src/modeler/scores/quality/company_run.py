@@ -45,6 +45,7 @@ from modeler.scores.quality.company_common import (
     O4_JUDGMENT_YEARS,
     Lake,
     TradingCalendar,
+    default_prereg,
     filing_availability,
     git_head,
     guard_years,
@@ -59,10 +60,6 @@ FS_LATEST_YEARS = tuple(range(2015, 2026))  # 결과 변수용 "가장 늦은 �
 PERIOD_YEARS = {"dev": DEV_YEARS, "judgment": JUDGMENT_YEARS, "checks": CHECK_YEARS}
 PERIODS = tuple(PERIOD_YEARS)
 
-DEFAULT_PREREG = (
-    "/Users/whishaw/wss_p/my/milestones/common/scores/20261010_quality_score/"
-    "01_preregistration.md"
-)
 SAMPLE_EVENTS = 10  # 디버깅 표본: 결과마다 사건 최대 10건
 SAMPLE_NON_EVENTS = 5  # 비사건 최대 5건
 
@@ -1062,7 +1059,7 @@ def run(
     n_boot: int = cj.N_BOOT,
     o1_mode: str = "auto",
     xbrl_cache: str | Path | None = None,
-    prereg: str | Path | None = DEFAULT_PREREG,
+    prereg: str | Path | None = None,
     args: dict | None = None,
     sources: Sources | None = None,
 ) -> dict:
@@ -1122,7 +1119,7 @@ def run(
         o1_info=o1_final,
         even_flags=even,
         xbrl_cache=src.xbrl_cache,
-        prereg=Path(prereg) if prereg else None,
+        prereg=Path(prereg) if prereg else default_prereg(),
         t0=t0,
         outputs=written,
         extra=extra,
@@ -1162,7 +1159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--seed", type=int, default=cj.SEED)
     ap.add_argument("--n-boot", type=int, default=cj.N_BOOT)
     ap.add_argument("--out-dir", default=None)
-    ap.add_argument("--prereg", default=DEFAULT_PREREG)
+    ap.add_argument("--prereg", default=None)
     a = ap.parse_args(argv)
     lake = Lake.from_env(raw_snapshot=a.raw_snapshot, derived_snapshot=a.derived_snapshot)
     try:
