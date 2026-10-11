@@ -106,3 +106,37 @@ def test_judge_all_on_synthetic(tmp_path):
     assert res["E3a_record"]["C_a"]["n_pairs_cond"] >= 0
     assert "records" in res and "group_size_ge3" in res["records"]
     assert res["not_implemented"]
+
+
+def test_lags_from_watch_skips_left_censored_and_reports_pending(tmp_path):
+    import json as _json
+
+    from modeler.scores.quality import etf_e3_run as run
+
+    p = tmp_path / "watch.jsonl"
+    rows = [
+        {"kind": "start", "at": "2026-10-11T15:05:41"},
+        {"kind": "std", "day": "2026-10-12", "standardDt": "20260831"},
+        {"kind": "std", "day": "2026-10-13", "standardDt": "20260831"},
+        {"kind": "error", "day": "2026-10-14", "attempt": 0},
+        {"kind": "std", "day": "2026-10-19", "standardDt": "20260930"},
+    ]
+    p.write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
+    out = run.lags_from_watch(p)
+    # 08-31은 첫 조회에서 이미 보였으므로 지연으로 세지 않는다. 09-30은 10-19에 처음 보여 19일.
+    assert out["lags"] == [19]
+    # 다음 달(10-31)은 아직 안 지났다
+    assert out["censored_over"] is None
+    # 첫 조회 뒤 오래 안 나온 경우: 08-31만 보이고 마지막 조회가 2027-01-05 → 09-30 기준 97일 경과
+    p.write_text(
+        "\n".join(
+            _json.dumps(r)
+            for r in [
+                {"kind": "std", "day": "2026-10-12", "standardDt": "20260831"},
+                {"kind": "std", "day": "2027-01-05", "standardDt": "20260831"},
+            ]
+        )
+        + "\n"
+    )
+    out = run.lags_from_watch(p)
+    assert out["lags"] == [] and out["censored_over"] == 97

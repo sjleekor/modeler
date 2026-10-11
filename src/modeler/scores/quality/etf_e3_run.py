@@ -289,21 +289,48 @@ def structure_counts_from_struct(struct) -> dict:
 
 
 # ================================================================ 동결 뒤: 판정
-def lags_from_watch(path: str | Path) -> list[int]:
-    """하루 1건 조회 기록(watch.jsonl)에서 기준일(standardDt)마다 처음 나온 날의 지연(일)을 읽는다."""
-    first: dict[str, str] = {}
+def _month_end_after(std: date) -> date:
+    """기준일 ``std`` 다음 달의 달력 말일."""
+    y, m = (std.year + 1, 1) if std.month == 12 else (std.year, std.month + 1)
+    nxt = date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)
+    return date.fromordinal(nxt.toordinal() - 1)
+
+
+def lags_from_watch(path: str | Path) -> dict:
+    """하루 1건 조회 기록(watch.jsonl) → 지연 실측.
+
+    - 기준일(standardDt)마다 처음 나온 날 − 기준일 = 지연(일). **단 첫 조회에서 이미 보인 기준일은 빼고**(그 전에 공개돼
+      지연의 상한일 뿐이다), 앞선 조회에서 더 이른 기준일이 보였던 경우만 센다. 쉬는 날(10-15~18) 뒤 처음 보이면
+      처음 본 날로 센다(지연을 크게 잡는 쪽).
+    - ``censored_over``: 마지막으로 보인 기준일의 다음 달 말일이 아직 안 나왔으면, 마지막 조회일 − 그 말일(일).
+    메인 정정(10-11): 처음 판은 첫 조회의 기준일(이미 공개된 08-31)을 "그날 처음 나옴"으로 세어 가짜 지연을 만들었다.
+    """
+    obs: list[tuple[str, str]] = []
     for line in Path(path).read_text().splitlines():
         if not line.strip():
             continue
         r = json.loads(line)
         if r.get("kind") == "std" and r.get("standardDt"):
-            first.setdefault(r["standardDt"], r["day"])
+            obs.append((r["day"], r["standardDt"]))
+    obs.sort()
+    first: dict[str, str] = {}
+    seen_before: set[str] = set()
     lags = []
-    for std, day in first.items():
-        d0 = datetime.strptime(std, "%Y%m%d").date()
-        d1 = date.fromisoformat(day)
-        lags.append((d1 - d0).days)
-    return lags
+    for k, (day, std) in enumerate(obs):
+        if std not in first:
+            first[std] = day
+            if k > 0 and any(s < std for s in seen_before):
+                d0 = datetime.strptime(std, "%Y%m%d").date()
+                lags.append((date.fromisoformat(day) - d0).days)
+        seen_before.add(std)
+    censored = None
+    if obs:
+        last_day, _ = obs[-1]
+        latest = max(s for _, s in obs)
+        pending = _month_end_after(datetime.strptime(latest, "%Y%m%d").date())
+        el = (date.fromisoformat(last_day) - pending).days
+        censored = el if el > 0 else None
+    return {"lags": lags, "censored_over": censored, "n_obs": len(obs)}
 
 
 def build_inputs(
@@ -510,7 +537,11 @@ def run_judgment(
     tag_commit = require_frozen(repo)
     out.mkdir(parents=True, exist_ok=True)
     ctx = sm.load_ctx(root, verify=True)
-    lag = fees.lag_summary(lags_from_watch(lag_watch) if lag_watch else None)
+    if lag_watch:
+        lw = lags_from_watch(lag_watch)
+        lag = fees.lag_summary(lw["lags"], lw["censored_over"])
+    else:
+        lag = fees.lag_summary(None)
     res = judge_all(ctx, n_perm=n_perm, n_boot=n_boot, lag=lag)
     write_json(res, out / "judgment_results.json")
     manifest(

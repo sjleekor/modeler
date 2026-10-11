@@ -140,11 +140,13 @@ def outcome_range(
 LAG_MIN_OBS = 6
 
 
-def lag_summary(measured_lags: list[int] | None) -> dict:
+def lag_summary(measured_lags: list[int] | None, censored_over: int | None = None) -> dict:
     """실측 지연(일) 목록 → 최소·중앙·최대와 상태.
 
-    6개 미만이면 ``status = "잠정(지연 실측 전)"``. 6개 이상이고 최대 > ``LAG_DAYS`` 이면 ``cap = True``
-    (E3b′ 등급 상한 C, "지연 규칙 부족").
+    6개 미만이면 ``status = "잠정(지연 실측 전)"``. **관측 수와 상관없이** 실측 지연 하나라도 ``LAG_DAYS`` 를 넘거나,
+    아직 안 나온 기준일의 경과일(``censored_over``)이 ``LAG_DAYS`` 를 넘으면 ``cap = True``
+    (E3b′ 등급 상한 C, "지연 규칙 부족"). 메인 정정(10-11): 처음 판은 6개 이상일 때만 상한을 걸어,
+    한 달이라도 92일을 넘긴 사실을 판정이 놓칠 수 있었다.
     """
     lags = sorted(int(x) for x in (measured_lags or []))
     n = len(lags)
@@ -153,6 +155,7 @@ def lag_summary(measured_lags: list[int] | None) -> dict:
         "min": None,
         "median": None,
         "max": None,
+        "censored_over": censored_over,
         "status": "잠정(지연 실측 전)",
         "cap": False,
     }
@@ -160,5 +163,6 @@ def lag_summary(measured_lags: list[int] | None) -> dict:
         out.update({"min": lags[0], "median": float(np.median(lags)), "max": lags[-1]})
     if n >= LAG_MIN_OBS:
         out["status"] = "실측"
-        out["cap"] = lags[-1] > LAG_DAYS
+    over = (n and lags[-1] > LAG_DAYS) or (censored_over is not None and censored_over > LAG_DAYS)
+    out["cap"] = bool(over)
     return out

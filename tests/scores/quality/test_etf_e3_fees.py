@@ -127,3 +127,12 @@ def test_lag_summary():
     assert s["status"] == "실측" and not s["cap"] and s["median"] == 47.5
     s = fees.lag_summary([40, 41, 45, 50, 60, 93])
     assert s["cap"] is True
+
+
+def test_lag_cap_on_any_single_observation_over_92():
+    s = fees.lag_summary([95])
+    assert s["status"] == "잠정(지연 실측 전)" and s["cap"] is True
+    s = fees.lag_summary([], censored_over=93)
+    assert s["cap"] is True
+    s = fees.lag_summary([40], censored_over=30)
+    assert s["cap"] is False
