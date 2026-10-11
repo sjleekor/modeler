@@ -1,6 +1,5 @@
 """E3 기록용 칸: R1·R7·R8·R11·R12·F구간별 폐지·R9·R13 (합성 자료)."""
 
-import csv
 from datetime import date
 
 import numpy as np
@@ -126,24 +125,51 @@ def test_r12_baseline_picks_top_g_vs_largest_passive(tmp_path):
     assert out2["n_same_etf"] == 1 and out2["n_group_years"] == 0
 
 
-def test_r9_waits_without_data_and_computes_with_csv(tmp_path, monkeypatch):
+TR = "S&P 500 Total Return Index"
+
+
+def test_r9_waits_without_index_values(tmp_path):
     etfs = {
         "379800": dict(name="KODEX S&P", alpha=0.0, nav_noise=0.0, idx="합성지수"),
         "448290": dict(name="TIGER S&P", alpha=0.0, nav_noise=0.0, idx="합성지수"),
     }
     ctx = make_ctx(tmp_path, etfs, {k: 0.2 for k in etfs})
-    monkeypatch.delenv(rec.SP500_ENV, raising=False)
     assert rec.r9_index_tracking(ctx)["status"] == "자료 대기"
-    p = tmp_path / "sp.csv"
-    with open(p, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["date", "value"])
-        for d in DAYS:
-            w.writerow([d.isoformat(), 100.0])
-    out = rec.r9_index_tracking(ctx, p)
-    assert out["status"] == "계산"
-    y = out["etfs"]["379800"][2015]
-    assert y["abs_diff_bp"] < 1.0 and abs(y["index_tr"]) < 1e-12
+
+
+def test_r9_uses_krx_reported_index_and_cross_values(tmp_path):
+    days = {d: i for i, d in enumerate(DAYS)}
+    lo, hi = days[date(2015, 1, 5)], days[date(2015, 12, 30)]
+
+    def obj_a(i):
+        return 100.0 * (1.0002**i) if lo <= i <= hi else None
+
+    def obj_b(i):  # 448290 은 구간 뒤쪽 절반만 보고하고, 세 날은 값이 다르다
+        if not (lo + 100 <= i <= hi):
+            return None
+        return obj_a(i) * (1.01 if i in (lo + 120, lo + 121, lo + 122) else 1.0)
+
+    etfs = {
+        "379800": dict(name="KODEX S&P", alpha=0.0, nav_noise=0.0, idx=TR, obj=obj_a),
+        "448290": dict(name="TIGER S&P", alpha=0.0, nav_noise=0.0, idx=TR, obj=obj_b),
+    }
+    ctx = make_ctx(tmp_path, etfs, {k: 0.2 for k in etfs})
+    out = rec.r9_index_tracking(ctx)
+    assert out["status"] == "계산" and out["circular"] is True
+    sr = out["series"]
+    assert sr["n_days_both_differ"] == 3 and sr["n_days_both"] == hi - 100 - lo + 1
+    y = out["etfs"]["379800"]["combined_series"][2015]
+    # 지수 수익 = 값 있는 첫날~끝날 비율, ETF 는 알파 0 이라 총수익 ≈ 0 → 차이 ≈ |지수 수익|
+    assert y["index_tr"] == pytest.approx(1.0002 ** (hi - lo) - 1)
+    assert y["abs_diff_bp"] == pytest.approx(abs(y["etf_tr"] - y["index_tr"]) * 1e4)
+    assert y["signed_diff_bp"] < 0 and y["n_index_days"] == hi - lo + 1
+    # 교차 값: 379800 은 448290 이 보고한 날(뒤쪽 절반)만
+    c = out["etfs"]["379800"]["cross_other_etf_reported"][2015]
+    assert (
+        out["etfs"]["379800"]["cross_source"] == "448290"
+        and c["n_index_days"] == hi - (lo + 100) + 1
+    )
+    assert out["etfs"]["448290"]["cross_source"] == "379800"
 
 
 def test_r13_guard_and_run(tmp_path):

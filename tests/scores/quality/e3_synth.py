@@ -114,6 +114,9 @@ def build_panel(tmp_path, etfs, days=DAYS, seed=1, pay=True, quarterly_amt=0.01)
                     NAV="" if d in spec.get("nav_missing", ()) else f"{nav:.2f}",
                     LIST_SHRS=str(shares),
                     IDX_IND_NM=idx_nm,
+                    OBJ_STKPRC_IDX=(
+                        "" if not spec.get("obj") or spec["obj"](i) is None else str(spec["obj"](i))
+                    ),
                     ACC_TRDVAL="1000000",
                     INVSTASST_NETASST_TOTAMT=str(spec.get("netasst", 100000000)),
                     MKTCAP="100000000",

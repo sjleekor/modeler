@@ -40,7 +40,7 @@ from modeler.scores.quality import etf_e3_stat as st
 FROZEN_TAG = "etf-holding-cost-e3-frozen"
 
 NOT_IMPLEMENTED = {
-    "R9_kospi200_tr": "코스피200 TR(KRX drvprod)은 10-23 백필 전이라 자료 없음. S&P 500 TR은 입력 CSV가 있을 때만 계산(없으면 결과에 '자료 대기')",
+    "R9_kospi200_tr": "코스피200 TR(KRX drvprod)은 10-23 백필 전이라 자료 없음. S&P 500 TR은 KRX 일별 파일의 지수값으로 계산함",
     "foreign_exposure_nav_lag": "구현은 국내 노출만 쓴 변형(region=domestic)으로 대신함",
 }
 

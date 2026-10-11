@@ -10,16 +10,14 @@
 - ``r12_baseline``  R12 기준선: 그룹-연도마다 (가) 형성 자기 창 G_own 최고 ETF vs (나) 순자산 최대 패시브 ETF의
   H_own 차이(bp).
 - ``delisted_by_f_band``  폐지·합병 ETF-연 수를 F 구간(<0.10, 0.10~0.30, 0.30~0.50, ≥0.50 %)별로.
-- ``r9_index_tracking``  R9 지수 TR 절대 추적차이(S&P 500 TR 자료가 있을 때만, 없으면 "자료 대기").
+- ``r9_index_tracking``  R9 지수 TR 절대 추적차이(KRX 일별 파일의 OBJ_STKPRC_IDX, 379800·448290).
 - ``r13_forward``  R13 전진 확인(형성 2025 → 결과 2026): KRX 자료가 2026-12-30까지 있을 때만.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import os
 from datetime import date
-from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -36,7 +34,6 @@ F_BAND_LABELS = ("F<0.10", "0.10<=F<0.30", "0.30<=F<0.50", "F>=0.50")
 FORWARD_FORM_YEAR = 2025
 FORWARD_MIN_END = date(2026, 12, 30)
 SP500_TR_ETFS = ("379800", "448290")
-SP500_ENV = "E3_SP500_TR_CSV"
 
 
 def _run():
@@ -240,45 +237,85 @@ def delisted_by_f_band(ctx: sm.Ctx, years) -> dict:
 
 
 # ---------------------------------------------------------------- R9
-def r9_index_tracking(ctx: sm.Ctx, path: str | Path | None = None) -> dict:
-    """S&P 500 TR 지수(CSV: ``date``(YYYY-MM-DD)·``value``)와 379800·448290 의 연 절대 추적차이.
+SP500_TR_NAME = "S&P 500 Total Return Index"
 
-    KRX 거래일 t 의 NAV는 미국 t−1 종가를 반영하므로 지수는 t 직전(엄밀히 이전) 지수 날짜 값에 맞춘다.
-    코스피200 TR(KRX drvprod)은 백필 전이라 없다. 경로는 인자 또는 환경변수 ``E3_SP500_TR_CSV``.
-    """
-    path = path or os.environ.get(SP500_ENV)
-    if not path or not Path(path).exists():
-        return {
-            "status": "자료 대기",
-            "note": "S&P 500 TR(2021-04-09~2025-05-23) 입력 없음. 코스피200 TR은 10-23 백필 전",
-        }
-    idx = pl.read_csv(str(path), try_parse_dates=True).sort("date")
-    dates = idx["date"].to_numpy().astype("datetime64[D]")
-    vals = idx["value"].to_numpy().astype(float)
+
+def _sp500_series(ctx: sm.Ctx) -> dict[str, dict[int, float]]:
+    """ETF별 {거래일 번호: 지수값}: ``IDX_IND_NM`` 이 S&P 500 TR 이고 ``OBJ_STKPRC_IDX`` 가 있는 날."""
+    r = ctx.panel.rows.filter(
+        pl.col("ISU_CD").is_in(list(SP500_TR_ETFS))
+        & (pl.col("IDX_IND_NM") == SP500_TR_NAME)
+        & pl.col("OBJ_STKPRC_IDX").is_not_null()
+    )
+    out: dict[str, dict[int, float]] = {c: {} for c in SP500_TR_ETFS}
+    for c, t, v in zip(r["ISU_CD"], r["day_idx"], r["OBJ_STKPRC_IDX"]):
+        out[c][int(t)] = float(v)
+    return out
+
+
+def _tracking_by_year(ctx: sm.Ctx, j: int, series: dict[int, float]) -> dict:
+    """연도별 (지수 값 있는 첫날 f ~ 끝날 l) 구간의 ETF 총수익과 지수 수익. ETF 수익은 (f, l]의 r_t 곱이다."""
     d = ctx.dense
-    out: dict = {"status": "계산", "etfs": {}}
-    for code in SP500_TR_ETFS:
-        if code not in d.col:
+    out = {}
+    days = np.array(sorted(series))
+    for y in sorted({int(d.years[t]) for t in days}):
+        ys = days[d.years[days] == y]
+        if len(ys) < 2:
+            continue
+        f, l = int(ys[0]), int(ys[-1])
+        t = np.arange(f + 1, l + 1)
+        ok = ctx.rfin[t, j]
+        fac = (d.nav[t[ok], j] + ctx.D[t[ok], j]) / d.nav[t[ok] - 1, j]
+        etf = float(np.prod(fac) - 1)
+        idx = series[l] / series[f] - 1
+        out[y] = {
+            "etf_tr": etf,
+            "index_tr": idx,
+            "signed_diff_bp": (etf - idx) * 1e4,
+            "abs_diff_bp": abs(etf - idx) * 1e4,
+            "n_index_days": int(len(ys)),
+            "n_days_without_r": int((~ok).sum()),
+        }
+    return out
+
+
+def r9_index_tracking(ctx: sm.Ctx) -> dict:
+    """S&P 500 TR 지수 절대 추적차이. 지수값은 KRX 일별 파일 안 ``OBJ_STKPRC_IDX`` (379800·448290 이 보고한 값).
+
+    지수 계열 = 날짜별로 두 ETF가 보고한 값(둘 다 있으면 379800 값, 값이 다른 날 수를 기록). 같은 ETF가 보고한 지수로
+    자기 추적차이를 재는 순환이 있어 ``circular = True`` 이고, 다른 ETF가 보고한 값으로 잰 교차 값(겹치는 날만)을 같이
+    낸다. 지수값이 이미 KRX 날짜에 붙어 있어 시차 맞춤은 없다. 코스피200 TR(KRX drvprod)은 백필 전이라 없다.
+    """
+    ser = _sp500_series(ctx)
+    a, b = SP500_TR_ETFS
+    if not ser[a] and not ser[b]:
+        return {"status": "자료 대기", "note": "KRX 일별 파일에 S&P 500 TR 지수값 있는 날 없음"}
+    comb = dict(ser[b])
+    comb.update(ser[a])
+    both = set(ser[a]) & set(ser[b])
+    n_diff = sum(1 for t in both if abs(ser[a][t] - ser[b][t]) > 1e-9 * max(1.0, abs(ser[a][t])))
+    out: dict = {
+        "status": "계산",
+        "circular": True,
+        "series": {
+            "n_days_combined": len(comb),
+            "n_days_by_etf": {a: len(ser[a]), b: len(ser[b])},
+            "n_days_both": len(both),
+            "n_days_both_differ": n_diff,
+        },
+        "etfs": {},
+    }
+    for code, other in ((a, b), (b, a)):
+        if code not in ctx.dense.col:
             out["etfs"][code] = {"note": "KRX 자료에 없음"}
             continue
-        j = d.col[code]
-        pos = np.searchsorted(dates, d.dates, side="left") - 1  # t 보다 이전인 마지막 지수 날짜
-        ok = (pos >= 0) & ctx.rfin[:, j]
-        iv = np.where(pos >= 0, vals[np.maximum(pos, 0)], np.nan)
-        per_year = {}
-        for y in sorted(set(d.years[ok].tolist())):
-            t = np.flatnonzero(ok & (d.years == y))
-            if len(t) < 100:
-                continue
-            f = (d.nav[t, j] + ctx.D[t, j]) / d.nav[t - 1, j]
-            etf = float(np.prod(f) - 1)
-            index = float(iv[t[-1]] / iv[t[0] - 1] - 1)
-            per_year[int(y)] = {
-                "etf_tr": etf,
-                "index_tr": index,
-                "abs_diff_bp": abs(etf - index) * 1e4,
-            }
-        out["etfs"][code] = per_year
+        j = ctx.dense.col[code]
+        cross = {t: v for t, v in ser[other].items() if t in ser[code]}  # 겹치는 날만
+        out["etfs"][code] = {
+            "combined_series": _tracking_by_year(ctx, j, comb),
+            "cross_other_etf_reported": _tracking_by_year(ctx, j, cross),
+            "cross_source": other,
+        }
     return out
 
 
