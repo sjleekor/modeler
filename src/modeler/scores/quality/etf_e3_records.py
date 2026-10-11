@@ -262,12 +262,12 @@ def _tracking_by_year(ctx: sm.Ctx, j: int, series: dict[int, float]) -> dict:
         ys = days[d.years[days] == y]
         if len(ys) < 2:
             continue
-        f, l = int(ys[0]), int(ys[-1])
-        t = np.arange(f + 1, l + 1)
+        first, last = int(ys[0]), int(ys[-1])
+        t = np.arange(first + 1, last + 1)
         ok = ctx.rfin[t, j]
         fac = (d.nav[t[ok], j] + ctx.D[t[ok], j]) / d.nav[t[ok] - 1, j]
         etf = float(np.prod(fac) - 1)
-        idx = series[l] / series[f] - 1
+        idx = series[last] / series[first] - 1
         out[y] = {
             "etf_tr": etf,
             "index_tr": idx,
