@@ -145,7 +145,7 @@ def simulate(sk: Skeleton, sc: dict, rng: np.random.Generator) -> tuple[st.StatD
     G = rtr_y + F / 100.0
     H = rtr_y1 + A / 100.0
     gd = G[sk.ga] - G[sk.gb]
-    ok = np.abs(gd) >= st.SCORE_THR
+    ok = np.abs(gd) >= st.SCORE_THR - st.EPS
     gsign = np.where(ok, np.sign(gd), 0).astype(np.int8)
     sd = st.StatData(
         year=sk.years,

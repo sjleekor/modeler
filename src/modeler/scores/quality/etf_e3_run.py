@@ -76,6 +76,53 @@ def require_frozen(repo: Path | None = None, tag: str = FROZEN_TAG) -> str:
     return sha
 
 
+PARSER_SHA_PREFIX = "1e81d6a3"  # 동결 파서 etf_classify.py (E2 동결, 사양 §2)
+
+
+def check_parser_hash(path: Path | None = None) -> str:
+    """동결 파서 sha256이 ``1e81d6a3`` 로 시작하는지. 아니면 ``FrozenGuardError``."""
+    path = path or Path(__file__).with_name("etf_classify.py")
+    h = inp.sha256_file(path)
+    if not h.startswith(PARSER_SHA_PREFIX):
+        raise FrozenGuardError(f"판정 거절: 동결 파서 sha256 {h[:8]}… ≠ {PARSER_SHA_PREFIX}…")
+    return h
+
+
+def require_clean_tree(repo: Path | None = None) -> None:
+    """modeler 작업 트리에 추적 파일 수정이 없어야 한다(미추적 파일은 무시)."""
+    repo = repo or repo_root()
+    _, st_ = _git(repo, "status", "--porcelain", "--untracked-files=no")
+    if st_:
+        raise FrozenGuardError("판정 거절: modeler 작업 트리에 추적 파일 수정이 있다.\n" + st_)
+
+
+def require_prereg(prereg: str | Path | None, tag: str = FROZEN_TAG) -> tuple[Path, str]:
+    """사전등록 문서: 파일이 들어 있는 git 저장소(my)에 동결 태그가 있고, 태그 시점 내용과 작업 파일이 같아야 한다."""
+    if not prereg:
+        raise FrozenGuardError("판정 거절: --prereg(사전등록 문서 경로)가 필요하다.")
+    f = Path(prereg).resolve()
+    if not f.is_file():
+        raise FrozenGuardError(f"판정 거절: 사전등록 문서가 없다: {f}")
+    rc, top = _git(f.parent, "rev-parse", "--show-toplevel")
+    if rc != 0:
+        raise FrozenGuardError(f"판정 거절: 사전등록 문서가 git 저장소 안에 있지 않다: {f}")
+    rc, _ = _git(Path(top), "rev-parse", "-q", "--verify", f"refs/tags/{tag}^{{commit}}")
+    if rc != 0:
+        raise FrozenGuardError(f"판정 거절: 사전등록 저장소({top})에 태그 {tag} 가 없다.")
+    rc, _ = _git(Path(top), "diff", "--quiet", tag, "--", str(f))
+    if rc != 0:
+        raise FrozenGuardError(
+            "판정 거절: 사전등록 문서가 태그 시점 내용과 다르다(또는 태그에 없다)."
+        )
+    return f, inp.sha256_file(f)
+
+
+def require_lag_watch(path: str | Path | None) -> tuple[Path, str]:
+    if not path or not Path(path).is_file():
+        raise FrozenGuardError("판정 거절: --lag-watch(지연 기록 watch.jsonl)가 필요하다.")
+    return Path(path), inp.sha256_file(path)
+
+
 # ---------------------------------------------------------------- manifest
 def manifest(out: Path, ctx: sm.Ctx | None, purpose: str, extra: dict) -> dict:
     repo = repo_root()
@@ -83,10 +130,23 @@ def manifest(out: Path, ctx: sm.Ctx | None, purpose: str, extra: dict) -> dict:
     _, branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
     _, status = _git(repo, "status", "--porcelain")
     mods = {}
-    for m in ("inputs", "dense", "exdate", "fees", "sample", "returns", "stat", "power", "run"):
+    for m in (
+        "inputs",
+        "dense",
+        "exdate",
+        "fees",
+        "sample",
+        "returns",
+        "records",
+        "stat",
+        "power",
+        "run",
+    ):
         f = Path(__file__).with_name(f"etf_e3_{m}.py")
         if f.exists():
             mods[f.name] = inp.sha256_file(f)
+    mods["etf_classify.py"] = inp.sha256_file(Path(__file__).with_name("etf_classify.py"))
+    lock = repo / "uv.lock"
     m = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "purpose": purpose,
@@ -106,6 +166,8 @@ def manifest(out: Path, ctx: sm.Ctx | None, purpose: str, extra: dict) -> dict:
             "n_boot": st.B_BOOT,
         },
         "modules_sha256": mods,
+        "uv_lock_sha256": inp.sha256_file(lock) if lock.exists() else None,
+        "collector_commit": None,  # 이 맥에서 알 수 없으면 칸만(동결 전 확인)
         "code": {
             "repo": "modeler",
             "branch": branch,
@@ -551,27 +613,39 @@ def record_variants(ctx, years, sample, inpt, rs, n_boot, seed) -> dict:
 def run_judgment(
     out: Path,
     root: Path,
-    lag_watch: str | None,
+    lag_watch: str | Path | None,
+    prereg: str | Path | None = None,
     repo: Path | None = None,
     n_perm: int = st.B_PERM,
     n_boot: int = st.B_BOOT,
 ) -> dict:
-    """판정 진입점. **태그 ``etf-holding-cost-e3-frozen`` 가 없으면 거절한다.**"""
+    """판정 진입점. 아래를 모두 통과해야 입력을 읽는다(하나라도 아니면 ``FrozenGuardError`` 로 거절, 출력 없음).
+
+    1) 태그 ``etf-holding-cost-e3-frozen`` 이 modeler 에 있고 HEAD가 품는다. 2) 추적 파일 수정 없음.
+    3) 동결 파서 sha256 ``1e81d6a3…``. 4) ``prereg`` 가 my 저장소 태그 시점과 같다. 5) ``lag_watch`` 파일이 있다.
+    """
     tag_commit = require_frozen(repo)
+    require_clean_tree(repo)
+    parser_sha = check_parser_hash()
+    prereg_path, prereg_sha = require_prereg(prereg)
+    lw_path, lw_sha = require_lag_watch(lag_watch)
     out.mkdir(parents=True, exist_ok=True)
     ctx = sm.load_ctx(root, verify=True)
-    if lag_watch:
-        lw = lags_from_watch(lag_watch)
-        lag = fees.lag_summary(lw["lags"], lw["censored_over"])
-    else:
-        lag = fees.lag_summary(None)
+    lw = lags_from_watch(lw_path)
+    lag = fees.lag_summary(lw["lags"], lw["censored_over"])
     res = judge_all(ctx, n_perm=n_perm, n_boot=n_boot, lag=lag)
     write_json(res, out / "judgment_results.json")
     manifest(
         out,
         ctx,
         "E3 판정(동결 뒤). E3a 기록 첫 칸 + E3b′ 판정.",
-        {"frozen_tag": FROZEN_TAG, "frozen_tag_commit": tag_commit, "lag_watch": lag_watch},
+        {
+            "frozen_tag": FROZEN_TAG,
+            "frozen_tag_commit": tag_commit,
+            "parser_sha256": parser_sha,
+            "preregistration": {"path": str(prereg_path), "sha256": prereg_sha},
+            "lag_watch": {"path": str(lw_path), "sha256": lw_sha},
+        },
     )
     return res
 
@@ -586,7 +660,10 @@ def main(argv: list[str] | None = None) -> int:
     pf.add_argument("--no-verify", action="store_true")
     jd = sub.add_parser("judge", help="동결 뒤에만: 판정 (태그 가드)")
     jd.add_argument("--out-dir", default=None)
-    jd.add_argument("--lag-watch", default=None, help="DIS 하루 1건 조회 기록(watch.jsonl) 사본")
+    jd.add_argument(
+        "--lag-watch", required=True, help="DIS 하루 1건 조회 기록(watch.jsonl) 사본(필수)"
+    )
+    jd.add_argument("--prereg", required=True, help="사전등록 문서 경로(my 저장소, 필수)")
     a = ap.parse_args(argv)
     root = inp.stock_data_root()
     today = datetime.now().strftime("%Y%m%d")
@@ -597,7 +674,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     out = Path(a.out_dir or root / f"kr/output/etf_holding_cost_e3_judgment_{today}")
     try:
-        run_judgment(out, root, a.lag_watch)
+        run_judgment(out, root, a.lag_watch, a.prereg)
     except FrozenGuardError as e:
         print(str(e), file=sys.stderr)
         return 2

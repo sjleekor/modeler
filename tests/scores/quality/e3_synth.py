@@ -98,7 +98,7 @@ def build_panel(tmp_path, etfs, days=DAYS, seed=1, pay=True, quarterly_amt=0.01)
                     if d == spec["split_at"]:
                         nav = nav / 2
                 if spec.get("outlier_at") == d:
-                    nav = nav * 0.6
+                    nav = nav * spec.get("outlier_mult", 0.6)
                 close = round(nav)
                 prev_ref = prev_close
                 if pay and i in adj_idx and prev_close is not None:

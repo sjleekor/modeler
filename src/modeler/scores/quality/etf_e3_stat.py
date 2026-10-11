@@ -35,6 +35,7 @@ SPLIT_YEAR = 2019  # 전반 ≤ 2019 < 후반
 STOP_UPPER = 0.55  # D일 때 상한 < 0.55 → 접기 제안
 BETA_LO = 0.7  # 규칙 1-a: β̂ 90% 구간 상한 < 0.7 또는 하한 > 1.3
 BETA_HI = 1.3
+EPS = 1e-12  # 문턱 경계(정확히 5bp·0.5bp)가 부동소수 오차로 갈리지 않게
 F_THR_PCT = 0.05  # E3a 일치율: |F_i − F_j| ≥ 5bp = 0.05 %p
 
 
@@ -102,7 +103,7 @@ def make_stat_data(
         for a in range(n):
             for b in range(a + 1, n):
                 sd = score_diff[g][a, b]
-                ok = bool(pair_valid[g][a, b]) and np.isfinite(sd) and abs(sd) >= score_thr
+                ok = bool(pair_valid[g][a, b]) and np.isfinite(sd) and abs(sd) >= score_thr - EPS
                 pa.append(a)
                 pb.append(b)
                 pgy.append(g)
@@ -143,7 +144,7 @@ def gy_sums(cond: np.ndarray, corr: np.ndarray, sd: StatData) -> tuple[np.ndarra
 def _cond_corr(sd: StatData, hd: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     gs = sd.gsign[None, :] if hd.ndim == 2 else sd.gsign
     with np.errstate(invalid="ignore"):
-        cond = (gs != 0) & np.isfinite(hd) & (np.abs(hd) >= sd.tie_thr)
+        cond = (gs != 0) & np.isfinite(hd) & (np.abs(hd) >= sd.tie_thr - EPS)
         corr = np.sign(hd) == gs
     return cond, corr
 

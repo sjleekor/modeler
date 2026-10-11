@@ -137,6 +137,11 @@ def _index_change(ctx: Ctx, y: int) -> dict[str, bool]:
     return dict(zip(g["ISU_CD"].to_list(), (g["n"] > 1).to_list()))
 
 
+def outlier_mask(change: np.ndarray) -> np.ndarray:
+    """NAV 하루 변화 절대값 ≥ 30%(경계 포함, 부동소수 오차 1e-12 허용)."""
+    return np.abs(change) >= OUTLIER - 1e-12
+
+
 def split_matrix(d: Dense) -> np.ndarray:
     """분할·병합일: LIST_SHRS 비 r ≥ 1.5 또는 ≤ 1/1.5 이고 NAV 비 × r 이 [0.9, 1.1]."""
     m = np.zeros_like(d.has_row)
@@ -184,7 +189,7 @@ def window_flags(ctx: Ctx, y: int, split: np.ndarray) -> pl.DataFrame:
         warnings.simplefilter("ignore")
         pc = np.full_like(d.nav, np.nan)
         pc[1:] = d.nav[1:] / d.nav[:-1] - 1.0
-    outl = ((np.abs(pc[sl]) >= OUTLIER) & ~ctx.exmask[sl]).any(axis=0)
+    outl = (outlier_mask(pc[sl]) & ~ctx.exmask[sl]).any(axis=0)
     spl = split[sl].any(axis=0)
     idxc = _index_change(ctx, y)
     return pl.DataFrame(
@@ -333,7 +338,7 @@ def build_sample(
         cons.select("year", "isu_cd", "n_dist", "ratio"), on=["year", "isu_cd"], how="left"
     )
     ey = ey.with_columns(
-        (pl.col("ratio").is_not_null() & (pl.col("ratio") < ex.CONSISTENCY_MIN)).alias(
+        (pl.col("ratio").is_not_null() & (pl.col("ratio") < ex.CONSISTENCY_MIN - 1e-12)).alias(
             "x_exdate_consistency"
         ),
         pl.col("n_dist").fill_null(0),
@@ -392,7 +397,7 @@ def build_sample(
 
     surv = ey.filter(pl.col("excluded_at") == "")
     gcnt = surv.group_by("year", "gkey").len().rename({"len": "n"})
-    keep = gcnt.filter(pl.col("n") >= 2)
+    keep = gcnt.filter(pl.col("n") >= min_group)
     ey = ey.join(
         keep.select("year", "gkey").with_columns(pl.lit(True).alias("final")),
         on=["year", "gkey"],
