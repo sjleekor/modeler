@@ -9,7 +9,7 @@
 - 총수익(보수 전) ``gross_{i,y} = 지속_i + 잡음_{i,y}``. 지속 몫 s = 지속 분산 / (지속 + 잡음 분산), 잡음 sd = σ.
   지속 성분은 형성 연도와 결과 연도에 같다.
 - 운용사 공통: 운용사 번호를 ETF마다 임의로 붙이고(운용사 10개, 점유 지프식), 몫 ω만큼 ① 지속 성분의 일부가
-  운용사 단위(그룹을 넘어 같은 운용사가 공유, 연도 불변)이고 ② 잡음의 일부가 운용사-연도 공통 충격이다.
+  운용사 단위(그룹을 넘어 같은 운용사가 공유, 연도 불변)이고 ② 잡음의 일부가 운용사-연도 공통 충격(연도마다 운용사마다 하나, 그룹을 넘어 공유)이다.
 - 전달률 β: 관측 총수익 ``RTR_i(y) = gross_{i,y} − β · A_i/100`` . 따라서
   ``G_i = RTR_i(Y) + F_i/100`` , ``H_i = RTR_i(Y+1) + A_i/100`` 이고 β = 1 이면 보수 전 수익만 남는다.
 - 모의에서는 쌍마다의 공통 창 차이를 무시한다(H[a, b] = H_a). 같은 ETF가 여러 연도에 나오는 것도 무시한다(연도마다 독립).
@@ -131,10 +131,14 @@ def simulate(sk: Skeleton, sc: dict, rng: np.random.Generator) -> tuple[st.StatD
     op = rng.choice(N_OPERATORS, size=E, p=_zipf_probs(N_OPERATORS))
     u_op = rng.standard_normal(N_OPERATORS)
     persist = tau * (np.sqrt(1 - om) * rng.standard_normal(E) + np.sqrt(om) * u_op[op])
-    # 운용사-연도 충격: 형성·결과 두 해, 운용사-연도마다 하나
-    v = rng.standard_normal((2, N_OPERATORS))
-    gross_y = persist + sigma * (np.sqrt(1 - om) * rng.standard_normal(E) + np.sqrt(om) * v[0][op])
-    gross_y1 = persist + sigma * (np.sqrt(1 - om) * rng.standard_normal(E) + np.sqrt(om) * v[1][op])
+    # 운용사-연도 충격: 연도마다 운용사마다 하나. 형성 Y 는 v[Y], 결과 Y+1 은 v[Y+1] (연속한 두 연도가 겹쳐 쓴다)
+    y_min = int(sk.years.min())
+    v = rng.standard_normal((int(sk.years.max()) - y_min + 2, N_OPERATORS))
+    yi = np.repeat(sk.years - y_min, sk.sizes)  # ETF-연마다 형성 연도 번호
+    gross_y = persist + sigma * (np.sqrt(1 - om) * rng.standard_normal(E) + np.sqrt(om) * v[yi, op])
+    gross_y1 = persist + sigma * (
+        np.sqrt(1 - om) * rng.standard_normal(E) + np.sqrt(om) * v[yi + 1, op]
+    )
     beta = sc["beta"]
     rtr_y = gross_y - beta * F / 100.0
     rtr_y1 = gross_y1 - beta * A / 100.0
