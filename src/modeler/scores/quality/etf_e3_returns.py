@@ -58,19 +58,36 @@ class GyValues:
     ok_y: np.ndarray  # (n, n) bool
     ok_y1: np.ndarray  # (n, n) bool
     operator: list[str | None]
+    own_y: np.ndarray | None = None  # RTR_i(Y) 자기 창(R12 기준선용)
+    own_y_lost: np.ndarray | None = None
+    delisted_y1: np.ndarray | None = None  # Y+1 중 상장폐지(부분 창)
 
 
 def gy_values(
-    ctx: Ctx, gy: GroupYear, fee_field: str = "ter", lag_days: int = fees.LAG_DAYS
+    ctx: Ctx,
+    gy: GroupYear,
+    fee_field: str = "ter",
+    lag_days: int = fees.LAG_DAYS,
+    aug_fixed: bool = False,
 ) -> GyValues:
     d = ctx.dense
     n = len(gy.cols)
     y = gy.year
     t_last = d.dates[d.year_range(y)[1]]
     fund = [ctx.code_map.get(c) for c in gy.isu]
-    F = np.array([fees.formation_value(ctx.fee, f, t_last, lag_days, fee_field) for f in fund])
-    A = np.array([fees.outcome_value(ctx.fee, f, y + 1, fee_field) for f in fund])
+    F = np.array(
+        [fees.formation_value(ctx.fee, f, t_last, lag_days, fee_field, aug_fixed) for f in fund]
+    )
+    end1 = d.year_range(y + 1)[1]
+    delisted = np.array([ctx.last_idx is not None and ctx.last_idx[int(c)] < end1 for c in gy.cols])
+    A = np.array(
+        [
+            fees.outcome_value(ctx.fee, f, y + 1, fee_field, 1 if dl else fees.A_MIN_MONTHS)
+            for f, dl in zip(fund, delisted)
+        ]
+    )
     own = [own_rtr(ctx, int(c), y + 1) for c in gy.cols]
+    own_y = [own_rtr(ctx, int(c), y) for c in gy.cols]
     G = np.full((n, n), np.nan)
     H = np.full((n, n), np.nan)
     R = np.full((n, n), np.nan)
@@ -103,4 +120,7 @@ def gy_values(
         ok_y=oky,
         ok_y1=oky1,
         operator=[ctx.fee.operator.get(f) if f else None for f in fund],
+        own_y=np.array([o[0] for o in own_y]),
+        own_y_lost=np.array([o[1] for o in own_y]),
+        delisted_y1=delisted,
     )

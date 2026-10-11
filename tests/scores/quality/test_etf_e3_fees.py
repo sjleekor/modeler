@@ -136,3 +136,14 @@ def test_lag_cap_on_any_single_observation_over_92():
     assert s["cap"] is True
     s = fees.lag_summary([40], censored_over=30)
     assert s["cap"] is False
+
+
+def test_aug_fixed_picks_august_file_even_when_rule_picks_september():
+    fa = make()
+    # 2016-12-30: 규칙은 8월 말(0.8). T = 2016-12-01 처럼 T−92 가 9월 말을 고르는 날을 만든다
+    t = np.datetime64(date(2017, 1, 3))  # T−92 = 2016-10-03 → 규칙은 2016-09-30 파일(0.9)
+    assert fees.formation_value(fa, "F1", t) == pytest.approx(0.9)
+    # 같은 해(2017)의 8월 말 값 = 0.8 + 1
+    assert fees.formation_value(fa, "F1", t, aug_fixed=True) == pytest.approx(1.8)
+    assert fees.formation_available(fa, "F1", t, aug_fixed=True)
+    assert not fees.formation_available(fa, "F1", np.datetime64(date(2019, 12, 30)), aug_fixed=True)

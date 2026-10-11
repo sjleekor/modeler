@@ -33,20 +33,14 @@ from modeler.scores.quality import etf_e3_exdate as ex
 from modeler.scores.quality import etf_e3_fees as fees
 from modeler.scores.quality import etf_e3_inputs as inp
 from modeler.scores.quality import etf_e3_power as pw
+from modeler.scores.quality import etf_e3_records as rec
 from modeler.scores.quality import etf_e3_sample as sm
 from modeler.scores.quality import etf_e3_stat as st
 
 FROZEN_TAG = "etf-holding-cost-e3-frozen"
 
 NOT_IMPLEMENTED = {
-    "R1_unexplained_difference": "TODO 기록용 — 보수로 설명 안 되는 차이(R1). 판정 안 넣음",
-    "R7_general_account_15.4": "TODO 기록용 — 일반 계좌 15.4% 세후",
-    "R8_close_based": "TODO 기록용 — 종가 기준 수익률",
-    "R9_index_tr_tracking": "TODO 기록용 — 지수 TR 절대 추적차이",
-    "R11_delisted_partial_window": "TODO 기록용 — 폐지 ETF 부분 창",
-    "R12_baseline": "TODO 기록용 — 기준선",
-    "R13_forward_confirmation": "TODO 전진 확인(2025 형성)은 2027-01 이후",
-    "delisted_merged_by_F_band": "TODO 기록용 — 폐지·합병 ETF-연 수를 F 구간별로(F 구간 문턱 사양에 없음)",
+    "R9_kospi200_tr": "코스피200 TR(KRX drvprod)은 10-23 백필 전이라 자료 없음. S&P 500 TR은 입력 CSV가 있을 때만 계산(없으면 결과에 '자료 대기')",
     "foreign_exposure_nav_lag": "구현은 국내 노출만 쓴 변형(region=domestic)으로 대신함",
 }
 
@@ -334,12 +328,16 @@ def lags_from_watch(path: str | Path) -> dict:
 
 
 def build_inputs(
-    ctx: sm.Ctx, sample: sm.Sample, fee_field: str = "ter", lag_days: int = fees.LAG_DAYS
+    ctx: sm.Ctx,
+    sample: sm.Sample,
+    fee_field: str = "ter",
+    lag_days: int = fees.LAG_DAYS,
+    aug_fixed: bool = False,
 ) -> dict:
     """판정 값 계산(동결 뒤 전용). E3b′·E3a(C_a) 의 ``StatData`` 와 β̂·이득 입력."""
     from modeler.scores.quality import etf_e3_returns as rt
 
-    vals = [rt.gy_values(ctx, gy, fee_field, lag_days) for gy in sample.gys]
+    vals = [rt.gy_values(ctx, gy, fee_field, lag_days, aug_fixed) for gy in sample.gys]
     keys = sorted({gy.key for gy in sample.gys})
     gid = {k: i for i, k in enumerate(keys)}
     sizes = [len(gy.cols) for gy in sample.gys]
@@ -452,15 +450,40 @@ def record_variants(ctx, years, sample, inpt, rs, n_boot, seed) -> dict:
             **{
                 k: v
                 for k, v in kw.items()
-                if k in ("key_mode", "min_group", "fee_field", "lag_days", "region")
+                if k
+                in (
+                    "key_mode",
+                    "min_group",
+                    "fee_field",
+                    "lag_days",
+                    "region",
+                    "aug_fixed",
+                )
             },
         )
         if not s2.gys:
             out[label] = {"note": "표본 없음"}
             return
-        i2 = build_inputs(ctx, s2, kw.get("fee_field", "ter"), kw.get("lag_days", fees.LAG_DAYS))
+        i2 = build_inputs(
+            ctx,
+            s2,
+            kw.get("fee_field", "ter"),
+            kw.get("lag_days", fees.LAG_DAYS),
+            kw.get("aug_fixed", False),
+        )
         out[label] = st.c_only(i2["sd_b"], n_boot, seed)
 
+    run(
+        "fee_aug_fixed", aug_fixed=True
+    )  # R5 계열: F를 Y의 8월 말 파일에서(지연 119일 이상으로 통일)
+    out["R1_unexplained"] = rec.r1_unexplained(inpt["xs"], inpt["ys"])
+    out["R7_general_account_0.846"] = rec.r7_general_account(ctx, sample, n_boot, seed)
+    out["R8_close_based"] = rec.r8_close_based(ctx, sample, n_boot, seed)
+    out["R11_delisted_partial_window"] = rec.r11_delisted_partial(ctx, years, n_boot, seed)
+    out["R12_baseline"] = rec.r12_baseline(ctx, sample, vals)
+    out["delisted_merged_by_F_band"] = rec.delisted_by_f_band(ctx, years)
+    out["R9_index_tracking"] = rec.r9_index_tracking(ctx)
+    out["R13_forward_confirmation"] = rec.r13_forward(ctx, n_boot, seed)
     run("group_size_ge3", min_group=3)
     run("group_size_ge5", min_group=5)
     run("key_without_return_type_R4", key_mode="no_rt")

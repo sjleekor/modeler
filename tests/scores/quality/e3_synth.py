@@ -115,7 +115,7 @@ def build_panel(tmp_path, etfs, days=DAYS, seed=1, pay=True, quarterly_amt=0.01)
                     LIST_SHRS=str(shares),
                     IDX_IND_NM=idx_nm,
                     ACC_TRDVAL="1000000",
-                    INVSTASST_NETASST_TOTAMT="100000000",
+                    INVSTASST_NETASST_TOTAMT=str(spec.get("netasst", 100000000)),
                     MKTCAP="100000000",
                 )
                 w.writerow(row)

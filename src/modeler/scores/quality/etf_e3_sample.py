@@ -10,8 +10,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import warnings
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +60,7 @@ class Ctx:
     nav_shift: int = ex.FROZEN_NAV_SHIFT
     rule: str = ex.FROZEN_RULE
     extra: dict = field(default_factory=dict)
+    last_idx: np.ndarray | None = None  # ETF 열별 마지막 거래일 번호(상장 유지 판단)
 
 
 def return_defined(d: Dense) -> np.ndarray:
@@ -98,7 +101,15 @@ def make_ctx(
         input_sha=input_sha or {},
         nav_shift=nav_shift,
         rule=rule,
+        last_idx=_last_idx(life, d),
     )
+
+
+def _last_idx(life: pl.DataFrame, d: Dense) -> np.ndarray:
+    out = np.full(len(d.isu), -1)
+    for c, f in zip(life["isu_cd"].to_list(), life["last_idx"].to_list()):
+        out[d.col[c]] = f
+    return out
 
 
 def load_ctx(
@@ -158,11 +169,16 @@ def window_flags(ctx: Ctx, y: int, split: np.ndarray) -> pl.DataFrame:
     sl = slice(s0, e1 + 1)
     t = np.arange(s0, e1 + 1)
     start = np.maximum(s0, first_idx)
-    inwin = t[:, None] >= start[None, :]
+    last_idx = np.full(N, -1)
+    li = ctx.life.select("isu_cd", "last_idx")
+    for c, f in zip(li["isu_cd"].to_list(), li["last_idx"].to_list()):
+        last_idx[d.col[c]] = f
+    end = np.minimum(e1, last_idx)  # 폐지된 ETF는 마지막 NAV 날까지(상장 유지 ETF는 e1)
+    inwin = (t[:, None] >= start[None, :]) & (t[:, None] <= end[None, :])
     nav = d.nav[sl]
     miss = ((~np.isfinite(nav)) & inwin).sum(axis=0)
     first_nav_missing = ~np.isfinite(d.nav[np.minimum(start, e1), np.arange(N)])
-    last_nav_missing = ~np.isfinite(d.nav[e1])
+    last_nav_missing = ~np.isfinite(d.nav[np.maximum(end, 0), np.arange(N)])
     nav_missing = (miss > NAV_MISS_MAX) | first_nav_missing | last_nav_missing
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -200,6 +216,24 @@ class Sample:
     aux: dict = field(default_factory=dict)
 
 
+def year_closed_panel(panel: ep.Panel) -> ep.Panel:
+    """달력 끝에 다음 해 첫날 하나를 덧붙여, 마지막 해를 '끝난 해'로 보게 한 패널(``etf_e2.etf_years`` 용).
+
+    ETF 행·거래일 번호는 그대로다. 호출하는 쪽이 자료가 그 해 마지막 거래일까지 있는지 확인해야 한다.
+    """
+    cal = panel.calendar
+    last = cal["date"][-1]
+    extra = pl.DataFrame(
+        {
+            "date": [date(last.year + 1, 1, 4)],
+            "day_idx": [int(cal["day_idx"][-1]) + 1],
+            "is_month_end": [True],
+        },
+        schema=cal.schema,
+    )
+    return dataclasses.replace(panel, calendar=pl.concat([cal, extra]))
+
+
 def key_of(group_key: str, mode: str = "frozen") -> str:
     """``frozen`` = E2 동결 키 그대로. ``no_rt`` = 수익률 표기 칸(마지막)을 뺀 기록용 R4 키."""
     if mode == "frozen":
@@ -210,9 +244,17 @@ def key_of(group_key: str, mode: str = "frozen") -> str:
 
 
 def pair_window_ok(ctx: Ctx, i: int, j: int, y: int) -> bool:
-    """연 y 창에서 쌍 (i, j)의 공통일이 있고, 두 ETF의 분배락일이 모두 공통일 안에 있다."""
+    """연 y 창에서 쌍 (i, j)의 공통일이 있고, 두 ETF의 분배락일이 모두 공통일 안에 있다.
+
+    창 끝은 두 ETF가 다 상장해 있는 마지막 날까지다(상장 유지 ETF 쌍이면 연 말일 그대로, 폐지 ETF가 낀 부분 창이면
+    그 폐지일까지).
+    """
     d = ctx.dense
     s, e = d.year_range(y)
+    if ctx.last_idx is not None:
+        e = min(e, int(ctx.last_idx[i]), int(ctx.last_idx[j]))
+    if e < s:
+        return False
     sl = slice(s, e + 1)
     common = ctx.rfin[sl, i] & ctx.rfin[sl, j]
     if common.sum() == 0:
@@ -230,11 +272,33 @@ def build_sample(
     fee_field: str = "ter",
     lag_days: int = fees.LAG_DAYS,
     region: str | None = None,
+    aug_fixed: bool = False,
+    include_delisted_y1: bool = False,
+    close_year_end: bool = False,
 ) -> Sample:
-    """표본·제외·개수. ``region`` 은 'domestic' 등으로 거르는 기록용 변형(국내 노출만)."""
+    """표본·제외·개수.
+
+    ``region`` 은 'domestic' 등으로 거르는 기록용 변형(국내 노출만). ``aug_fixed`` 는 F를 Y의 8월 말 파일에서 읽는다.
+    ``include_delisted_y1`` 은 Y+1 중 상장폐지된 ETF-연을 Y+1 마지막 NAV 날까지의 부분 창으로 넣는다(R11, 나머지 조건
+    같음. 결과 보수 A는 있는 달이 1개 이상이면 된다). ``close_year_end`` 는 자료가 Y+1의 마지막 거래일까지 있을 때
+    끝나지 않은 해로 보지 않게 한다(전진 확인 R13).
+    """
     d = ctx.dense
     life = ctx.life
-    ey = e2.etf_years(ctx.panel, life, list(years), with_values=False).filter(pl.col("ok_lenient"))
+    pnl = year_closed_panel(ctx.panel) if close_year_end else ctx.panel
+    ey = e2.etf_years(pnl, life, list(years), with_values=False)
+    if include_delisted_y1:
+        ok_nodel = ~(
+            pl.col("fail_days_y")
+            | pl.col("fail_days_y1")
+            | pl.col("fail_maturity")
+            | pl.col("fail_pension")
+            | pl.col("fail_hold")
+        )
+        ey = ey.filter(ok_nodel)
+    else:
+        ey = ey.filter(pl.col("ok_lenient"))
+    ey = ey.with_columns(pl.col("fail_delisted_y1").alias("delisted_y1"))
     ey = ey.with_columns(
         pl.col("group_key")
         .map_elements(lambda k: key_of(k, key_mode), return_dtype=pl.String)
@@ -281,7 +345,9 @@ def build_sample(
     x_map, f_ok, a_months = [], [], []
     for c, fnd, y in zip(ey["isu_cd"].to_list(), fund, ey["year"].to_list()):
         x_map.append(fnd is None)
-        f_ok.append(fees.formation_available(ctx.fee, fnd, t_last[y], lag_days, fee_field))
+        f_ok.append(
+            fees.formation_available(ctx.fee, fnd, t_last[y], lag_days, fee_field, aug_fixed)
+        )
         a_months.append(fees.outcome_months(ctx.fee, fnd, y + 1, fee_field))
     ey = ey.with_columns(
         pl.Series("fund_code", fund, dtype=pl.String),
@@ -289,7 +355,13 @@ def build_sample(
         pl.Series("f_available", f_ok),
         pl.Series("a_months", a_months, dtype=pl.Int64),
     ).with_columns(
-        (~pl.col("f_available") | (pl.col("a_months") < fees.A_MIN_MONTHS)).alias("x_fee")
+        (
+            ~pl.col("f_available")
+            | (
+                pl.col("a_months")
+                < pl.when(pl.col("delisted_y1")).then(1).otherwise(fees.A_MIN_MONTHS)
+            )
+        ).alias("x_fee")
     )
 
     # 순차 제외 + 개수

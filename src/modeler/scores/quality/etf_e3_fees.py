@@ -57,8 +57,18 @@ def _field(fa: FeeArrays, field: str) -> np.ndarray:
     return fa.vals[field]
 
 
-def formation_month_index(fa: FeeArrays, t_last: np.datetime64, lag_days: int = LAG_DAYS) -> int:
-    """기준일 ≤ T − lag 인 월말 파일 가운데 가장 늦은 것의 번호. 없으면 −1."""
+def formation_month_index(
+    fa: FeeArrays, t_last: np.datetime64, lag_days: int = LAG_DAYS, aug_fixed: bool = False
+) -> int:
+    """기준일 ≤ T − lag 인 월말 파일 가운데 가장 늦은 것의 번호. 없으면 −1.
+
+    ``aug_fixed`` 이면 규칙 대신 T가 속한 해의 8월 월말 파일 하나(기록용 변형, 지연 119일 이상으로 통일).
+    """
+    if aug_fixed:
+        y = int(t_last.astype("datetime64[Y]").astype(int)) + 1970
+        ym = fa.months.astype("datetime64[M]")
+        hit = np.flatnonzero(ym == np.datetime64(f"{y}-08"))
+        return int(hit[0]) if len(hit) else -1
     lim = t_last - np.timedelta64(lag_days, "D")
     k = int(np.searchsorted(fa.months, lim, side="right")) - 1
     return k
@@ -70,11 +80,12 @@ def formation_available(
     t_last: np.datetime64,
     lag_days: int = LAG_DAYS,
     field: str = "ter",
+    aug_fixed: bool = False,
 ) -> bool:
     """F가 있는가(값은 읽지 않고 유무만)."""
     if fund is None or fund not in fa.fund_col:
         return False
-    k = formation_month_index(fa, t_last, lag_days)
+    k = formation_month_index(fa, t_last, lag_days, aug_fixed)
     if k < 0:
         return False
     return bool(np.isfinite(_field(fa, field)[k, fa.fund_col[fund]]))
@@ -86,11 +97,12 @@ def formation_value(
     t_last: np.datetime64,
     lag_days: int = LAG_DAYS,
     field: str = "ter",
+    aug_fixed: bool = False,
 ) -> float:
     """F 값(%). 없으면 NaN. 판정 실행에서만 쓴다."""
     if fund is None or fund not in fa.fund_col:
         return float("nan")
-    k = formation_month_index(fa, t_last, lag_days)
+    k = formation_month_index(fa, t_last, lag_days, aug_fixed)
     if k < 0:
         return float("nan")
     return float(_field(fa, field)[k, fa.fund_col[fund]])
