@@ -7,7 +7,7 @@
     STOCK_DATA_ROOT=../stock_data PYTHONPATH=src python -m modeler.scores.quality.etf_theme_card
 
 경로는 환경변수 ``STOCK_DATA_ROOT`` 로 받는다(기본 ``../stock_data``). 산출물은
-``kr/output/quality_score_etf_theme_cards_20261010/`` 에만 쓴다. **KRX 약관(제3자 제공 금지) 때문에
+``kr/output/quality_score_etf_theme_cards_20261011_fee/`` 에 쓴다(10-10 판 디렉터리는 덮지 않는다). **KRX 약관(제3자 제공 금지) 때문에
 산출물을 외부에 올리지 않는다.**
 
 규칙
@@ -23,7 +23,9 @@
 - **채권혼합 표시(``bond_mix_display``)**: ``synthetic_display`` 와 같은 방식이다. 마지막 거래일 이름
   (``ISU_NM``)에 ``채권혼합`` 이 있으면 참으로 둘 뿐이며 **판정에 쓰지 않는다**(동결 테마 사전은 그대로).
   채권혼합 상품은 주식 비중이 절반 안팎이라 테마 노출이 묽다는 점을 카드에서 알아보게 하는 표시다.
-- 총보수는 원천이 정해지지 않아 전부 ``원천 미정``.
+- 총보수(10-11 갱신): 원천은 DIS 월말 보수 사본이다(``etf_theme_fee``). ``fee_total_pct``(합계 보수)·
+  ``ter_pct``·``fee_basis_date``·``fee_status`` 를 카드 끝에 붙인다. **설명값이며 선택 근거가 아니다**
+  (E3 전진 확인 전). 첫 판의 ``fee`` 칸(``원천 미정``)은 칸·값을 그대로 두었다(옛 칸 동일 확인용).
 """
 
 from __future__ import annotations
@@ -42,10 +44,11 @@ import polars as pl
 from modeler.scores.quality import etf_e1 as e1
 from modeler.scores.quality import etf_panel as ep
 from modeler.scores.quality import etf_theme as et
+from modeler.scores.quality import etf_theme_fee as ef
 
 CARD_VERSION = "quality-score-v0/etf_theme_card/1"
 
-DEFAULT_OUT_REL = "kr/output/quality_score_etf_theme_cards_20261010"
+DEFAULT_OUT_REL = "kr/output/quality_score_etf_theme_cards_20261011_fee"
 DEFAULT_MEMBERSHIP_REL = "kr/output/quality_score_prep_20261010/etf_theme_membership.csv"
 
 MONTH_END = date(2026, 9, 30)  # E1 기준 월말(자료 끝 달은 월말로 안 쓴다, etf_e1 I21)
@@ -333,6 +336,8 @@ def build_summary(cards: pl.DataFrame) -> pl.DataFrame:
         ],
         pl.col("netasst_won").median().alias("netasst_median_won"),
     ]
+    if "fee_status" in cards.columns:  # 10-11: 총보수 값이 있는 상품 수(맨 끝에 붙는다)
+        aggs.append((pl.col("fee_status") == ef.ST_OK).sum().alias("n_fee_value"))
     out = cards.group_by("theme", "category", "required_by_user", maintain_order=True).agg(aggs)
     return out.with_columns(pl.col("theme").replace_strict(order, return_dtype=pl.Int64).alias("_o")).sort(
         "_o"
@@ -360,15 +365,31 @@ def _e1_cell(r: dict) -> str:
     return s
 
 
+def _fee_cells(r: dict) -> str:
+    """총보수·TER 칸. 값이 없으면 총보수 칸에 사유(``fee_status``)를 적고 TER 칸은 비운다."""
+    if r["fee_status"] != ef.ST_OK:
+        return f" {_md(r['fee_status'])} | |"
+    a = "" if r["fee_total_pct"] is None else f"{r['fee_total_pct']:.4f}"
+    t = "" if r["ter_pct"] is None else f"{r['ter_pct']:.4f}"
+    return f" {a} | {t} |"
+
+
 def render_user_theme_md(cards: pl.DataFrame, month_end: date, end_date: date) -> str:
     """사용자 일곱 테마마다 표 하나. 연금 적격 후보만. 숫자만, 추천 문장 없음."""
+    has_fee = "fee_status" in cards.columns
+    fee_basis = cards["fee_basis_date"][0] if has_fee and cards.height else None
     lines = [
         "# ETF 테마 상품 카드 — 사용자 일곱 테마 (설명용 기록)",
         "",
         f"E1 기준 월말 {month_end}, 거래대금·괴리율 창은 자료 끝 {end_date}까지 최근 "
         f"{DESC_WINDOW_SESSIONS}거래일입니다. 사전등록 §11.5 설명용 기록이며 판정이 아닙니다. "
-        "수익률·유망성·테마 사이 비교는 넣지 않았습니다. 총보수는 원천 미정입니다. "
-        "KRX 약관상 외부에 올리지 않습니다.",
+        "수익률·유망성·테마 사이 비교는 넣지 않았습니다. "
+        + (
+            f"총보수·TER는 DIS 기준일 {fee_basis}의 설명값입니다(선택 근거가 아닙니다. 값이 없으면 사유를 적었습니다). "
+            if has_fee
+            else "총보수는 원천 미정입니다. "
+        )
+        + "KRX 약관상 외부에 올리지 않습니다.",
         "",
         f"E1 판정 표시: 국내형 E1은 동결 규칙으로 판정해 D였습니다(2026-10-10, 사용자 결정: 유지 — 설명값으로 계속 씁니다). "
         f"해외형은 순자산 하나로 매긴 기록용입니다. {E2_JUDGMENT_NOTE}.",
@@ -386,8 +407,9 @@ def render_user_theme_md(cards: pl.DataFrame, month_end: date, end_date: date) -
             f"상장 {sub.height} · 적격 {elig.height} · 경보 {n_alert}",
             "",
             "| 상품 | 기초지수 | 국내/해외 | 액티브 | 환헤지 | 합성 | 채권혼합 | E1 백분위/경보 또는 없는 이유 "
-            "| 순자산(억 원) | 거래대금 중앙값(억 원) | 괴리율(%) |",
-            "|---|---|---|---|---|---|---|---|---:|---:|---:|",
+            "| 순자산(억 원) | 거래대금 중앙값(억 원) | 괴리율(%)"
+            + (" | 총보수(%) | TER(%) |" if has_fee else " |"),
+            "|---|---|---|---|---|---|---|---|---:|---:|---:" + ("|---:|---:|" if has_fee else "|"),
         ]
         for r in elig.iter_rows(named=True):
             na = "" if r["netasst_won"] is None else f"{r['netasst_won'] / 1e8:,.1f}"
@@ -397,7 +419,7 @@ def render_user_theme_md(cards: pl.DataFrame, month_end: date, end_date: date) -
                 f"| {_md(r['isu_cd'])} {_md(r['isu_nm'])} | {_md(r['idx_ind_nm'])} | {_md(r['region'])} "
                 f"| {_yn(r['active'])} | {_md(r['hedge'])} | {_yn(r['synthetic_display'])} "
                 f"| {_yn(r['bond_mix_display'])} "
-                f"| {_md(_e1_cell(r))} | {na} | {tv} | {gp} |"
+                f"| {_md(_e1_cell(r))} | {na} | {tv} | {gp} |" + (_fee_cells(r) if has_fee else "")
             )
         lines.append("")
     return "\n".join(lines)
@@ -426,6 +448,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--input", default=str(root / ep.DEFAULT_INPUT_REL))
     ap.add_argument("--membership", default=str(root / DEFAULT_MEMBERSHIP_REL))
     ap.add_argument("--out-dir", default=str(root / DEFAULT_OUT_REL))
+    ap.add_argument("--dis-dir", default=str(root / ef.DIS_DIR_REL))
+    ap.add_argument("--code-map", default=str(root / ef.CODE_MAP_REL))
+    ap.add_argument("--manual-confirm", default=str(root / ef.MANUAL_REL))
+    ap.add_argument("--fee-cutoff", default=str(ef.DEFAULT_CUTOFF), help="이 날짜 이하 중 가장 늦은 DIS 월말을 기준일로")
     a = ap.parse_args(argv)
     out = Path(a.out_dir)
 
@@ -440,6 +466,15 @@ def main(argv: list[str] | None = None) -> int:
 
     scores = e1.monthly_scores(panel, life)  # 기본 인자 그대로
     cards = build_cards(panel, life, mem, scores, MONTH_END)
+
+    months = ef.available_months(Path(a.dis_dir) / "raw")
+    basis = ef.pick_basis_date(months, date.fromisoformat(a.fee_cutoff))
+    month_rows = ef.load_month(Path(a.dis_dir) / "raw", basis)
+    cmap, known = ef.load_code_map(a.code_map, a.manual_confirm)
+    confirmed = dict(zip(cmap["short_code"].to_list(), cmap["fund_code"].to_list()))
+    fees = ef.fee_table(cards["isu_cd"].unique(maintain_order=True).to_list(), confirmed, known, month_rows, basis)
+    cards = ef.attach_fees(cards, fees)
+    fee_counts = ef.summarize_status(cards)
     summary = build_summary(cards)
 
     out.mkdir(parents=True, exist_ok=True)
@@ -456,6 +491,24 @@ def main(argv: list[str] | None = None) -> int:
         "inputs": {
             "panel_csv": {"path": str(a.input), "sha256": _sha256(a.input)},
             "frozen_membership_csv": {"path": str(a.membership), "sha256": _sha256(a.membership)},
+            "dis_summary_json": {"path": str(Path(a.dis_dir) / "SUMMARY.json"), "sha256": _sha256(Path(a.dis_dir) / "SUMMARY.json")},
+            "dis_raw_basis_file": {
+                "path": str(Path(a.dis_dir) / "raw" / f"{basis:%Y%m%d}.xml.gz"),
+                "sha256": _sha256(Path(a.dis_dir) / "raw" / f"{basis:%Y%m%d}.xml.gz"),
+            },
+            "dis_code_map_csv": {"path": str(a.code_map), "sha256": _sha256(a.code_map)},
+            "dis_manual_confirm_csv": {"path": str(a.manual_confirm), "sha256": _sha256(a.manual_confirm)},
+        },
+        "fee": {
+            "version": ef.FEE_VERSION,
+            "basis_date": str(basis),
+            "cutoff": a.fee_cutoff,
+            "months_in_copy": len(months),
+            "last_month_in_copy": str(months[-1]),
+            "map_rule": "confidence high + 수동 확인 20쌍(E3와 같은 규칙), 같은 달 중복 행은 첫 행",
+            "use": "설명값. 선택 근거 아님(E3 전진 확인 전, 사전등록 v2 §8.1)",
+            "status_counts": fee_counts,
+            "module": {"file": str(Path(ef.__file__)), "sha256": _sha256(ef.__file__)},
         },
         "frozen_dictionary": {"file": str(theme_src), "sha256": _sha256(theme_src)},
         "membership_check": cmp,
@@ -472,6 +525,7 @@ def main(argv: list[str] | None = None) -> int:
             "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
             "commit": _git("rev-parse", "HEAD"),
             "git_status_porcelain": _git("status", "--porcelain").splitlines(),
+            "worktree_clean": _git("status", "--porcelain") == "",
         },
         "dates": {
             "month_end": str(MONTH_END),
@@ -489,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
         "outputs": sorted(["theme_cards.csv", "theme_summary.csv", "cards_user7.md"]),
     }
     (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
-    print(json.dumps({"cards": cards.height, "etfs": manifest["n_etfs"], "membership": cmp}, ensure_ascii=False))
+    print(json.dumps({"cards": cards.height, "etfs": manifest["n_etfs"], "membership": cmp, "fee": fee_counts}, ensure_ascii=False))
     return 0
 
 
