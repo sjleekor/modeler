@@ -1,0 +1,603 @@
+# ruff: noqa: E501
+"""KR 재무·규모·공시 14개 해설 페이지 설정 (03번 문서)."""
+
+DOC_DIR = "milestones/common/20261012_feature_explainer"
+OUT_NAME = "03_kr_fin_event.html"
+DOC_MD = "03_kr_fin_event.md"
+RESULT_MD = "09_kr_result.md"
+RUN_ID = "kr_l3_20261012T113305Z"
+PANEL_REL = (
+    "kr/datasets/02_updown_prob/snapshot_date=2026-08-23/source=sj2_remote/"
+    "FS1h_h20_lag1_rank_idxbench__holdout/feat_panel.parquet"
+)
+RAW_REL = "kr/raw/raw_postgres/snapshot_date=2026-09-30/source=sj2_remote"
+REF_DATE = "2026-08-28"
+PREFIX = ("fin_", "ev_", "own_")
+MARKET = "kr"
+PAGE_TITLE = "KR 재무·공시 피쳐 해설"
+GROUP_NAMES = {"c09": "수익성 (ROA·ROE·영업이익률)", "c10": "레버리지 (부채비율·자기자본비율)"}
+MODELER_COMMIT = "24eb8e0"
+N_ICE = 40
+EX_DAYS = 260
+EX_MARKET = "KOSPI"
+
+SCATTER_LABELS = ["fin_roa", "fin_roe", "fin_cash_ratio", "own_major_filing_60d", "fin_log_mcap"]
+
+THEMES = [
+    (
+        "수익성",
+        "이익을 자산·자본·매출로 나눈 비율 4개. 분기 보고서 한 건의 값입니다.",
+        ["fin_roa", "fin_roe", "fin_operating_margin", "fin_asset_turnover"],
+    ),
+    (
+        "재무 안정성",
+        "빚·자기 돈·현금의 비중 4개. 모두 단변량 검정을 받은 적이 없습니다.",
+        ["fin_debt_to_equity", "fin_equity_ratio", "fin_ocf_to_assets", "fin_cash_ratio"],
+    ),
+    (
+        "상태 플래그",
+        "순위로 바꾸지 않고 0/1 그대로 들어가는 스위치 2개.",
+        ["fin_is_negative_equity", "fin_has_fs"],
+    ),
+    ("규모", "회사 덩치. 매일 갱신되는 값입니다.", ["fin_log_mcap"]),
+    (
+        "공시·지분 사건",
+        "DART 공시의 내용이 아니라 건수를 센 값 3개.",
+        ["ev_amendment_ratio_1y", "ev_filing_burst_60d", "own_major_filing_60d"],
+    ),
+]
+
+FMT = {
+    "fin_roa": "pct",
+    "fin_roe": "pct",
+    "fin_operating_margin": "pct",
+    "fin_asset_turnover": "mult",
+    "fin_debt_to_equity": "mult",
+    "fin_equity_ratio": "pct",
+    "fin_ocf_to_assets": "pct",
+    "fin_cash_ratio": "pct",
+    "fin_is_negative_equity": "bin",
+    "fin_has_fs": "bin",
+    "fin_log_mcap": "num",
+    "ev_amendment_ratio_1y": "pct",
+    "ev_filing_burst_60d": "mult",
+    "own_major_filing_60d": "int",
+}
+
+BASIS = {
+    "fin_pit": "재무제표 기준 · 사업보고서는 기말 + 90일, 분기·반기는 기말 + 45일 뒤부터 씁니다 (실제 접수일이 아니라 보수적인 고정 지연)",
+    "mcap": "매일 갱신 · 주식 수는 공시 다음 거래일부터, 종가는 당일 값",
+    "filing": "DART 접수 이력 기준 · 접수일 D의 공시는 D+1 거래일부터 반영",
+}
+
+
+def seg(a, b, kind="use", text=""):
+    return {"a": a, "b": b, "kind": kind, "text": text}
+
+
+FS_NOTE = "거래일 창이 아니라 보고서 한 건의 값입니다. t일에 쓰는 값은 그때까지 쓸 수 있게 된 가장 최신 보고서의 기간 값입니다."
+
+
+def fs_win(formula, label, note=FS_NOTE):
+    return dict(
+        axis=8,
+        formula=formula,
+        rows=[dict(label=label, segs=[seg(-1, 0, "use", "최신 보고서 1건")])],
+        marks=[(0, "t")],
+        note=note,
+    )
+
+
+CARDS = {
+    "fin_roa": dict(
+        title="총자산이익률 (ROA)",
+        basis="fin_pit",
+        intuition="회사가 가진 자산 100원으로 이익을 얼마나 냈는지입니다. 값이 크면 자산을 효율적으로 쓰는 회사로 보지만, 우리 자료에서 이 열이 수익과 이어진다고 확인한 것은 없습니다.",
+        analogy="가게에 넣은 돈이 100원이면 그 가게가 한 기간에 몇 원을 남겼는지 보는 것과 같습니다.",
+        win=fs_win("순이익 ÷ 총자산", "보고서에 적힌 기간 값의 비율"),
+        principle=dict(
+            type="timeline",
+            title="재무제표가 모델에 들어오기까지",
+            events=[
+                dict(at=0, label="기말", sub="분기·연도 끝"),
+                dict(at=45, label="분기·반기 보고서", sub="기말 + 45일부터 사용", kind="today"),
+                dict(at=90, label="사업보고서", sub="기말 + 90일부터 사용", kind="today"),
+            ],
+            spans=[
+                dict(a=0, b=45, label="고정 지연 45일 (분기·반기)"),
+                dict(a=0, b=90, label="고정 지연 90일 (연간)"),
+            ],
+            known={"from": 45, "label": "모델이 쓸 수 있는 시점"},
+            caption="공시일 열이 없어서 실제 접수일 대신 기한에 가까운 고정 날짜를 씁니다. 대체로 실제 공시보다 늦습니다. 값은 사후 정정이 반영된 최종본입니다.",
+        ),
+        what="순이익을 총자산으로 나눈 값입니다. 분자와 분모는 보고서에 적힌 기간 값이고 TTM이나 평균 자산이 아닙니다.",
+        model="순위가 오를수록 점수가 오르는 단조 증가(ρ +0.92)입니다. SHAP 10위, 섞기는 단독 4위로 안정합니다.",
+        caution="문헌 정의(TTM·평균 자산·접수일)와 코드 정의(기간 값·기말 자산·고정 지연)가 다릅니다. 단변량 검정이 없어 문헌 근거를 그대로 옮기면 안 됩니다.",
+    ),
+    "fin_roe": dict(
+        title="자기자본이익률 (ROE)",
+        basis="fin_pit",
+        intuition="주주 몫의 자본 100원이 이익을 얼마나 만들었는지입니다. 자본이 아주 작거나 마이너스인 회사에서는 값이 왜곡되므로, 크다고 좋은 회사라고 읽으면 안 됩니다.",
+        analogy="내 재산이 마이너스인 사람이 손해를 봤는데, 손해 ÷ 재산이 플러스로 나와 이익처럼 보이는 것과 같습니다.",
+        win=fs_win("( 지배주주 순이익, 없으면 순이익 ) ÷ 자기자본", "보고서에 적힌 기간 값의 비율"),
+        principle=dict(
+            type="ratio",
+            title="분모가 음수가 되면",
+            unit="",
+            rows=[
+                dict(
+                    label="정상 (예시 숫자)",
+                    numLabel="순이익",
+                    num=30,
+                    denLabel="자기자본",
+                    den=100,
+                    result="ROE = 30 ÷ 100 = +0.3",
+                ),
+                dict(
+                    label="적자 + 자본잠식 (예시 숫자)",
+                    numLabel="순이익",
+                    num=-30,
+                    denLabel="자기자본",
+                    den=-10,
+                    result="ROE = −30 ÷ −10 = +3.0 → 적자인데 양수",
+                    note="코드는 자기자본이 0일 때만 비웁니다(NULLIF). 음수는 그대로 나눕니다.",
+                ),
+            ],
+            caption="실측(09 §5.4): 자본잠식 144행(11개 종목)은 fin_roe 원값이 전부 양수였고 순위 평균이 0.993이었습니다. 그런데 이 행들의 fin_roe 평균 SHAP은 −0.0143으로, 순위 0.98 이상인 잠식 아닌 행(+0.0264)과 반대였습니다. 모델이 잠식을 알아봤다는 뜻은 아닙니다.",
+        ),
+        what="(지배주주) 순이익을 자기자본으로 나눈 값입니다. 자본잠식이면 적자인데도 양수가 될 수 있습니다.",
+        model="순위가 오를수록 점수가 오르고(ρ +0.91) SHAP 8위, 섞기 5위로 안정합니다. 맨 위 근처에서 곡선이 꺾여 역U자로 분류됐습니다.",
+        caution="자본잠식 처리가 문서마다 다르지만 코드로는 부호가 뒤집히는 쪽이 맞습니다. fin_debt_to_equity·fin_equity_ratio와 분모가 겹칩니다.",
+    ),
+    "fin_operating_margin": dict(
+        title="영업이익률",
+        basis="fin_pit",
+        intuition="매출 100원에서 영업이익이 몇 원 남는지입니다. 높으면 장사가 잘 되는 회사로 보지만, 우리 자료로 확인한 것은 없습니다.",
+        analogy="치킨 한 마리를 팔고 재료비·인건비를 뺀 뒤 몇 원이 남는지 보는 것과 같습니다.",
+        win=fs_win("영업이익 ÷ 매출", "보고서에 적힌 기간 값의 비율"),
+        principle=dict(
+            type="ratio",
+            title="같은 매출, 다른 영업이익",
+            unit="",
+            rows=[
+                dict(
+                    label="이익이 남는 회사 (예시 숫자)",
+                    numLabel="영업이익",
+                    num=10,
+                    denLabel="매출",
+                    den=100,
+                    result="영업이익률 = 10 ÷ 100 = +0.10",
+                ),
+                dict(
+                    label="영업적자 회사 (예시 숫자)",
+                    numLabel="영업이익",
+                    num=-5,
+                    denLabel="매출",
+                    den=100,
+                    result="영업이익률 = −5 ÷ 100 = −0.05",
+                ),
+            ],
+        ),
+        what="영업이익을 매출로 나눈 값입니다. 보고서 기간 값이라 TTM과 다릅니다.",
+        model="순위가 오를수록 점수가 오르고(ρ +0.74) U자로 분류됐습니다. SHAP 24위로 안정하지만 섞기(9위)는 불안정합니다.",
+        caution="매출 매핑이 얇았던 구간은 비어 있습니다. 업종마다 마진 구조가 달라 순위가 업종 차이를 반영할 수 있고, 업종 중립화는 하지 않았습니다.",
+    ),
+    "fin_asset_turnover": dict(
+        title="총자산회전율",
+        basis="fin_pit",
+        intuition="가진 자산으로 매출을 몇 배 만드는지입니다. 값이 크면 자산을 빠르게 굴리는 업종이거나 회사입니다.",
+        analogy="같은 트럭으로 하루에 짐을 몇 번 나르는지 세는 것과 같습니다.",
+        win=fs_win("매출 ÷ 총자산", "보고서에 적힌 기간 값의 비율"),
+        principle=dict(
+            type="ratio",
+            title="같은 자산, 다른 매출",
+            unit="",
+            rows=[
+                dict(
+                    label="자산을 빨리 굴리는 쪽 (예시 숫자)",
+                    numLabel="매출",
+                    num=200,
+                    denLabel="총자산",
+                    den=100,
+                    result="회전율 = 200 ÷ 100 = 2.0배",
+                ),
+                dict(
+                    label="자산이 무거운 쪽 (예시 숫자)",
+                    numLabel="매출",
+                    num=50,
+                    denLabel="총자산",
+                    den=100,
+                    result="회전율 = 50 ÷ 100 = 0.5배",
+                ),
+            ],
+        ),
+        what="매출을 총자산으로 나눈 값입니다. 기간 값 ÷ 기말 자산이라 문서의 TTM ÷ 평균 자산과 다릅니다.",
+        model="순위가 오를수록 점수가 내려가는 쪽(ρ −0.75)이라 카드의 기대 부호 +와 맞지 않고 '설명 못 함'으로 분류됐습니다. 섞기(16위)는 불안정합니다.",
+        caution="업종 구분이 크게 반영되는 열일 수 있으나 데이터로 확인하지 않았습니다. 분기 보고서 값이 단독인지 누적인지도 확인하지 못했습니다.",
+    ),
+    "fin_debt_to_equity": dict(
+        title="부채비율",
+        basis="fin_pit",
+        intuition="자기 돈 1원당 빚이 얼마인지입니다. 크면 빚이 많은 회사입니다. 부실 위험이 크다는 이야기와 위험을 감수한 보상이라는 이야기가 둘 다 가능해서 방향은 열려 있습니다.",
+        analogy="내 돈 1,000만 원에 대출 2,000만 원을 얹어 집을 산 사람은 부채비율이 2배입니다.",
+        win=fs_win(
+            "총부채 ÷ 자기자본   (자기자본이 0 이하면 비움)", "보고서에 적힌 기간 값의 비율"
+        ),
+        principle=dict(
+            type="flow",
+            title="자본잠식이면 비워 둡니다",
+            steps=[
+                dict(title="총부채·자기자본", text="최신 보고서의 두 값을 가져옵니다."),
+                dict(title="자기자본이 0보다 큰가", text="0 이하이면 계산하지 않고 NULL로 둡니다."),
+                dict(
+                    title="순위 또는 0.5",
+                    text="값이 있으면 순위, 비었으면 0.5를 넣고 isna 표시를 1로 켭니다.",
+                    hl=True,
+                    tag="모델 입력",
+                ),
+            ],
+            measure="ROE와 달리 부호가 뒤집힌 값이 순위에 들어가지 않습니다.",
+        ),
+        what="총부채를 자기자본으로 나눈 값입니다. 자본잠식 종목은 NULL이라 isna가 1이고 순위 자리에는 0.5가 들어갑니다.",
+        model="순위가 오를수록 점수가 오르는 쪽(ρ +0.66)이지만 모양은 '기타'입니다. SHAP 28위로 안정하고 섞기(17위)는 불안정합니다.",
+        caution="fin_equity_ratio와 같은 레버리지 정보라 한쪽이 다른 쪽의 거의 단조 변환일 수 있습니다(묶음 c10). 이 열의 기대 부호는 문서에 없습니다.",
+    ),
+    "fin_equity_ratio": dict(
+        title="자기자본비율",
+        basis="fin_pit",
+        intuition="자산 중 자기 돈이 차지하는 비중입니다. 높으면 재무구조가 튼튼합니다.",
+        analogy="집값 중 내 돈이 몇 %인지 보는 것과 같습니다. 대출이 적을수록 높아집니다.",
+        win=fs_win("자기자본 ÷ 총자산", "보고서에 적힌 기간 값의 비율"),
+        principle=dict(
+            type="ratio",
+            title="자본잠식이어도 값이 나옵니다",
+            unit="",
+            rows=[
+                dict(
+                    label="튼튼한 회사 (예시 숫자)",
+                    numLabel="자기자본",
+                    num=60,
+                    denLabel="총자산",
+                    den=100,
+                    result="자기자본비율 = 60 ÷ 100 = +0.6",
+                ),
+                dict(
+                    label="자본잠식 회사 (예시 숫자)",
+                    numLabel="자기자본",
+                    num=-10,
+                    denLabel="총자산",
+                    den=100,
+                    result="자기자본비율 = −10 ÷ 100 = −0.1",
+                    note="분모가 총자산이라 NULL로 만들지 않고 음수가 그대로 순위에 들어갑니다.",
+                ),
+            ],
+        ),
+        what="자기자본을 총자산으로 나눈 값입니다.",
+        model="순위가 오를수록 점수가 내려가는 역U자(ρ −0.69)입니다. SHAP 36위로 안정하고 섞기(28위)는 불안정합니다.",
+        caution="fin_debt_to_equity와 같은 레버리지 정보입니다. 이 열의 가설 문서는 없습니다.",
+    ),
+    "fin_ocf_to_assets": dict(
+        title="영업현금흐름 대비 자산",
+        basis="fin_pit",
+        intuition="장사로 실제 들어온 현금이 자산 대비 얼마인지입니다. 장부상 이익이 아니라 현금이라서, 이익은 났는데 현금이 안 들어오는 회사와 구분됩니다.",
+        analogy="장부에 이익이 적혀 있어도 금고에 현금이 안 들어오면 소용없다는 것과 같습니다. 이 열은 금고를 봅니다.",
+        win=fs_win("영업활동현금흐름 ÷ 총자산", "보고서에 적힌 기간 값의 비율"),
+        principle=dict(
+            type="ratio",
+            title="현금이 들어온 회사와 새는 회사",
+            unit="",
+            rows=[
+                dict(
+                    label="현금이 들어온 회사 (예시 숫자)",
+                    numLabel="영업현금흐름",
+                    num=20,
+                    denLabel="총자산",
+                    den=100,
+                    result="값 = 20 ÷ 100 = +0.20",
+                ),
+                dict(
+                    label="현금이 새는 회사 (예시 숫자)",
+                    numLabel="영업현금흐름",
+                    num=-5,
+                    denLabel="총자산",
+                    den=100,
+                    result="값 = −5 ÷ 100 = −0.05",
+                ),
+            ],
+        ),
+        what="영업활동현금흐름을 총자산으로 나눈 값입니다.",
+        model="방향 ρ가 +0.09로 거의 없고 모양은 '기타'입니다. SHAP 34위로 안정하고, 섞으면 rank IC가 조금 오릅니다(−0.00095, 안정).",
+        caution="fin_accruals_to_assets·fin_cfo_yield는 이 열과 다른 양입니다. 이름이 비슷해도 서로 대신 쓸 수 없습니다.",
+    ),
+    "fin_cash_ratio": dict(
+        title="현금 비중",
+        basis="fin_pit",
+        intuition="자산 중 현금과 현금성 자산이 차지하는 비중입니다. 높으면 단기 지급 여력이 큰 회사로 보이지만, 현금이 많다는 이유로 이후 수익이 높다고 말할 근거는 우리에게 없습니다.",
+        analogy="가진 재산 중 통장에서 바로 꺼내 쓸 수 있는 돈이 몇 %인지 보는 것과 같습니다.",
+        win=fs_win("현금 및 현금성 자산 ÷ 총자산", "보고서에 적힌 기간 값의 비율"),
+        principle=dict(
+            type="ratio",
+            title="자산 중 현금이 차지하는 몫",
+            unit="",
+            rows=[
+                dict(
+                    label="현금이 두터운 회사 (예시 숫자)",
+                    numLabel="현금",
+                    num=30,
+                    denLabel="총자산",
+                    den=100,
+                    result="현금 비중 = 30 ÷ 100 = 0.30",
+                ),
+                dict(
+                    label="현금이 얇은 회사 (예시 숫자)",
+                    numLabel="현금",
+                    num=5,
+                    denLabel="총자산",
+                    den=100,
+                    result="현금 비중 = 5 ÷ 100 = 0.05",
+                ),
+            ],
+        ),
+        what="현금 및 현금성 자산을 총자산으로 나눈 값입니다.",
+        model="SHAP 3위로 크게 기대지만 방향 ρ는 +0.19로 약하고 U자로 분류됐습니다. 섞기(8위)는 불안정합니다.",
+        caution="학습 뒤에 매핑 규칙이 바뀌어 학습 때 비어 있던 값이 지금 코드로는 채워집니다. 서빙이 학습 시점 규칙으로 고정됐는지는 확인하지 않았습니다. 곡선은 isna=0 기준이라 빈 행의 반응은 없습니다.",
+    ),
+    "fin_is_negative_equity": dict(
+        title="자본잠식 표시",
+        basis="fin_pit",
+        intuition="자기자본이 0 이하인 회사에 1을 붙이는 표시입니다. 대부분의 날에는 거의 모든 종목이 0입니다.",
+        analogy="빚이 재산보다 커진 집에 경고 스티커를 붙이는 것과 같습니다. 스티커가 붙은 집은 드뭅니다.",
+        win=fs_win(
+            "자기자본이 0 이하이면 1, 아니면 0",
+            "최신 보고서의 자기자본 부호",
+            note="거래일 창이 아니라 보고서 한 건의 값입니다. 모듈 설명에는 해당 종목이 약 12개라고 적혀 있습니다.",
+        ),
+        principle=dict(
+            type="flow",
+            title="0/1 스위치",
+            steps=[
+                dict(title="자기자본 확인", text="최신 보고서의 자기자본을 봅니다."),
+                dict(title="0 이하이면 1", text="그렇지 않으면 0입니다."),
+                dict(
+                    title="순위 변환 없이 그대로",
+                    text="트리는 '0.5보다 큰가' 분기 한 번으로 집단을 가를 수 있습니다.",
+                    hl=True,
+                    tag="모델 입력",
+                ),
+            ],
+            measure="이 열은 수익 신호가 아니라 다른 열을 어떻게 읽을지 알려 주는 상태 표시로 둔 것입니다.",
+        ),
+        what="자기자본이 0 이하이면 1인 표시입니다. 순위로 바꾸지 않습니다.",
+        model="SHAP 43위로 아주 작고 곡선은 평평하며 SHAP은 불안정해서 해석하지 않습니다. 섞기는 −0.00010으로 작지만 안정합니다.",
+        caution="1인 종목이 날마다 극소수라 횡단면이 통째로 0인 날이 생깁니다. 이 열 자체의 부호 가설과 검정은 없습니다.",
+    ),
+    "fin_has_fs": dict(
+        title="재무제표 유무 표시",
+        basis="fin_pit",
+        intuition="그 시점에 재무제표 데이터가 붙어 있으면 1입니다. 실적을 평가하는 열이 아니라 데이터가 있는지 알려 주는 표시입니다.",
+        analogy="서류가 접수됐는지 찍는 접수 도장과 같습니다. 서류 내용이 좋다는 뜻은 아닙니다.",
+        win=fs_win(
+            "총자산 값이 있으면 1, 없으면 0",
+            "최신 보고서의 총자산 유무",
+            note="거래일 창이 아니라 보고서 한 건의 값입니다. 보고서가 하나도 없는 구간에서 이 열이 0인지 NULL인지는 확인하지 못했습니다.",
+        ),
+        principle=dict(
+            type="flow",
+            title="접수 도장",
+            steps=[
+                dict(title="총자산 값 확인", text="최신 보고서에 총자산이 적혀 있는지 봅니다."),
+                dict(
+                    title="있으면 1", text="없으면 0입니다. 손익·현금 쪽만 있는 법인은 0이 됩니다."
+                ),
+                dict(
+                    title="순위 변환 없이 그대로",
+                    text="0/1 그대로 들어가 분기 한 번으로 집단을 가릅니다.",
+                    hl=True,
+                    tag="모델 입력",
+                ),
+            ],
+            measure="상관이 높게 나와도 신호가 아니라 데이터 가용성일 수 있습니다.",
+        ),
+        what="총자산 값이 붙어 있는지를 0/1로 표시한 열입니다.",
+        model="SHAP 45위로 가장 아래쪽이고 곡선은 평평하며 SHAP은 불안정해서 해석하지 않습니다. 방향 ρ는 계산되지 않았습니다.",
+        caution="수익 가설이 없고 재무 비율 열의 isna 표시와 정보가 겹칠 수 있습니다. 겹치는 정도는 확인하지 않았습니다.",
+    ),
+    "fin_log_mcap": dict(
+        title="로그 시가총액",
+        basis="mcap",
+        intuition="회사의 덩치입니다. 시가총액이 작은 회사가 이후 60~120일 동안 시장보다 더 올랐습니다. 다만 이 신호는 거래가 잘 안 되는 종목이 더 오른다는 신호와 거의 같은 것을 다른 방식으로 잰 것입니다.",
+        analogy="동네 가게와 대형마트를 매출이 아니라 건물 크기로 줄 세우는 것과 같습니다.",
+        win=dict(
+            axis=8,
+            formula="ln( 시점 정확 주식 수 × 당일 종가 )",
+            rows=[dict(label="오늘 하루", segs=[seg(-1, 0, "use", "당일")])],
+            marks=[(0, "t")],
+            note="분기 재무를 기다리지 않아 값의 나이가 없습니다. 품질 조건을 통과한 날에만 값이 있습니다.",
+        ),
+        principle=dict(
+            type="flow",
+            title="시가총액이 값이 되기까지",
+            steps=[
+                dict(
+                    title="주식 수",
+                    text="DART 지분 공시로 만든 주식 수입니다. 공시 다음 거래일부터 씁니다.",
+                ),
+                dict(title="× 당일 종가", text="오늘 종가를 곱해 시가총액을 구합니다."),
+                dict(
+                    title="자연로그 → 순위",
+                    text="로그를 씌워도 순위로 바꾸면 결과는 같습니다.",
+                    hl=True,
+                    tag="모델 입력",
+                ),
+            ],
+            measure="같은 마트의 다른 재무 열은 평균 74~105일 묵은 값이지만 이 열은 매일 새 값입니다.",
+        ),
+        what="시점 정확 시가총액의 자연로그입니다. 크면 대형주, 작으면 소형주입니다.",
+        model="순위가 오를수록 점수가 내려가고(ρ −0.53) 카드의 기대 부호 −와 같습니다. SHAP 9위로 안정하고 섞기(40위)는 불안정합니다.",
+        caution="px_amihud_20d와 평균 순위상관이 −0.721이라 규모와 비유동성을 가르지 못합니다. 단변량 A등급은 60~120일 초과수익 기준이고 서빙 라벨은 20일 상승 여부입니다.",
+    ),
+    "ev_amendment_ratio_1y": dict(
+        title="정정공시 비율",
+        basis="filing",
+        intuition="최근 1년간 낸 공시 중 정정본의 비율입니다. 공시를 자주 고치는 회사는 이후 60~120일 동안 시장보다 덜 올랐습니다. 정정이 직접 주가를 떨어뜨린다기보다 공시 품질이나 내부 통제가 흔들린다는 조기 신호라는 해석이 가능합니다.",
+        analogy="숙제를 낸 뒤 수정본을 다시 내는 학생의 비율과 같습니다. 무엇이 틀렸는지는 가리지 않고 다시 낸 비율만 봅니다.",
+        win=dict(
+            axis=270,
+            formula="정정공시 건수(최근 250거래일) ÷ 전체 공시 건수(같은 기간)",
+            rows=[
+                dict(label="분자: 정정본 공시", segs=[seg(-249, 0, "use", "250거래일")]),
+                dict(label="분모: 전체 공시", segs=[seg(-249, 0, "minus", "250거래일")]),
+            ],
+            marks=[(-249, "t−249"), (0, "t")],
+            note="분모가 0이면 비웁니다. 공시 이력이 아직 없는 종목은 NULL이라 0.5가 들어갑니다.",
+        ),
+        principle=dict(
+            type="ratio",
+            title="정정본이 차지하는 몫",
+            unit="건",
+            rows=[
+                dict(
+                    label="거의 안 고치는 회사 (예시 숫자)",
+                    numLabel="정정본",
+                    num=1,
+                    denLabel="전체 공시",
+                    den=8,
+                    result="비율 = 1 ÷ 8 = 0.125",
+                ),
+                dict(
+                    label="자주 고치는 회사 (예시 숫자)",
+                    numLabel="정정본",
+                    num=4,
+                    denLabel="전체 공시",
+                    den=8,
+                    result="비율 = 4 ÷ 8 = 0.5",
+                ),
+            ],
+            caption="정정 판정은 보고서명에 기재정정·첨부정정·첨부추가·변경등록이 들어 있는지입니다. '나중에 정정됐다'가 아니라 '이 공시가 정정본이다'를 셉니다.",
+        ),
+        what="최근 250거래일 정정공시 건수를 같은 기간 전체 공시 건수로 나눈 값입니다.",
+        model="순위가 오를수록 점수가 내려가고(ρ −0.64) 카드의 기대 부호 −와 같습니다. SHAP 26위로 안정하고 섞기(15위)는 불안정합니다.",
+        caution="정정의 종류를 구분하지 않습니다. 단순 첨부 추가와 내용 정정을 한 묶음으로 셉니다. KOSPI 커버리지가 KOSDAQ보다 낮고 원인은 분석하지 않았습니다.",
+    ),
+    "ev_filing_burst_60d": dict(
+        title="공시 건수 급증 정도",
+        basis="filing",
+        intuition="최근 60일 공시 건수가 그 회사의 평소 수준보다 얼마나 늘었는지입니다. 공시가 갑자기 몰린 회사가 이후 약간 부진했지만, 효과는 작고 방향도 처음부터 열어 두었던 열입니다.",
+        analogy="평소 편지가 두세 통 오던 집에 우편물이 갑자기 몰린 것과 같습니다. 좋은 소식인지 나쁜 소식인지는 편지 수로는 모릅니다.",
+        win=dict(
+            axis=270,
+            formula="최근 60거래일 공시 건수 ÷ ( 최근 250거래일 동안 그 값의 중앙값 )",
+            rows=[
+                dict(label="분자: 60거래일 공시 건수", segs=[seg(-59, 0, "use", "60거래일")]),
+                dict(label="분모: 그 건수의 중앙값", segs=[seg(-249, 0, "minus", "250거래일")]),
+                dict(
+                    label="계산 조건: 이력 250거래일 이상", segs=[seg(-249, 0, "need", "250거래일")]
+                ),
+            ],
+            marks=[(-249, "t−249"), (-59, "t−59"), (0, "t")],
+            note="상장 후 첫 1년은 값이 없습니다. 회사 자기 중앙값으로 나눠서 규모 차이가 상쇄됩니다.",
+        ),
+        principle=dict(
+            type="ratio",
+            title="평소 대비 몇 배인가",
+            unit="건",
+            rows=[
+                dict(
+                    label="공시가 몰린 회사 (예시 숫자)",
+                    numLabel="최근 60일",
+                    num=6,
+                    denLabel="평소(중앙값)",
+                    den=3,
+                    result="급증 정도 = 6 ÷ 3 = 2.0 → 평소의 2배",
+                ),
+                dict(
+                    label="평소와 같은 회사 (예시 숫자)",
+                    numLabel="최근 60일",
+                    num=3,
+                    denLabel="평소(중앙값)",
+                    den=3,
+                    result="급증 정도 = 3 ÷ 3 = 1.0 → 평소와 같은 속도",
+                ),
+            ],
+            caption="중앙값을 쓰는 것은 과거에 한 번 폭증한 일이 분모를 오래 누르지 않게 하려는 것입니다.",
+        ),
+        what="최근 60거래일 공시 건수를 직전 250거래일 동안 그 값의 중앙값으로 나눈 값입니다. 1이면 평소와 같습니다.",
+        model="순위가 오를수록 점수가 내려가는 쪽(ρ −0.65)이고 곡선은 평평합니다. SHAP 35위로 안정하고 섞기(22위)는 불안정합니다.",
+        caution="공시 종류를 구분하지 않습니다. 유상증자 공시와 정기보고서를 같은 1건으로 셉니다. 단변량 효과가 작고 시간 placebo가 기준에 가까웠습니다.",
+    ),
+    "own_major_filing_60d": dict(
+        title="5% 대량보유 공시 건수",
+        basis="filing",
+        intuition="최근 60일 동안 이 회사에 대해 5% 이상 지분을 가진 사람이 낸 보고서가 몇 건인지입니다. 지분 변동이 잦은 회사가 이후 60일 동안 시장보다 덜 올랐습니다. 다만 건수만으로는 지분을 사 모으는 것인지 팔고 나가는 것인지 알 수 없습니다.",
+        analogy="건물 지분 5% 넘게 가진 사람이 서류를 낸 횟수를 세는 것과 같습니다. 사는 중인지 파는 중인지는 횟수로 알 수 없습니다.",
+        win=dict(
+            axis=70,
+            formula="SUM( 주식등의대량보유상황보고서 접수 건수 , 최근 60거래일 )",
+            rows=[
+                dict(label="건수의 합 (비율로 나누지 않음)", segs=[seg(-59, 0, "use", "60거래일")])
+            ],
+            marks=[(-59, "t−59"), (0, "t")],
+            note="공시가 없으면 NULL이 아니라 0이라 거의 모든 종목·날짜에 값이 있습니다.",
+        ),
+        principle=dict(
+            type="flow",
+            title="접수 건수가 값이 되기까지",
+            steps=[
+                dict(
+                    title="5% 이상 보유자의 보고", text="일반 보고서와 약식 보고서를 DART에 냅니다."
+                ),
+                dict(
+                    title="접수일 다음 거래일부터",
+                    text="접수일 D의 공시는 D+1 거래일부터 반영합니다.",
+                ),
+                dict(
+                    title="최근 60거래일 건수 합",
+                    text="비율이 아니라 건수 그대로이고 0이 많아 동점이 많습니다.",
+                    hl=True,
+                    tag="여기서 재는 값",
+                ),
+            ],
+            measure="공시의 내용이 아니라 건수만 셉니다.",
+        ),
+        what="최근 60거래일 동안 접수된 5% 대량보유 상황 보고서(일반 + 약식)의 건수입니다.",
+        model="방향 ρ는 +0.25로 약하고 U자로 분류됐으며 SHAP 6위지만 SHAP·섞기 모두 불안정해서 해석하지 않습니다. 섞으면 IC가 오히려 오릅니다(−0.00285).",
+        caution="규모와 얽힙니다. 큰 회사에 대량보유자가 많아 공시도 많고, 규모를 통제한 증분 IC는 없습니다. 매수와 매도를 구분하지 못합니다.",
+    ),
+}
+
+EXAMPLES = {}
+EX_WINDOWS = {}
+
+HTML_OVERRIDE = dict(
+    KICKER="서빙 피쳐 해설 · 03 · 그림판",
+    LEDE=(
+        "서빙 모델 <code>kr_daily_h20_v1</code>이 쓰는 재무·규모·공시 피쳐 14개(<code>fin_*</code> 11개, <code>ev_*</code> 2개, <code>own_*</code> 1개)를 그림으로 풀었습니다. "
+        '정의와 직관의 정본은 <a href="03_kr_fin_event.md"><code>03_kr_fin_event.md</code></a>이고, 이 페이지는 그 그림판입니다. '
+        "재무 10개(<code>fin_is_negative_equity</code>·<code>fin_has_fs</code> 포함)는 단변량 검정을 받은 적이 없어서, 카드의 직관은 정의에서 나온 일반적인 읽기이고 우리 결과가 지지하는 이야기가 아닙니다. "
+        "모델 반응 그림(③·④·⑤)은 이미 열린 holdout(2025-08-01~2026-08-28)으로 만든 <b>진단이지 판정이 아닙니다.</b> 가로축은 값이 아니라 그날 종목들 사이의 순위(백분위)입니다."
+    ),
+    MAPINTRO=(
+        "가로는 평균 |SHAP|(모델 점수를 얼마나 흔드나), 세로는 그 피쳐 하나만 섞었을 때 rank IC가 줄어든 정도(ΔrankIC)입니다. "
+        "<b>0선 아래는 섞었더니 IC가 오히려 오른 피쳐</b>입니다. 47개 전체 중 이 문서의 14개만 색을 칠했고, 나머지 33개는 회색입니다."
+    ),
+    MAPLEGEND=(
+        '<span><svg viewBox="0 0 26 10"><circle cx="13" cy="5" r="5" style="fill:var(--s1)"/></svg>SHAP 안정</span>'
+        '<span><svg viewBox="0 0 26 10"><circle cx="13" cy="5" r="4" style="fill:var(--surface);stroke:var(--s1)" stroke-width="2"/></svg>SHAP 불안정</span>'
+        '<span><svg viewBox="0 0 26 10"><circle cx="13" cy="5" r="3.5" style="fill:var(--muted);opacity:.55"/></svg>이 문서 밖 33개 (참고)</span>'
+    ),
+    MAPCAP=(
+        "읽을 점. <code>fin_roa</code>(+0.01029)와 <code>fin_roe</code>(+0.00840)가 이 문서에서 섞기 값이 가장 크고 단독 47개 중 4위·5위로 안정합니다. "
+        "<code>fin_cash_ratio</code>는 SHAP 3위인데 섞기는 +0.00289로 작고 불안정합니다. "
+        "<code>own_major_filing_60d</code>는 SHAP 6위인데 섞으면 IC가 오히려 오르고(−0.00285) 불안정합니다. "
+        "플래그 <code>fin_is_negative_equity</code>·<code>fin_has_fs</code>는 SHAP 43위·45위로 거의 쓰이지 않습니다. "
+        '모양과 안정 판정의 기준은 <a href="09_kr_result.md"><code>09_kr_result.md</code></a> §1에 있습니다.'
+    ),
+    GROUPSINTRO=(
+        "날짜별 순위 상관 |ρ| ≥ 0.7인 피쳐끼리 묶었습니다(SHAP 날짜 53일 평균). 이 문서의 14개 중 묶음에 든 것은 수익성 c09와 레버리지 c10뿐이고 나머지는 단독입니다. "
+        "<b>묶음 안에서는 서로 몫을 나눠 가집니다.</b> 같은 정보를 담은 피쳐 하나를 섞어도 이웃이 대신 알려 주고, SHAP도 둘로 갈립니다. "
+        "수익성 묶음 c09를 한꺼번에 섞으면 rank IC 하락이 0.02879로 이 문서에서 가장 큽니다. 두 절반에서 값이 거의 같습니다(0.02809 / 0.02940)."
+    ),
+    FOOT=(
+        "<li><b>예시 숫자</b>: 원리 그림의 비율 막대 숫자는 이해를 돕는 가상의 값입니다. 실측은 그림 아래 문장에 따로 적었습니다(<code>fin_roe</code>의 자본잠식 144행은 09 §5.4). 이 문서는 가격 창이 없는 피쳐라 예시 종목 차트가 없습니다.</li>"
+    ),
+)
