@@ -142,6 +142,99 @@ def select_reason_text(block: object) -> str | None:
         parts.append(f"지연 {int(lag)}세션")
     return ("select 사유: " + ", ".join(parts) + ".") if parts else None
 
+
+# 운영자 메모. 사람이 그날 실패·stale 섹션 옆에 남기는 짧은 설명입니다(`operator-memo.v1`).
+# 게시 규칙(02 문서)을 입력에서 한 번 더 막습니다. 어기면 단위 전체를 렌더하지 않고 거절합니다.
+OPERATOR_MEMO_SCHEMA = "operator-memo.v1"
+OPERATOR_MEMO_KEYS = {"KR": "KR 종목 순위", "US": "US 종목 순위", "MS": "시장·섹터"}
+OPERATOR_MEMO_MAX_CHARS = 200
+OPERATOR_MEMO_SECRET = re.compile(
+    r"(?:password|passwd|secret|token|비밀번호|토큰)\s*[:=]", re.IGNORECASE
+)
+
+
+def operator_memo_problems(text: str) -> list[str]:
+    """메모 한 건이 게시 규칙을 어기는 곳을 모읍니다(비어 있으면 통과)."""
+    problems = []
+    if not text.strip():
+        problems.append("비어 있습니다")
+    if len(text) > OPERATOR_MEMO_MAX_CHARS:
+        problems.append(f"{OPERATOR_MEMO_MAX_CHARS}자를 넘습니다({len(text)}자)")
+    if re.search(r"[\x00-\x1f\x7f]", text):
+        problems.append("줄바꿈·제어 문자가 있습니다")
+    for label, pattern in FORBIDDEN_PATTERNS:
+        if pattern.search(text):
+            problems.append(label)
+    if OPERATOR_MEMO_SECRET.search(text):
+        problems.append("비밀값을 적는 모양(password=·token: 등)")
+    return problems
+
+
+def load_operator_memo(raw: bytes | None, unit: str) -> dict[str, str]:
+    """`operator-memo.v1` JSON 바이트를 읽어 {KR|US|MS: 메모}로 돌려줍니다. 없으면 빈 dict.
+
+    형식이 틀리거나, 날짜가 단위와 다르거나, 메모가 게시 규칙을 어기면 `InputError`입니다.
+    잘못된 메모를 말없이 빼면 운영자가 쓴 것이 안 나가도 모르므로 거절합니다.
+    """
+    if raw is None:
+        return {}
+    data = load_json_bytes(raw, "운영자 메모")
+    if data.get("schema") != OPERATOR_MEMO_SCHEMA:
+        raise InputError(f"운영자 메모의 schema가 {OPERATOR_MEMO_SCHEMA}이 아닙니다.")
+    if data.get("report_date") != unit:
+        raise InputError("운영자 메모의 report_date가 단위 날짜와 다릅니다.")
+    extra = set(data) - {"schema", "report_date", "memos"}
+    if extra:
+        raise InputError(f"운영자 메모에 알 수 없는 키가 있습니다: {sorted(extra)}")
+    memos = data.get("memos")
+    if not isinstance(memos, dict):
+        raise InputError("운영자 메모의 memos가 객체가 아닙니다.")
+    out: dict[str, str] = {}
+    for key, text in memos.items():
+        if key not in OPERATOR_MEMO_KEYS:
+            raise InputError(f"운영자 메모의 키 {c(key)}는 KR·US·MS 중 하나여야 합니다.")
+        if not isinstance(text, str):
+            raise InputError(f"운영자 메모 {key}가 문자열이 아닙니다.")
+        problems = operator_memo_problems(text)
+        if problems:
+            raise InputError(f"운영자 메모 {key}를 쓸 수 없습니다: " + ", ".join(problems))
+        out[key] = text.strip()
+    return out
+
+
+def operator_memo_line(text: str) -> str:
+    return "운영자 메모: " + c(text)
+
+
+def apply_operator_memo(kr: dict, us: dict, ms: dict, memos: dict[str, str], log) -> None:
+    """메모를 실패·stale 섹션의 사유에 덧붙입니다. 정상·partial 섹션에는 붙이지 않습니다.
+
+    모델 항목은 stale일 때 `select` 줄(안내 문단·상태 표·요약 경고가 모두 이 값을 읽습니다)에
+    이어 적고, 실패일 때는 `reason` 목록 끝에 더합니다. 순위 표를 내지 않은(suppressed) stale
+    항목은 select 사유도 안 보이므로 메모도 붙이지 않습니다. 붙이지 못한 메모는 log에 남깁니다.
+    """
+    for key, sec in (("KR", kr), ("US", us)):
+        text = memos.get(key)
+        if text is None:
+            continue
+        line = operator_memo_line(text)
+        shown = False
+        for m in sec["models"]:
+            if m["status"] == "failed":
+                m["reason"].append(line)
+                shown = True
+            elif m["status"] == "stale" and not m["suppressed"]:
+                m["select"] = (m["select"] + " " + line) if m["select"] else line
+                shown = True
+        if not shown:
+            log(f"경고: {key} 운영자 메모를 붙일 실패·stale 섹션이 없어 쓰지 않았습니다.")
+    text = memos.get("MS")
+    if text is not None:
+        if ms["status"] in ("failed", "stale"):
+            ms["reason"].append(operator_memo_line(text))
+        else:
+            log("경고: MS 운영자 메모를 붙일 실패·stale 섹션이 없어 쓰지 않았습니다.")
+
 SECTION_FILES = {
     "summary": "README.md",
     "market-sector": "market-sector.md",
@@ -2356,6 +2449,7 @@ def build_context(
     log,
     security_names: bytes | None = None,
     names_notes: dict | None = None,
+    operator_memo: bytes | None = None,
 ) -> dict:
     """envelope(JSON 바이트)와 시장·섹터 입력으로 렌더 입력(ctx)을 만듭니다. 파일은 쓰지 않습니다.
 
@@ -2364,6 +2458,8 @@ def build_context(
     종류를 판정하고, 이름이 없는 시장은 종류 열을 생략합니다.
     `names_notes`는 {시장: 이름 원천을 쓰지 못한 사유}입니다. 종류 열을 생략한 시장의 데이터 상태
     `증권 종류` 절에 사유로 적습니다(publisher가 레이크에서 이름을 만들지 못했을 때).
+    `operator_memo`는 `operator-memo.v1` JSON 바이트입니다. 실패·stale 섹션에 "운영자 메모" 줄로
+    붙고, 없으면 출력은 메모 기능이 없던 때와 바이트까지 같습니다.
     """
     env = load_json_bytes(env_bytes, "envelope")
     unit, decision = parse_envelope(env)
@@ -2407,6 +2503,7 @@ def build_context(
     attach_kinds(kr, "KR", names)
     attach_kinds(us, "US", names)
     ms_sec = build_ms_section(ms, unit)
+    apply_operator_memo(kr, us, ms_sec, load_operator_memo(operator_memo, unit), log)
     stamp = generated_at
     if stamp:
         parsed = parse_dt(stamp)
@@ -2494,6 +2591,7 @@ def generate(
     overwrite: bool,
     log,
     names_path: Path | None = None,
+    memo_path: Path | None = None,
 ) -> str:
     """단위 하나를 저장소 트리에 쓰고 인덱스를 다시 만듭니다. 수동·시험용입니다.
 
@@ -2504,8 +2602,17 @@ def generate(
     env_bytes = read_bytes(env_path, "envelope")
     ms_bytes = read_bytes(ms_path, "시장·섹터 입력") if ms_path else None
     names_bytes = read_bytes(names_path, "증권 이름 입력") if names_path else None
+    memo_bytes = read_bytes(memo_path, "운영자 메모") if memo_path else None
     ctx = build_context(
-        repo, env_bytes, ms_bytes, release, generated_at, top_n, log, security_names=names_bytes
+        repo,
+        env_bytes,
+        ms_bytes,
+        release,
+        generated_at,
+        top_n,
+        log,
+        security_names=names_bytes,
+        operator_memo=memo_bytes,
     )
     unit = ctx["unit"]
     udir = unit_dir(repo, unit)
@@ -3418,6 +3525,11 @@ def main(argv: list | None = None) -> int:
         type=Path,
         help="security-names.v1 JSON (순위 표 종류 열의 이름 원천. 없으면 KR 행 이름만 씀)",
     )
+    parser.add_argument(
+        "--operator-memo",
+        type=Path,
+        help="operator-memo.v1 JSON (실패·stale 섹션에 붙일 운영자 메모)",
+    )
     parser.add_argument("--release", help="서빙 release id")
     parser.add_argument("--generated-at", help="ISO 시각(시간대 포함). 없으면 지금")
     parser.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
@@ -3473,6 +3585,7 @@ def main(argv: list | None = None) -> int:
                     args.overwrite,
                     log,
                     names_path=args.security_names,
+                    memo_path=args.operator_memo,
                 )
             elif not (args.init or args.reindex):
                 raise InputError("--envelope, --init, --reindex, --validate 중 하나가 필요합니다.")
