@@ -26,12 +26,14 @@ def _roots(args) -> tuple[Path, Path]:
 
 def cmd_run(args) -> int:
     sd, my = _roots(args)
-    features = args.features or list(C.DEFAULT_FEATURES)
+    features = args.features or list(C.ALL_FEATURES)
     unknown = [f for f in features if f not in C.FEATURES]
     if unknown:
         print(f"unknown features: {unknown}", file=sys.stderr)
         return 2
-    run_id = args.run_id or f"kr_cases_20261015_seed{args.seed}"
+    run_id = args.run_id or (
+        C.KR38_RUN_ID if args.seed == C.SEED else f"kr_cases_20261016_seed{args.seed}_all47"
+    )
     out_root = Path(args.out_root) if args.out_root else sd / "kr" / "output" / "feature_cases"
     guard_path(out_root)
     html_dir = Path(args.html_dir) if args.html_dir else my / MY_SUBDIR
@@ -41,7 +43,7 @@ def cmd_run(args) -> int:
 
     guard_not_in_repo(html_dir, repo_root_of_code())
     html_dir.mkdir(parents=True, exist_ok=True)
-    cases, dist = res["cases"], res["dist"]
+    cases, dist, sizes, unform = res["cases"], res["dist"], res["sizes"], res["unformable"]
     counts = {}
     for f in features:
         spec = C.FEATURES[f]
@@ -59,10 +61,18 @@ def cmd_run(args) -> int:
             res["n_grid"],
             run_id,
             args.seed,
+            sizes=sizes.filter(pl.col("feature") == f).to_dicts(),
+            unformable=unform.get(f),
         )
         (html_dir / f"{f}.html").write_text(page, encoding="utf-8")
     index = render_index(
-        [C.FEATURES[f] for f in features], counts, res["dates"], res["n_grid"], run_id, args.seed
+        [C.FEATURES[f] for f in features],
+        counts,
+        res["dates"],
+        res["n_grid"],
+        run_id,
+        args.seed,
+        unformable=unform,
     )
     (html_dir / "index.html").write_text(index, encoding="utf-8")
     print(f"run_id {run_id}\noutput {out_dir}\nhtml {html_dir}")
@@ -76,7 +86,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="select cases, compute distributions, write tables and HTML")
-    r.add_argument("--features", nargs="+", help="default: all 9 pilot features")
+    r.add_argument("--features", nargs="+", help="default: all 47 features")
     r.add_argument("--seed", type=int, default=C.SEED)
     r.add_argument("--run-id")
     r.add_argument("--out-root", help="default: <STOCK_DATA_ROOT>/kr/output/feature_cases")

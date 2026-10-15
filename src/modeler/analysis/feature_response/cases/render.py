@@ -14,6 +14,7 @@ import polars as pl
 from . import config as C
 from .config import FeatureSpec
 from .dist import group_order
+from .select import group_names, has_good_side
 
 TEMPLATE = Path(__file__).with_name("template.html")
 MINUS = "−"
@@ -24,8 +25,16 @@ GROUP_COLOR = {
     "top": "var(--s1)",
     "bottom": "var(--s2)",
     "all": "var(--muted)",
+    "modal": "var(--s1)",
+    "other": "var(--s2)",
 }
 MKT_LABEL = "시장 동일가중(근사)"
+
+
+def kicker(spec: FeatureSpec | None = None) -> str:
+    if spec is not None and spec.name in C.PILOT_FEATURES:
+        return "KR 피쳐 사례 갤러리 · 시범 9개 중 하나 · 2026-10-15"
+    return "KR 피쳐 사례 갤러리 · 나머지 38개 확장 · 2026-10-16"
 
 
 def esc(s: object) -> str:
@@ -51,7 +60,21 @@ def val_str(v: float | None) -> str:
     return s.replace("-", MINUS)
 
 
+def _order(spec: FeatureSpec) -> list[str]:
+    return group_order(spec.direction, spec.mode, spec.good_group)
+
+
 def group_label(g: str, spec: FeatureSpec) -> str:
+    if spec.mode == "two":
+        m_good = spec.good_group == "modal"
+        o_good = spec.good_group == "other"
+        modal = "가장 흔한 값" + (" (좋은 쪽)" if m_good else "")
+        other = "그 외" + (" (좋은 쪽)" if o_good else "")
+        if not spec.good_group:
+            return {"modal": modal, "other": other, "all": "전체 유니버스"}[g]
+        if m_good:
+            return {"good": modal, "opp": other, "all": "전체 유니버스"}[g]
+        return {"good": other, "opp": modal, "all": "전체 유니버스"}[g]
     if spec.direction == 0:
         return {"top": "상위 10%", "bottom": "하위 10%", "mid": "중간 80%", "all": "전체 유니버스"}[
             g
@@ -392,7 +415,7 @@ def _ticks(lo: float, hi: float, n: int = 5) -> list[float]:
 
 
 def box_chart(dist: pl.DataFrame, spec: FeatureSpec, metric: str, label: str) -> str:
-    groups = group_order(spec.direction)
+    groups = _order(spec)
     Wd, Hd, lm, r, t, b = 420, 270, 52, 10, 14, 58
     stats = {
         g: {
@@ -471,7 +494,7 @@ def box_chart(dist: pl.DataFrame, spec: FeatureSpec, metric: str, label: str) ->
 
 
 def path_chart(dist: pl.DataFrame, spec: FeatureSpec) -> str:
-    groups = group_order(spec.direction)
+    groups = _order(spec)
     Wd, Hd, lm, r, t, b = 460, 270, 52, 10, 14, 34
     data = {}
     for g in groups:
@@ -554,7 +577,7 @@ def stats_table(dist: pl.DataFrame, spec: FeatureSpec) -> str:
         ("raw_label_20d", "시장 대비 초과(raw_label_20d)"),
         ("fwd_ret_20d", "20일 수익(fwd_ret_20d)"),
     ):
-        for g in group_order(spec.direction):
+        for g in _order(spec):
             cells = []
             for st, _ in cols:
                 v = _stat(dist, g, metric, st)
@@ -574,7 +597,7 @@ def stats_table(dist: pl.DataFrame, spec: FeatureSpec) -> str:
 
 
 def path_table(dist: pl.DataFrame, spec: FeatureSpec) -> str:
-    groups = group_order(spec.direction)
+    groups = _order(spec)
     head = "".join(f'<th colspan="3">{esc(group_label(g, spec))}</th>' for g in groups)
     sub = "".join("<th>Q1</th><th>중앙값</th><th>Q3</th>" for _ in groups)
     rows = []
@@ -593,7 +616,7 @@ def legend(spec: FeatureSpec) -> str:
         '<div class="legend">'
         + "".join(
             f'<span><b class="sw" style="background:{GROUP_COLOR[g]}"></b>{esc(group_label(g, spec))}</span>'
-            for g in group_order(spec.direction)
+            for g in _order(spec)
         )
         + '<span><i class="dash" style="border-color:var(--warn)"></i>거래세 0.20% 참고선(비용 전 값)</span></div>'
     )
@@ -610,6 +633,74 @@ COMMON_CAVEATS = (
 )
 
 
+def sizes_box(spec: FeatureSpec, sizes: list[dict], n_grid: int) -> str:
+    """Actual group sizes on the grid, computed from the features alone (no outcomes)."""
+    if not sizes:
+        return ""
+    order = [*group_names(spec.direction, spec.mode, spec.good_group), "mid"]
+    by = {s["group"]: s for s in sizes}
+    rows = []
+    for g in order:
+        s = by.get(g)
+        if s is None:
+            continue
+        label = "중간" if g == "mid" else group_label(g, spec)
+        empty = [d for d in s["drawn_dates_empty"].split(",") if d]
+        rows.append(
+            f'<tr><td class="l">{esc(label)}</td><td>{s["rows"]:,}</td><td>{s["share"] * 100:.1f}%</td>'
+            f"<td>{s['mean_per_date']:,.1f}</td><td>{s['dates_nonempty']}/{s['grid_dates']}</td>"
+            f'<td>{s["drawn_dates_min_size"]:,}</td><td class="l">{esc(", ".join(empty)) if empty else "없음"}</td></tr>'
+        )
+    why = (
+        "같은 값은 같은 무리로 들어가므로(평균 순위 백분위 ≥ 0.9 또는 ≤ 0.1) 무리 크기가 10%와 다를 수 있습니다. 값이 한쪽에 몰린 날에는 한쪽 무리가 비기도 합니다."
+        if spec.mode == "tie"
+        else "그날 시장 안에서 가장 흔한 값(건수가 같으면 작은 값)과 그 외로 나눈 크기입니다."
+    )
+    return (
+        '<div class="sizes"><h4>무리의 실제 크기 (피쳐 값만으로 센 것)</h4>'
+        f'<p class="cap">{esc(why)} 값이 빈 행은 뺍니다. 빈 날짜는 무작위로 뽑은 12개 날짜 중 그 무리가 비어 사례를 못 뽑은 날입니다.</p>'
+        '<div class="tw"><table><thead><tr><th class="l">무리</th><th>격자 전체 행</th><th>비중</th>'
+        "<th>날짜당 평균</th><th>비어 있지 않은 날짜</th><th>뽑은 날짜 중 최소 크기</th>"
+        '<th class="l">뽑은 날짜 중 빈 날짜</th></tr></thead><tbody>'
+        + "".join(rows)
+        + "</tbody></table></div></div>"
+    )
+
+
+def unformable_page(
+    spec: FeatureSpec, reason: str, sizes: list[dict], n_grid: int, run_id: str, seed: int
+) -> str:
+    b = [
+        f'<div class="top"><div class="kicker">{kicker(spec)}</div><h1><code>{esc(spec.name)}</code></h1>'
+    ]
+    b.append(
+        f'<p class="lede">좋은 쪽: {esc(spec.good_label)}. 방향 근거: {esc(spec.basis)}. '
+        "<b>이 피쳐는 무리를 나눌 수 없어 사례를 뽑지 않았습니다.</b></p>"
+        '<nav class="toc" aria-label="목차"><a href="index.html">갤러리 목록</a><a href="#card">카드</a><a href="#dist">무리 크기</a></nav></div>'
+    )
+    b.append(
+        '<section class="block" id="card"><h2>카드와 층 3</h2><dl class="cardinfo">'
+        f'<dt>카드</dt><dd><a href="../{esc(spec.card)}.html">{esc(spec.card)}</a> (같은 폴더의 <code>{esc(spec.card)}.md</code>)</dd>'
+        f"<dt>한 줄 직관</dt><dd>{esc(spec.short)}</dd>"
+        f"<dt>기대 부호</dt><dd>{esc(spec.expected)}</dd>"
+        f'<dt>층 3 모델 반응</dt><dd>{esc(spec.layer3)} <span class="cap">(<code>09_kr_result.md</code> §3)</span></dd>'
+        f"<dt>단변량 검정</dt><dd>{esc(spec.test)}</dd></dl></section>"
+    )
+    b.append(
+        '<section class="block" id="dist"><h2>무리를 만들 수 없음</h2>'
+        f'<div class="banner"><b>{esc(reason)}.</b> 그림을 그리면 한 무리뿐인 가짜 비교가 되므로 사례·분포 그림을 만들지 않았습니다. 이 페이지는 사실만 적습니다.</div>'
+        + sizes_box(spec, sizes, n_grid)
+        + "</section>"
+    )
+    b.append(
+        '<footer class="foot"><ul>'
+        f"<li>실행 {esc(run_id)} · 시드 {seed} · KR 개발 구간(2016-01-04–2025-06-30 formation, 격자 {n_grid}개 날짜). 라벨은 열지 않고 피쳐 값만 셌습니다.</li></ul></footer>"
+    )
+    return render_shell(
+        f"{spec.name} 사례 갤러리", "".join(b), f"{spec.name}: 무리를 만들 수 없어 사례 없음."
+    )
+
+
 def render_feature_page(
     spec: FeatureSpec,
     cases: pl.DataFrame,
@@ -620,15 +711,20 @@ def render_feature_page(
     run_id: str,
     seed: int,
     commentary_dir: Path | None = None,
+    sizes: list[dict] | None = None,
+    unformable: str | None = None,
 ) -> str:
+    if unformable:
+        return unformable_page(spec, unformable, sizes, n_grid, run_id, seed)
     com = load_commentary(spec.name, commentary_dir)
     rnd = cases.filter(pl.col("kind") == "random")
     ext = cases.filter(pl.col("kind") != "random")
-    first, second = ("top", "bottom") if spec.direction == 0 else ("good", "opp")
+    first, second = group_names(spec.direction, spec.mode, spec.good_group)
     gname = {g: group_label(g, spec) for g in (first, second, "all")}
+    sizes = sizes or []
 
     b: list[str] = []
-    b.append('<div class="top"><div class="kicker">KR 피쳐 사례 갤러리 · 시범 · 2026-10-15</div>')
+    b.append(f'<div class="top"><div class="kicker">{kicker(spec)}</div>')
     b.append(f"<h1><code>{esc(spec.name)}</code></h1>")
     b.append(
         f'<p class="lede">좋은 쪽: {esc(spec.good_label)}. 방향 근거: {esc(spec.basis)}. '
@@ -657,8 +753,14 @@ def render_feature_page(
     b.append('<section class="block" id="dist"><h2>① 분포 먼저 — 개발 구간 전체 격자</h2>')
     b.append(
         f"<p>2016-01-04부터 20거래일 간격 격자 {n_grid}개 날짜(20일 창이 서로 겹치지 않음)의 모든 종목을 "
-        "그날 시장(KOSPI·KOSDAQ)별 백분위로 나눈 세 무리입니다. 같은 날짜의 종목끼리는 시장 분위기를 공유하므로 서로 독립이 아닙니다. 비용 전 값입니다.</p>"
+        + (
+            "그날 시장(KOSPI·KOSDAQ)별로 가장 흔한 값과 그 외로 나눈 두 무리입니다."
+            if spec.mode == "two"
+            else "그날 시장(KOSPI·KOSDAQ)별 백분위로 나눈 세 무리입니다."
+        )
+        + " 같은 날짜의 종목끼리는 시장 분위기를 공유하므로 서로 독립이 아닙니다. 비용 전 값입니다.</p>"
     )
+    b.append(sizes_box(spec, sizes, n_grid))
     b.append(legend(spec))
     b.append(
         '<div class="two"><div class="chart"><h4>20일 시장 대비 초과수익 (raw_label_20d)</h4>'
@@ -693,8 +795,13 @@ def render_feature_page(
     # random cases
     b.append('<section class="block" id="cases"><h2>② 무작위 사례</h2>')
     b.append(
-        "<p>날짜마다 좋은 쪽(또는 상위) 3개 · 반대쪽(또는 하위) 3개 · 전체 2개를 시드 "
-        f"{seed}로 뽑았습니다. 성과를 보고 고르지 않았습니다.</p>"
+        "<p>날짜마다 "
+        + (
+            "두 무리에서 3개씩 · 전체 2개를 시드 "
+            if spec.mode == "two"
+            else "좋은 쪽(또는 상위) 3개 · 반대쪽(또는 하위) 3개 · 전체 2개를 시드 "
+        )
+        + f"{seed}로 뽑았습니다. 성과를 보고 고르지 않았습니다. 무리가 빈 날짜에는 그 무리의 사례가 없습니다.</p>"
         '<div class="legend"><span><i style="border-color:var(--s1)"></i>종목 가격(formation 종가=100)</span>'
         f'<span><i style="border-color:var(--muted);border-top-width:2px"></i>{MKT_LABEL}</span>'
         '<span><b class="sw" style="background:var(--s1);opacity:.25"></b>피쳐 계산 창</span>'
@@ -729,7 +836,11 @@ def render_feature_page(
     )
 
     # extremes
-    pool_text = "좋은 쪽 10% 무리" if spec.direction else "상위 10%와 하위 10% 무리를 합친 것"
+    two = spec.mode == "two"
+    if has_good_side(spec.direction, spec.mode, spec.good_group):
+        pool_text = "좋은 쪽 무리" if two else "좋은 쪽 10% 무리"
+    else:
+        pool_text = "두 무리를 합친 것" if two else "상위 10%와 하위 10% 무리를 합친 것"
     b.append(
         '<section class="block" id="extreme"><h2>③ 극단 사례</h2>'
         '<div class="banner"><b>대표 사례가 아닙니다.</b> 아래는 무작위가 아니라 결과로 고른 양 끝입니다. '
@@ -764,8 +875,14 @@ def render_feature_page(
         "<li>상·하한가 근접은 거래정지가 아닌 날 일간 변동 29.5~31%, ±31% 초과는 제한폭 밖(기업행동·신규 상장 등 원인 미확인)입니다.</li>"
         "</ul></footer>"
     )
+    body = "".join(b)
+    if spec.mode == "two":
+        body = body.replace(
+            "그날 시장 안 백분위로 나눈 좋은 쪽 10%·중간 80%·반대쪽 10%(방향이 없는 피쳐는 상위·중간·하위)입니다.",
+            "그날 시장 안에서 가장 흔한 값과 그 외로 나눈 두 무리입니다(중간 무리는 없습니다).",
+        ).replace("세 무리가 함께", "두 무리가 함께")
     return render_shell(
-        f"{spec.name} 사례 갤러리", "".join(b), f"{spec.name}의 개발 구간 사례 갤러리(가설 탐색)."
+        f"{spec.name} 사례 갤러리", body, f"{spec.name}의 개발 구간 사례 갤러리(가설 탐색)."
     )
 
 
@@ -838,26 +955,43 @@ def render_index(
     run_id: str,
     seed: int,
     commentary_dir: Path | None = None,
+    unformable: dict[str, str] | None = None,
 ) -> str:
+    unformable = unformable or {}
     coms = {sp.name: load_commentary(sp.name, commentary_dir) for sp in specs}
+    n_pilot = sum(1 for s in specs if s.name in C.PILOT_FEATURES)
     b = [
-        '<div class="top"><div class="kicker">KR 피쳐 사례 갤러리 · 시범 · 2026-10-15</div><h1>피쳐 사례 갤러리</h1>'
-        f'<p class="lede">피쳐 값이 극단인 종목이 그 뒤 20거래일 동안 실제로 어떻게 움직였는지 보는 그림판입니다. 개발 구간(formation 2016-01-04–2025-06-30)만 씁니다. 날짜 {len(dates)}개는 모든 피쳐가 같습니다.</p>'
+        f'<div class="top"><div class="kicker">{kicker(None) if n_pilot < len(specs) else kicker(specs[0] if specs else None)}</div><h1>피쳐 사례 갤러리</h1>'
+        f'<p class="lede">피쳐 값이 극단인 종목이 그 뒤 20거래일 동안 실제로 어떻게 움직였는지 보는 그림판입니다. 개발 구간(formation 2016-01-04–2025-06-30)만 씁니다. 날짜 {len(dates)}개는 모든 피쳐가 같습니다. '
+        f'피쳐 {len(specs)}개 중 시범 {n_pilot}개에는 <span class="pil">시범</span> 표시가 있습니다.</p>'
         '<div class="notice"><b>가설 탐색이지 판정이 아닙니다.</b><ul>'
         + "".join(f"<li>{esc(c)}</li>" for c in COMMON_CAVEATS)
         + "</ul></div></div>"
     ]
-    b.append('<section class="block"><h2>피쳐 9개</h2><div class="idx">')
-    for s in specs:
-        c = counts[s.name]
-        b.append(
-            '<div class="idxrow">'
-            f'<h3><a href="{esc(s.name)}.html"><code>{esc(s.name)}</code></a></h3>'
-            f"<p>{esc(s.short)}</p>"
-            f"<p>좋은 쪽: {esc(s.good_label)} · 사례 {c['random']}개 + 극단 {c['extreme']}개 · 격자 {n_grid}개 날짜 · "
-            f'카드 <a href="../{esc(s.card)}.html">{esc(s.card)}</a></p></div>'
-        )
-    b.append("</div>" + howto_box("index") + "</section>")
+    b.append(f'<section class="block"><h2>피쳐 {len(specs)}개</h2>')
+    for card, gtitle in C.CARD_GROUPS:
+        grp = [s for s in specs if s.card == card]
+        if not grp:
+            continue
+        b.append(f'<h3 class="idxgroup">{esc(gtitle)} · {len(grp)}개</h3><div class="idx">')
+        for s in grp:
+            c = counts[s.name]
+            tag = '<span class="pil">시범</span>' if s.name in C.PILOT_FEATURES else ""
+            if s.name in unformable:
+                body = f"<p><b>무리를 만들 수 없어 사례 없음.</b> {esc(unformable[s.name])}</p>"
+            else:
+                mode = "두 무리(가장 흔한 값 / 그 외) · " if s.mode == "two" else ""
+                body = (
+                    f"<p>좋은 쪽: {esc(s.good_label)} · {mode}사례 {c['random']}개 + 극단 {c['extreme']}개 · 격자 {n_grid}개 날짜 · "
+                    f'카드 <a href="../{esc(s.card)}.html">{esc(s.card)}</a></p>'
+                )
+            b.append(
+                '<div class="idxrow">'
+                f'<h3><a href="{esc(s.name)}.html"><code>{esc(s.name)}</code></a>{tag}</h3>'
+                f"<p>{esc(s.short)}</p>{body}</div>"
+            )
+        b.append("</div>")
+    b.append(howto_box("index") + "</section>")
     if specs and all(coms[sp.name].get("dist_raw") for sp in specs):
         items = "".join(
             f'<li><a href="{esc(sp.name)}.html"><code>{esc(sp.name)}</code></a> \u2014 '
@@ -872,4 +1006,6 @@ def render_index(
         f'<section class="block"><h2>고른 날짜</h2><p class="mono">{" · ".join(d.isoformat() for d in dates)}</p>'
         f'<p class="cap">시드 {seed} · 실행 {esc(run_id)}. 해마다 1개(2016–2025) + 나머지 2개는 전체에서 무작위.</p></section>'
     )
-    return render_shell("피쳐 사례 갤러리", "".join(b), "KR 피쳐 사례 갤러리 시범 9개의 목록.")
+    return render_shell(
+        "피쳐 사례 갤러리", "".join(b), f"KR 피쳐 사례 갤러리 {len(specs)}개의 목록."
+    )

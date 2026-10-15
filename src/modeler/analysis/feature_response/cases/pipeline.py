@@ -37,9 +37,18 @@ from .guards import (
     guard_not_in_repo,
     guard_path,
 )
-from .select import add_pct, build_grid, choose_dates, group_names, select_cases, with_groups
+from .select import (
+    add_pct,
+    build_grid,
+    choose_dates,
+    group_names,
+    group_size_table,
+    has_good_side,
+    select_cases,
+    with_groups,
+)
 
-GROUP_RANK = {"good": 0, "top": 0, "opp": 1, "bottom": 1, "all": 2}
+GROUP_RANK = {"good": 0, "top": 0, "modal": 0, "opp": 1, "bottom": 1, "other": 1, "all": 2}
 
 
 def sha256_file(path: Path, chunk: int = 8 << 20) -> str:
@@ -164,16 +173,39 @@ def run_pilot(
 
     case_frames: list[pl.DataFrame] = []
     dist_rows: list[dict] = []
+    size_rows: list[dict] = []
+    unformable: dict[str, str] = {}
     for f, spec in specs.items():
         log(f"feature {f}")
         pct = add_pct(feature_frame(panel, f, grid_dates))
+        gdf = with_groups(pct, spec.direction, spec.mode, spec.good_group)
+        gnames = group_names(spec.direction, spec.mode, spec.good_group)
+        sizes = group_size_table(gdf.select("trade_date", "group"), dates, gnames)
+        for s in sizes:
+            size_rows.append(
+                {"feature": f, **s, "drawn_dates_empty": ",".join(s["drawn_dates_empty"])}
+            )
+        if spec.mode == "two":
+            empty = [s["group"] for s in sizes if s["group"] in gnames and s["rows"] == 0]
+            if empty:
+                unformable[f] = (
+                    "두 무리를 만들 수 없음: 개발 격자 전체에서 " + ", ".join(empty) + " 무리가 0행"
+                )
+                log(f"  {unformable[f]}")
+                continue
         picks = select_cases(
-            pct.filter(pl.col("trade_date").is_in(dates)), spec.direction, seed, f
+            pct.filter(pl.col("trade_date").is_in(dates)),
+            spec.direction,
+            seed,
+            f,
+            mode=spec.mode,
+            good_group=spec.good_group,
         ).with_columns(
             pl.lit("random").alias("kind"), pl.lit(None, dtype=pl.Int64).alias("ext_rank")
         )
-        gdf = with_groups(pct, spec.direction)
-        pool_groups = list(group_names(spec.direction)) if spec.direction == 0 else ["good"]
+        pool_groups = (
+            ["good"] if has_good_side(spec.direction, spec.mode, spec.good_group) else list(gnames)
+        )
         pool = gdf.filter(
             pl.col("trade_date").is_in(dates) & pl.col("group").is_in(pool_groups)
         ).join(labels, on=["trade_date", "ticker"], how="left")
@@ -186,7 +218,14 @@ def run_pilot(
             on=["trade_date", "ticker"],
             how="inner",
         )
-        dist_rows += distribution_rows(f, spec.direction, g, paths_all[g["ri"].to_numpy()])
+        dist_rows += distribution_rows(
+            f,
+            spec.direction,
+            g,
+            paths_all[g["ri"].to_numpy()],
+            spec.mode,
+            spec.good_group,
+        )
 
     allc = (
         pl.concat(case_frames)
@@ -297,6 +336,21 @@ def run_pilot(
         },
     )
     dist_df.write_parquet(out_dir / "distribution.parquet")
+    sizes_df = pl.DataFrame(
+        size_rows,
+        schema={
+            "feature": pl.String,
+            "group": pl.String,
+            "rows": pl.Int64,
+            "share": pl.Float64,
+            "grid_dates": pl.Int64,
+            "dates_nonempty": pl.Int64,
+            "mean_per_date": pl.Float64,
+            "drawn_dates_empty": pl.String,
+            "drawn_dates_min_size": pl.Int64,
+        },
+    )
+    sizes_df.write_parquet(out_dir / "group_sizes.parquet")
     prow = []
     for (d, t), s in series.items():
         for i, rel in enumerate(s["rel"]):
@@ -316,7 +370,16 @@ def run_pilot(
         "labels_used": "dev_only",
         "seed": seed,
         "features": list(specs),
-        "directions": {f: {"direction": s.direction, "basis": s.basis} for f, s in specs.items()},
+        "directions": {
+            f: {
+                "direction": s.direction,
+                "basis": s.basis,
+                "mode": s.mode,
+                "good_group": s.good_group,
+            }
+            for f, s in specs.items()
+        },
+        "unformable_features": unformable,
         "formation_dates": [d.isoformat() for d in dates],
         "grid": {
             "n": len(grid),
@@ -329,6 +392,12 @@ def run_pilot(
             "per_date": {"good_or_top": C.N_GOOD, "opp_or_bottom": C.N_OPP, "all": C.N_ALL},
             "pct": "average rank / count within (trade_date, market)",
             "good_side": f"pct >= {C.TOP_PCT} or <= {C.BOTTOM_PCT} by direction",
+            "mode_two": "modal value of (trade_date, market) vs the rest; ties in count go to "
+            "the smaller value; applies to px_is_halted, fin_is_negative_equity, "
+            "px_halt_ratio_20d, fin_has_fs, own_major_filing_60d (plan section 11)",
+            "empty_group": "a group empty on a drawn date yields no cases for it (recorded in "
+            "group_sizes.parquet drawn_dates_empty); a two-group feature with a group empty on "
+            "the whole grid gets no cases (unformable_features)",
             "hit": "raw_label_20d > 0, good side only",
             "extremes": f"top/bottom {C.N_EXTREME} raw_label_20d in the good-side group",
             "limit_hit": f"{C.LIMIT_LO} <= |close/prev-1| <= {C.LIMIT_HI}, non-halt, day +1..+20",
@@ -369,7 +438,8 @@ def run_pilot(
         "forbidden_checks": {
             "holdout_guard_fires": holdout_ok,
             "max_trade_date_read": str(panel["trade_date"].max()),
-            "max_label_window_end": max(cal[ci[d] + C.HORIZON] for d in dates).isoformat(),
+            "max_label_window_end_selected": max(cal[ci[d] + C.HORIZON] for d in dates).isoformat(),
+            "max_label_window_end_grid": max(end for _, _, end in grid).isoformat(),
             "all_formation_dates_in_window": True,
             "label_windows_end_by_2025_07_31": True,
             "grid_non_overlapping": True,
@@ -391,6 +461,8 @@ def run_pilot(
         "manifest": manifest,
         "cases": cases_out,
         "dist": dist_df,
+        "sizes": sizes_df,
+        "unformable": unformable,
         "series": series,
         "dates": dates,
         "n_grid": len(grid),

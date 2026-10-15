@@ -22,6 +22,7 @@ from modeler.analysis.feature_response.cases.select import (
     add_pct,
     build_grid,
     choose_dates,
+    group_size_table,
     hit_flag,
     select_cases,
     with_groups,
@@ -234,3 +235,168 @@ def test_commentary_loading_and_render(tmp_path):
     assert safe_html("<b>a</b><script>") == "<b>a</b>&lt;script&gt;"
     (tmp_path / "bad.json").write_text("{", encoding="utf-8")
     assert load_commentary("bad", tmp_path) == {}
+
+
+# ---- plan section 11: two-group and tie-aware modes ---------------------------------------
+
+
+def _two_frame(d: dt.date, n: int = 200, other_every: int = 10) -> pl.DataFrame:
+    """Binary feature: every ``other_every``-th ticker is 1, the rest 0."""
+    df = _day_frame(d, n).drop("value")
+    return df.with_columns(
+        pl.Series("value", [1.0 if i % other_every == 0 else 0.0 for i in range(n)])
+    )
+
+
+def test_two_group_modal_vs_other_per_market():
+    d = dt.date(2020, 1, 2)
+    pct = add_pct(_two_frame(d))
+    g = with_groups(pct, 0, mode="two", good_group=None)
+    assert set(g["group"]) == {"modal", "other"}
+    assert set(g.filter(pl.col("group") == "modal")["value"]) == {0.0}
+    assert set(g.filter(pl.col("group") == "other")["value"]) == {1.0}
+    # good side names follow good_group
+    gm = with_groups(pct, 0, mode="two", good_group="modal")
+    assert set(gm.filter(pl.col("value") == 0.0)["group"]) == {"good"}
+    go = with_groups(pct, 0, mode="two", good_group="other")
+    assert set(go.filter(pl.col("value") == 1.0)["group"]) == {"good"}
+
+
+def test_two_group_modal_is_per_date_and_market_with_small_value_tiebreak():
+    d1, d2 = dt.date(2020, 1, 2), dt.date(2020, 1, 3)
+    rows = []
+    for d, vals in ((d1, [0, 0, 1]), (d2, [1, 1, 0]), (d1, [5, 7])):
+        for i, v in enumerate(vals):
+            rows.append(
+                {
+                    "trade_date": d,
+                    "ticker": f"{d.day}{len(rows)}",
+                    "market": "KOSPI",
+                    "value": float(v),
+                }
+            )
+    # d1 holds 0,0,1,5,7 -> modal 0; d2 holds 1,1,0 -> modal 1
+    g = with_groups(add_pct(pl.DataFrame(rows)), 0, mode="two")
+    assert set(g.filter((pl.col("trade_date") == d1) & (pl.col("group") == "modal"))["value"]) == {
+        0.0
+    }
+    assert set(g.filter((pl.col("trade_date") == d2) & (pl.col("group") == "modal"))["value"]) == {
+        1.0
+    }
+    # tie in count: smaller value wins
+    t = pl.DataFrame(
+        {
+            "trade_date": [d1] * 4,
+            "ticker": list("abcd"),
+            "market": ["KOSPI"] * 4,
+            "value": [3.0, 3.0, 2.0, 2.0],
+        }
+    )
+    assert set(
+        with_groups(add_pct(t), 0, mode="two").filter(pl.col("group") == "modal")["value"]
+    ) == {2.0}
+
+
+def test_two_group_selection_counts_and_empty_group_is_skipped():
+    dates = [dt.date(2020, 1, 2), dt.date(2021, 1, 4)]
+    first = _two_frame(dates[0])
+    second = _two_frame(dates[1]).with_columns(pl.lit(0.0).alias("value"))  # no "other" at all
+    pct = add_pct(pl.concat([first, second]))
+    cases = select_cases(pct, 0, C.SEED, "fin_has_fs", mode="two", good_group=None)
+    got0 = {
+        r["group"]: r["len"]
+        for r in cases.filter(pl.col("trade_date") == dates[0]).group_by("group").len().to_dicts()
+    }
+    assert got0 == {"modal": 3, "other": 3, "all": 2}
+    got1 = {
+        r["group"]: r["len"]
+        for r in cases.filter(pl.col("trade_date") == dates[1]).group_by("group").len().to_dicts()
+    }
+    assert got1 == {"modal": 3, "all": 2}  # empty group: no cases, no error
+    again = select_cases(pct, 0, C.SEED, "fin_has_fs", mode="two", good_group=None)
+    assert cases.sort(["trade_date", "ticker"]).equals(again.sort(["trade_date", "ticker"]))
+    # with a good side the groups are named good/opp
+    gcases = select_cases(pct, 0, C.SEED, "own", mode="two", good_group="modal")
+    assert set(gcases["group"]) == {"good", "opp", "all"}
+    assert set(gcases.filter(pl.col("group") == "good")["value"]) == {0.0}
+
+
+def test_two_group_size_table_records_empty_dates():
+    dates = [dt.date(2020, 1, 2), dt.date(2021, 1, 4)]
+    pct = add_pct(
+        pl.concat(
+            [_two_frame(dates[0]), _two_frame(dates[1]).with_columns(pl.lit(0.0).alias("value"))]
+        )
+    )
+    g = with_groups(pct, 0, mode="two")
+    rows = {
+        r["group"]: r
+        for r in group_size_table(g.select("trade_date", "group"), dates, ("modal", "other"))
+    }
+    assert rows["modal"]["rows"] == 180 + 200 and rows["other"]["rows"] == 20
+    assert rows["other"]["dates_nonempty"] == 1
+    assert rows["other"]["drawn_dates_empty"] == [dates[1].isoformat()]
+    assert rows["modal"]["drawn_dates_empty"] == []
+
+
+def test_tie_mode_keeps_ties_together_and_matches_old_pct():
+    d = dt.date(2020, 1, 2)
+    # 40 zeros, then 60 distinct values: zeros share an average rank percentile of 0.205
+    vals = [0.0] * 40 + [float(i) for i in range(1, 61)]
+    df = pl.DataFrame(
+        {
+            "trade_date": [d] * 100,
+            "ticker": [f"{i:06d}" for i in range(100)],
+            "market": ["KOSPI"] * 100,
+            "value": vals,
+        }
+    )
+    pct = add_pct(df)
+    zeros = pct.filter(pl.col("value") == 0.0)["pct"].unique().to_list()
+    assert zeros == [0.205]  # average rank 20.5 / count 100
+    g = with_groups(pct, 1)
+    assert g.filter(pl.col("group") == "opp").height == 0  # ties pushed above 0.1: group empty
+    top = g.filter(pl.col("group") == "good")
+    # rank 90/100 = 0.9 is inside (>=)
+    assert top.height == 11 and top["pct"].min() >= 0.9
+    # the same value never lands in two groups
+    g2 = with_groups(pct, -1)
+    assert set(g2.filter(pl.col("value") == 0.0)["group"]) == {"mid"}
+    rows = group_size_table(g.select("trade_date", "group"), [d], ("good", "opp"))
+    by = {r["group"]: r for r in rows}
+    assert (
+        by["good"]["rows"] == 11
+        and by["opp"]["rows"] == 0
+        and by["opp"]["drawn_dates_empty"] == [d.isoformat()]
+    )
+    # selection on the empty side yields no cases for it and does not fail
+    cases = select_cases(pct, 1, C.SEED, "flow_short_selling_volume")
+    assert "opp" not in set(cases["group"])
+
+
+def test_feature_specs_cover_all_47_with_frozen_modes():
+    assert len(C.FEATURES) == 47 and len(C.PILOT_FEATURES) == 9
+    two = {n for n, s in C.FEATURES.items() if s.mode == "two"}
+    assert two == {
+        "px_is_halted",
+        "fin_is_negative_equity",
+        "px_halt_ratio_20d",
+        "fin_has_fs",
+        "own_major_filing_60d",
+    }
+    assert C.FEATURES["own_major_filing_60d"].good_group == "modal"
+    assert C.FEATURES["px_halt_ratio_20d"].good_group == "other"
+    assert all(
+        C.FEATURES[n].good_group is None
+        for n in two - {"own_major_filing_60d", "px_halt_ratio_20d"}
+    )
+    assert all(s.good_group is None for s in C.FEATURES.values() if s.mode == "tie")
+    # plan section 11 direction table spot checks
+    d = {n: s.direction for n, s in C.FEATURES.items()}
+    assert d["px_maxret_20d"] == -1 and d["px_amihud_20d"] == 1 and d["fin_log_mcap"] == -1
+    assert (
+        d["px_vol_20d"] == 1 and d["px_gap_vs_ma20"] == -1 and d["flow_foreign_netbuy_sum_20d"] == 0
+    )
+    assert d["fin_cash_ratio"] == 0 and d["fin_asset_turnover"] == 1
+    # the nine pilot specs are untouched
+    assert [C.FEATURES[n].direction for n in C.PILOT_FEATURES] == [-1, -1, 1, 1, 1, 1, 1, 1, 0]

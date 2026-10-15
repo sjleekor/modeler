@@ -84,12 +84,58 @@ def add_pct(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def group_names(direction: int) -> tuple[str, str]:
+def group_names(
+    direction: int, mode: str = "tie", good_group: str | None = None
+) -> tuple[str, str]:
+    """Display order of the two comparison groups.
+
+    ``tie``: ``(good, opp)`` or ``(top, bottom)`` when no good side is set.
+    ``two`` (modal value vs the rest): ``(good, opp)`` when a good side is set, else
+    ``(modal, other)``.
+    """
+    if mode == "two":
+        return ("good", "opp") if good_group else ("modal", "other")
     return ("top", "bottom") if direction == 0 else ("good", "opp")
 
 
-def with_groups(df: pl.DataFrame, direction: int) -> pl.DataFrame:
+def two_group_names(good_group: str | None) -> tuple[str, str]:
+    """Names given to (modal-value group, other group) in ``two`` mode."""
+    if good_group == "modal":
+        return "good", "opp"
+    if good_group == "other":
+        return "opp", "good"
+    return "modal", "other"
+
+
+def has_good_side(direction: int, mode: str = "tie", good_group: str | None = None) -> bool:
+    return bool(good_group) if mode == "two" else direction != 0
+
+
+def modal_values(df: pl.DataFrame) -> pl.DataFrame:
+    """Most frequent value per (trade_date, market); ties go to the smaller value."""
+    return (
+        df.group_by(["trade_date", "market", "value"])
+        .len()
+        .sort(["trade_date", "market", "len", "value"], descending=[False, False, True, False])
+        .group_by(["trade_date", "market"], maintain_order=True)
+        .first()
+        .select("trade_date", "market", pl.col("value").alias("_modal"))
+    )
+
+
+def with_groups(
+    df: pl.DataFrame, direction: int, mode: str = "tie", good_group: str | None = None
+) -> pl.DataFrame:
     assert_outcome_blind(df.columns)
+    if mode == "two":
+        m_name, o_name = two_group_names(good_group)
+        out = df.join(modal_values(df), on=["trade_date", "market"], how="left")
+        return out.with_columns(
+            pl.when(pl.col("value") == pl.col("_modal"))
+            .then(pl.lit(m_name))
+            .otherwise(pl.lit(o_name))
+            .alias("group")
+        ).drop("_modal")
     first, second = group_names(direction)
     hi = pl.col("pct") >= TOP_PCT
     lo = pl.col("pct") <= BOTTOM_PCT
@@ -117,6 +163,8 @@ def select_cases(
     n_good: int = N_GOOD,
     n_opp: int = N_OPP,
     n_all: int = N_ALL,
+    mode: str = "tie",
+    good_group: str | None = None,
 ) -> pl.DataFrame:
     """Draw cases for every date in ``cands``. Needs ``pct``; never sees outcomes.
 
@@ -131,8 +179,8 @@ def select_cases(
     extra = set(cands.columns) - ALLOWED - {"group"}
     if extra:
         raise OutcomeLeakError(f"unexpected columns in selection input: {sorted(extra)}")
-    g = with_groups(cands.select(sorted(ALLOWED & set(cands.columns))), direction)
-    first, second = group_names(direction)
+    g = with_groups(cands.select(sorted(ALLOWED & set(cands.columns))), direction, mode, good_group)
+    first, second = group_names(direction, mode, good_group)
     rows = []
     for d in sorted(g["trade_date"].unique().to_list()):
         day = g.filter(pl.col("trade_date") == d).sort(["ticker", "market"])
@@ -157,3 +205,36 @@ def hit_flag(raw_label: float | None, group: str) -> bool | None:
     if group != "good" or raw_label is None or raw_label != raw_label:
         return None
     return raw_label > 0
+
+
+def group_size_table(g: pl.DataFrame, dates: list[dt.date], names: tuple[str, str]) -> list[dict]:
+    """Actual group sizes (outcome-blind). ``g`` has trade_date and group; ``dates`` are drawn.
+
+    One row per group: rows and dates with the group non-empty over the whole grid, mean size
+    per grid date, share of all rows, and the drawn dates on which the group is empty.
+    """
+    assert_outcome_blind(g.columns)
+    grid_dates = sorted(g["trade_date"].unique().to_list())
+    total = g.height
+    out = []
+    for name in (*names, "mid"):
+        sub = g.filter(pl.col("group") == name)
+        per_day = sub.group_by("trade_date").len()
+        n_by_date = dict(
+            zip(per_day["trade_date"].to_list(), per_day["len"].to_list(), strict=True)
+        )
+        if name == "mid" and sub.height == 0:
+            continue
+        out.append(
+            {
+                "group": name,
+                "rows": int(sub.height),
+                "share": sub.height / total if total else 0.0,
+                "grid_dates": len(grid_dates),
+                "dates_nonempty": len(n_by_date),
+                "mean_per_date": float(sub.height / len(grid_dates)) if grid_dates else 0.0,
+                "drawn_dates_empty": [d.isoformat() for d in dates if n_by_date.get(d, 0) == 0],
+                "drawn_dates_min_size": min((n_by_date.get(d, 0) for d in dates), default=0),
+            }
+        )
+    return out

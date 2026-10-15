@@ -11,9 +11,9 @@ QS = (0.05, 0.25, 0.5, 0.75, 0.95)
 METRICS = ("raw_label_20d", "fwd_ret_20d")
 
 
-def group_order(direction: int) -> list[str]:
-    a, b = group_names(direction)
-    return [a, "mid", b]
+def group_order(direction: int, mode: str = "tie", good_group: str | None = None) -> list[str]:
+    a, b = group_names(direction, mode, good_group)
+    return [a, b] if mode == "two" else [a, "mid", b]
 
 
 def box_stats(values: np.ndarray) -> dict:
@@ -39,11 +39,13 @@ def distribution_rows(
     direction: int,
     grid: pl.DataFrame,
     paths: np.ndarray,
+    mode: str = "tie",
+    good_group: str | None = None,
 ) -> list[dict]:
     """``grid``: grid (date, ticker) rows with group and labels; ``paths`` aligned (R, 21)."""
     rows: list[dict] = []
     groups = grid["group"].to_numpy()
-    for g in group_order(direction):
+    for g in group_order(direction, mode, good_group):
         sel = groups == g
         ndates = grid.filter(pl.col("group") == g)["trade_date"].n_unique()
         for metric in METRICS:
