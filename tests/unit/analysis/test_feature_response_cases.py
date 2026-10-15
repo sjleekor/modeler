@@ -400,3 +400,75 @@ def test_feature_specs_cover_all_47_with_frozen_modes():
     assert d["fin_cash_ratio"] == 0 and d["fin_asset_turnover"] == 1
     # the nine pilot specs are untouched
     assert [C.FEATURES[n].direction for n in C.PILOT_FEATURES] == [-1, -1, 1, 1, 1, 1, 1, 1, 0]
+
+
+def _dist_rows(feature: str, groups: dict[str, tuple[float, float, float]]) -> list[dict]:
+    out = []
+    for g, (hit, mean, n) in groups.items():
+        for stat, v in (("hit_rate", hit), ("mean", mean), ("n", n)):
+            out.append(
+                {
+                    "feature": feature,
+                    "group": g,
+                    "metric": "raw_label_20d",
+                    "stat": stat,
+                    "k": None,
+                    "value": v,
+                }
+            )
+        out.append(  # other metric must be ignored
+            {
+                "feature": feature,
+                "group": g,
+                "metric": "fwd_ret_20d",
+                "stat": "hit_rate",
+                "k": None,
+                "value": 0.99,
+            }
+        )
+    return out
+
+
+def test_rank_rows_pairs_sort_and_flags():
+    from modeler.analysis.feature_response.cases.rank import pair_names, rank_rows, summary_text
+
+    names = ["px_idio_vol_60d", "px_ret_60d", "px_halt_ratio_20d", "px_is_halted", "fin_has_fs"]
+    specs = [C.FEATURES[n] for n in names]
+    assert pair_names(C.FEATURES["px_idio_vol_60d"]) == ("good", "opp", "mid")
+    assert pair_names(C.FEATURES["px_ret_60d"]) == ("top", "bottom", "mid")
+    assert pair_names(C.FEATURES["px_halt_ratio_20d"]) == ("good", "opp", None)
+    assert pair_names(C.FEATURES["fin_has_fs"]) == ("other", "modal", None)
+    rows_ = (
+        _dist_rows(
+            "px_idio_vol_60d",
+            {"good": (0.44, 0.02, 20000), "mid": (0.41, 0.0, 180000), "opp": (0.35, -0.01, 20000)},
+        )
+        + _dist_rows(
+            "px_ret_60d",
+            {"top": (0.36, -0.02, 20000), "mid": (0.41, 0.0, 180000), "bottom": (0.42, 0.0, 20000)},
+        )
+        + _dist_rows("px_halt_ratio_20d", {"good": (0.35, -0.03, 909), "opp": (0.41, 0.0, 237000)})
+        + _dist_rows("fin_has_fs", {"other": (0.40, 0.0, 5000), "modal": (0.405, 0.0, 200000)})
+    )
+    dist = pl.DataFrame(rows_)
+    rows = rank_rows(specs, dist, {"px_is_halted": "x"})
+    assert [r["name"] for r in rows] == [
+        "px_idio_vol_60d",
+        "px_halt_ratio_20d",
+        "px_ret_60d",
+        "fin_has_fs",
+        "px_is_halted",
+    ]
+    by = {r["name"]: r for r in rows}
+    assert by["px_idio_vol_60d"]["hit_diff"] == pytest.approx(9.0)
+    assert by["px_idio_vol_60d"]["sign"] == "lead"
+    assert by["px_halt_ratio_20d"]["hit_diff"] == pytest.approx(-6.0)
+    assert by["px_halt_ratio_20d"]["sign"] == "trail"
+    assert by["px_halt_ratio_20d"]["small"] and not by["px_idio_vol_60d"]["small"]
+    assert by["px_ret_60d"]["sign"] == "none"
+    assert by["px_ret_60d"]["hit_diff"] == pytest.approx(-6.0)
+    assert by["fin_has_fs"]["hit_diff"] == pytest.approx(-0.5)
+    assert by["px_is_halted"]["hit_diff"] is None and by["px_is_halted"]["sign"] == "nogroup"
+    assert "반대 쪽" in summary_text(by["px_halt_ratio_20d"])
+    assert "같은 쪽" in summary_text(by["px_idio_vol_60d"])
+    assert summary_text(by["fin_has_fs"]) == "양 끝 차이 1%p 안팎"

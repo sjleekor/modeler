@@ -73,6 +73,7 @@ def cmd_run(args) -> int:
         run_id,
         args.seed,
         unformable=unform,
+        dist=dist,
     )
     (html_dir / "index.html").write_text(index, encoding="utf-8")
     print(f"run_id {run_id}\noutput {out_dir}\nhtml {html_dir}")

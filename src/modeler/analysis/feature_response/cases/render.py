@@ -14,6 +14,7 @@ import polars as pl
 from . import config as C
 from .config import FeatureSpec
 from .dist import group_order
+from .rank import KIND_LABEL, direction_text, first_clause, rank_rows, summary_text
 from .select import group_names, has_good_side
 
 TEMPLATE = Path(__file__).with_name("template.html")
@@ -947,6 +948,205 @@ def render_shell(title: str, body: str, desc: str) -> str:
     )
 
 
+RANK_JS = """
+(function(){
+var tb=document.getElementById('rk-body'); if(!tb) return;
+var rows=Array.prototype.slice.call(tb.rows);
+var state={key:'ahd',dir:-1}, gf=null, sf=null;
+function val(r,k){var v=r.getAttribute('data-'+k); return (k==='name')?v:parseFloat(v);}
+function sortRows(){
+  var k=state.key, d=state.dir;
+  rows.sort(function(a,b){
+    var na=a.getAttribute('data-nogroup')==='1', nb=b.getAttribute('data-nogroup')==='1';
+    if(na!==nb) return na?1:-1;
+    if(na&&nb) return val(a,'name')<val(b,'name')?-1:1;
+    var x=val(a,k), y=val(b,k);
+    if(x<y) return -1*d; if(x>y) return 1*d;
+    return val(a,'name')<val(b,'name')?-1:1;
+  });
+  rows.forEach(function(r){tb.appendChild(r);});
+  var hs=document.querySelectorAll('#rk th[data-sort]');
+  Array.prototype.forEach.call(hs,function(th){
+    var on=th.getAttribute('data-sort')===k;
+    th.setAttribute('aria-sort', on?(d>0?'ascending':'descending'):'none');
+  });
+  var bs=document.querySelectorAll('#rk .sb');
+  Array.prototype.forEach.call(bs,function(b){
+    var on=b.getAttribute('data-k')===k;
+    b.classList.toggle('on',on);
+    b.setAttribute('data-arrow', on?(d>0?'\\u25B2':'\\u25BC'):'');
+  });
+}
+function applyFilter(){
+  var n=0;
+  rows.forEach(function(r){
+    var ok=(gf===null||r.getAttribute('data-grp')===gf)&&(sf===null||r.getAttribute('data-sign')===sf);
+    r.hidden=!ok; if(ok) n++;
+  });
+  var c=document.getElementById('rk-count'); if(c) c.textContent=n+'\\uAC1C / '+rows.length+'\\uAC1C';
+}
+Array.prototype.forEach.call(document.querySelectorAll('#rk .sb'),function(b){
+  b.addEventListener('click',function(){
+    var k=b.getAttribute('data-k');
+    if(state.key===k) state.dir=-state.dir;
+    else {state.key=k; state.dir=(k==='name'||k==='grp')?1:-1;}
+    sortRows();
+  });
+});
+function chipGroup(sel,set){
+  var cs=document.querySelectorAll(sel);
+  Array.prototype.forEach.call(cs,function(c){
+    c.addEventListener('click',function(){
+      var v=c.getAttribute('data-v'), on=c.getAttribute('aria-pressed')==='true';
+      Array.prototype.forEach.call(cs,function(o){o.setAttribute('aria-pressed','false');});
+      if(!on) c.setAttribute('aria-pressed','true');
+      set(on?null:v); applyFilter();
+    });
+  });
+}
+chipGroup('#rk-f .fg',function(v){gf=v;});
+chipGroup('#rk-f .fs',function(v){sf=v;});
+sortRows(); applyFilter();
+})();
+"""
+
+SIGN_LABEL = {"lead": "+ 좋은 쪽이 앞섬", "trail": "− 반대쪽이 앞섬", "none": "방향 없음"}
+RANK_READ = (
+    "<b>이 표를 읽는 법</b>"
+    "<ul>"
+    "<li><b>적중률 차</b>는 첫째 무리의 적중률에서 둘째 무리의 적중률을 뺀 값(%p)입니다. 적중률은 20일 뒤 시장보다 오른 종목(초과수익&gt;0)의 몫이고, "
+    "<b>평균 차</b>는 같은 방식으로 뺀 20일 초과수익 평균입니다. 양 끝 무리의 벌어진 정도를 한 숫자로 줄인 것입니다.</li>"
+    "<li>첫째·둘째는 좋은 쪽이 있는 피쳐는 좋은 쪽·반대쪽, 방향이 없는 피쳐는 상위 10%·하위 10%입니다. 두 무리 피쳐 가운데 방향이 없는 것은 그 외·가장 흔한 값입니다. "
+    "중간은 중간 80%이고 두 무리 피쳐에는 없어 “—”로 둡니다.</li>"
+    "<li>부호가 +이면 좋은 쪽(첫째)이 앞선 것이고 −이면 반대쪽이 앞선 것입니다. 좋은 쪽은 카드 기대·관측·모델 방향(탐색) 중 하나로 정해 둔 것이며, 방향 근거 열에 적었습니다. "
+    "방향이 없는 피쳐의 부호는 상위·하위 중 어느 쪽이 앞섰는지만 뜻합니다.</li>"
+    "<li><b>순서는 보는 순서일 뿐 판정이 아닙니다.</b> 개발 구간을 이미 여러 번 열람한 뒤의 결과 후 관찰이고, 비용을 빼기 전 값입니다. "
+    "순위가 높다고 쓸 만하다는 뜻이 아니며 낮다고 못 쓴다는 뜻도 아닙니다.</li>"
+    "<li>날짜는 겹치지 않는 격자 {n_grid}개입니다. 같은 날짜의 종목은 시장 움직임을 함께 받으므로 표본(n)의 행 수만큼 독립 관측이 있는 것이 아닙니다.</li>"
+    '<li><span class="chip flag">표본 적음</span>은 비교한 두 무리 중 작은 쪽이 {small_n:,}행 미만이거나 작은 쪽이 큰 쪽의 {small_pct}% 미만인 경우입니다. 이 표시가 있는 차이는 더 흔들립니다.</li>'
+    "<li>핵심 설명의 앞 절은 카드의 한 줄 직관이고, 뒤 절은 오른쪽 숫자에서 자동으로 만든 문장입니다. 차이가 5%p 이상이면 뚜렷, 2\u20135%p이면 중간, 2%p 미만이면 작음으로 적습니다.</li>"
+    "</ul>"
+)
+
+
+def _sgn(x: float | None, digits: int = 1) -> str:
+    if x is None:
+        return "—"
+    s = f"{abs(x):.{digits}f}"
+    if float(s) == 0:
+        return s
+    return ("+" if x > 0 else MINUS) + s
+
+
+def _pct(x: float | None) -> str:
+    return "—" if x is None else f"{x * 100:.1f}%"
+
+
+def _num(x: float | None) -> str:
+    return "—" if x is None else f"{x:,.0f}"
+
+
+def rank_table(
+    specs: list[FeatureSpec],
+    dist: pl.DataFrame,
+    n_grid: int,
+    unformable: dict[str, str] | None = None,
+) -> str:
+    from .rank import SMALL_N, SMALL_RATIO
+
+    rows = rank_rows(specs, dist, unformable)
+    body = []
+    for r in rows:
+        sp = r["spec"]
+        nog = r["hit_diff"] is None
+        pil = '<span class="pil">시범</span>' if sp.name in C.PILOT_FEATURES else ""
+        small = '<span class="chip flag">표본 적음</span>' if r["small"] else ""
+        rho = re.search(r"ρ\s*[+−-]\d\.\d+", sp.basis)
+        src = KIND_LABEL[r["kind"]]
+        if r["kind"] == "none":
+            dtxt = "좋은 쪽 없음" + (f" ({rho.group(0)})" if rho else "")
+        else:
+            dtxt = f"{src} · {direction_text(sp)}" + (f" ({rho.group(0)})" if rho else "")
+        mean_cls = "" if nog else (" pos" if (r["mean_diff"] or 0) > 0 else " neg")
+        hd = r["hit_diff"]
+        data = (
+            f'data-name="{esc(sp.name)}" data-grp="{r["grp"]}" data-sign="{r["sign"]}" '
+            f'data-nogroup="{1 if nog else 0}" '
+            f'data-hd="{0.0 if nog else hd:.4f}" data-ahd="{0.0 if nog else abs(hd):.4f}" '
+            f'data-md="{0.0 if nog or r["mean_diff"] is None else r["mean_diff"]:.4f}"'
+        )
+        grp_name = dict(C.CARD_GROUPS)[sp.card]
+        if nog:
+            expl = (
+                f'{esc(first_clause(sp.short))}<br><span class="sm">무리 없음. '
+                "개발 격자 전체에서 한 무리가 비어 두 무리를 만들 수 없습니다.</span>"
+            )
+            hit_cell = '<td class="l">—</td>'
+            n_cell = '<td class="l">—</td>'
+            hd_cell = '<td class="num">—</td>'
+            md_cell = '<td class="num">—</td>'
+        else:
+            expl = (
+                f'{esc(first_clause(sp.short))}<br><span class="sm">{esc(summary_text(r))}</span>'
+            )
+            hit_cell = '<td class="l mono">' + " / ".join(_pct(h) for h in r["hit"]) + "</td>"
+            n_cell = '<td class="l mono">' + " / ".join(_num(n) for n in r["n"]) + "</td>"
+            hd_cell = f'<td class="num sg-{r["sign"]}"><b>{_sgn(hd)}</b></td>'
+            md_cell = f'<td class="num{mean_cls}">{_sgn(r["mean_diff"])}</td>'
+        body.append(
+            f"<tr {data}" + (' class="nog"' if nog else "") + f'><td class="rk">{r["rank"]}</td>'
+            f'<td class="l"><a href="{esc(sp.name)}.html"><code>{esc(sp.name)}</code></a>{pil}{small}</td>'
+            f'<td class="l">{esc(grp_name)}</td>'
+            f'<td class="w">{expl}</td>'
+            f'<td class="l">{esc(dtxt)}</td>'
+            f"{hd_cell}{md_cell}{hit_cell}{n_cell}"
+            f'<td class="w sm">{esc(sp.layer3)}</td></tr>'
+        )
+
+    def sb(k: str, label: str) -> str:
+        return f'<button type="button" class="sb" data-k="{k}">{label}</button>'
+
+    head = (
+        "<tr>"
+        '<th class="l" scope="col">순위<br><span class="sm">(|적중률 차| 기준)</span></th>'
+        f'<th class="l" scope="col" data-sort="name">{sb("name", "피쳐")}</th>'
+        f'<th class="l" scope="col" data-sort="grp">{sb("grp", "묶음")}</th>'
+        '<th class="l" scope="col">핵심 설명</th>'
+        '<th class="l" scope="col">방향 근거</th>'
+        f'<th scope="col" data-sort="hd">{sb("hd", "적중률 차")}<br>{sb("ahd", "|차|")}</th>'
+        f'<th scope="col" data-sort="md">{sb("md", "평균 차")}</th>'
+        '<th class="l" scope="col">적중률<br><span class="sm">첫째 / 중간 / 둘째</span></th>'
+        '<th class="l" scope="col">표본(n)<br><span class="sm">첫째 / 중간 / 둘째</span></th>'
+        '<th class="l" scope="col">층 3 한 줄</th>'
+        "</tr>"
+    )
+    fg = "".join(
+        f'<button type="button" class="fchip fg" data-v="{i}" aria-pressed="false">{esc(t)}</button>'
+        for i, (_, t) in enumerate(C.CARD_GROUPS)
+    )
+    fs = "".join(
+        f'<button type="button" class="fchip fs" data-v="{k}" aria-pressed="false">{esc(v)}</button>'
+        for k, v in SIGN_LABEL.items()
+    )
+    read = (
+        RANK_READ.replace("{n_grid}", str(n_grid))
+        .replace("{small_n:,}", f"{SMALL_N:,}")
+        .replace("{small_pct}", f"{round(SMALL_RATIO * 100)}")
+    )
+    return (
+        '<section class="block" id="ranking"><h2>피쳐 47개 순위표</h2>'
+        f'<div class="howto rkread">{read}</div>'
+        '<div class="rkfilter" id="rk-f"><span class="fl">묶음</span>'
+        f"{fg}"
+        '<span class="fl">부호</span>'
+        f'{fs}<span class="fl" id="rk-count" aria-live="polite"></span></div>'
+        '<div class="tw rktw" role="region" aria-label="피쳐 순위표" tabindex="0">'
+        f'<table class="rktable" id="rk"><thead>{head}</thead><tbody id="rk-body">{"".join(body)}</tbody></table></div>'
+        '<p class="cap">개발 구간 formation 날짜 격자 전체에서 계산했습니다. 지표는 20일 초과수익(시장 동일가중 근사 대비)입니다. 머리글의 버튼을 누르면 그 기준으로 다시 정렬합니다(한 번 더 누르면 방향이 바뀝니다).</p>'
+        f"<script>{RANK_JS}</script></section>"
+    )
+
+
 def render_index(
     specs: list[FeatureSpec],
     counts: dict,
@@ -956,6 +1156,7 @@ def render_index(
     seed: int,
     commentary_dir: Path | None = None,
     unformable: dict[str, str] | None = None,
+    dist: pl.DataFrame | None = None,
 ) -> str:
     unformable = unformable or {}
     coms = {sp.name: load_commentary(sp.name, commentary_dir) for sp in specs}
@@ -968,6 +1169,8 @@ def render_index(
         + "".join(f"<li>{esc(c)}</li>" for c in COMMON_CAVEATS)
         + "</ul></div></div>"
     ]
+    if dist is not None and dist.height:
+        b.append(rank_table(specs, dist, n_grid, unformable))
     b.append(f'<section class="block"><h2>피쳐 {len(specs)}개</h2>')
     for card, gtitle in C.CARD_GROUPS:
         grp = [s for s in specs if s.card == card]
