@@ -169,3 +169,68 @@ def test_hit_rule():
     assert hit_flag(0.5, "opp") is None
     assert hit_flag(0.5, "all") is None
     assert hit_flag(None, "good") is None
+
+
+# ---------------------------------------------------------------------------------------------
+# commentary and captions (synthetic)
+# ---------------------------------------------------------------------------------------------
+def _case_row(**kw) -> dict:
+    base = {
+        "label_missing": False,
+        "group": "good",
+        "hit": True,
+        "fwd_ret_20d": 0.05,
+        "raw_label_20d": 0.03,
+        "halt_fwd": 0,
+        "halt_prev20": 0,
+        "limit_hits": 0,
+        "jump_over_limit": 0,
+        "preferred": False,
+        "neg_equity": False,
+        "corp_action": "",
+    }
+    base.update(kw)
+    return base
+
+
+def _series() -> dict:
+    rel = list(range(-C.PRE_DAYS, 21))
+    close = [100.0 * (0.88 if r == -C.PRE_DAYS else 1.0) for r in rel]
+    close = [None if False else v for v in close]
+    by = {r: v for r, v in zip(rel, close, strict=True)}
+    by[-5] = 90.0
+    return {"rel": rel, "close_norm": [by[r] for r in rel]}
+
+
+def test_case_caption_numbers_and_flags():
+    from modeler.analysis.feature_response.cases.render import case_caption
+
+    spec = next(s for s in C.FEATURES.values() if s.window and s.window <= C.PRE_DAYS)
+    out = case_caption(_case_row(preferred=True, halt_fwd=2), _series(), spec)
+    assert f"formation 전 {C.PRE_DAYS}일 +14%" in out
+    assert "이후 20일 +5%(시장 대비 +3%), 맞음" in out
+    assert "우선주" in out and "이후 거래정지 2일" in out
+    miss = case_caption(_case_row(hit=False, raw_label_20d=-0.02), None, spec)
+    assert "틀림" in miss and "formation 전" not in miss
+    gone = case_caption(_case_row(label_missing=True), None, spec)
+    assert "라벨 없음" in gone
+
+
+def test_commentary_loading_and_render(tmp_path):
+    from modeler.analysis.feature_response.cases.render import (
+        load_commentary,
+        safe_html,
+    )
+
+    assert load_commentary("nope", tmp_path) == {}
+    (tmp_path / "f.json").write_text(
+        '{"feature":"f","dist_raw":"<b>좋습니다</b>. 둘째 문장.","path":"","x":"무시",'
+        '"dates":{"2020-01-02":"하루"}}',
+        encoding="utf-8",
+    )
+    com = load_commentary("f", tmp_path)
+    assert set(com) == {"dist_raw", "dates"}
+    assert com["dates"] == {"2020-01-02": "하루"}
+    assert safe_html("<b>a</b><script>") == "<b>a</b>&lt;script&gt;"
+    (tmp_path / "bad.json").write_text("{", encoding="utf-8")
+    assert load_commentary("bad", tmp_path) == {}

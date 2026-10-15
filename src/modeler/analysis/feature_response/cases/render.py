@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import datetime as dt
 import html
+import json
+import re
 from pathlib import Path
 
 import polars as pl
@@ -60,6 +62,137 @@ def group_label(g: str, spec: FeatureSpec) -> str:
         "mid": "중간 80%",
         "all": "전체 유니버스",
     }[g]
+
+
+# ---------------------------------------------------------------------------------------------
+# commentary: generic "읽는 법" boxes, per-feature "이 피쳐에서" boxes, per-case captions
+# ---------------------------------------------------------------------------------------------
+COMMENTARY_DIR = Path(__file__).with_name("commentary")
+COMMENTARY_KEYS = ("dist_raw", "dist_fwd", "path", "random", "extremes")
+
+HOWTO = {
+    "dist_raw": (
+        "상자는 Q1부터 Q3까지, 굵은 선은 중앙값, 속 빈 점은 평균이고 수염은 5\u201395 백분위입니다. "
+        "무리는 그날 시장 안 백분위로 나눈 좋은 쪽 10%·중간 80%·반대쪽 10%(방향이 없는 피쳐는 상위·중간·하위)입니다. "
+        "초과수익은 종목 20일 수익에서 그날 시장 동일가중 수익을 뺀 값이라, 초과&gt;0 비율은 시장을 이긴 종목의 몫입니다. "
+        "시장을 이기는 종목이 절반을 넘기 어려운 경우가 많아 비율이 50%보다 낮은 것은 이 그림만의 특징이 아닙니다. 무리끼리 비교해서 보십시오."
+    ),
+    "dist_fwd": (
+        "왼쪽 그림과 같은 상자 그림이되 시장을 빼지 않은 20일 수익입니다. "
+        "두 그림의 차이가 그날 시장 전체의 움직임입니다. 세 무리가 함께 위아래로 움직이면 피쳐가 아니라 시장 효과입니다."
+    ),
+    "path": (
+        "선은 무리별 누적 초과수익의 중앙값, 띠는 Q1\u2013Q3입니다. 0일은 formation 종가, 20일은 라벨 시점입니다. "
+        "선이 갈라지는 시점과 띠가 겹치는 정도를 보십시오. 띠가 많이 겹치면 무리 사이 차이가 종목 간 흩어짐보다 작다는 뜻입니다. "
+        "점선은 거래세 0.20% 참고선이며 비용을 뺀 값이 아닙니다."
+    ),
+    "random": (
+        "파란 선은 formation 종가를 100으로 맞춘 종목 가격, 회색 선은 시장 동일가중 근사입니다. "
+        "파란 음영은 피쳐 계산 창, 주황 음영은 이후 20거래일(라벨 창), 세로 점선이 formation 날짜입니다. "
+        "아래 칩은 맞음·틀림(좋은 쪽만)과 거래정지·상하한가 근접·우선주 같은 주의 표시입니다. "
+        "카드 한 장은 한 종목의 한 시점일 뿐이라, 여러 장에서 되풀이되는 모양만 보십시오."
+    ),
+    "extremes": (
+        "무작위가 아니라 결과를 보고 고른 양 끝입니다. 성과 상위·하위 5개를 나란히 놓았으니 둘을 비교해 공통 특징(칩, 시장, 날짜)을 찾는 용도입니다. "
+        "눈에 띄는 모양이 있어도 이 5개는 가장 극단이라 일반적인 모습이 아닙니다."
+    ),
+    "index": (
+        "각 피쳐 페이지는 개발 구간 전체 분포, 무작위 사례, 극단 사례 순서입니다. "
+        "분포 그림은 무리 사이 차이를, 카드는 그 차이를 이루는 종목 하나하나의 실제 가격을 보여 줍니다. "
+        "모든 그림 밑에 \u201c읽는 법\u201d(공통)과 \u201c이 피쳐에서\u201d(피쳐별 해설)가 있습니다. 해설은 관찰이며 판정이 아닙니다."
+    ),
+}
+
+_ALLOWED_TAG = re.compile(r"&lt;(/?)(b|code)&gt;")
+
+
+def safe_html(text: str) -> str:
+    """Escape everything, then restore only <b> and <code> tags."""
+    return _ALLOWED_TAG.sub(r"<\1\2>", html.escape(str(text), quote=False))
+
+
+def load_commentary(feature: str, directory: Path | None = None) -> dict:
+    """Read commentary/<feature>.json. Missing or broken file gives an empty dict."""
+    path = (directory or COMMENTARY_DIR) / f"{feature}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {k: data[k] for k in COMMENTARY_KEYS if isinstance(data.get(k), str) and data[k].strip()}
+    dates = data.get("dates")
+    if isinstance(dates, dict):
+        out["dates"] = {
+            str(k): v for k, v in list(dates.items())[:12] if isinstance(v, str) and v.strip()
+        }
+    return out
+
+
+def howto_box(key: str) -> str:
+    return f'<div class="howto"><b>읽는 법</b> {HOWTO[key]}</div>'
+
+
+def feature_box(com: dict, key: str) -> str:
+    t = com.get(key)
+    return f'<div class="thisfeat"><b>이 피쳐에서</b> {safe_html(t)}</div>' if t else ""
+
+
+def explain(com: dict, key: str) -> str:
+    return howto_box(key) + feature_box(com, key)
+
+
+def _first_sentence(text: str) -> str:
+    return re.split(r"(?<=[.!?])\s", text.strip(), maxsplit=1)[0]
+
+
+def _chg(a: float | None, b: float | None) -> float | None:
+    if a is None or b is None or a == 0:
+        return None
+    return b / a - 1
+
+
+def case_caption(r: dict, s: dict | None, spec: FeatureSpec) -> str:
+    """One deterministic line computed from the case data only."""
+    parts = []
+    if s:
+        by = dict(zip(s["rel"], s["close_norm"], strict=True))
+        pre = _chg(by.get(-C.PRE_DAYS), by.get(0))
+        if pre is not None:
+            parts.append(f"formation 전 {C.PRE_DAYS}일 {pct_str(pre, 0)}")
+        w = spec.window
+        if w and w <= C.PRE_DAYS:
+            win = _chg(by.get(-w), by.get(0))
+            if win is not None:
+                parts.append(f"계산 창(최근 {w}일) {pct_str(win, 0)}")
+    if r["label_missing"]:
+        parts.append("이후 20일 라벨 없음")
+    else:
+        tail = (
+            f"이후 20일 {pct_str(r['fwd_ret_20d'], 0)}(시장 대비 {pct_str(r['raw_label_20d'], 0)})"
+        )
+        if r["group"] == "good" and r["hit"] is not None:
+            tail += ", 맞음" if r["hit"] else ", 틀림"
+        parts.append(tail)
+    words = []
+    if r["halt_fwd"]:
+        words.append(f"이후 거래정지 {r['halt_fwd']}일")
+    if r["halt_prev20"]:
+        words.append(f"직전 20일 거래정지 {r['halt_prev20']}일")
+    if r["limit_hits"]:
+        words.append(f"상하한가 근접 {r['limit_hits']}회")
+    if r["jump_over_limit"]:
+        words.append(f"±31% 초과 변동 {r['jump_over_limit']}회")
+    if r["preferred"]:
+        words.append("우선주")
+    if r["neg_equity"]:
+        words.append("자본잠식")
+    if r["corp_action"]:
+        words.append(f"기업행동 {r['corp_action']}")
+    line = ", ".join(parts)
+    if words:
+        line += ". 표시: " + ", ".join(words)
+    return line + "."
 
 
 # ---------------------------------------------------------------------------------------------
@@ -168,7 +301,7 @@ def chips(r: dict, spec: FeatureSpec) -> str:
         pos = r["raw_label_20d"] > 0
         out.append(
             f'<span class="chip na" title="맞음·틀림은 좋은 쪽에만 붙임. 여기서는 부호만 표시">'
-            f'초과수익 {"> 0" if pos else "≤ 0"}</span>'
+            f"초과수익 {'> 0' if pos else '≤ 0'}</span>"
         )
     if r["halt_fwd"]:
         out.append(
@@ -209,11 +342,11 @@ def case_card(r: dict, series: dict, spec: FeatureSpec, extreme: bool = False) -
     s = series.get((r["trade_date"], r["ticker"]))
     excess = r["raw_label_20d"]
     title = (
-        f'{r["name"]} {r["ticker"]} {r["market"]} · formation {r["trade_date"]} · '
-        f'{spec.name} {val_str(r["value"])}(백분위 {r["pct"] * 100:.1f}) · '
-        f'20일 수익 {pct_str(r["fwd_ret_20d"])} · 초과 {pct_str(excess)}'
+        f"{r['name']} {r['ticker']} {r['market']} · formation {r['trade_date']} · "
+        f"{spec.name} {val_str(r['value'])}(백분위 {r['pct'] * 100:.1f}) · "
+        f"20일 수익 {pct_str(r['fwd_ret_20d'])} · 초과 {pct_str(excess)}"
     )
-    cls = f'x-{"top" if r["kind"] == "extreme_top" else "bottom"}' if extreme else f'g-{r["group"]}'
+    cls = f"x-{'top' if r['kind'] == 'extreme_top' else 'bottom'}" if extreme else f"g-{r['group']}"
     svg = case_svg(s, spec, title) if s else '<p class="cap">가격 자료 없음</p>'
     tag = ""
     if extreme:
@@ -223,11 +356,11 @@ def case_card(r: dict, series: dict, spec: FeatureSpec, extreme: bool = False) -
         f'<div class="ch"><b>{esc(r["name"])}</b><span class="mono">{esc(r["ticker"])}</span>'
         f'<span class="mk">{esc(r["market"])}</span>{tag}</div>{svg}'
         '<dl class="kv">'
-        f'<dt>피쳐 값</dt><dd>{val_str(r["value"])}</dd>'
+        f"<dt>피쳐 값</dt><dd>{val_str(r['value'])}</dd>"
         f'<dt title="그날 같은 시장 안 순위(평균 순위/종목 수). 100에 가까울수록 값이 큼">시장 내 백분위</dt><dd>{r["pct"] * 100:.1f}</dd>'
-        f'<dt>20일 수익</dt><dd>{pct_str(r["fwd_ret_20d"])}</dd>'
+        f"<dt>20일 수익</dt><dd>{pct_str(r['fwd_ret_20d'])}</dd>"
         f'<dt title="그날 시장 전 종목 동일가중 20일 수익을 뺀 값(라벨 raw_label_20d)">시장 대비 초과</dt><dd>{pct_str(excess)}</dd>'
-        f'</dl><div class="chips">{chips(r, spec)}</div></article>'
+        f'</dl><p class="caption">{esc(case_caption(r, s, spec))}</p><div class="chips">{chips(r, spec)}</div></article>'
     )
 
 
@@ -302,9 +435,9 @@ def box_chart(dist: pl.DataFrame, spec: FeatureSpec, metric: str, label: str) ->
             continue
         bw = min(70, slot * 0.5)
         tip = (
-            f'{group_label(g, spec)} · n={int(s["n"])} · 중앙값 {pct_str(s["q50"], 2)} · 평균 {pct_str(s["mean"], 2)} · '
-            f'Q1 {pct_str(s["q25"], 2)} · Q3 {pct_str(s["q75"], 2)} · 5% {pct_str(s["q05"], 2)} · 95% {pct_str(s["q95"], 2)} · '
-            f'초과 > 0 비율 {s["hit_rate"] * 100:.1f}%'
+            f"{group_label(g, spec)} · n={int(s['n'])} · 중앙값 {pct_str(s['q50'], 2)} · 평균 {pct_str(s['mean'], 2)} · "
+            f"Q1 {pct_str(s['q25'], 2)} · Q3 {pct_str(s['q75'], 2)} · 5% {pct_str(s['q05'], 2)} · 95% {pct_str(s['q95'], 2)} · "
+            f"초과 > 0 비율 {s['hit_rate'] * 100:.1f}%"
         )
         p.append(f"<g><title>{esc(tip)}</title>")
         p.append(
@@ -486,7 +619,9 @@ def render_feature_page(
     n_grid: int,
     run_id: str,
     seed: int,
+    commentary_dir: Path | None = None,
 ) -> str:
+    com = load_commentary(spec.name, commentary_dir)
     rnd = cases.filter(pl.col("kind") == "random")
     ext = cases.filter(pl.col("kind") != "random")
     first, second = ("top", "bottom") if spec.direction == 0 else ("good", "opp")
@@ -528,15 +663,21 @@ def render_feature_page(
     b.append(
         '<div class="two"><div class="chart"><h4>20일 시장 대비 초과수익 (raw_label_20d)</h4>'
         + box_chart(dist, spec, "raw_label_20d", "시장 대비 초과수익")
-        + '<p class="cap">상자 Q1–Q3, 굵은 선 중앙값, 속 빈 점 평균, 수염 5–95 백분위.</p></div>'
+        + '<p class="cap">상자 Q1–Q3, 굵은 선 중앙값, 속 빈 점 평균, 수염 5–95 백분위.</p>'
+        + explain(com, "dist_raw")
+        + "</div>"
         '<div class="chart"><h4>20일 수익 (fwd_ret_20d)</h4>'
         + box_chart(dist, spec, "fwd_ret_20d", "20일 수익")
-        + '<p class="cap">같은 그림을 시장을 빼기 전 수익으로 그렸습니다.</p></div></div>'
+        + '<p class="cap">같은 그림을 시장을 빼기 전 수익으로 그렸습니다.</p>'
+        + explain(com, "dist_fwd")
+        + "</div></div>"
     )
     b.append(
         '<div class="chart" style="max-width:640px"><h4>formation 이후 누적 초과수익 경로 (0–20거래일)</h4>'
         + path_chart(dist, spec)
-        + f'<p class="cap">선은 중앙값, 띠는 Q1–Q3. 종목 누적수익에서 {MKT_LABEL} 누적수익을 뺐습니다. 중간에 가격이 끊긴 종목은 그 날부터 빠집니다.</p></div>'
+        + f'<p class="cap">선은 중앙값, 띠는 Q1–Q3. 종목 누적수익에서 {MKT_LABEL} 누적수익을 뺐습니다. 중간에 가격이 끊긴 종목은 그 날부터 빠집니다.</p>'
+        + explain(com, "path")
+        + "</div>"
     )
     b.append(
         '<details class="tbl"><summary>숫자 표 보기 — 상자 통계·적중률</summary>'
@@ -560,6 +701,7 @@ def render_feature_page(
         '<span><b class="sw" style="background:var(--s2);opacity:.3"></b>이후 20거래일</span>'
         '<span><b class="sw" style="background:var(--warn)"></b>거래정지일</span></div>'
         '<p class="cap">가격은 일봉 종가 그대로이며 수정주가 여부는 확인하지 않았습니다. 기업행동은 DART 자본변동(주식분할·무상증자·무상감자) 기록이 있는 것만 칩으로 표시하고, 기록이 빠진 것은 표시되지 않습니다. 그림 가로축은 formation 기준 거래일(−120…+20)입니다.</p>'
+        + explain(com, "random")
     )
     for d in dates:
         day = rnd.filter(pl.col("trade_date") == d)
@@ -567,6 +709,9 @@ def render_feature_page(
         b.append(
             f'<div class="dategrp"><h3>{end}</h3><p class="sub">formation {end} · 사례 {day.height}개</p>'
         )
+        dtext = com.get("dates", {}).get(end)
+        if dtext:
+            b.append(f'<div class="thisfeat"><b>이 날짜</b> {safe_html(dtext)}</div>')
         for g in (first, second, "all"):
             sub = day.filter(pl.col("group") == g)
             if sub.height == 0:
@@ -589,6 +734,7 @@ def render_feature_page(
         '<section class="block" id="extreme"><h2>③ 극단 사례</h2>'
         '<div class="banner"><b>대표 사례가 아닙니다.</b> 아래는 무작위가 아니라 결과로 고른 양 끝입니다. '
         f"고른 날짜 {len(dates)}개의 {pool_text} 전체 중 시장 대비 초과수익이 가장 큰 5개와 가장 작은 5개입니다.</div>"
+        + explain(com, "extremes")
     )
     for kind, ttl in (
         ("extreme_top", "초과수익 상위 5개"),
@@ -647,19 +793,19 @@ def cases_table(df: pl.DataFrame) -> str:
         rows.append(
             "<tr>"
             + "".join(
-                f"<td{' class=\"l\"' if i in (1, 2, 3, 14) else ''}>{esc(c)}</td>"
+                f"<td{' class="l"' if i in (1, 2, 3, 14) else ''}>{esc(c)}</td>"
                 for i, c in enumerate(
                     [
                         r["trade_date"],
                         r["group"] if r["kind"] == "random" else r["kind"],
-                        f'{r["name"]} {r["ticker"]}',
+                        f"{r['name']} {r['ticker']}",
                         r["market"],
                         val_str(r["value"]),
-                        f'{r["pct"] * 100:.1f}',
+                        f"{r['pct'] * 100:.1f}",
                         pct_str(r["fwd_ret_20d"]),
                         pct_str(r["raw_label_20d"]),
                         hit,
-                        f'{r["halt_fwd"]}/{r["halt_prev20"]}',
+                        f"{r['halt_fwd']}/{r['halt_prev20']}",
                         r["limit_hits"],
                         r["jump_over_limit"],
                         "예" if r["preferred"] else "",
@@ -673,7 +819,7 @@ def cases_table(df: pl.DataFrame) -> str:
     return (
         '<div class="tw"><table><thead><tr>'
         + "".join(f"<th>{h}</th>" for h in head)
-        + f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+        + f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
     )
 
 
@@ -691,7 +837,9 @@ def render_index(
     n_grid: int,
     run_id: str,
     seed: int,
+    commentary_dir: Path | None = None,
 ) -> str:
+    coms = {sp.name: load_commentary(sp.name, commentary_dir) for sp in specs}
     b = [
         '<div class="top"><div class="kicker">KR 피쳐 사례 갤러리 · 시범 · 2026-10-15</div><h1>피쳐 사례 갤러리</h1>'
         f'<p class="lede">피쳐 값이 극단인 종목이 그 뒤 20거래일 동안 실제로 어떻게 움직였는지 보는 그림판입니다. 개발 구간(formation 2016-01-04–2025-06-30)만 씁니다. 날짜 {len(dates)}개는 모든 피쳐가 같습니다.</p>'
@@ -706,10 +854,20 @@ def render_index(
             '<div class="idxrow">'
             f'<h3><a href="{esc(s.name)}.html"><code>{esc(s.name)}</code></a></h3>'
             f"<p>{esc(s.short)}</p>"
-            f'<p>좋은 쪽: {esc(s.good_label)} · 사례 {c["random"]}개 + 극단 {c["extreme"]}개 · 격자 {n_grid}개 날짜 · '
+            f"<p>좋은 쪽: {esc(s.good_label)} · 사례 {c['random']}개 + 극단 {c['extreme']}개 · 격자 {n_grid}개 날짜 · "
             f'카드 <a href="../{esc(s.card)}.html">{esc(s.card)}</a></p></div>'
         )
-    b.append("</div></section>")
+    b.append("</div>" + howto_box("index") + "</section>")
+    if specs and all(coms[sp.name].get("dist_raw") for sp in specs):
+        items = "".join(
+            f'<li><a href="{esc(sp.name)}.html"><code>{esc(sp.name)}</code></a> \u2014 '
+            f"{safe_html(_first_sentence(coms[sp.name]['dist_raw']))}</li>"
+            for sp in specs
+        )
+        b.append(
+            f'<section class="block"><h2>피쳐별 한 줄 요약</h2><ul class="sumlist">{items}</ul>'
+            '<p class="cap">각 피쳐 페이지의 \u201c이 피쳐에서\u201d 해설 첫 문장입니다.</p></section>'
+        )
     b.append(
         f'<section class="block"><h2>고른 날짜</h2><p class="mono">{" · ".join(d.isoformat() for d in dates)}</p>'
         f'<p class="cap">시드 {seed} · 실행 {esc(run_id)}. 해마다 1개(2016–2025) + 나머지 2개는 전체에서 무작위.</p></section>'

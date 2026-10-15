@@ -209,7 +209,7 @@ def corp_action_text(actions: pl.DataFrame, prices: Prices, ticker: str, ci0: in
     a, b = prices.cal[lo], prices.cal[hi]
     ev = actions.filter(
         (pl.col("ticker") == ticker) & (pl.col("event_date") >= a) & (pl.col("event_date") <= b)
-    ).sort("event_date")
+    ).sort(["event_date", "kind"])  # same-day events: fixed order so reruns are identical
     return "; ".join(
         f"{k} {d.isoformat()}" for d, k in zip(ev["event_date"], ev["kind"], strict=True)
     )
