@@ -525,10 +525,12 @@ def test_kr_is_unchanged_next_to_a_v2_us_block(tmp_path: Path) -> None:
 # 옛(v1) 입력은 main 렌더러와 바이트가 같아야 합니다. 아래 해시는 이 변경 전 코드(main aaa0f54,
 # R-7 상태 줄 포함)로 같은 입력을 그린 파일의 sha256입니다. kr-stocks.md·us-stocks.md는 093a6c1
 # 기준 값에서 R-7 줄만큼 바뀌었고(줄을 빼면 옛 값이 나옴), 나머지 세 파일 해시는 그대로입니다.
+# R-7 KR 문구 분리(briefing-r7-kr-halt)로 kr-stocks.md만 다시 구했습니다(681efdcaad… → 46c3837b…,
+# KR 상태 줄 한 줄 차이). us-stocks.md 등 나머지 넷은 그대로입니다.
 V1_GOLDEN = {
     "README.md": "1c56bbd8cf271edd89d392504ed686e5f8034013ac6e16619ad55320b805dbd3",
     "data-status.md": "4164e71cf8c6d5b23db74cc0e5788e7aa06842f6cd631c80ab62e2b179757c67",
-    "kr-stocks.md": "681efdcaad25f1c3eeed2fc7d93016162a079147ff384beeb8684682ba26b841",
+    "kr-stocks.md": "46c3837b5854b1b8b2bee5504b4afcb9f67335c82980501d6a669a97d64f56d9",
     "market-sector.md": "d70e8405f770450530af0c892ee0457604718d1e3bb84c0af70df59815f06e1a",
     "us-stocks.md": "a0008eaa6b64e6e220723dd47796724a227abe93337fbc1b0a2b1e8ba6649832",
 }

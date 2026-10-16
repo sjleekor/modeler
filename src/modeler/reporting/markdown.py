@@ -269,7 +269,11 @@ REPLAY_NOTICE = (
 )
 SYNTHETIC_NOTICE = "합성 fixture 예시 전용 — 실제 시장 데이터가 아닙니다."
 DISCLAIMER = "연구용 탐색 결과입니다. 투자 권유가 아니며 실현 수익률은 표시하지 않습니다."
-RANKING_STATUS = "이 순위는 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B · 미국 A 0)"
+RANKING_STATUS_US = "이 순위는 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B · 미국 A 0)"
+RANKING_STATUS_KR = (
+    "이 순위는 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B). "
+    "모델02 연구는 2026-10-10에 중단했고, 지금 순위는 성능 평가를 받은 적 없는 서빙 점수입니다"
+)
 
 FORBIDDEN_PATTERNS = (
     ("서버 절대경로 /home/", re.compile(r"/home/")),
@@ -1380,7 +1384,7 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
         if not rows:
             lines += ["이번 판에 순위가 없습니다 (전체 0개).", ""]
         else:
-            lines += ["> " + RANKING_STATUS, ""]
+            lines += ["> " + RANKING_STATUS_KR, ""]
             show_kind = sec.get("show_kind", False)
             held, reasons, body = 0, Counter(), []
             for row, kind in zip(rows, kinds_of(m)):
@@ -1558,7 +1562,7 @@ def render_us(ctx: dict) -> tuple[list, dict]:
             "",
         ]
     if shown_rows:
-        lines += ["> " + RANKING_STATUS, ""]
+        lines += ["> " + RANKING_STATUS_US, ""]
         if not sec.get("show_kind"):
             lines += [KIND_OMITTED, ""]
         else:
