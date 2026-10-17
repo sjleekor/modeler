@@ -98,7 +98,12 @@ def test_entry_validation() -> None:
 # --- c1 / o1 behaviour ----------------------------------------------------
 
 
-def _con(rows: list[tuple], quality: list[tuple] | None = None, index: list[tuple] | None = None):
+def _con(
+    rows: list[tuple],
+    quality: list[tuple] | None = None,
+    index: list[tuple] | None = None,
+    master: list[tuple] | None = None,
+):
     """rows: (date, ticker, open, high, low, close); market KOSPI."""
     con = duckdb.connect()
     values = ",".join(
@@ -116,6 +121,11 @@ def _con(rows: list[tuple], quality: list[tuple] | None = None, index: list[tupl
             + v
             + ") AS t(trade_date, ticker, market, ca_event)"
         )
+    if master is not None:
+        v = ",".join(f"('{t}', '{m}', '{st}')" for t, m, st in master)
+        con.execute(
+            "CREATE VIEW master AS SELECT * FROM (VALUES " + v + ") AS t(ticker, market, status)"
+        )
     if index is not None:
         v = ",".join(f"(DATE '{d}', '{s}', {x})" for d, s, x in index)
         con.execute(
@@ -131,19 +141,19 @@ def _bar(c: float) -> tuple[float, float, float, float]:
     return (c - 1, c + 1, c - 2, c)
 
 
-def _series(ticker: str, start: str, closes: list[float | None]) -> list[tuple]:
+def _series(ticker: str, start: str, closes: list) -> list[tuple]:
     """Consecutive calendar days; None = halted day (0,0,0,0)."""
     first = datetime.date.fromisoformat(start)
     out = []
     for i, c in enumerate(closes):
         d = (first + datetime.timedelta(days=i)).isoformat()
-        bar = (0, 0, 0, 0) if c is None else _bar(c)
+        bar = (0, 0, 0, 0) if c is None else (c if isinstance(c, tuple) else _bar(c))
         out.append((d, ticker, *bar))
     return out
 
 
-def _run(con, spec: LabelSpec, quality_view: str | None = None, entry: str = "c1"):
-    sql = build_entry_label_sql(spec, entry, quality_view=quality_view)
+def _run(con, spec: LabelSpec, quality_view: str | None = None, entry: str = "c1", **kw):
+    sql = build_entry_label_sql(spec, entry, quality_view=quality_view, **kw)
     return (
         con.execute(f"SELECT * FROM ({sql}) ORDER BY ticker, trade_date")
         .fetch_df()
@@ -177,7 +187,10 @@ def test_c1_shift_matches_hand_calculation_and_keeps_c0() -> None:
     assert a1["bench_ret_c1_1d"] == pytest.approx(bench)
     assert a1["raw_label_c1_1d"] == pytest.approx(132 / 110 - 1 - bench)
     assert a1["y_up_c1_1d"] == 1 and b1["y_up_c1_1d"] == 0
-    assert not a1["label_missing_exit_c1_1d"]
+    assert a1["label_exit_kind_c1_1d"] == "regular"
+    assert a1["label_exit_lag_c1_1d"] == 0
+    assert a1["label_end_date_c1_1d"] == _d("2020-01-04")
+    assert not a1["in_terminal_tail"]
 
 
 def test_halted_entry_day_is_null_not_pushed_back() -> None:
@@ -188,8 +201,7 @@ def test_halted_entry_day_is_null_not_pushed_back() -> None:
     assert a["fwd_ret_c1_1d"] != a["fwd_ret_c1_1d"]  # NaN
     # c0 skipped the halt: enter d1 100 -> next live session d3 120
     assert a["fwd_ret_1d"] == pytest.approx(0.20)
-    # not a missing-exit case
-    assert not a["label_missing_exit_c1_1d"]
+    assert a["label_exit_kind_c1_1d"] == "untradable"
 
 
 def test_limit_up_locked_entry_is_null_and_15pct_before_2015_06_15() -> None:
@@ -225,13 +237,16 @@ def test_limit_up_locked_entry_is_null_and_15pct_before_2015_06_15() -> None:
     assert v == pytest.approx(100 / 115 - 1)
 
 
-def test_limit_down_locked_exit_is_null() -> None:
-    r = _series("A", "2020-01-02", [100, 100, 100, 100])
-    r[2] = ("2020-01-04", "A", 70, 70, 70, 70)  # -30% flat on exit day
+def test_limit_down_locked_exit_moves_to_next_free_session() -> None:
+    r = _series("A", "2020-01-02", [100, 100, (70, 70, 70, 70), 100])
+    r += _series("B", "2020-01-02", [10] * 6)
     df = _run(_con(r), LabelSpec(horizons=(1,), kind="abs"))
-    v = df.loc[("A", _d("2020-01-02"))]["fwd_ret_c1_1d"]
-    assert v != v
-    assert not df.loc[("A", _d("2020-01-02"))]["label_missing_exit_c1_1d"]
+    a = df.loc[("A", _d("2020-01-02"))]
+    # entry d2 (100); scheduled exit d3 is locked limit-down -> next free session d4 (100)
+    assert a["fwd_ret_c1_1d"] == pytest.approx(0.0)
+    assert a["label_exit_kind_c1_1d"] == "late"
+    assert a["label_end_date_c1_1d"] == _d("2020-01-05")
+    assert a["label_exit_lag_c1_1d"] == 1
 
 
 def test_corporate_action_in_shifted_window_masks() -> None:
@@ -259,23 +274,134 @@ def test_corporate_action_in_shifted_window_masks() -> None:
     assert df.loc[("A", _d("2020-01-02"))]["fwd_ret_c1_2d"] == pytest.approx(0.0)
 
 
-def test_missing_exit_is_flagged_and_row_kept() -> None:
-    # A is delisted after d4; B lives on. c0 drops A's last rows, c1 flags them.
-    rows = _series("A", "2020-01-02", [100, 100, 100, 100])
-    rows += _series("B", "2020-01-02", [10, 10, 10, 10, 10, 10])
-    df = _run(_con(rows), LabelSpec(horizons=(2,), kind="abs"))
-    # t=d3: entry d4 ok, exit would be d6 -> missing
+def test_ended_series_without_exit_is_terminal_at_last_close_and_row_kept() -> None:
+    rows = _series("A", "2020-01-02", [100, 100, 100, 90])
+    rows += _series("B", "2020-01-02", [10] * 6)  # A ended: its last row is before the market's
+    spec = LabelSpec(horizons=(2,), kind="abs")
+    df = _run(_con(rows), spec)
+    # t=d3: entry d4 (90), exit would be d6 -> terminal at the last close (90)
     a = df.loc[("A", _d("2020-01-04"))]
-    assert bool(a["label_missing_exit_c1_2d"])
-    assert a["fwd_ret_c1_2d"] != a["fwd_ret_c1_2d"]
-    # t=d4 (last day): no entry at all -> not flagged
-    assert not df.loc[("A", _d("2020-01-05"))]["label_missing_exit_c1_2d"]
+    assert a["label_exit_kind_c1_2d"] == "terminal"
+    assert a["fwd_ret_c1_2d"] == pytest.approx(0.0)
+    assert a["label_end_date_c1_2d"] == _d("2020-01-05")
+    assert a["label_exit_lag_c1_2d"] == 0  # floored: the end is nearer than h sessions
+    # t=d4 (last row): no entry day in A -> untradable (entry missing)
+    assert df.loc[("A", _d("2020-01-05"))]["label_exit_kind_c1_2d"] == "untradable"
     # t=d1: exit d4 exists
-    assert df.loc[("A", _d("2020-01-02"))]["fwd_ret_c1_2d"] == pytest.approx(0.0)
+    assert df.loc[("A", _d("2020-01-02"))]["fwd_ret_c1_2d"] == pytest.approx(90 / 100 - 1)
     # the row set is wider than c0's (c0 inner join has no d3 of A for h=2)
     c0 = _con(rows).execute(build_label_sql(LabelSpec(horizons=(2,), kind="abs"))).fetch_df()
     c0 = c0.set_index(["ticker", "trade_date"])
     assert ("A", _d("2020-01-04")) not in c0.index
+
+
+def test_panel_end_and_still_halted_are_censored() -> None:
+    # both series run to the panel end: no exit -> censored, never terminal
+    rows = _series("A", "2020-01-02", [100] * 6) + _series("B", "2020-01-02", [10] * 6)
+    df = _run(_con(rows), LabelSpec(horizons=(5,), kind="abs"))
+    a = df.loc[("A", _d("2020-01-04"))]  # entry d4, exit idx 9 beyond the panel
+    assert a["label_exit_kind_c1_5d"] == "censored" and a["fwd_ret_c1_5d"] != a["fwd_ret_c1_5d"]
+    last = df.loc[("A", _d("2020-01-07"))]  # no t+1 yet
+    assert last["label_exit_kind_c1_5d"] == "censored"
+    # A is still halted at the panel end (its last row is the market's last date)
+    rows = _series("A", "2020-01-02", [100, 100, 100, 100, None, None, None])
+    rows += _series("B", "2020-01-02", [10] * 7)
+    df = _run(_con(rows), LabelSpec(horizons=(5,), kind="abs"))
+    a = df.loc[("A", _d("2020-01-02"))]
+    assert a["label_exit_kind_c1_5d"] == "censored"
+    assert a["fwd_ret_c1_5d"] != a["fwd_ret_c1_5d"]
+
+
+def _delisted_after_long_halt(tail_closes: list[float]) -> list[tuple]:
+    rows = _series("A", "2020-01-02", [100, 101, 102, 103, 104] + [None] * 30 + tail_closes)
+    return rows + _series("B", "2020-01-02", [10] * 60)
+
+
+def test_terminal_tail_after_long_halt_is_not_masked_and_is_flagged() -> None:
+    tail = [104 * 0.6**k for k in range(1, 8)]  # -40% a day: 정리매매
+    rows = _delisted_after_long_halt(tail)
+    quality = [(r[0], "A", True) for r in rows if r[1] == "A"][-7:]  # every tail row is an event
+    spec = LabelSpec(horizons=(10, 5), kind="abs")
+    df = _run(_con(rows, quality=quality), spec, quality_view="quality")
+    a = df.loc[("A", _d("2020-01-05"))]  # t=d4 (103): entry d5 (104), exit idx 15 > 12
+    assert a["label_exit_kind_c1_10d"] == "terminal"
+    assert a["fwd_ret_c1_10d"] == pytest.approx(0.6**7 - 1)
+    assert a["label_end_date_c1_10d"] == _d("2020-02-12")  # the series' last row (day 42)
+    assert a["label_exit_lag_c1_10d"] == 42 - 5 - 10
+    # t=d1, h=5: exit idx 7 is inside the tail; tail events do not mask -> late
+    b = df.loc[("A", _d("2020-01-02"))]
+    assert b["label_exit_kind_c1_5d"] == "late"
+    assert b["fwd_ret_c1_5d"] == pytest.approx(104 * 0.6**2 / 101 - 1)
+    # in_terminal_tail: only the 7 tail rows
+    flags = df.loc["A"]["in_terminal_tail"]
+    assert int(flags.sum()) == 7 and bool(flags.iloc[-1]) and not bool(flags.iloc[4])
+    assert not df.loc["B"]["in_terminal_tail"].any()
+
+
+def test_event_outside_the_tail_still_masks_a_terminal_label() -> None:
+    rows = _delisted_after_long_halt([104 * 0.6**k for k in range(1, 8)])
+    quality = [("2020-01-04", "A", True)]  # on d3, between entry d2.. and exit
+    df = _run(
+        _con(rows, quality=quality),
+        LabelSpec(horizons=(10,), kind="abs"),
+        quality_view="quality",
+    )
+    a = df.loc[("A", _d("2020-01-02"))]
+    assert a["label_exit_kind_c1_10d"] == "ca_masked"
+    assert a["fwd_ret_c1_10d"] != a["fwd_ret_c1_10d"]
+
+
+def test_long_halt_end_needs_an_explicit_haircut() -> None:
+    rows = _series("A", "2020-01-02", [100, 101, 102, 103, 104] + [None] * 25)
+    rows += _series("B", "2020-01-02", [10] * 60)
+    spec = LabelSpec(horizons=(3,), kind="abs")
+    con = _con(rows)
+    t = ("A", _d("2020-01-05"))  # t=d4: entry d5 (104), exit idx 8 missing
+    df = _run(con, spec)
+    assert df.loc[t]["label_exit_kind_c1_3d"] == "terminal_unpriced"
+    assert df.loc[t]["fwd_ret_c1_3d"] != df.loc[t]["fwd_ret_c1_3d"]
+    assert df.loc[t]["label_end_date_c1_3d"] == _d("2020-01-31")  # last halt row, day 30
+    df = _run(con, spec, end_halt_haircut=0.5)
+    assert df.loc[t]["label_exit_kind_c1_3d"] == "terminal_halted"
+    assert df.loc[t]["fwd_ret_c1_3d"] == pytest.approx(0.5 * 104 / 104 - 1)
+    # o1 exits at the last close too: enter at the open of d5 (103)
+    df = _run(con, spec, entry="o1", end_halt_haircut=0.5)
+    assert df.loc[t]["fwd_ret_o1_3d"] == pytest.approx(0.5 * 104 / 103 - 1)
+    # a shorter halt than the end-halt threshold is an ordinary terminal
+    df = _run(con, spec, end_halt_sessions=30)
+    assert df.loc[t]["label_exit_kind_c1_3d"] == "terminal"
+    assert df.loc[t]["fwd_ret_c1_3d"] == pytest.approx(0.0)
+    # the entry day itself is halted for t=d5: untradable
+    assert df.loc[("A", _d("2020-01-06"))]["label_exit_kind_c1_3d"] == "untradable"
+
+
+def test_market_transfer_is_not_a_delisting_with_master_view() -> None:
+    rows = _series("A", "2020-01-02", [100, 101, 102, 103]) + _series("B", "2020-01-02", [10] * 8)
+    spec = LabelSpec(horizons=(2,), kind="abs")
+    t = ("A", _d("2020-01-04"))  # entry d4, exit missing
+    transfer = [("A", "KOSDAQ", "DELISTED"), ("A", "KOSPI", "ACTIVE"), ("B", "KOSPI", "ACTIVE")]
+    df = _run(_con(rows, master=transfer), spec, master_view="master")
+    assert df.loc[t]["label_exit_kind_c1_2d"] == "censored"
+    delisted = [("A", "KOSPI", "DELISTED"), ("B", "KOSPI", "ACTIVE")]
+    df = _run(_con(rows, master=delisted), spec, master_view="master")
+    assert df.loc[t]["label_exit_kind_c1_2d"] == "terminal"
+    # without a master view the gap rule alone decides, and min_end_gap_sessions tunes it
+    df = _run(_con(rows), spec)
+    assert df.loc[t]["label_exit_kind_c1_2d"] == "terminal"
+    df = _run(_con(rows), spec, min_end_gap_sessions=5)
+    assert df.loc[t]["label_exit_kind_c1_2d"] == "censored"
+
+
+def test_parameter_validation() -> None:
+    spec = LabelSpec()
+    for kw in (
+        {"min_end_gap_sessions": 0},
+        {"end_halt_sessions": 0},
+        {"terminal_tail_max": 0},
+        {"end_halt_haircut": 1.5},
+    ):
+        with pytest.raises(ValueError):
+            build_entry_label_sql(spec, "c1", **kw)
 
 
 def test_o1_uses_open_prices_and_has_no_index_columns() -> None:
@@ -307,7 +433,14 @@ def test_c1_index_bench_uses_entry_and_exit_dates() -> None:
 
 def test_c1_outputs_and_materialize_signature() -> None:
     sql = build_entry_label_sql(LabelSpec(horizons=(1,)), "c1")
-    for col in ("y_rank_c1_1d", "y_reg_c1_1d", "y_cls_c1_1d", "label_missing_exit_c1_1d"):
+    for col in (
+        "y_rank_c1_1d",
+        "y_reg_c1_1d",
+        "y_cls_c1_1d",
+        "label_exit_kind_c1_1d",
+        "label_end_date_c1_1d",
+        "label_exit_lag_c1_1d",
+    ):
         assert col in sql
     assert "quality_view" in materialize_entry_label.__code__.co_varnames
 
