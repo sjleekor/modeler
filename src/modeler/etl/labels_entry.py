@@ -36,14 +36,25 @@ Entry / exit
         a sensitivity.
       * series not ended (panel end, or still halted at panel end) -> NULL,
         ``censored``.
-  - Corporate-action mask: any ``ca_event`` in [t+1, exit] (needs ``quality_view``;
-    without it no mask) -> NULL, ``ca_masked``. Rows of a *terminal tail* are
+      * End-of-data guard: a terminal kind (``terminal``, ``terminal_halted``,
+        ``terminal_unpriced``) needs the SCHEDULED exit session to exist in the
+        market calendar (entry session + h <= the market's last session), i.e.
+        the window was observable for survivors too. Otherwise ``censored``
+        (NULL); without it the last h+1 sessions would hold only delisted names.
+        ``late`` exits (the actual exit was observed) are not guarded.
+  - Corporate-action mask: any ``ca_event`` in the window (needs ``quality_view``;
+    without it no mask) -> NULL, ``ca_masked``. The window is (t+1, exit] for c1
+    (an event dated t+1 is a jump between the t and t+1 closes and does not touch
+    a t+1-close entry) and [t+1, exit] for o1 (the t+1 open is after the
+    overnight event). Rows of a *terminal tail* are
     ignored: the non-halt rows after the last halt row of an ENDED series, when
     there are 1..``terminal_tail_max`` of them (정리매매 crashes look like events).
     Interpretation: a series with no halt row at all has no tail.
 
 Columns (``tag`` in {c1, o1}; per horizon h)
-  ``fwd_ret_{tag}_{h}d``, ``bench_ret_{tag}_{h}d`` (eqw market, terminal included),
+  ``fwd_ret_{tag}_{h}d``, ``bench_ret_{tag}_{h}d`` (eqw market, terminal included;
+  NULL on a (date, market) with fewer than ``min_cross_section`` valid ``fwd``,
+  which makes ``raw_label`` and ``y_*`` NULL there while ``fwd`` stays),
   ``raw_label_{tag}_{h}d``, ``y_{rank,reg,cls,up,top}_{tag}_{h}d`` for
   ``spec.outputs``, and
   - ``label_exit_kind_{tag}_{h}d``: regular | late | terminal | terminal_halted |
@@ -61,7 +72,7 @@ Columns (``tag`` in {c1, o1}; per horizon h)
 
 Parameters: ``min_end_gap_sessions`` (1), ``master_view`` (None; ticker, market,
 status), ``end_halt_sessions`` (20), ``end_halt_haircut`` (None),
-``terminal_tail_max`` (10).
+``terminal_tail_max`` (10), ``min_cross_section`` (30).
 
 Leakage note: terminal values use knowledge of the delisting, which is allowed
 for labels but never for features. A label can end hundreds of sessions after t
@@ -102,9 +113,13 @@ def _entry_ctes(
     end_halt_sessions: int,
     end_halt_haircut: float | None,
     terminal_tail_max: int,
+    min_cross_section: int,
 ) -> list[str]:
     tag = entry
     pcol = "close_d" if tag == "c1" else "open_d"
+    # c1 enters at the t+1 close: an event dated t+1 is already behind the entry.
+    # o1 enters at the t+1 open: an event dated t+1 happened overnight, before it.
+    ca_before = "e.ca_cum" if tag == "c1" else "e.ca_cum - e.ca_ev"
     event_expr = "COALESCE(q.ca_event, FALSE)" if quality_view else "FALSE"
     q_join = (
         f"LEFT JOIN {quality_view} q "
@@ -243,7 +258,7 @@ def _entry_ctes(
                    c.next_date AS e_date, c.next_s AS e_s, e.d_idx AS e_idx,
                    CASE WHEN e.trade_date IS NOT NULL AND NOT e.up_lock
                         THEN e.{pcol} END AS e_px,
-                   e.ca_cum - e.ca_ev AS e_ca_before,
+                   {ca_before} AS e_ca_before, c.mkt_last_s,
                    CASE WHEN c.next_date IS NULL THEN 'censored'
                         WHEN e.trade_date IS NULL OR e.up_lock OR e.{pcol} IS NULL
                         THEN 'untradable' END AS kind0
@@ -266,7 +281,7 @@ def _entry_ctes(
         )
         ctes.append(f"""
         fx{h} AS (
-            SELECT n.trade_date, n.ticker, n.market, n.kind0, n.e_px, n.e_s,
+            SELECT n.trade_date, n.ticker, n.market, n.kind0, n.e_px, n.e_s, n.mkt_last_s,
                    (x.trade_date IS NOT NULL) AS has_exit,
                    x.{pcol} AS x_px, x.s_idx AS x_s, x.trade_date AS x_date,
                    COALESCE(s.ended, FALSE) AS ended, s.last_close, s.last_date, s.last_s,
@@ -285,22 +300,26 @@ def _entry_ctes(
         ctes.append(f"""
         fk{h} AS (
             SELECT *,
-                   CASE WHEN kind0 IS NOT NULL THEN kind0
-                        WHEN has_exit THEN
-                            CASE WHEN ca_n > 0 THEN 'ca_masked'
-                                 WHEN x_s - e_s - {h} > 0 THEN 'late' ELSE 'regular' END
-                        WHEN ended THEN
-                            CASE WHEN ca_n > 0 THEN 'ca_masked'
-                                 WHEN n_trail >= {end_halt_sessions} AND {hc} IS NULL
-                                     THEN 'terminal_unpriced'
-                                 WHEN n_trail >= {end_halt_sessions} THEN 'terminal_halted'
-                                 ELSE 'terminal' END
-                        ELSE 'censored' END AS kind,
-                   CASE WHEN kind0 IS NULL
-                        THEN COALESCE(x_date, CASE WHEN ended THEN last_date END) END AS end_date,
-                   CASE WHEN kind0 IS NULL AND (has_exit OR ended)
-                        THEN GREATEST(0, COALESCE(x_s, last_s) - e_s - {h}) END AS exit_lag
-            FROM fx{h}
+                   CASE WHEN kind IN ('censored', 'untradable') THEN NULL
+                        ELSE COALESCE(x_date, last_date) END AS end_date,
+                   CASE WHEN kind IN ('censored', 'untradable') THEN NULL
+                        ELSE GREATEST(0, COALESCE(x_s, last_s) - e_s - {h}) END AS exit_lag
+            FROM (
+                SELECT *,
+                       CASE WHEN kind0 IS NOT NULL THEN kind0
+                            WHEN has_exit THEN
+                                CASE WHEN ca_n > 0 THEN 'ca_masked'
+                                     WHEN x_s - e_s - {h} > 0 THEN 'late' ELSE 'regular' END
+                            WHEN ended THEN
+                                CASE WHEN e_s + {h} > mkt_last_s THEN 'censored'
+                                     WHEN ca_n > 0 THEN 'ca_masked'
+                                     WHEN n_trail >= {end_halt_sessions} AND {hc} IS NULL
+                                         THEN 'terminal_unpriced'
+                                     WHEN n_trail >= {end_halt_sessions} THEN 'terminal_halted'
+                                     ELSE 'terminal' END
+                            ELSE 'censored' END AS kind
+                FROM fx{h}
+            )
         )""")
         idx_sel = (
             f",\n                   CASE WHEN fwd IS NOT NULL "
@@ -326,7 +345,9 @@ def _entry_ctes(
         if spec.kind == "excess":
             ctes.append(f"""
         ebench{h} AS (
-            SELECT trade_date, market, AVG(fwd_ret_{tag}_{h}d) AS bench_ret_{tag}_{h}d
+            SELECT trade_date, market,
+                   CASE WHEN COUNT(fwd_ret_{tag}_{h}d) >= {min_cross_section}
+                        THEN AVG(fwd_ret_{tag}_{h}d) END AS bench_ret_{tag}_{h}d
             FROM fc{h} GROUP BY trade_date, market
         )""")
     return ctes
@@ -390,12 +411,21 @@ def build_entry_label_sql(
     end_halt_sessions: int = 20,
     end_halt_haircut: float | None = None,
     terminal_tail_max: int = 10,
+    min_cross_section: int = 30,
 ) -> str:
     """c0 label (``build_label_sql(spec)``) plus the ``entry`` (c1/o1) family."""
     if entry not in _VALID_ENTRY:
         raise ValueError(f"entry must be one of {_VALID_ENTRY}, got {entry!r}")
-    if min_end_gap_sessions < 1 or end_halt_sessions < 1 or terminal_tail_max < 1:
-        raise ValueError("min_end_gap_sessions, end_halt_sessions, terminal_tail_max must be >= 1")
+    if (
+        min_end_gap_sessions < 1
+        or end_halt_sessions < 1
+        or terminal_tail_max < 1
+        or min_cross_section < 1
+    ):
+        raise ValueError(
+            "min_end_gap_sessions, end_halt_sessions, terminal_tail_max, "
+            "min_cross_section must be >= 1"
+        )
     if end_halt_haircut is not None and not 0.0 <= end_halt_haircut <= 1.0:
         raise ValueError(f"end_halt_haircut must be in [0, 1] or None, got {end_halt_haircut}")
     c0_sql = build_label_sql(spec, price_view, index_view)
@@ -409,6 +439,7 @@ def build_entry_label_sql(
         end_halt_sessions=end_halt_sessions,
         end_halt_haircut=end_halt_haircut,
         terminal_tail_max=terminal_tail_max,
+        min_cross_section=min_cross_section,
     )
     head = [f"c0 AS ({c0_sql})"]
     if spec.index_bench and entry == "c1":
@@ -456,7 +487,8 @@ def materialize_entry_label(
     """Build + register the entry-label mart view (default ``label_entry_v2``).
 
     ``terminal_kwargs``: ``min_end_gap_sessions``, ``master_view``,
-    ``end_halt_sessions``, ``end_halt_haircut``, ``terminal_tail_max``.
+    ``end_halt_sessions``, ``end_halt_haircut``, ``terminal_tail_max``,
+    ``min_cross_section``.
     """
     sql = build_entry_label_sql(spec, entry, price_view, quality_view, **terminal_kwargs)  # type: ignore[arg-type]
     materialize(con, config, table, sql, force=force)

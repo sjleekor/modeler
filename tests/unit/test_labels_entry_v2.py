@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 import pytest
 
 from modeler.etl.labels import (
@@ -153,6 +154,7 @@ def _series(ticker: str, start: str, closes: list) -> list[tuple]:
 
 
 def _run(con, spec: LabelSpec, quality_view: str | None = None, entry: str = "c1", **kw):
+    kw.setdefault("min_cross_section", 1)  # synthetic panels are tiny
     sql = build_entry_label_sql(spec, entry, quality_view=quality_view, **kw)
     return (
         con.execute(f"SELECT * FROM ({sql}) ORDER BY ticker, trade_date")
@@ -162,8 +164,6 @@ def _run(con, spec: LabelSpec, quality_view: str | None = None, entry: str = "c1
 
 
 def _d(s: str):
-    import pandas as pd
-
     return pd.Timestamp(s)
 
 
@@ -249,7 +249,7 @@ def test_limit_down_locked_exit_moves_to_next_free_session() -> None:
     assert a["label_exit_lag_c1_1d"] == 1
 
 
-def test_corporate_action_in_shifted_window_masks() -> None:
+def test_corporate_action_window_c1_excludes_entry_day_o1_includes_it() -> None:
     dates = ["2020-01-02", "2020-01-03", "2020-01-04", "2020-01-05", "2020-01-06", "2020-01-07"]
     r = _series("A", "2020-01-02", [100, 100, 100, 100, 100, 100])
 
@@ -257,21 +257,64 @@ def test_corporate_action_in_shifted_window_masks() -> None:
         return [(d, "A", d == event_day) for d in dates]
 
     spec = LabelSpec(horizons=(2,), kind="abs")
-    # t = d1, entry d2, exit d4: window [d2, d4]
-    for ev, masked in [
-        ("2020-01-02", False),  # on t itself: outside
-        ("2020-01-03", True),  # on the entry day: inside
-        ("2020-01-04", True),
-        ("2020-01-05", True),  # exit day
-        ("2020-01-06", False),  # after exit
-        (None, False),
-    ]:
-        df = _run(_con(r, quality=q(ev)), spec, quality_view="quality")
-        v = df.loc[("A", _d("2020-01-02"))]["fwd_ret_c1_2d"]
-        assert bool(v != v) is masked, ev
+    # t = d1, entry d2, exit d4 (d2 = 01-03, d4 = 01-05)
+    cases = [
+        # event day, masked for c1, masked for o1
+        ("2020-01-02", False, False),  # on t itself: outside
+        ("2020-01-03", False, True),  # entry day: after a c1 entry, before an o1 entry
+        ("2020-01-04", True, True),  # the day after entry
+        ("2020-01-05", True, True),  # exit day
+        ("2020-01-06", False, False),  # after exit
+        (None, False, False),
+    ]
+    for ev, m_c1, m_o1 in cases:
+        for entry, masked in (("c1", m_c1), ("o1", m_o1)):
+            df = _run(_con(r, quality=q(ev)), spec, quality_view="quality", entry=entry)
+            row = df.loc[("A", _d("2020-01-02"))]
+            v = row[f"fwd_ret_{entry}_2d"]
+            assert bool(v != v) is masked, (ev, entry)
+            assert (row[f"label_exit_kind_{entry}_2d"] == "ca_masked") is masked, (ev, entry)
     # no quality view: no mask
     df = _run(_con(r), spec)
     assert df.loc[("A", _d("2020-01-02"))]["fwd_ret_c1_2d"] == pytest.approx(0.0)
+
+
+def test_terminal_needs_the_scheduled_exit_inside_the_calendar() -> None:
+    spec = LabelSpec(horizons=(3,), kind="abs")
+    a = _series("A", "2020-01-02", [100, 100, 100, 90])  # delisted after d4
+    t = ("A", _d("2020-01-04"))  # t=d3: entry d4 (session 4), scheduled exit session 7
+    # the calendar ends at session 6: survivors are censored here, so is A
+    df = _run(_con(a + _series("B", "2020-01-02", [10] * 6)), spec)
+    assert df.loc[t]["label_exit_kind_c1_3d"] == "censored"
+    assert df.loc[t]["fwd_ret_c1_3d"] != df.loc[t]["fwd_ret_c1_3d"]
+    assert pd.isna(df.loc[t]["label_end_date_c1_3d"])
+    # the calendar reaches session 7: the window was observable, A is terminal
+    df = _run(_con(a + _series("B", "2020-01-02", [10] * 7)), spec)
+    assert df.loc[t]["label_exit_kind_c1_3d"] == "terminal"
+    assert df.loc[t]["fwd_ret_c1_3d"] == pytest.approx(0.0)
+    # survivors with the same window are censored at session 6, exit observed at 7
+    df = _run(_con(a + _series("B", "2020-01-02", [10] * 7)), spec)
+    assert df.loc[("B", _d("2020-01-04"))]["label_exit_kind_c1_3d"] == "regular"
+
+
+def test_min_cross_section_nulls_bench_raw_and_y_but_keeps_fwd() -> None:
+    rows = _series("A", "2020-01-02", [100, 100, 110, 110, 110])
+    rows += _series("B", "2020-01-02", [100, 100, 100, 100, 100])
+    rows += _series("C", "2020-01-02", [100, 100, None, 100, 100])
+    spec = LabelSpec(horizons=(1,), outputs=("rank", "up"))
+    # t=d2: C's entry day d3 is halted -> only A and B are valid
+    t2 = [("A", _d("2020-01-03")), ("B", _d("2020-01-03"))]
+    t1 = ("A", _d("2020-01-02"))
+    df = _run(_con(rows), spec, min_cross_section=3)
+    for t in t2:
+        r = df.loc[t]
+        assert not pd.isna(r["fwd_ret_c1_1d"])  # fwd stays
+        for c in ("bench_ret_c1_1d", "raw_label_c1_1d", "y_rank_c1_1d", "y_up_c1_1d"):
+            assert pd.isna(r[c]), c
+    r = df.loc[t1]  # three valid rows: bench exists
+    assert not pd.isna(r["bench_ret_c1_1d"])
+    df = _run(_con(rows), spec, min_cross_section=2)
+    assert not pd.isna(df.loc[t2[0]]["bench_ret_c1_1d"])
 
 
 def test_ended_series_without_exit_is_terminal_at_last_close_and_row_kept() -> None:
@@ -398,6 +441,7 @@ def test_parameter_validation() -> None:
         {"min_end_gap_sessions": 0},
         {"end_halt_sessions": 0},
         {"terminal_tail_max": 0},
+        {"min_cross_section": 0},
         {"end_halt_haircut": 1.5},
     ):
         with pytest.raises(ValueError):
