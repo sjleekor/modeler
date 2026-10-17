@@ -10,6 +10,7 @@ import pytest
 
 from modeler.etl.features.fin_scan import build_fin_scan_daily_sql
 from modeler.etl.features.fin_v2 import build_fin_v2_sql
+from modeler.etl.features.fin_vintage import JOIN_PLAN_COALESCE, JOIN_PLAN_OR
 
 FILED = dt.date(2020, 5, 1)
 ASOF = dt.date(2020, 6, 1)
@@ -120,6 +121,74 @@ def test_base_ok_gate() -> None:
     con = _con(rows, ["A"])
     con.execute("UPDATE dim_price_quality_daily SET is_halted = TRUE")
     assert _roe(con)["A"] is None
+
+
+def test_numerator_branches() -> None:
+    rows = [
+        # C: controlling shares the equity filing -> controlling (net income is older)
+        _row("C", "controlling_net_income", 20.0, "R2"),
+        _row("C", "net_income", 90.0, "R1"),
+        _row("C", "total_equity", 200.0, "R2"),
+        # N: controlling is older than the equity filing, net income shares it -> net income
+        _row("N", "controlling_net_income", 20.0, "R1"),
+        _row("N", "net_income", 30.0, "R2"),
+        _row("N", "total_equity", 200.0, "R2"),
+        # B: both shared -> controlling wins
+        _row("B", "controlling_net_income", 20.0, "R2"),
+        _row("B", "net_income", 30.0, "R2"),
+        _row("B", "total_equity", 200.0, "R2"),
+        # X: neither shares the equity filing -> NULL
+        _row("X", "controlling_net_income", 20.0, "R1"),
+        _row("X", "net_income", 30.0, "R1"),
+        _row("X", "total_equity", 200.0, "R2"),
+    ]
+    out = _roe(_con(rows, ["C", "N", "B", "X"]))
+    assert out["C"] == pytest.approx(0.1)
+    assert out["N"] == pytest.approx(0.15)
+    assert out["B"] == pytest.approx(0.1)
+    assert out["X"] is None
+
+
+def test_default_join_plan_is_coalesce() -> None:
+    assert build_fin_v2_sql() == build_fin_v2_sql(join_plan=JOIN_PLAN_COALESCE)
+    assert build_fin_v2_sql() != build_fin_v2_sql(join_plan=JOIN_PLAN_OR)
+
+
+def test_both_join_plans_return_the_same_rows() -> None:
+    d = dt.date
+    rows = []
+    for t in ("A", "B"):
+        for seq, (filed, rcept, ni, eq) in enumerate(
+            [
+                (d(2020, 3, 2), "R1", 10.0, 100.0),
+                (d(2020, 5, 1), "R2", 20.0, 150.0),
+                (d(2020, 8, 3), "R3", 25.0, -50.0 if t == "B" else 160.0),
+            ],
+            start=1,
+        ):
+            rows += [
+                _row(t, "net_income", ni, rcept, seq=seq, filed=filed),
+                _row(t, "controlling_net_income", ni - 1, rcept, seq=seq, filed=filed),
+                _row(t, "total_equity", eq, rcept, seq=seq, filed=filed),
+            ]
+    con = _con(rows, ["A", "B"])
+    for day in (d(2020, 3, 1), d(2020, 4, 1), d(2020, 9, 1)):
+        for t in ("A", "B"):
+            con.execute(
+                "INSERT INTO dim_stock_pit_daily VALUES (?, ?, 'KOSPI', 1e6, 100, TRUE, FALSE, ?)",
+                [day, t, FILED],
+            )
+            con.execute(
+                "INSERT INTO dim_price_quality_daily VALUES (?, ?, 'KOSPI', FALSE, 1)", [day, t]
+            )
+
+    def _rows(plan: str) -> list[tuple]:
+        sql = build_fin_v2_sql(join_plan=plan)
+        return con.execute(f"SELECT * FROM ({sql}) ORDER BY ticker, trade_date").fetchall()
+
+    coalesce, or_plan = _rows(JOIN_PLAN_COALESCE), _rows(JOIN_PLAN_OR)
+    assert coalesce == or_plan
+    assert any(r[3] is not None for r in coalesce) and any(r[3] is None for r in coalesce)
 
 
 def test_fin_scan_sql_text_is_unchanged() -> None:
