@@ -70,9 +70,26 @@ Columns (``tag`` in {c1, o1}; per horizon h)
   the entry date and on the actual exit date). No index open series exists, so o1
   has no index columns. The legacy ``y_*`` columns still come from c0.
 
+Fixed benchmark (``fixed_benchmarks``, default none): for each ``(tag, idx_nm)``
+(or ``(tag, idx_clss, idx_nm)`` if the name alone is ambiguous) a row of
+``fixed_index_view`` (``krx_index_daily``: bas_dd, idx_clss, idx_nm, close_idx,
+open_idx) gives one index series for ALL stocks, whatever their market: the
+investor's fixed alternative, and the main judgment yardstick G of plan
+``16_c1_label_benchmark.md`` §6. Columns per horizon:
+``bench_ret_{tag}_{entry}_{h}d`` = index return over the stock's own entry date
+and actual exit date (c1: close to close; o1: ``open_idx`` on the entry date to
+``open_idx`` on the exit date; a terminal exit uses the series' last row date and
+the index CLOSE, like the stock side), and ``raw_label_{tag}_{entry}_{h}d`` =
+``fwd - bench``. NULL when the stock label is NULL or the index has no value on
+either exact date (no forward fill). The market-specific ``index_bench`` columns
+and the eqw benchmark stay as diagnostics. KOSPI 200 in the lake is
+``("k200", "코스피 200")`` (idx_group kospi, idx_clss KOSPI; one row per date,
+unique by name alone, 2026-10-18).
+
 Parameters: ``min_end_gap_sessions`` (1), ``master_view`` (None; ticker, market,
 status), ``end_halt_sessions`` (20), ``end_halt_haircut`` (None),
-``terminal_tail_max`` (10), ``min_cross_section`` (30).
+``terminal_tail_max`` (10), ``min_cross_section`` (30), ``fixed_benchmarks`` (()),
+``fixed_index_view`` (``krx_index_daily``).
 
 Leakage note: terminal values use knowledge of the delisting, which is allowed
 for labels but never for features. A label can end hundreds of sessions after t
@@ -86,6 +103,9 @@ rows the c0 inner join would drop. The dataset therefore differs from
 
 from __future__ import annotations
 
+import re
+from collections.abc import Sequence
+
 import duckdb
 
 from modeler.etl.config import LakeConfig
@@ -94,6 +114,7 @@ from modeler.etl.mart import materialize, register_mart_view
 
 LABEL_ENTRY_TABLE = "label_entry_v2"
 _VALID_ENTRY = ("c1", "o1")
+_TAG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # Daily price limit (same values as the inline CASE in etl/quality.py).
 _LIMIT_CHANGE_DATE = "2015-06-15"
@@ -114,6 +135,8 @@ def _entry_ctes(
     end_halt_haircut: float | None,
     terminal_tail_max: int,
     min_cross_section: int,
+    fixed: Sequence[tuple[str, str | None, str]] = (),
+    fixed_index_view: str = "krx_index_daily",
 ) -> list[str]:
     tag = entry
     pcol = "close_d" if tag == "c1" else "open_d"
@@ -269,9 +292,27 @@ def _entry_ctes(
         )""",
     ]
     hc = "NULL" if end_halt_haircut is None else repr(float(end_halt_haircut))
+    fpc = "close_i" if tag == "c1" else "open_i"
+    for ftag, fclss, fnm in fixed:
+        where = f"idx_nm = '{_sql_str(fnm)}'"
+        if fclss is not None:
+            where += f" AND idx_clss = '{_sql_str(fclss)}'"
+        ctes.append(f"""
+        fb_{ftag} AS (
+            SELECT bas_dd AS trade_date, CAST(close_idx AS DOUBLE) AS close_i,
+                   CAST(open_idx AS DOUBLE) AS open_i
+            FROM {fixed_index_view} WHERE {where}
+        )""")
     for h in spec.horizons:
         use_idx = spec.index_bench and tag == "c1"
         idx_cols = ", ie.idx_close AS ie_close, ix.idx_close AS ix_close" if use_idx else ""
+        exit_date = "COALESCE(x.trade_date, CASE WHEN s.ended THEN s.last_date END)"
+        for ftag, _, _ in fixed:
+            idx_cols += (
+                f", fe_{ftag}.{fpc} AS fb_{ftag}_e"
+                f", CASE WHEN x.trade_date IS NOT NULL THEN fx_{ftag}.{fpc} "
+                f"ELSE fx_{ftag}.close_i END AS fb_{ftag}_x"
+            )
         idx_join = (
             "\n            LEFT JOIN idx ie ON ie.market = n.market AND ie.trade_date = n.e_date"
             "\n            LEFT JOIN idx ix ON ix.market = n.market AND ix.trade_date = "
@@ -279,6 +320,11 @@ def _entry_ctes(
             if use_idx
             else ""
         )
+        for ftag, _, _ in fixed:
+            idx_join += (
+                f"\n            LEFT JOIN fb_{ftag} fe_{ftag} ON fe_{ftag}.trade_date = n.e_date"
+                f"\n            LEFT JOIN fb_{ftag} fx_{ftag} ON fx_{ftag}.trade_date = {exit_date}"
+            )
         ctes.append(f"""
         fx{h} AS (
             SELECT n.trade_date, n.ticker, n.market, n.kind0, n.e_px, n.e_s, n.mkt_last_s,
@@ -327,6 +373,12 @@ def _entry_ctes(
             if use_idx
             else ""
         )
+        for ftag, _, _ in fixed:
+            idx_sel += (
+                f",\n                   CASE WHEN fwd IS NOT NULL "
+                f"THEN fb_{ftag}_x / NULLIF(fb_{ftag}_e, 0) - 1 END "
+                f"AS bench_ret_{ftag}_{tag}_{h}d"
+            )
         ctes.append(f"""
         fc{h} AS (
             SELECT trade_date, ticker, market, fwd AS fwd_ret_{tag}_{h}d,
@@ -353,7 +405,13 @@ def _entry_ctes(
     return ctes
 
 
-def _entry_select_cols(spec: LabelSpec, entry: str) -> str:
+def _sql_str(v: str) -> str:
+    return v.replace("'", "''")
+
+
+def _entry_select_cols(
+    spec: LabelSpec, entry: str, fixed: Sequence[tuple[str, str | None, str]] = ()
+) -> str:
     tag = entry
     lo, hi = spec.winsor
     win = "PARTITION BY base.trade_date, base.market"
@@ -369,6 +427,12 @@ def _entry_select_cols(spec: LabelSpec, entry: str) -> str:
         cols.append(f"e{h}.label_exit_kind_{tag}_{h}d")
         cols.append(f"e{h}.label_end_date_{tag}_{h}d")
         cols.append(f"e{h}.label_exit_lag_{tag}_{h}d")
+        for ftag, _, _ in fixed:
+            cols.append(f"e{h}.bench_ret_{ftag}_{tag}_{h}d")
+            cols.append(
+                f"(e{h}.fwd_ret_{tag}_{h}d - e{h}.bench_ret_{ftag}_{tag}_{h}d) "
+                f"AS raw_label_{ftag}_{tag}_{h}d"
+            )
         if spec.index_bench and tag == "c1":
             cols.append(f"e{h}.bench_ret_idx_{tag}_{h}d")
             cols.append(
@@ -399,6 +463,29 @@ def _entry_select_cols(spec: LabelSpec, entry: str) -> str:
     return ",\n            ".join(cols)
 
 
+def _normalize_fixed(
+    fixed_benchmarks: Sequence[tuple[str, ...]],
+) -> list[tuple[str, str | None, str]]:
+    """``(tag, idx_nm)`` or ``(tag, idx_clss, idx_nm)`` -> ``(tag, idx_clss|None, idx_nm)``."""
+    out: list[tuple[str, str | None, str]] = []
+    for item in fixed_benchmarks:
+        if len(item) == 2:
+            tag, nm = item
+            clss = None
+        elif len(item) == 3:
+            tag, clss, nm = item
+        else:
+            raise ValueError(
+                f"fixed benchmark must be (tag, idx_nm) or (tag, idx_clss, idx_nm): {item!r}"
+            )
+        if not _TAG_RE.match(tag):
+            raise ValueError(f"fixed benchmark tag must match {_TAG_RE.pattern}, got {tag!r}")
+        if tag in {t for t, _, _ in out}:
+            raise ValueError(f"duplicate fixed benchmark tag {tag!r}")
+        out.append((tag, clss, nm))
+    return out
+
+
 def build_entry_label_sql(
     spec: LabelSpec,
     entry: str,
@@ -412,6 +499,8 @@ def build_entry_label_sql(
     end_halt_haircut: float | None = None,
     terminal_tail_max: int = 10,
     min_cross_section: int = 30,
+    fixed_benchmarks: Sequence[tuple[str, ...]] = (),
+    fixed_index_view: str = "krx_index_daily",
 ) -> str:
     """c0 label (``build_label_sql(spec)``) plus the ``entry`` (c1/o1) family."""
     if entry not in _VALID_ENTRY:
@@ -428,6 +517,7 @@ def build_entry_label_sql(
         )
     if end_halt_haircut is not None and not 0.0 <= end_halt_haircut <= 1.0:
         raise ValueError(f"end_halt_haircut must be in [0, 1] or None, got {end_halt_haircut}")
+    fixed = _normalize_fixed(fixed_benchmarks)
     c0_sql = build_label_sql(spec, price_view, index_view)
     ctes = _entry_ctes(
         spec,
@@ -440,6 +530,8 @@ def build_entry_label_sql(
         end_halt_haircut=end_halt_haircut,
         terminal_tail_max=terminal_tail_max,
         min_cross_section=min_cross_section,
+        fixed=fixed,
+        fixed_index_view=fixed_index_view,
     )
     head = [f"c0 AS ({c0_sql})"]
     if spec.index_bench and entry == "c1":
@@ -466,7 +558,7 @@ def build_entry_label_sql(
             base.trade_date, base.ticker, base.market,
             c0.* EXCLUDE (trade_date, ticker, market),
             base.in_terminal_tail,
-            {_entry_select_cols(spec, entry)}
+            {_entry_select_cols(spec, entry, fixed)}
         FROM base
         LEFT JOIN c0 USING (trade_date, ticker, market){joins}
     """
@@ -488,7 +580,7 @@ def materialize_entry_label(
 
     ``terminal_kwargs``: ``min_end_gap_sessions``, ``master_view``,
     ``end_halt_sessions``, ``end_halt_haircut``, ``terminal_tail_max``,
-    ``min_cross_section``.
+    ``min_cross_section``, ``fixed_benchmarks``, ``fixed_index_view``.
     """
     sql = build_entry_label_sql(spec, entry, price_view, quality_view, **terminal_kwargs)  # type: ignore[arg-type]
     materialize(con, config, table, sql, force=force)

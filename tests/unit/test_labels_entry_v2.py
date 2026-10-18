@@ -104,6 +104,7 @@ def _con(
     quality: list[tuple] | None = None,
     index: list[tuple] | None = None,
     master: list[tuple] | None = None,
+    krx_index: list[tuple] | None = None,
 ):
     """rows: (date, ticker, open, high, low, close); market KOSPI."""
     con = duckdb.connect()
@@ -121,6 +122,16 @@ def _con(
             "CREATE VIEW quality AS SELECT * FROM (VALUES "
             + v
             + ") AS t(trade_date, ticker, market, ca_event)"
+        )
+    if krx_index is not None:
+        # (date, idx_nm, open_idx, close_idx); a decoy index rides along
+        v = ",".join(
+            f"(DATE '{d}', 'kospi', 'KOSPI', '{nm}', {o}, {c})" for d, nm, o, c in krx_index
+        )
+        con.execute(
+            "CREATE VIEW krx_index_daily AS SELECT * FROM (VALUES "
+            + v
+            + ") AS t(bas_dd, index_group, idx_clss, idx_nm, open_idx, close_idx)"
         )
     if master is not None:
         v = ",".join(f"('{t}', '{m}', '{st}')" for t, m, st in master)
@@ -501,3 +512,127 @@ def test_entry_output_carries_the_c0_columns_unchanged() -> None:
         for _, r in c0.iterrows():
             v = got.loc[(r["ticker"], r["trade_date"])]
             assert v == pytest.approx(r[col]) or (v != v and r[col] != r[col])
+
+
+# --- fixed benchmark (KOSPI 200) ----------------------------------------------
+
+_K200 = (("k200", "코스피 200"),)
+
+
+def _k200_rows(start: str, opens: list, closes: list, name: str = "코스피 200") -> list[tuple]:
+    first = datetime.date.fromisoformat(start)
+    return [
+        ((first + datetime.timedelta(days=i)).isoformat(), name, o, c)
+        for i, (o, c) in enumerate(zip(opens, closes, strict=True))
+        if o is not None
+    ]
+
+
+def _krx(rows: list[tuple]) -> list[tuple]:
+    decoy = _k200_rows("2020-01-02", [1] * 12, [1] * 12, name="코스피")  # must be ignored
+    return rows + decoy
+
+
+def test_default_entry_sql_is_unchanged_by_the_fixed_benchmark_option() -> None:
+    pins = {
+        "a": (
+            LabelSpec(),
+            "c1",
+            {},
+            "cabd562dbb32d20203349edd7f7969b0b1dc8dda6efc1abace5cc63d074a1f4d",
+        ),
+        "b": (
+            LabelSpec(index_bench=True, horizons=(5, 20)),
+            "c1",
+            {"quality_view": "q"},
+            "d769328c096a0772d64dd697b9698c212dc15e2d8eb699370e432b6f512b6b19",
+        ),
+        "c": (
+            LabelSpec(kind="abs"),
+            "o1",
+            {"end_halt_haircut": 0.5, "master_view": "m"},
+            "f36f91e0e089422f59be463c3d1ab1389525a1f8aed4ae5e33b5157c20421239",
+        ),
+    }
+    for sp, entry, kw, sha in pins.values():
+        assert _h(build_entry_label_sql(sp, entry, **kw)) == sha
+        assert build_entry_label_sql(sp, entry, fixed_benchmarks=(), **kw) == build_entry_label_sql(
+            sp, entry, **kw
+        )
+
+
+def test_fixed_benchmark_c1_and_o1_match_hand_calculation() -> None:
+    rows = _series("A", "2020-01-02", [100, 110, 132, 132])  # open = close - 1
+    rows += _series("B", "2020-01-02", [10] * 4)
+    kx = _krx(_k200_rows("2020-01-02", [199, 209, 230, 249], [200, 210, 231, 250]))
+    spec = LabelSpec(horizons=(1,), kind="abs")
+    t = ("A", _d("2020-01-02"))
+    df = _run(_con(rows, krx_index=kx), spec, fixed_benchmarks=_K200)
+    r = df.loc[t]
+    assert r["bench_ret_k200_c1_1d"] == pytest.approx(231 / 210 - 1)
+    assert r["raw_label_k200_c1_1d"] == pytest.approx(132 / 110 - 1 - (231 / 210 - 1))
+    df = _run(_con(rows, krx_index=kx), spec, entry="o1", fixed_benchmarks=_K200)
+    r = df.loc[t]
+    assert r["fwd_ret_o1_1d"] == pytest.approx(131 / 109 - 1)
+    assert r["bench_ret_k200_o1_1d"] == pytest.approx(230 / 209 - 1)
+    assert r["raw_label_k200_o1_1d"] == pytest.approx(131 / 109 - 1 - (230 / 209 - 1))
+    # the stock label and the eqw benchmark are unchanged by adding the option
+    base = _run(_con(rows, krx_index=kx), spec, entry="o1")
+    assert base.loc[t]["fwd_ret_o1_1d"] == pytest.approx(r["fwd_ret_o1_1d"])
+
+
+def test_fixed_benchmark_terminal_uses_series_last_date_and_close() -> None:
+    # A trades to d4 (last close 90), has one halt row d5, then is gone; B runs on.
+    rows = _series("A", "2020-01-02", [100, 100, 100, 90, None])
+    rows += _series("B", "2020-01-02", [10] * 8)
+    kx = _krx(
+        _k200_rows(
+            "2020-01-02",
+            [199, 199, 199, 199, 209, 209, 209, 209],
+            [200, 200, 200, 200, 220, 220, 220, 220],
+        )
+    )
+    spec = LabelSpec(horizons=(2,), kind="abs")
+    t = ("A", _d("2020-01-04"))  # t=d3: entry d4, exit missing, series ended at d5
+    df = _run(_con(rows, krx_index=kx), spec, fixed_benchmarks=_K200)
+    assert df.loc[t]["label_exit_kind_c1_2d"] == "terminal"
+    assert df.loc[t]["label_end_date_c1_2d"] == _d("2020-01-06")
+    assert df.loc[t]["bench_ret_k200_c1_2d"] == pytest.approx(220 / 200 - 1)  # d4 -> d5 close
+    # o1: stock enters at the d4 open (89) and exits at the last CLOSE (90);
+    # the index goes from the d4 open (199) to the d5 CLOSE (220)
+    df = _run(_con(rows, krx_index=kx), spec, entry="o1", fixed_benchmarks=_K200)
+    assert df.loc[t]["fwd_ret_o1_2d"] == pytest.approx(90 / 89 - 1)
+    assert df.loc[t]["bench_ret_k200_o1_2d"] == pytest.approx(220 / 199 - 1)
+
+
+def test_fixed_benchmark_missing_index_date_is_null_not_filled() -> None:
+    rows = _series("A", "2020-01-02", [100, 110, 132, 132, 140])
+    rows += _series("B", "2020-01-02", [10] * 5)
+    # the index has no row for d3 (2020-01-04)
+    kx = _krx(_k200_rows("2020-01-02", [199, 209, None, 249, 259], [200, 210, None, 250, 260]))
+    spec = LabelSpec(horizons=(1,), kind="abs")
+    df = _run(_con(rows, krx_index=kx), spec, fixed_benchmarks=_K200)
+    a = df.xs("A", level="ticker")
+    # t=d1: exit d3 missing -> NULL bench/raw, fwd kept; t=d2: entry d3 missing -> same
+    for d in ("2020-01-02", "2020-01-03"):
+        r = a.loc[_d(d)]
+        assert not pd.isna(r["fwd_ret_c1_1d"])
+        assert pd.isna(r["bench_ret_k200_c1_1d"]) and pd.isna(r["raw_label_k200_c1_1d"])
+    # t=d3 (entry d4, exit d5) is fine: no forward fill from d2
+    assert a.loc[_d("2020-01-04")]["bench_ret_k200_c1_1d"] == pytest.approx(260 / 250 - 1)
+    n_null = int(a["bench_ret_k200_c1_1d"].isna().sum() - a["fwd_ret_c1_1d"].isna().sum())
+    assert n_null == 2
+
+
+def test_fixed_benchmark_three_part_key_and_validation() -> None:
+    rows = _series("A", "2020-01-02", [100, 110, 132]) + _series("B", "2020-01-02", [10] * 3)
+    kx = _krx(_k200_rows("2020-01-02", [199, 209, 230], [200, 210, 231]))
+    df = _run(
+        _con(rows, krx_index=kx),
+        LabelSpec(horizons=(1,), kind="abs"),
+        fixed_benchmarks=(("k200", "KOSPI", "코스피 200"),),
+    )
+    assert df.loc[("A", _d("2020-01-02"))]["bench_ret_k200_c1_1d"] == pytest.approx(231 / 210 - 1)
+    for bad in ((("K 200", "x"),), (("a", "x"), ("a", "y")), (("a",),)):
+        with pytest.raises(ValueError):
+            build_entry_label_sql(LabelSpec(), "c1", fixed_benchmarks=bad)
