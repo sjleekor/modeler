@@ -284,6 +284,7 @@ def test_new_columns_follow_the_planned_output() -> None:
         "fin_roa_v2",
         "fin_capital_impaired_v2",
         *_RATIOS,
+        "fin_ttm_conflict_v2",  # G-14 sensitivity column (NULL without the vintage flag)
     ]
 
 
@@ -375,3 +376,80 @@ def test_fin_scan_sql_text_is_unchanged() -> None:
     assert hashlib.sha256(build_fin_scan_daily_sql().encode()).hexdigest() == (
         "9656de5eb96b9b1498187308a9ea3831a3f0a2f4e29ff45cca7fb061fdd7fb4a"
     )
+
+
+# --- fin_ttm_conflict_v2 (G-14, R1 sensitivity) -------------------------------------------
+
+
+def _con_conflict(rows, tickers):
+    """Like ``_con`` but the vintage has ``ttm_includes_conflict`` (rows: tuple + flag)."""
+    con = _con([r for r, _ in rows], tickers)
+    con.execute("ALTER TABLE fin_quarterly_metric_vintage ADD COLUMN ttm_includes_conflict BOOLEAN")
+    for r, flag in rows:
+        con.execute(
+            "UPDATE fin_quarterly_metric_vintage SET ttm_includes_conflict = ? "
+            "WHERE ticker = ? AND metric_code = ? AND rcept_no = ?",
+            [flag, r[0], r[1], r[4]],
+        )
+    return con
+
+
+def _flag(con, *cols):
+    sql = build_fin_v2_sql(vintage_has_ttm_conflict=True)
+    out = con.execute(f"SELECT ticker, fin_ttm_conflict_v2, {', '.join(cols)} FROM ({sql})")
+    return {r[0]: r[1:] for r in out.fetchall()}
+
+
+def test_conflict_flag_follows_the_picked_numerator() -> None:
+    rows = [
+        # A: controlling (conflict) shares the filing -> TRUE although net income is clean
+        (_row("A", "controlling_net_income", 20.0, "R1"), True),
+        (_row("A", "net_income", 90.0, "R1"), False),
+        (_row("A", "total_equity", 100.0, "R1"), None),
+        (_row("A", "total_assets", 400.0, "R1"), None),
+        # B: controlling is in another filing, net income (clean) is used -> FALSE
+        (_row("B", "controlling_net_income", 20.0, "R0"), True),
+        (_row("B", "net_income", 30.0, "R1"), False),
+        (_row("B", "total_equity", 100.0, "R1"), None),
+        (_row("B", "total_assets", 300.0, "R1"), None),
+        # C: ROE and ROA read different filings; only the ROA numerator has a conflict -> TRUE
+        (_row("C", "controlling_net_income", 20.0, "R1"), False),
+        (_row("C", "net_income", 30.0, "R2"), True),
+        (_row("C", "total_equity", 100.0, "R1"), None),
+        (_row("C", "total_assets", 300.0, "R2"), None),
+        # D: no ratio is defined (no assets, equity <= 0) -> NULL even with a conflict flag
+        (_row("D", "net_income", 30.0, "R1"), True),
+        (_row("D", "total_equity", -5.0, "R1"), None),
+    ]
+    out = _flag(_con_conflict(rows, ["A", "B", "C", "D"]), "fin_roe_v2", "fin_roa_v2")
+    assert out["A"][0] is True
+    assert out["B"][0] is False
+    assert out["C"][0] is True
+    assert out["D"][0] is None
+    assert out["D"][1] is None and out["D"][2] is None
+
+
+def test_conflict_flag_is_null_without_the_vintage_column() -> None:
+    con = _con([_row("A", "net_income", 1.0, "R1"), _row("A", "total_assets", 10.0, "R1")], ["A"])
+    row = con.execute(
+        f"SELECT fin_roa_v2, fin_ttm_conflict_v2 FROM ({build_fin_v2_sql()})"
+    ).fetchone()
+    assert row[0] == pytest.approx(0.1)
+    assert row[1] is None
+
+
+def test_conflict_flag_does_not_change_other_columns() -> None:
+    rows = [
+        (_row("A", "net_income", 30.0, "R1"), True),
+        (_row("A", "total_equity", 100.0, "R1"), None),
+        (_row("A", "total_assets", 300.0, "R1"), None),
+        (_row("A", "revenue", 600.0, "R1"), None),
+    ]
+    con = _con_conflict(rows, ["A"])
+    plain = _con([r for r, _ in rows], ["A"])
+    cols = "fin_roe_v2, fin_roa_v2, fin_capital_impaired_v2, fin_asset_turnover_v2"
+    a = con.execute(
+        f"SELECT {cols} FROM ({build_fin_v2_sql(vintage_has_ttm_conflict=True)})"
+    ).fetchall()
+    b = plain.execute(f"SELECT {cols} FROM ({build_fin_v2_sql()})").fetchall()
+    assert a == b
