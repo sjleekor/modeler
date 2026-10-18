@@ -20,6 +20,19 @@ endpoints; ``px_ret_60_20_v2`` masks ``t-60..t`` as the plan states; rolling
 statistics of daily returns (vol, amihud, limit-hit) mask their ``n`` rows;
 ``px_ret_1d_v2`` (the single-day log return itself) is masked only on a ``ca_event``
 day ``t`` — the corporate-action jump — and carries no window.
+
+KRX raw trading value (17 §8.2, 16 §9.1; user-approved C2-9): Naver close and volume are
+rewritten for later splits, rights issues and capital reductions, and a rights issue adjusts
+price and volume by different factors. Adjusted close x adjusted volume therefore differs from
+the real trading value by more than 5% on about 26% of the rows of tickers with any adjustment,
+and the rewrite is retroactive, so future events leak into past rows. ``px_turnover_v2``,
+``px_turnover_ma20_v2`` and the ``px_amihud_20d_v2`` denominator use ``trading_value`` (KRW)
+from ``daily_market_cap`` instead, joined on ``(trade_date, ticker)`` only: ``daily_market_cap.market``
+is the market at that time while ``daily_ohlcv.market`` is the current one for all history. If a
+key repeats, the row whose market equals the price row's market wins (same rule as
+``flow_v2``). A missing or non-positive value stays NULL; there is no fallback to adjusted
+values. Returns still come from adjusted closes (ratios of adjusted prices are correct).
+Turnover columns carry no CA mask: raw trading value is not affected by adjustment.
 """
 
 from __future__ import annotations
@@ -52,14 +65,21 @@ PRICE_V2_COLUMNS = (
     "px_amihud_20d_v2",
     "px_limit_hit_ratio_20d_v2",
     "px_ret_1d_v2",
+    "px_turnover_v2",
+    "px_turnover_ma20_v2",
 )
 
 
 def build_price_v2_sql(
     price_view: str = "daily_ohlcv",
     quality_view: str | None = None,
+    market_cap_view: str = "daily_market_cap",
 ) -> str:
-    """SQL producing ``feat_price_v2`` from a daily OHLCV view (keys: trade_date, ticker, market)."""
+    """SQL producing ``feat_price_v2`` from a daily OHLCV view (keys: trade_date, ticker, market).
+
+    ``market_cap_view`` supplies the KRX raw ``trading_value`` (columns: trade_date, ticker,
+    market, trading_value).
+    """
     quality_join = (
         f"LEFT JOIN {quality_view} q USING (trade_date, ticker, market)" if quality_view else ""
     )
@@ -73,9 +93,15 @@ def build_price_v2_sql(
         WITH valid AS (
             {build_valid_session_sql(price_view)}
         ),
-        vq AS (
+        krx_raw AS (
+            SELECT trade_date, ticker, market AS krx_market,
+                   CASE WHEN trading_value > 0 THEN CAST(trading_value AS DOUBLE) END
+                       AS krx_tv
+            FROM {market_cap_view}
+        ),
+        vq0 AS (
             SELECT v.trade_date, v.ticker, v.market, v.valid_session_idx,
-                   v.close_d, v.turnover, v.simple_ret, v.log_ret,
+                   v.close_d, v.simple_ret, v.log_ret, mc.krx_tv,
                    CAST(p.high AS DOUBLE) AS high_d,
                    CAST(p.low AS DOUBLE) AS low_d,
                    CASE WHEN v.trade_date < DATE '{PRICE_LIMIT_CHANGE_DATE}'
@@ -84,7 +110,20 @@ def build_price_v2_sql(
                    {ca_event} AS ca_event
             FROM valid v
             JOIN {price_view} p USING (trade_date, ticker, market)
+            LEFT JOIN krx_raw mc ON mc.trade_date = v.trade_date AND mc.ticker = v.ticker
             {quality_join}
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY v.trade_date, v.ticker, v.market
+                ORDER BY (mc.krx_market = v.market) DESC NULLS LAST,
+                         mc.krx_market ASC NULLS LAST,
+                         mc.krx_tv ASC NULLS LAST
+            ) = 1
+        ),
+        vq AS (
+            SELECT *,
+                   CASE WHEN log_ret IS NOT NULL AND krx_tv IS NOT NULL
+                        THEN ABS(log_ret) / krx_tv END AS amihud_term
+            FROM vq0
         ),
         raw AS (
             SELECT
@@ -111,8 +150,11 @@ def build_price_v2_sql(
                 CASE WHEN COUNT(close_d) OVER w251 = 252
                      THEN close_d / NULLIF(MAX(close_d) OVER w251, 0) - 1 END AS r_dist,
                 SUM(CASE WHEN ca_event THEN 1 ELSE 0 END) OVER w251 AS ca_251,
-                CASE WHEN COUNT(log_ret) OVER w19 = 20
-                     THEN AVG(ABS(log_ret) / NULLIF(turnover, 0)) OVER w19 END AS r_amihud,
+                CASE WHEN COUNT(amihud_term) OVER w19 = 20
+                     THEN AVG(amihud_term) OVER w19 END AS r_amihud,
+                krx_tv AS r_turn,
+                CASE WHEN COUNT(krx_tv) OVER w19 = 20 THEN AVG(krx_tv) OVER w19 END
+                    AS r_turn_ma20,
                 CASE WHEN COUNT(simple_ret) OVER w19 = 20
                      THEN AVG(CASE WHEN ABS(simple_ret) >= limit_pct - {PRICE_LIMIT_MARGIN}
                                    THEN 1.0 ELSE 0.0 END) OVER w19 END AS r_limit
@@ -139,7 +181,9 @@ def build_price_v2_sql(
             CASE WHEN r.ca_251 = 0 THEN r.r_dist END AS px_dist_52w_high_v2,
             CASE WHEN r.ca_19 = 0 THEN r.r_amihud END AS px_amihud_20d_v2,
             CASE WHEN r.ca_19 = 0 THEN r.r_limit END AS px_limit_hit_ratio_20d_v2,
-            r.r_ret1 AS px_ret_1d_v2
+            r.r_ret1 AS px_ret_1d_v2,
+            r.r_turn AS px_turnover_v2,
+            r.r_turn_ma20 AS px_turnover_ma20_v2
         FROM {price_view} p
         LEFT JOIN raw r USING (trade_date, ticker, market)
     """
@@ -151,10 +195,11 @@ def materialize_price_v2(
     *,
     price_view: str = "daily_ohlcv",
     quality_view: str | None = None,
+    market_cap_view: str = "daily_market_cap",
     force: bool = False,
 ) -> str:
     """Build + register the ``feat_price_v2`` mart view. Returns the view name."""
-    sql = build_price_v2_sql(price_view, quality_view=quality_view)
+    sql = build_price_v2_sql(price_view, quality_view=quality_view, market_cap_view=market_cap_view)
     plan = MartPlan(plan_id="single", final_sql=sql, semantics_version=PRICE_V2_SEMANTICS)
     materialize(con, config, PRICE_V2_TABLE, sql, force=force, plan=plan)
     return register_mart_view(con, config, PRICE_V2_TABLE)

@@ -38,6 +38,14 @@ def _con(rows: list[tuple], ca_dates: tuple[date, ...] = ()) -> duckdb.DuckDBPyC
     )
     con.executemany("INSERT INTO ohlcv VALUES (?, 'A', 'KOSPI', ?, ?, ?, ?, ?)", rows)
     con.execute(
+        "CREATE TABLE daily_market_cap (trade_date DATE, ticker VARCHAR, market VARCHAR, "
+        "trading_value BIGINT)"
+    )
+    # default KRX raw value = close * volume (unadjusted fixtures); tests override rows
+    con.execute(
+        "INSERT INTO daily_market_cap SELECT trade_date, ticker, market, close * volume FROM ohlcv"
+    )
+    con.execute(
         "CREATE TABLE qual (trade_date DATE, ticker VARCHAR, market VARCHAR, ca_event BOOLEAN)"
     )
     for d in ca_dates:
@@ -174,8 +182,12 @@ def test_ca_event_in_window_nulls_all_columns() -> None:
     ca = days[200]
     res = _run(_con(rows, ca_dates=(ca,)), with_quality=True)
     t = 205  # CA 5 sessions back: inside every window (the 1-day return has no window).
-    assert all(res[days[t]][c] is None for c in PRICE_V2_COLUMNS if c != "px_ret_1d_v2")
+    unmasked = {"px_ret_1d_v2", "px_turnover_v2", "px_turnover_ma20_v2"}
+    assert all(res[days[t]][c] is None for c in PRICE_V2_COLUMNS if c not in unmasked)
     assert res[days[t]]["px_ret_1d_v2"] is not None
+    # raw KRX trading value is not affected by adjustment: no CA mask on turnover
+    assert res[days[t]]["px_turnover_v2"] is not None
+    assert res[days[t]]["px_turnover_ma20_v2"] is not None
     t = 299  # CA 99 sessions back: only the 252-session window still sees it.
     assert res[days[t]]["px_ret_60d_v2"] is not None
     assert res[days[t]]["px_vol_60d_v2"] is not None
@@ -222,3 +234,107 @@ def test_importing_price_v2_leaves_legacy_sql_unchanged() -> None:
     sql_q = build_price_sql(quality_view="q")
     assert hashlib.sha256(sql_q.encode()).hexdigest() == _LEGACY_SQL_Q_SHA
     assert "_v2" not in build_price_sql()
+
+
+# --- KRX raw trading value (17 §8.2, C2-9) -------------------------------------
+
+
+def _set_tv(con, day: date, value: int | None) -> None:
+    con.execute("DELETE FROM daily_market_cap WHERE trade_date = ?", [day])
+    if value is not None:
+        con.execute("INSERT INTO daily_market_cap VALUES (?, 'A', 'KOSPI', ?)", [day, value])
+
+
+def test_turnover_v2_hand_values_and_ma20() -> None:
+    rows = _rising(25)
+    days = [r[0] for r in rows]
+    res = _run(_con(rows))
+    tv = [r[4] * r[5] for r in rows]
+    assert res[days[3]]["px_turnover_v2"] == tv[3]
+    assert res[days[18]]["px_turnover_ma20_v2"] is None  # only 19 sessions
+    assert math.isclose(res[days[19]]["px_turnover_ma20_v2"], sum(tv[:20]) / 20)
+    assert math.isclose(res[days[24]]["px_turnover_ma20_v2"], sum(tv[5:25]) / 20)
+
+
+def test_missing_krx_value_is_null_without_fallback() -> None:
+    rows = _rising(30)
+    days = [r[0] for r in rows]
+    con = _con(rows)
+    _set_tv(con, days[25], None)  # no row at all
+    _set_tv(con, days[26], 0)  # non-positive
+    res = _run(con)
+    assert res[days[25]]["px_turnover_v2"] is None
+    assert res[days[26]]["px_turnover_v2"] is None
+    # windows containing a missing day stay NULL (needs all 20)
+    assert res[days[27]]["px_turnover_ma20_v2"] is None
+    assert res[days[27]]["px_amihud_20d_v2"] is None
+    # a window clear of the gap is still present
+    assert res[days[24]]["px_turnover_ma20_v2"] is not None
+    assert res[days[24]]["px_amihud_20d_v2"] is not None
+    assert res[days[29]]["px_turnover_ma20_v2"] is None  # window days[10..29] holds the gap
+
+
+def test_rights_issue_adjusted_close_times_volume_differs_from_raw_value() -> None:
+    rows = _rising(30)
+    days = [r[0] for r in rows]
+    raw_tv = {r[0]: r[4] * r[5] for r in rows}
+    # Naver rewrites history before day 20: price x0.95, volume untouched.
+    adj = [
+        (d, round(o * 0.95), round(h * 0.95), round(lo * 0.95), round(c * 0.95), v)
+        if i < 20
+        else (d, o, h, lo, c, v)
+        for i, (d, o, h, lo, c, v) in enumerate(rows)
+    ]
+    con = _con(adj)
+    con.execute("DELETE FROM daily_market_cap")
+    for d, v in raw_tv.items():
+        con.execute("INSERT INTO daily_market_cap VALUES (?, 'A', 'KOSPI', ?)", [d, v])
+    res = _run(con)
+    t = days[10]
+    adjusted_product = adj[10][4] * adj[10][5]
+    assert res[t]["px_turnover_v2"] == raw_tv[t]
+    assert abs(adjusted_product - raw_tv[t]) / raw_tv[t] > 0.04
+    assert math.isclose(
+        res[days[29]]["px_turnover_ma20_v2"], sum(raw_tv[d] for d in days[10:30]) / 20
+    )
+
+
+def test_amihud_uses_raw_trading_value_denominator() -> None:
+    rows = _rising(25)
+    days = [r[0] for r in rows]
+    con = _con(rows)
+    for d in days:  # make raw value differ from close x volume
+        con.execute("UPDATE daily_market_cap SET trading_value = 2000000 WHERE trade_date = ?", [d])
+    res = _run(con)
+    t = 24
+    rets = [math.log(rows[i][4] / rows[i - 1][4]) for i in range(t - 19, t + 1)]
+    want = sum(abs(r) / 2_000_000 for r in rets) / 20
+    assert math.isclose(res[days[t]]["px_amihud_20d_v2"], want, rel_tol=1e-12)
+
+
+def test_market_transfer_ticker_joins_on_date_and_ticker_only() -> None:
+    rows = _rising(25)
+    days = [r[0] for r in rows]
+    con = _con(rows)
+    # KRX recorded the ticker under KOSDAQ for the early days (market at that time).
+    con.execute("UPDATE daily_market_cap SET market = 'KOSDAQ' WHERE trade_date < ?", [days[10]])
+    res = _run(con)
+    assert res[days[3]]["px_turnover_v2"] == rows[3][4] * rows[3][5]
+    assert res[days[24]]["px_turnover_ma20_v2"] is not None
+
+
+def test_duplicate_market_cap_rows_prefer_the_price_rows_market() -> None:
+    rows = _rising(5)
+    days = [r[0] for r in rows]
+    con = _con(rows)
+    con.execute("INSERT INTO daily_market_cap VALUES (?, 'A', 'KOSDAQ', 7)", [days[2]])
+    res = _run(con)
+    assert len(res) == 5
+    assert res[days[2]]["px_turnover_v2"] == rows[2][4] * rows[2][5]
+
+
+def test_halt_row_has_no_turnover_value() -> None:
+    rows = _rising(5)
+    rows[2] = (rows[2][0], 0, 0, 0, rows[2][4], 0)
+    res = _run(_con(rows))
+    assert res[rows[2][0]]["px_turnover_v2"] is None

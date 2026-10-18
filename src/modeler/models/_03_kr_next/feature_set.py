@@ -24,6 +24,12 @@ fixed, no new feature". Nothing here was chosen by looking at development-period
   KRX listed shares, replaces ``..._to_float_...``, whose DART denominator is stale for about two
   months after an event, empty in Q1/Q3 filings and has unit errors). The ``to_float`` columns
   stay in ``feat_flow_v2`` for the record but are not in ``MAIN_COLS``. Counts stay 43 / 30.
+* Turnover fix (17 §8.2, 16 §9.1; user-approved C2-9). Adjusted close x adjusted volume misses
+  the KRX trading value by more than 5% on about 26% of the rows of tickers with any adjustment
+  and carries future events into past rows, so ``px_turnover`` and ``px_turnover_ma20``
+  (legacy ``feat_price``) are replaced by ``px_turnover_v2`` and ``px_turnover_ma20_v2``
+  (``feat_price_v2``, KRX ``trading_value`` from ``daily_market_cap``); ``px_amihud_20d_v2``
+  uses the same denominator. Counts stay 43 / 30.
 * ``HYPOTHESIS_COLS`` — the columns the "avoid the tail" hypothesis (``14`` §6.3) is written on.
   All of them are inside ``MAIN_COLS``; the hypothesis adds no feature.
 
@@ -45,8 +51,8 @@ PRICE_COLS: tuple[str, ...] = (
     "px_vol_20d_v2",
     "px_vol_60d_v2",
     "px_high_low_range_20d_v2",
-    "px_turnover",
-    "px_turnover_ma20",
+    "px_turnover_v2",
+    "px_turnover_ma20_v2",
     "px_amihud_20d_v2",
     "px_gap_vs_ma20_v2",
     "px_dist_52w_high_v2",
@@ -105,14 +111,14 @@ MART_COLUMNS: dict[str, tuple[str, ...]] = {
         "px_vol_20d_v2",
         "px_vol_60d_v2",
         "px_high_low_range_20d_v2",
+        "px_turnover_v2",
+        "px_turnover_ma20_v2",
         "px_amihud_20d_v2",
         "px_gap_vs_ma20_v2",
         "px_dist_52w_high_v2",
     ),
     # unchanged definitions: no v2 column exists or is needed (17 §2)
     "feat_price": (
-        "px_turnover",
-        "px_turnover_ma20",
         "px_halt_ratio_20d",
         "px_reversal_5d",
         "px_maxret_20d",
@@ -168,8 +174,8 @@ SERVING_MAP: dict[str, tuple[str, ...] | None] = {
     "px_vol_20d": ("px_vol_20d_v2",),
     "px_vol_60d": ("px_vol_60d_v2",),
     "px_high_low_range_20d": ("px_high_low_range_20d_v2",),
-    "px_turnover": ("px_turnover",),
-    "px_turnover_ma20": ("px_turnover_ma20",),
+    "px_turnover": ("px_turnover_v2",),
+    "px_turnover_ma20": ("px_turnover_ma20_v2",),
     "px_amihud_20d": ("px_amihud_20d_v2",),
     "px_gap_vs_ma20": ("px_gap_vs_ma20_v2",),
     "px_dist_52w_high": ("px_dist_52w_high_v2",),
