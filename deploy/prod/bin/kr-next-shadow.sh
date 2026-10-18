@@ -7,13 +7,18 @@
 #                         records/        out_root of the daily records + records/ledger.jsonl
 #                         locks/          kr-next-shadow.lock (this script's own lock)
 #                         panels_in/D=<D>/panel.parquet   serving-mode panel of the signal day t
-#                                         (+ optional panel_manifest.json), written by the
-#                                         shadow prepare step (not built yet, see README)
+#                                         (+ panel_manifest.json), written by the shadow prepare
+#                                         step (modeler.models._03_kr_next.shadow_prepare)
 #   SERVING_ROOT        briefing serving root, read only for config/ops.json (python, kr_calendar,
 #                       prepared_root)  (default /home/whi/apps/market-briefing/serving)
 #   SHADOW_WAIT_UNTIL   HH:MM KST, stop waiting for the kr-prepare marker (default 09:20)
 #   SHADOW_POLL_SECONDS poll interval (default 30)
-#   SHADOW_PREPARE_CMD  optional command that builds panels_in/D=<D>/panel.parquet (gets D as $1)
+#   SHADOW_PREPARE_CMD  optional command that builds panels_in/D=<D>/panel.parquet (gets D as $1);
+#                       when unset the default is `python -m modeler.models._03_kr_next.shadow_prepare run`
+#                       (derived views of the day's raw snapshot + the serving panel of t), which uses
+#   SHADOW_RAW_LAKE     raw_postgres dir (default ${KR_STOCK_DATA_ROOT:-/home/whi/data/stock_data}/kr/raw/raw_postgres)
+#   SHADOW_RAW_SOURCE   raw source name (default sj2_remote)
+#   SHADOW_PREPARE_MEMORY_LIMIT  DuckDB memory_limit (default 2GB)   SHADOW_PREPARE_THREADS (default 4)
 #   BOOTSTRAP_PYTHON    reads ops.json only (default python3)
 #
 # It waits for the kr-prepare completion marker prepared/kr/score_date=*/prep_id=<D>/completion.json
@@ -122,10 +127,24 @@ log "kr-prepare marker: $marker"
 # ---- panel of the signal day ----------------------------------------------------------------
 panel_dir="$SHADOW_ROOT/panels_in/D=$D"
 panel="$panel_dir/panel.parquet"
-if [ ! -f "$panel" ] && [ -n "${SHADOW_PREPARE_CMD:-}" ]; then
-  log "building the panel: $SHADOW_PREPARE_CMD $D"
+if [ ! -f "$panel" ]; then
   mkdir -p "$panel_dir"
-  $SHADOW_PREPARE_CMD "$D" || fail 31 "SHADOW_PREPARE_CMD failed"
+  if [ -n "${SHADOW_PREPARE_CMD:-}" ]; then
+    log "building the panel: $SHADOW_PREPARE_CMD $D"
+    $SHADOW_PREPARE_CMD "$D" || fail 31 "SHADOW_PREPARE_CMD failed"
+  else
+    # default: shadow_prepare builds the derived views of the day's raw snapshot (once, under
+    # $SHADOW_ROOT/views/D-<D>) and the serving panel of t.  Write-once; an existing panel is
+    # never reached here.
+    raw_lake=${SHADOW_RAW_LAKE:-${KR_STOCK_DATA_ROOT:-/home/whi/data/stock_data}/kr/raw/raw_postgres}
+    mkdir -p "$SHADOW_ROOT/tmp"
+    log "building the panel: shadow_prepare run (raw lake $raw_lake, memory ${SHADOW_PREPARE_MEMORY_LIMIT:-2GB}, threads ${SHADOW_PREPARE_THREADS:-4})"
+    "$python" -m modeler.models._03_kr_next.shadow_prepare run --date "$D" \
+      --raw-lake "$raw_lake" --source "${SHADOW_RAW_SOURCE:-sj2_remote}" \
+      --out-root "$SHADOW_ROOT" --sessions "$calendar" \
+      --memory-limit "${SHADOW_PREPARE_MEMORY_LIMIT:-2GB}" \
+      --threads "${SHADOW_PREPARE_THREADS:-4}" || fail 31 "shadow_prepare failed"
+  fi
 fi
 [ -f "$panel" ] || fail 31 "panel missing: $panel (the shadow prepare step has not written it)"
 manifest_args=()

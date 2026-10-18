@@ -427,5 +427,5 @@ sj2 serving venv에는 `exchange_calendars`가 없습니다(2026-10-06 확인: p
 
 ### 아직 없는 것
 
-- **패널을 만드는 prepare 단계.** wrapper는 `shadow/panels_in/D=<D>/panel.parquet`(신호일 t의 서빙 모드 패널, `liq_notice_flag`·`liq_notice_rcept_no` 포함)이 있어야 하고, 없으면 `SHADOW_PREPARE_CMD`를 한 번 부른 뒤에도 없으면 31로 멈춥니다. `_dlr` 재무 마트와 뷰 등록을 하는 이 단계는 kr-next-data 쪽 패널 빌더와 같이 따로 만들어야 합니다.
+- **prepare 단계는 만들었습니다** (`shadow_prepare.py`·`views.py`, 브랜치 `kr-next-prepare`). wrapper는 `shadow/panels_in/D=<D>/panel.parquet`이 없고 `SHADOW_PREPARE_CMD`도 없으면 `shadow_prepare run`을 부릅니다. 이 명령은 D날 raw 스냅샷(`SHADOW_RAW_LAKE`, 기본 `$KR_STOCK_DATA_ROOT/kr/raw/raw_postgres`)에서 파생 뷰 넷(`views/D-<D>/`, 쓰기 한 번)을 만들고 신호일 t의 서빙 패널과 `panel_manifest.json`을 씁니다. DuckDB `memory_limit` 기본은 2GB, 스레드 4입니다(`SHADOW_PREPARE_MEMORY_LIMIT`·`SHADOW_PREPARE_THREADS`). 맥 실측(2025-07-30 패널, 4스레드): 한도 6GB는 최대 7.9GB, 4GB는 5.7GB, 2GB는 3.2GB를 쓰고 1GB는 메모리 부족으로 멈춥니다. Cronicle `memory_limit` 8GB 안에 들려고 2GB로 정했고 패널은 6GB와 같습니다. 뷰 빌드는 약 40초, 패널은 약 105초입니다. 뷰 디렉터리는 하루 약 0.3GB씩 늘어나므로 보관 기간은 따로 정해야 합니다.
 - 서버 시간·메모리 실측, release 반영, 첫 실행 점검은 사용자와 서버가 필요합니다. 동결(번들 태그) 전에 입력을 쌓지 않습니다.
