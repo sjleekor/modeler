@@ -76,8 +76,8 @@ def test_signal_not_ready_before_252_and_no_lookahead():
     full = L.risk_share_signal(a, b)
     first = 5 + 20 - 1  # 첫 σ_20
     assert full.n_obs[first] == 1
-    ready = np.where(full.n_obs >= 252)[0][0]
-    assert ready == first + 251
+    ready = 5 + 251  # 252번째 위험 몫 수익
+    assert full.n_obs[ready] < 252
     assert np.isnan(full.w_vm[ready - 1]) and not np.isnan(full.w_vm[ready])
     # 뒤를 바꿔도 앞의 값은 같다(미래를 보지 않는다)
     a2, b2 = a.copy(), b.copy()

@@ -23,7 +23,7 @@ from modeler.scores.etf_baseline import lines as L
 from modeler.scores.etf_baseline.ledger import simulate
 from modeler.scores.etf_baseline.metrics import compute_metrics, yearly_table
 
-DESIGN_COMMIT = "035db6c"
+DESIGN_COMMIT = "88fc81c"
 END_DATE = date(2026, 10, 8)
 FIRST_DECISION = {"main": date(2012, 7, 31), "u2": date(2020, 8, 31)}
 COSTS = {"low": 0.0005, "high": 0.0030}  # 편도 (왕복 10bp·60bp)
@@ -101,7 +101,7 @@ def check(p: Prepared) -> tuple[dict, list[str]]:
         s = pos[fd]
         win = np.arange(s + 1, p.end_idx + 1)
         null_win = int(np.isnan(p.cash_ret[win]).sum())
-        ready = bool(p.signal.n_obs[s] >= L.SIGMA_TARGET_MIN_OBS)
+        ready = bool(not np.isnan(p.signal.sigma_target[s]))
         rep[f"window_{u}"] = {
             "first_decision": fd,
             "perf_days": len(win),

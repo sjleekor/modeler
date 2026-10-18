@@ -28,7 +28,7 @@ class RiskShareSignal:
 def risk_share_signal(r_dom: np.ndarray, r_us: np.ndarray) -> RiskShareSignal:
     """σ_20(t): 위험 몫 일간 수익 직전 20거래일(t 포함) 표준편차(표본, ddof=1).
 
-    σ_target(t): 첫 σ_20부터 t까지 σ_20의 중앙값(확장창), 관측 252개 이상일 때만.
+    σ_target(t): 첫 σ_20부터 t까지 σ_20의 중앙값(확장창), 위험 몫 수익이 252개 이상일 때만.
     ``w_vm(t) = clip(σ_target/σ_20, 0.5, 1.0)``. t까지의 값만 쓴다(미래를 보지 않는다).
     """
     T = len(r_dom)
@@ -39,9 +39,10 @@ def risk_share_signal(r_dom: np.ndarray, r_us: np.ndarray) -> RiskShareSignal:
         if not np.isnan(w).any():
             sig[i] = w.std(ddof=1)
     n_obs = np.cumsum(~np.isnan(sig)).astype(int)
+    n_rs = np.cumsum(~np.isnan(rs)).astype(int)  # I7 정정(88fc81c): 준비는 수익 252개 기준
     tgt = np.full(T, np.nan)
     for i in range(T):
-        if n_obs[i] >= SIGMA_TARGET_MIN_OBS:
+        if n_rs[i] >= SIGMA_TARGET_MIN_OBS and n_obs[i] >= 1:
             tgt[i] = np.nanmedian(sig[: i + 1])
     with np.errstate(invalid="ignore", divide="ignore"):
         w_vm = np.clip(tgt / sig, VM_LO, VM_HI)
