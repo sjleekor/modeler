@@ -394,3 +394,38 @@ sj2 serving venv에는 `exchange_calendars`가 없습니다(2026-10-06 확인: p
 - bundle(동결 run 산출물과 달력 파일 두 개, 약 4.0MB)은 맥에서 `build-bundle`로 만들어 `--ms-bundle`로 넘깁니다. 같은 동결 run에서 만들면 바이트까지 같습니다(두 번 만들어 `bundle.json` sha256이 `6e274910…`으로 같았습니다. 2026-10-06 맥에서 만든 값은 `6e2749105f172acd01ea485b6efa8cf7dab211e7ad5ff68b10967c4ca12ac88b`입니다).
 - 이 변경은 `us_daily.py`를 바꾸지 않아 US native의 code hash에는 영향이 없습니다.
 
+
+## 다음 한국 종목 모델의 그림자 서빙 (초안 · 서버에는 반영하지 않음, Cronicle 이벤트 없음)
+
+브리핑 서빙과 따로 도는 경로입니다. 브리핑 release(`r20261016`)와 `release_build.JOBS`(모델 셋 고정)는 건드리지 않습니다.
+모델 하나를 동결 번들로 매일 채점해 덮어쓰지 않는 기록(`predictions.parquet`, `record.json`, 해시를 잇는 `ledger.jsonl`)만 남깁니다. 형식과 규칙은 `src/modeler/models/_03_kr_next/shadow.py` 머리말에 있습니다.
+
+| 조각 | 위치 |
+|---|---|
+| 채점·기록·장부 검증 | `modeler.models._03_kr_next.shadow` (`score`, `verify`) |
+| release 빌더 | `modeler.models._03_kr_next.shadow_release` (`manifest`, `build`, `verify`) |
+| wrapper 초안 | `deploy/prod/bin/kr-next-shadow.sh` |
+
+### release 만들기 (맥, 번들이 동결된 뒤)
+
+1. `python -m modeler.models._03_kr_next.shadow_release manifest --modeler-root <modeler>`가 닫힘 목록(`modeler`의 import 폐쇄)의 sha256 줄을 찍습니다. 사람이 검토해 `--source-manifest` 파일로 저장합니다.
+2. `python -m modeler.models._03_kr_next.shadow_release build --modeler-root <modeler> --source-manifest <검토 목록> --bundle <동결 번들> --output <새 디렉터리>`. 출력 경로가 있으면 멈추고, 목록에 없거나 sha256이 다른 파일이 있어도 멈춥니다. `code_sha256`은 상대 경로로 계산해 release를 옮겨도 같습니다(브리핑 release와 다른 점).
+3. 서버에서도 `... shadow_release verify --release <디렉터리>`로 같은 검사를 합니다. wrapper가 실행 때마다 부릅니다.
+
+### 제안하는 Cronicle 이벤트 (생성은 사용자 승인 뒤)
+
+| 항목 | 값 |
+|---|---|
+| 이름 | `market_briefing_kr_next_shadow` (제안) |
+| 실행 | 호스트 Python. 스크립트는 `exec <기존 wrapper와 같은 디렉터리>/kr-next-shadow.sh` 한 줄(중단 신호가 wrapper에 닿도록) |
+| `memory_limit` | 8GB를 명시합니다. 0이나 비우기는 전역 1GB로 돌아갑니다. 패널 빌드의 서버 메모리는 아직 재지 않았습니다(맥 실측은 아래) |
+| 시각 | 평일 07:30 시작. kr-prepare 완료 마커(`prepared/kr/score_date=*/prep_id=<D>/completion.json`)를 30초마다 파일로만 확인하고 09:20까지 기다립니다. 04:00대 DART chain과 kr-prepare(약 41분), 06:30 fallback(약 07:11까지), 09:30 select, 10:00 run과 겹치지 않습니다 |
+| 피할 시간 | 22:50에서 24:00 사이 상태 변경 금지, OpenDART 운영 잡 22:10·23:30·04:00대 |
+| 락 | 자기 락 `shadow/locks/kr-next-shadow.lock`만 잡습니다. `kr-prepare.lock`은 기다리거나 잡지 않습니다 |
+| 종료 코드 | 0 정상(또는 락 중·휴장), 3 15:00 뒤에 써서 `valid=false`로 남김, 30 마커 없음, 31 패널 없음, 10 설정·release 검증 실패, 12 달력 밖 |
+| 마감 | 쓰기 마감은 D 15:00 KST. 그 전에 쓴 기록만 유효합니다(G-2). 같은 날 재실행은 `D=<D>/attempt-<n>/`에 따로 쌓이고 첫 유효 시도만 셉니다 |
+
+### 아직 없는 것
+
+- **패널을 만드는 prepare 단계.** wrapper는 `shadow/panels_in/D=<D>/panel.parquet`(신호일 t의 서빙 모드 패널, `liq_notice_flag`·`liq_notice_rcept_no` 포함)이 있어야 하고, 없으면 `SHADOW_PREPARE_CMD`를 한 번 부른 뒤에도 없으면 31로 멈춥니다. `_dlr` 재무 마트와 뷰 등록을 하는 이 단계는 kr-next-data 쪽 패널 빌더와 같이 따로 만들어야 합니다.
+- 서버 시간·메모리 실측, release 반영, 첫 실행 점검은 사용자와 서버가 필요합니다. 동결(번들 태그) 전에 입력을 쌓지 않습니다.
