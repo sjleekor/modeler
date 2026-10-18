@@ -50,6 +50,20 @@ MART_VIEWS = {
     "feat_market_cap": "syn_mcap",
     "feat_filing_activity": "syn_filing",
 }
+RECEIPT_SCHEMA = {
+    "ticker": pl.String,
+    "rcept_no": pl.String,
+    "rcept_dt": pl.Date,
+    "report_nm": pl.String,
+}
+#: (ticker, rcept_no, rcept_dt, report_nm): 000030 gets a 정리매매 start on day 10, 000040 one on
+#: day 10 that a 보류 received on day 12 cancels
+RECEIPTS: list[tuple] = [
+    ("000030", "20200111000001", datetime.date(2020, 1, 11), "기타시장안내(정리매매 개시)"),
+    ("000040", "20200111000002", datetime.date(2020, 1, 11), "정리매매개시"),
+    ("000040", "20200113000003", datetime.date(2020, 1, 13), "기타시장안내(정리매매보류관련)"),
+    ("000010", "20200111000004", datetime.date(2020, 1, 11), "사업보고서"),
+]
 OTHER_VIEWS = ("daily_ohlcv", "daily_market_cap", "dim_price_quality_daily", "stock_master")
 
 
@@ -128,7 +142,12 @@ def _con() -> duckdb.DuckDBPyConnection:
         frame = keyed.select(
             "trade_date", "ticker", "market", *[pl.col("v").alias(c) for c in cols]
         )
+        for extra in ds.MART_EXTRA_COLS.get(mart, ()):
+            frame = frame.with_columns(pl.lit(None, dtype=pl.Boolean).alias(extra))
         con.register(view, frame)
+    con.register(
+        "dart_filing_receipt_raw", pl.DataFrame(RECEIPTS, schema=RECEIPT_SCHEMA, orient="row")
+    )
     return con
 
 
@@ -176,7 +195,13 @@ def test_feature_columns_and_unknown_set() -> None:
 @pytest.mark.parametrize("feature_set", ["main", "noflow"])
 def test_output_columns_are_exactly_the_set(feature_set: str) -> None:
     out = _panel(_con(), feature_set)
-    expected = [*ds.KEYS, *ds.feature_columns(feature_set), *ds.UNIVERSE_FLAG_COLS]
+    expected = [
+        *ds.KEYS,
+        *ds.feature_columns(feature_set),
+        *ds.UNIVERSE_FLAG_COLS,
+        "fin_ttm_conflict_v2",
+        *ds.LIQ_NOTICE_COLS,
+    ]
     assert out.columns == expected
     assert len(ds.feature_columns("main")) == 43 and len(ds.feature_columns("noflow")) == 30
 
@@ -370,6 +395,11 @@ def test_terminal_tail_rows_leave_the_universe() -> None:
                     con.execute(f"SELECT * FROM {view}").pl(),
                     keyed.select(
                         "trade_date", "ticker", "market", *[pl.col("v").alias(c) for c in cols]
+                    ).with_columns(
+                        [
+                            pl.lit(None, dtype=pl.Boolean).alias(x)
+                            for x in ds.MART_EXTRA_COLS.get(mart, ())
+                        ]
                     ),
                 ]
             ),
@@ -464,3 +494,51 @@ def test_keep_raw_label_adds_fwd_and_raw() -> None:
     fwd = 1.05**20 - 1
     assert r[lab["fwd"]][0] == pytest.approx(fwd)
     assert r[lab["raw"]][0] == pytest.approx(fwd - (321.0 / 301.0 - 1))
+
+
+# --- serving 정리매매 rule and R1 column wiring ----------------------------------------------
+
+
+@pytest.mark.parametrize("labels", [False, True])
+def test_liq_notice_columns_in_both_modes(labels: bool) -> None:
+    out = _panel(_con(), "noflow", include_labels=labels)
+    assert out.schema["liq_notice_flag"] == pl.Boolean
+    assert out["liq_notice_flag"].null_count() == 0
+    # the rule never drops rows: every kept row of the other tests is still there
+    assert out.height == _panel(_con(), "noflow", include_labels=labels)["ticker"].len()
+    # 000030: start received 2020-01-11 (day 10), flagged from that session for 15 sessions
+    assert _value(out, "000030", 9, "liq_notice_flag") is False
+    assert _value(out, "000030", 10, "liq_notice_flag") is True
+    assert _value(out, "000030", 10, "liq_notice_rcept_no") == "20200111000001"
+    assert _value(out, "000030", 12, "liq_notice_flag") is True
+    # 000040: the later hold clears it
+    assert _value(out, "000040", 11, "liq_notice_flag") is True
+    assert _value(out, "000040", 12, "liq_notice_flag") is False  # hold received on day 12
+    assert _value(out, "000040", 12, "liq_notice_rcept_no") is None
+    # a name without a notice is FALSE (not NULL) with a NULL receipt number
+    assert _value(out, "000010", 12, "liq_notice_flag") is False
+    assert _value(out, "000010", 12, "liq_notice_rcept_no") is None
+
+
+def test_liq_notice_is_same_day_not_lagged() -> None:
+    # day 10 is the first flagged session even though lagged columns read day 9
+    out = _panel(_con(), "noflow")
+    assert _value(out, "000030", 10, "liq_notice_flag") is True
+    assert _value(out, "000030", 10, "mcap_krx_log") == 9 + TNO["000030"] * 100
+
+
+def test_fin_ttm_conflict_column_is_carried_but_is_not_a_feature() -> None:
+    out = _panel(_con(), "noflow")
+    assert "fin_ttm_conflict_v2" in out.columns
+    assert "fin_ttm_conflict_v2" not in fs.NOFLOW_COLS
+    assert "fin_ttm_conflict_v2" not in fs.MAIN_COLS
+
+
+def test_view_sql_out_lists_the_inline_views() -> None:
+    parts: dict[str, str] = {}
+    ds.build_kr_next_panel_sql("noflow", view_sql_out=parts)
+    assert {"kn_feat_fin_v2", "kn_tail", "kn_uni", "kn_liq"} <= set(parts)
+    assert not any("label" in k for k in parts)  # serving: no label view
+    parts2: dict[str, str] = {}
+    ds.build_kr_next_panel_sql("noflow", include_labels=True, view_sql_out=parts2)
+    assert "kn_label" in parts2 and "kn_tail" not in parts2

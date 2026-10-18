@@ -92,7 +92,7 @@ TIE_PREFERENCE: tuple[tuple[str, float | int], ...] = (
 )
 DEFAULT_FEATURES: tuple[str, ...] = fs.NOFLOW_COLS
 #: R1 sensitivity (G-14): columns nulled where the flag column is TRUE
-R1_FLAG_COL = "ttm_includes_conflict"
+R1_FLAG_COL = "fin_ttm_conflict_v2"
 R1_NULL_COLS: tuple[str, ...] = ("fin_roa_v2", "fin_roe_v2")
 
 NullMask = tuple[str, Sequence[str]]

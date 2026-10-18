@@ -67,7 +67,7 @@ def make_panel(
         ).alias("y"),
     )
     if extra_flag:
-        df = df.with_columns((pl.Series(rng.random(rows) < 0.2)).alias("ttm_includes_conflict"))
+        df = df.with_columns((pl.Series(rng.random(rows) < 0.2)).alias("fin_ttm_conflict_v2"))
     return df.drop("raw", "raw2", "has")
 
 
@@ -280,18 +280,23 @@ def test_fit_final_uses_only_trainable_rows_from_start_date():
     assert rows["label_end_date"].null_count() == 0
 
 
+def test_r1_flag_column_is_the_panel_column_name():
+    assert tr.R1_FLAG_COL == "fin_ttm_conflict_v2"
+    assert tr.R1_NULL_COLS == ("fin_roa_v2", "fin_roe_v2")
+
+
 def test_null_mask_nulls_columns_where_flag_true_before_ranking():
     panel = make_panel(extra_flag=True)
-    prep = tr.prepare_panel(panel, SMALL, null_mask=("ttm_includes_conflict", ["f_a", "f_b"]))
-    flag = panel["ttm_includes_conflict"]
+    prep = tr.prepare_panel(panel, SMALL, null_mask=("fin_ttm_conflict_v2", ["f_a", "f_b"]))
+    flag = panel["fin_ttm_conflict_v2"]
     assert prep.filter(flag)["f_a"].null_count() == flag.sum()
     assert prep.filter(flag)["f_b"].null_count() == flag.sum()
     assert prep.filter(~flag)["f_c"].null_count() == panel.filter(~flag)["f_c"].null_count()
-    assert "ttm_includes_conflict" not in prep.columns
+    assert "fin_ttm_conflict_v2" not in prep.columns
     with pytest.raises(ValueError):
-        tr.prepare_panel(panel, SMALL, null_mask=("ttm_includes_conflict", ["zzz"]))
+        tr.prepare_panel(panel, SMALL, null_mask=("fin_ttm_conflict_v2", ["zzz"]))
     # the refit path accepts the mask too
-    tr.cv_point(panel, tr.GRID[0], SMALL, null_mask=("ttm_includes_conflict", ["f_a"]))
+    tr.cv_point(panel, tr.GRID[0], SMALL, null_mask=("fin_ttm_conflict_v2", ["f_a"]))
 
 
 def test_fit_ridge_and_cv_ridge():
