@@ -1,7 +1,7 @@
 """C stage 2 — the next KR model's feature versions, fixed as column lists in code.
 
 Plan: ``my/milestones/common/20261012_feature_explainer/17_c2_feature_set.md`` §2 (the 47-column
-serving map), §3 (the two sets), §4 (the missingness rule).
+serving map), §3 (the two sets), §4 (the missingness rule), §8.1 (C2-7 / C2-8, below).
 
 Same reason as ``models/_02_updown_prob/features.py``: a preregistered column list that can be
 edited between runs is not preregistered, so the lists live in code and the tests pin them.
@@ -15,6 +15,15 @@ fixed, no new feature". Nothing here was chosen by looking at development-period
   columns, the main model if the delisted-flow backfill (15 §10.6 F1/F2) slips (15 §10.4 E3).
 * ``COLUMN_MART`` — which mart each column comes from, so a builder registers exactly the
   views it needs.
+* Retro-adjustment fix (17 §8.1, 15 §10.7; user-approved C2-7 / C2-8). Naver close and volume are
+  rewritten for later splits, reverse splits and capital reductions, so dividing KRX raw net-buy
+  shares by them puts future events into past rows. Two groups therefore point at ``feat_flow_v2``
+  columns that use KRX raw values from ``daily_market_cap``:
+  ``flow_individual_netbuy_to_volume_{5,20}d_v2`` (raw volume denominator, replaces the legacy
+  ``feat_flow`` columns) and ``flow_{foreign,inst,indiv}_netbuy_to_listed_{5,20}d_v2`` (same-day
+  KRX listed shares, replaces ``..._to_float_...``, whose DART denominator is stale for about two
+  months after an event, empty in Q1/Q3 filings and has unit errors). The ``to_float`` columns
+  stay in ``feat_flow_v2`` for the record but are not in ``MAIN_COLS``. Counts stay 43 / 30.
 * ``HYPOTHESIS_COLS`` — the columns the "avoid the tail" hypothesis (``14`` §6.3) is written on.
   All of them are inside ``MAIN_COLS``; the hypothesis adds no feature.
 
@@ -47,19 +56,19 @@ PRICE_COLS: tuple[str, ...] = (
     "px_idio_vol_60d",
 )
 FLOW_COLS: tuple[str, ...] = (
-    "flow_foreign_netbuy_to_float_5d_v2",
-    "flow_foreign_netbuy_to_float_20d_v2",
-    "flow_inst_netbuy_to_float_5d_v2",
-    "flow_inst_netbuy_to_float_20d_v2",
-    "flow_indiv_netbuy_to_float_5d_v2",
-    "flow_indiv_netbuy_to_float_20d_v2",
+    "flow_foreign_netbuy_to_listed_5d_v2",
+    "flow_foreign_netbuy_to_listed_20d_v2",
+    "flow_inst_netbuy_to_listed_5d_v2",
+    "flow_inst_netbuy_to_listed_20d_v2",
+    "flow_indiv_netbuy_to_listed_5d_v2",
+    "flow_indiv_netbuy_to_listed_20d_v2",
     "flow_foreign_netbuy_z_20d_v2",
     "flow_inst_netbuy_z_20d_v2",
     "flow_short_avg_price_v2",
     "flow_short_selling_volume_v2",
     "flow_short_selling_value_v2",
-    "flow_individual_netbuy_to_volume_5d",
-    "flow_individual_netbuy_to_volume_20d",
+    "flow_individual_netbuy_to_volume_5d_v2",
+    "flow_individual_netbuy_to_volume_20d_v2",
 )
 FIN_COLS: tuple[str, ...] = (
     "fin_roa_v2",
@@ -109,22 +118,21 @@ MART_COLUMNS: dict[str, tuple[str, ...]] = {
         "px_maxret_20d",
         "px_idio_vol_60d",
     ),
+    # to_listed / to_volume read KRX raw values from daily_market_cap (17 §8.1)
     "feat_flow_v2": (
-        "flow_foreign_netbuy_to_float_5d_v2",
-        "flow_foreign_netbuy_to_float_20d_v2",
-        "flow_inst_netbuy_to_float_5d_v2",
-        "flow_inst_netbuy_to_float_20d_v2",
-        "flow_indiv_netbuy_to_float_5d_v2",
-        "flow_indiv_netbuy_to_float_20d_v2",
+        "flow_foreign_netbuy_to_listed_5d_v2",
+        "flow_foreign_netbuy_to_listed_20d_v2",
+        "flow_inst_netbuy_to_listed_5d_v2",
+        "flow_inst_netbuy_to_listed_20d_v2",
+        "flow_indiv_netbuy_to_listed_5d_v2",
+        "flow_indiv_netbuy_to_listed_20d_v2",
         "flow_foreign_netbuy_z_20d_v2",
         "flow_inst_netbuy_z_20d_v2",
         "flow_short_avg_price_v2",
         "flow_short_selling_volume_v2",
         "flow_short_selling_value_v2",
-    ),
-    "feat_flow": (
-        "flow_individual_netbuy_to_volume_5d",
-        "flow_individual_netbuy_to_volume_20d",
+        "flow_individual_netbuy_to_volume_5d_v2",
+        "flow_individual_netbuy_to_volume_20d_v2",
     ),
     "feat_fin_v2": (
         "fin_roa_v2",
@@ -170,13 +178,13 @@ SERVING_MAP: dict[str, tuple[str, ...] | None] = {
     "px_reversal_5d": ("px_reversal_5d",),
     "px_maxret_20d": ("px_maxret_20d",),
     "px_idio_vol_60d": ("px_idio_vol_60d",),
-    # flow
-    "flow_foreign_netbuy_sum_5d": ("flow_foreign_netbuy_to_float_5d_v2",),
-    "flow_foreign_netbuy_sum_20d": ("flow_foreign_netbuy_to_float_20d_v2",),
-    "flow_inst_netbuy_sum_5d": ("flow_inst_netbuy_to_float_5d_v2",),
-    "flow_inst_netbuy_sum_20d": ("flow_inst_netbuy_to_float_20d_v2",),
-    "flow_indiv_netbuy_sum_5d": ("flow_indiv_netbuy_to_float_5d_v2",),
-    "flow_indiv_netbuy_sum_20d": ("flow_indiv_netbuy_to_float_20d_v2",),
+    # flow (net-buy sums and individual-to-volume use KRX raw values, 17 §8.1)
+    "flow_foreign_netbuy_sum_5d": ("flow_foreign_netbuy_to_listed_5d_v2",),
+    "flow_foreign_netbuy_sum_20d": ("flow_foreign_netbuy_to_listed_20d_v2",),
+    "flow_inst_netbuy_sum_5d": ("flow_inst_netbuy_to_listed_5d_v2",),
+    "flow_inst_netbuy_sum_20d": ("flow_inst_netbuy_to_listed_20d_v2",),
+    "flow_indiv_netbuy_sum_5d": ("flow_indiv_netbuy_to_listed_5d_v2",),
+    "flow_indiv_netbuy_sum_20d": ("flow_indiv_netbuy_to_listed_20d_v2",),
     "flow_foreign_holding_chg_5d": None,
     "flow_foreign_holding_chg_20d": None,
     "flow_foreign_netbuy_z_20d": ("flow_foreign_netbuy_z_20d_v2",),
@@ -184,8 +192,8 @@ SERVING_MAP: dict[str, tuple[str, ...] | None] = {
     "flow_short_avg_price": ("flow_short_avg_price_v2",),
     "flow_short_selling_volume": ("flow_short_selling_volume_v2",),
     "flow_short_selling_value": ("flow_short_selling_value_v2",),
-    "flow_individual_netbuy_to_volume_5d": ("flow_individual_netbuy_to_volume_5d",),
-    "flow_individual_netbuy_to_volume_20d": ("flow_individual_netbuy_to_volume_20d",),
+    "flow_individual_netbuy_to_volume_5d": ("flow_individual_netbuy_to_volume_5d_v2",),
+    "flow_individual_netbuy_to_volume_20d": ("flow_individual_netbuy_to_volume_20d_v2",),
     # financials and size
     "fin_roa": ("fin_roa_v2",),
     "fin_roe": ("fin_roe_v2",),

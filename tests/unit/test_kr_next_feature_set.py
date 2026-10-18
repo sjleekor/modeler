@@ -2,7 +2,9 @@
 
 The lists are a preregistration, so these tests are what stops one from drifting: the counts,
 the containment of the no-flow set, the serving map covering exactly the 47 serving columns,
-and every column being produced by the mart the table says it comes from.
+and every column being produced by the mart the table says it comes from. The flow group reads
+KRX raw values (17 §8.1: ``to_listed`` and ``to_volume_v2``), never the retro-adjusted Naver
+volume or the stale DART float.
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ from modeler.etl.features.filing_activity import (
     build_filing_activity_sql,
 )
 from modeler.etl.features.fin_v2 import FIN_V2_TABLE, build_fin_v2_sql
-from modeler.etl.features.flow import FLOW_TABLE, build_flow_sql
 from modeler.etl.features.flow_v2 import FLOW_V2_COLUMNS, FLOW_V2_TABLE
 from modeler.etl.features.market_cap import MARKET_CAP_TABLE, build_market_cap_sql
 from modeler.etl.features.price import PRICE_TABLE, build_price_sql
@@ -55,6 +56,37 @@ def test_noflow_is_main_without_exactly_the_flow_columns() -> None:
     assert not any(c.startswith("flow_") for c in fs.NOFLOW_COLS)
 
 
+def test_flow_group_is_pinned_to_krx_raw_denominators() -> None:
+    """17 §8.1: C2-7 and C2-8 swapped the denominators; a drift back would reintroduce the leak."""
+    assert fs.FLOW_COLS == (
+        "flow_foreign_netbuy_to_listed_5d_v2",
+        "flow_foreign_netbuy_to_listed_20d_v2",
+        "flow_inst_netbuy_to_listed_5d_v2",
+        "flow_inst_netbuy_to_listed_20d_v2",
+        "flow_indiv_netbuy_to_listed_5d_v2",
+        "flow_indiv_netbuy_to_listed_20d_v2",
+        "flow_foreign_netbuy_z_20d_v2",
+        "flow_inst_netbuy_z_20d_v2",
+        "flow_short_avg_price_v2",
+        "flow_short_selling_volume_v2",
+        "flow_short_selling_value_v2",
+        "flow_individual_netbuy_to_volume_5d_v2",
+        "flow_individual_netbuy_to_volume_20d_v2",
+    )
+    assert not any("_to_float_" in c for c in fs.MAIN_COLS)
+    # the legacy feat_flow volume ratios (Naver adjusted denominator) are gone from the set
+    for legacy in ("flow_individual_netbuy_to_volume_5d", "flow_individual_netbuy_to_volume_20d"):
+        assert legacy not in fs.MAIN_COLS
+        assert legacy not in fs.COLUMN_MART
+
+
+def test_to_float_columns_stay_in_the_mart_for_the_record_only() -> None:
+    record_only = [c for c in FLOW_V2_COLUMNS if "_to_float_" in c]
+    assert len(record_only) == 6
+    assert not set(record_only) & set(fs.MAIN_COLS)
+    assert not set(record_only) & set(fs.COLUMN_MART)
+
+
 def test_group_prefixes() -> None:
     assert all(c.startswith("px_") for c in fs.PRICE_COLS)
     assert all(c.startswith(("fin_", "mcap_")) for c in fs.FIN_COLS)
@@ -92,6 +124,17 @@ def test_dropped_columns_are_the_none_entries_and_not_in_main() -> None:
     assert all(fs.DROPPED.values())
 
 
+def test_serving_map_flow_replacements_follow_17_section_8_1() -> None:
+    m = fs.SERVING_MAP
+    for who in ("foreign", "inst", "indiv"):
+        for w in ("5d", "20d"):
+            assert m[f"flow_{who}_netbuy_sum_{w}"] == (f"flow_{who}_netbuy_to_listed_{w}_v2",)
+    for w in ("5d", "20d"):
+        assert m[f"flow_individual_netbuy_to_volume_{w}"] == (
+            f"flow_individual_netbuy_to_volume_{w}_v2",
+        )
+
+
 def test_serving_blocked_columns_never_enter() -> None:
     assert not set(EXCLUDED_FEATURES) & set(fs.SERVING_MAP)
     assert not set(EXCLUDED_FEATURES) & set(fs.MAIN_COLS)
@@ -116,7 +159,6 @@ def test_mart_names_are_the_real_table_names() -> None:
         PRICE_V2_TABLE,
         PRICE_TABLE,
         FLOW_V2_TABLE,
-        FLOW_TABLE,
         FIN_V2_TABLE,
         MARKET_CAP_TABLE,
         FILING_ACTIVITY_TABLE,
@@ -140,7 +182,6 @@ def test_fin_v2_columns_are_selected_by_the_builder() -> None:
 def test_legacy_mart_columns_are_selected_by_their_builders() -> None:
     builders = {
         PRICE_TABLE: build_price_sql("daily_ohlcv"),
-        FLOW_TABLE: build_flow_sql(),
         MARKET_CAP_TABLE: build_market_cap_sql(),
         FILING_ACTIVITY_TABLE: build_filing_activity_sql(),
     }
