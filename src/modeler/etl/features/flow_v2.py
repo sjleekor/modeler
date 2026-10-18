@@ -9,6 +9,8 @@ Columns (all keyed ``(trade_date, ticker, market)``):
 * ``flow_{foreign,inst,indiv}_netbuy_to_float_20d_v2`` — 20-session net-buy share sum over
   the same-day PIT float shares (``dim_stock_pit_daily.float_shares_pit``). NULL unless
   all 20 window rows carry a net-buy value.
+* ``flow_{foreign,inst,indiv}_netbuy_to_float_5d_v2`` — the same ratio over a 5-row window
+  (``COUNT = 5``), NULL unless all 5 window rows carry a net-buy value.
 * ``flow_{foreign,inst}_netbuy_z_20d_v2`` — ``flow.py``'s z-score, NULL unless the window
   holds 20 non-NULL observations (the original emits a value from a 2-row window).
 * ``flow_short_{avg_price,selling_volume,selling_value}_v2`` — ``flow.py``'s values, NULL
@@ -35,6 +37,9 @@ FLOW_V2_COLUMNS: tuple[str, ...] = (
     "flow_short_avg_price_v2",
     "flow_short_selling_volume_v2",
     "flow_short_selling_value_v2",
+    "flow_foreign_netbuy_to_float_5d_v2",
+    "flow_inst_netbuy_to_float_5d_v2",
+    "flow_indiv_netbuy_to_float_5d_v2",
 )
 
 assert set(METRIC_CODES) >= {
@@ -46,9 +51,9 @@ assert set(METRIC_CODES) >= {
 }
 
 
-def _to_float(raw: str, name: str) -> str:
-    return f"""CASE WHEN COUNT({raw}) OVER w20 = 20
-                     THEN SUM({raw}) OVER w20 / NULLIF(float_shares_pit, 0) END
+def _to_float(raw: str, name: str, window: str = "w20", rows: int = 20) -> str:
+    return f"""CASE WHEN COUNT({raw}) OVER {window} = {rows}
+                     THEN SUM({raw}) OVER {window} / NULLIF(float_shares_pit, 0) END
                 AS {name}"""
 
 
@@ -103,11 +108,18 @@ def build_flow_v2_sql(
             CASE WHEN short_regime_v2 = 'allowed' THEN short_selling_volume END
                 AS {FLOW_V2_COLUMNS[6]},
             CASE WHEN short_regime_v2 = 'allowed' THEN short_selling_value END
-                AS {FLOW_V2_COLUMNS[7]}
+                AS {FLOW_V2_COLUMNS[7]},
+            {_to_float("foreign_net_buy_volume", FLOW_V2_COLUMNS[8], "w5", 5)},
+            {_to_float("institution_net_buy_volume", FLOW_V2_COLUMNS[9], "w5", 5)},
+            {_to_float("individual_net_buy_volume", FLOW_V2_COLUMNS[10], "w5", 5)}
         FROM sessioned
         WINDOW w20 AS (
             PARTITION BY ticker, market ORDER BY trade_date
             ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+        ),
+        w5 AS (
+            PARTITION BY ticker, market ORDER BY trade_date
+            ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
         )
     """
 

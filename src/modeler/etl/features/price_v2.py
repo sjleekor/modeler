@@ -17,7 +17,9 @@ Unified rules:
 CA mask windows: price-level windows (MA20, 52w high, range) mask their own rows;
 return windows mask ``n`` rows back to ``t`` (``ROWS n PRECEDING``), covering both
 endpoints; ``px_ret_60_20_v2`` masks ``t-60..t`` as the plan states; rolling
-statistics of daily returns (vol, amihud, limit-hit) mask their ``n`` rows.
+statistics of daily returns (vol, amihud, limit-hit) mask their ``n`` rows;
+``px_ret_1d_v2`` (the single-day log return itself) is masked only on a ``ca_event``
+day ``t`` — the corporate-action jump — and carries no window.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ PRICE_V2_COLUMNS = (
     "px_dist_52w_high_v2",
     "px_amihud_20d_v2",
     "px_limit_hit_ratio_20d_v2",
+    "px_ret_1d_v2",
 )
 
 
@@ -86,6 +89,7 @@ def build_price_v2_sql(
         raw AS (
             SELECT
                 trade_date, ticker, market,
+                CASE WHEN ca_event THEN NULL ELSE log_ret END AS r_ret1,
                 LN(LAG(close_d, 20) OVER w / NULLIF(LAG(close_d, 60) OVER w, 0)) AS r_60_20,
                 SUM(CASE WHEN ca_event THEN 1 ELSE 0 END) OVER w60 AS ca_60,
                 CASE WHEN COUNT(high_d) OVER w19 = 20 AND MIN(low_d) OVER w19 > 0
@@ -134,7 +138,8 @@ def build_price_v2_sql(
             CASE WHEN r.ca_19 = 0 THEN r.r_gap END AS px_gap_vs_ma20_v2,
             CASE WHEN r.ca_251 = 0 THEN r.r_dist END AS px_dist_52w_high_v2,
             CASE WHEN r.ca_19 = 0 THEN r.r_amihud END AS px_amihud_20d_v2,
-            CASE WHEN r.ca_19 = 0 THEN r.r_limit END AS px_limit_hit_ratio_20d_v2
+            CASE WHEN r.ca_19 = 0 THEN r.r_limit END AS px_limit_hit_ratio_20d_v2,
+            r.r_ret1 AS px_ret_1d_v2
         FROM {price_view} p
         LEFT JOIN raw r USING (trade_date, ticker, market)
     """

@@ -94,6 +94,45 @@ def test_netbuy_to_float_is_null_when_any_window_row_is_missing() -> None:
     assert s[29] is None
 
 
+def test_netbuy_to_float_5d_needs_a_full_window() -> None:
+    days = _days(8)
+    vals = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    rows = [
+        (
+            d,
+            {
+                "foreign_net_buy_volume": v,
+                "institution_net_buy_volume": v * 2,
+                "individual_net_buy_volume": -v * 3,
+            },
+        )
+        for d, v in zip(days, vals, strict=True)
+    ]
+    con = _con(rows)
+    for col, scale in (
+        ("flow_foreign_netbuy_to_float_5d_v2", 1),
+        ("flow_inst_netbuy_to_float_5d_v2", 2),
+        ("flow_indiv_netbuy_to_float_5d_v2", -3),
+    ):
+        s = _series(con, col)
+        assert all(v is None for v in s[:4])  # fewer than 5 rows
+        assert s[4] == pytest.approx(scale * sum(vals[0:5]) / FLOAT)  # rows 0..4
+        assert s[7] == pytest.approx(scale * sum(vals[3:8]) / FLOAT)  # rows 3..7
+
+
+def test_netbuy_to_float_5d_is_null_when_any_window_row_is_missing() -> None:
+    days = _days(12)
+    rows = [
+        (d, {"foreign_net_buy_volume": None if i == 6 else 1.0, "institution_net_buy_volume": 1.0})
+        for i, d in enumerate(days)
+    ]
+    s = _series(_con(rows), "flow_foreign_netbuy_to_float_5d_v2")
+    assert s[4] == pytest.approx(5 / FLOAT)  # rows 0..4, full
+    assert s[5] == pytest.approx(5 / FLOAT)  # rows 1..5, full
+    assert all(v is None for v in s[6:11])  # windows ending 6..10 contain row 6
+    assert s[11] == pytest.approx(5 / FLOAT)  # rows 7..11, full again
+
+
 def test_z_is_null_until_twenty_observations() -> None:
     days = _days(22)
     vals = [float((i * 7) % 11) for i in range(22)]

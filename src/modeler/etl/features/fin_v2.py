@@ -27,6 +27,17 @@ Two more columns, from the same selected basis and gate:
   missing or ``BASE_OK`` fails), so the tail can include the capital-impaired firms that
   ``fin_roe_v2`` drops.
 
+Six more ratios replace the remaining legacy ``fin_pit.py:145-165`` ones (same meaning, vintage
+path, same-report rule): ``fin_operating_margin_v2`` (TTM operating income / TTM revenue,
+revenue > 0), ``fin_debt_to_equity_v2`` (total liabilities / equity, equity > 0),
+``fin_equity_ratio_v2`` (equity / assets, assets > 0, negative equity gives a negative ratio),
+``fin_ocf_to_assets_v2`` (TTM operating cash flow / assets), ``fin_cash_ratio_v2`` (cash and
+equivalents / assets), ``fin_asset_turnover_v2`` (TTM revenue / assets). Each is NULL unless
+numerator and denominator carry the same ``rcept_no`` and ``BASE_OK`` holds. Flow vs. instant
+is already settled by ``fin_vintage`` (``daily_value`` is the TTM value for flow metrics and
+the quarter-end value for balance-sheet metrics), so the ratios use ``daily_value`` as is and
+a flow/flow ratio has both sides TTM.
+
 The vintage mart only holds firms still in ``stock_master``; the next preregistration passes
 ``vintage_view="fin_quarterly_metric_vintage_dl"`` (``etl/marts/metric_vintages_delisted.py``)
 so delisted firms are covered too. The join is on ``ticker`` only, so nothing else changes.
@@ -52,7 +63,26 @@ from modeler.etl.mart import materialize, register_mart_view
 
 FIN_V2_TABLE = "feat_fin_v2"
 
-_METRICS = ("total_equity", "controlling_net_income", "net_income", "total_assets")
+_METRICS = (
+    "total_equity",
+    "controlling_net_income",
+    "net_income",
+    "total_assets",
+    "total_liabilities",
+    "operating_income",
+    "revenue",
+    "operating_cash_flow",
+    "cash_and_cash_equivalents",
+)
+
+
+def _selected(metric: str, alias: str) -> str:
+    """``metric``'s value and ``rcept_no`` under the ticker-date's one selected basis."""
+    return f"""CASE WHEN v_net_income_cfs IS NOT NULL THEN v_{metric}_cfs
+                 ELSE v_{metric}_ofs END AS {alias},
+            CASE WHEN v_net_income_cfs IS NOT NULL THEN r_{metric}_cfs
+                 ELSE r_{metric}_ofs END AS {alias}_rcept"""
+
 
 _INTERVAL_SELECT = "ticker, metric_code, fs_basis, daily_value, value_lag_4q,"
 
@@ -131,7 +161,14 @@ def build_fin_v2_sql(
                  ELSE CASE WHEN r_controlling_net_income_ofs = r_total_assets_ofs
                            THEN v_controlling_net_income_ofs
                            WHEN r_net_income_ofs = r_total_assets_ofs THEN v_net_income_ofs END
-            END AS earnings_for_assets
+            END AS earnings_for_assets,
+            {_selected("total_liabilities", "liabilities")},
+            {_selected("operating_income", "op_income")},
+            {_selected("revenue", "revenue")},
+            {_selected("operating_cash_flow", "ocf")},
+            {_selected("cash_and_cash_equivalents", "cash")},
+            CASE WHEN v_net_income_cfs IS NOT NULL THEN r_total_assets_cfs
+                 ELSE r_total_assets_ofs END AS assets_rcept
         FROM joined
     ),
     scored AS (
@@ -144,7 +181,25 @@ def build_fin_v2_sql(
              THEN earnings / equity END AS fin_roe_v2,
         CASE WHEN base_ok AND assets > 0 AND earnings_for_assets IS NOT NULL
              THEN earnings_for_assets / assets END AS fin_roa_v2,
-        CASE WHEN base_ok AND equity IS NOT NULL THEN equity <= 0 END AS fin_capital_impaired_v2
+        CASE WHEN base_ok AND equity IS NOT NULL THEN equity <= 0 END AS fin_capital_impaired_v2,
+        CASE WHEN base_ok AND revenue > 0 AND op_income IS NOT NULL
+                  AND op_income_rcept = revenue_rcept
+             THEN op_income / revenue END AS fin_operating_margin_v2,
+        CASE WHEN base_ok AND equity > 0 AND liabilities IS NOT NULL
+                  AND liabilities_rcept = equity_rcept
+             THEN liabilities / equity END AS fin_debt_to_equity_v2,
+        CASE WHEN base_ok AND assets > 0 AND equity IS NOT NULL
+                  AND equity_rcept = assets_rcept
+             THEN equity / assets END AS fin_equity_ratio_v2,
+        CASE WHEN base_ok AND assets > 0 AND ocf IS NOT NULL
+                  AND ocf_rcept = assets_rcept
+             THEN ocf / assets END AS fin_ocf_to_assets_v2,
+        CASE WHEN base_ok AND assets > 0 AND cash IS NOT NULL
+                  AND cash_rcept = assets_rcept
+             THEN cash / assets END AS fin_cash_ratio_v2,
+        CASE WHEN base_ok AND assets > 0 AND revenue IS NOT NULL
+                  AND revenue_rcept = assets_rcept
+             THEN revenue / assets END AS fin_asset_turnover_v2
     FROM scored
     """
 

@@ -171,6 +171,11 @@ def test_both_join_plans_return_the_same_rows() -> None:
                 _row(t, "controlling_net_income", ni - 1, rcept, seq=seq, filed=filed),
                 _row(t, "total_equity", eq, rcept, seq=seq, filed=filed),
                 _row(t, "total_assets", 500.0 + seq, rcept, seq=seq, filed=filed),
+                _row(t, "total_liabilities", 300.0 + seq, rcept, seq=seq, filed=filed),
+                _row(t, "operating_income", 5.0 * seq, rcept, seq=seq, filed=filed),
+                _row(t, "revenue", 100.0 * seq, rcept, seq=seq, filed=filed),
+                _row(t, "operating_cash_flow", 7.0 * seq, rcept, seq=seq, filed=filed),
+                _row(t, "cash_and_cash_equivalents", 20.0 * seq, rcept, seq=seq, filed=filed),
             ]
     con = _con(rows, ["A", "B"])
     for day in (d(2020, 3, 1), d(2020, 4, 1), d(2020, 9, 1)):
@@ -192,6 +197,7 @@ def test_both_join_plans_return_the_same_rows() -> None:
     assert any(r[3] is not None for r in coalesce) and any(r[3] is None for r in coalesce)
     assert any(r[4] is not None for r in coalesce)
     assert {r[5] for r in coalesce} >= {True, False}
+    assert all(any(r[i] is not None for r in coalesce) for i in range(6, 12))
 
 
 def _cols(con, *cols: str, plan: str | None = None) -> dict[str, tuple]:
@@ -277,7 +283,92 @@ def test_new_columns_follow_the_planned_output() -> None:
         "fin_roe_v2",
         "fin_roa_v2",
         "fin_capital_impaired_v2",
+        *_RATIOS,
     ]
+
+
+def _full(ticker: str, rcepts: dict[str, str], values: dict[str, float]) -> list[tuple]:
+    """One vintage row per metric in ``values``; ``rcepts`` picks each metric's filing."""
+    # net_income decides the basis (CFS), so every ticker carries one
+    rows = [_row(ticker, "net_income", 1.0, "R1")]
+    return rows + [_row(ticker, m, v, rcepts.get(m, "R1")) for m, v in values.items()]
+
+
+_BASE_VALUES = {
+    "total_equity": 200.0,
+    "total_assets": 400.0,
+    "total_liabilities": 200.0,
+    "operating_income": 50.0,
+    "revenue": 500.0,
+    "operating_cash_flow": 40.0,
+    "cash_and_cash_equivalents": 80.0,
+}
+
+_RATIOS = {
+    "fin_operating_margin_v2": (("operating_income", "revenue"), 0.1),
+    "fin_debt_to_equity_v2": (("total_liabilities", "total_equity"), 1.0),
+    "fin_equity_ratio_v2": (("total_equity", "total_assets"), 0.5),
+    "fin_ocf_to_assets_v2": (("operating_cash_flow", "total_assets"), 0.1),
+    "fin_cash_ratio_v2": (("cash_and_cash_equivalents", "total_assets"), 0.2),
+    "fin_asset_turnover_v2": (("revenue", "total_assets"), 1.25),
+}
+
+
+@pytest.mark.parametrize("column", list(_RATIOS))
+def test_each_new_ratio_needs_the_same_report(column: str) -> None:
+    (num, den), expected = _RATIOS[column]
+    rows = _full("OK", {}, _BASE_VALUES)
+    # MISS: the numerator metric comes from another filing than the denominator
+    rows += _full("MISS", {num: "R0"}, _BASE_VALUES)
+    out = _cols(_con(rows, ["OK", "MISS"]), column)
+    assert out["OK"][0] == pytest.approx(expected)
+    assert out["MISS"][0] is None
+
+
+@pytest.mark.parametrize(
+    ("column", "den", "bad"),
+    [
+        ("fin_operating_margin_v2", "revenue", 0.0),
+        ("fin_operating_margin_v2", "revenue", -10.0),
+        ("fin_debt_to_equity_v2", "total_equity", 0.0),
+        ("fin_debt_to_equity_v2", "total_equity", -10.0),
+        ("fin_equity_ratio_v2", "total_assets", 0.0),
+        ("fin_ocf_to_assets_v2", "total_assets", -1.0),
+        ("fin_cash_ratio_v2", "total_assets", 0.0),
+        ("fin_asset_turnover_v2", "total_assets", 0.0),
+    ],
+)
+def test_new_ratios_are_null_for_a_non_positive_denominator(column, den, bad) -> None:
+    values = {**_BASE_VALUES, den: bad}
+    out = _cols(_con(_full("A", {}, values), ["A"]), column)
+    assert out["A"][0] is None
+
+
+def test_equity_ratio_is_negative_for_negative_equity() -> None:
+    values = {**_BASE_VALUES, "total_equity": -100.0}
+    rows = _full("A", {}, values)
+    out = _cols(_con(rows, ["A"]), "fin_equity_ratio_v2", "fin_debt_to_equity_v2")
+    assert out["A"] == (pytest.approx(-0.25), None)
+
+
+def test_new_ratios_follow_base_ok_and_missing_metrics() -> None:
+    rows = _full("A", {}, _BASE_VALUES) + _full("B", {}, {"total_assets": 400.0})
+    con = _con(rows, ["A", "B"])
+    con.execute("UPDATE dim_price_quality_daily SET is_halted = TRUE WHERE ticker = 'A'")
+    cols = tuple(_RATIOS)
+    out = _cols(con, *cols)
+    assert out["A"] == (None,) * len(cols)
+    assert out["B"] == (None,) * len(cols)
+
+
+def test_existing_columns_are_unchanged_by_the_new_ratios() -> None:
+    rows = [
+        _row("A", "controlling_net_income", 20.0, "R1"),
+        _row("A", "net_income", 30.0, "R1"),
+        *_full("A", {}, _BASE_VALUES)[1:],
+    ]
+    out = _cols(_con(rows, ["A"]), "fin_roe_v2", "fin_roa_v2", "fin_capital_impaired_v2")
+    assert out["A"] == (pytest.approx(0.1), pytest.approx(0.05), False)
 
 
 def test_fin_scan_sql_text_is_unchanged() -> None:
