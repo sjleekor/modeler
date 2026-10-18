@@ -121,7 +121,7 @@ def check(p: Prepared) -> tuple[dict, list[str]]:
 
 
 def _git(*args: str) -> str:
-    wt = Path(modeler.__file__).resolve().parents[2].parent
+    wt = Path(modeler.__file__).resolve().parents[2]
     return subprocess.run(
         ["git", "-C", str(wt), *args], capture_output=True, text=True
     ).stdout.strip()
