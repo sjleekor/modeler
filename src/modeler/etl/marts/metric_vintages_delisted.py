@@ -33,6 +33,12 @@ The marts are new -- ``stock_metric_vintage_fact_dl`` and
 ``fin_quarterly_metric_vintage_dl`` -- so no frozen mart or cache key is reused or
 overwritten. ``feat_fin_v2`` takes ``vintage_view="fin_quarterly_metric_vintage_dl"``; the
 join there is on ``ticker`` only, so it needs no other change.
+
+``fin_quarterly_metric_vintage_dlr`` (18 §8.1, rule R1) is the ``_dl`` quarterly mart with
+one more change: a direct_interim Q2/Q3 value whose filing's quarterly and cumulative values
+disagree keeps the reported quarterly value instead of NULL (flag still TRUE), plus a
+``ttm_includes_conflict`` column. It is built by a guarded text replacement of the original
+builder's output (:func:`build_fin_quarterly_metric_vintage_dlr_sql`).
 """
 
 from __future__ import annotations
@@ -51,6 +57,7 @@ from modeler.etl.marts import metric_vintages as _mv
 
 SMVF_DL_TABLE = "stock_metric_vintage_fact_dl"
 FQMV_DL_TABLE = "fin_quarterly_metric_vintage_dl"
+FQMV_DLR_TABLE = "fin_quarterly_metric_vintage_dlr"
 
 SEMANTICS_V1 = _mv.SEMANTICS_V1
 SEMANTICS_V2 = _mv.SEMANTICS_V2
@@ -308,3 +315,116 @@ def materialize_fin_quarterly_metric_vintage_dl(
     )
     materialize(con, config, FQMV_DL_TABLE, sql, force=force, plan=plan)
     return register_mart_view(con, config, FQMV_DL_TABLE)
+
+
+# --- R1: keep the reported quarterly value on a source conflict (18 §8.1) ---------------------
+
+_R1_VARIANT_METADATA: tuple[tuple[str, object], ...] = (
+    *_VARIANT_METADATA,
+    ("conflict_rule", "R1_keep_reported_quarter"),
+)
+
+#: ``(expected, replacement)`` pairs applied to the original quarterly builder's text, each
+#: required to occur exactly once. The first two turn the Q2/Q3 ``THEN NULL`` branch of a
+#: direct_interim conflict into the reported quarterly value (the ``standalone_source_conflict``
+#: flag column is a separate expression and stays as is). The last three add
+#: ``ttm_includes_conflict``: the three neighbour flags join ``with_neighbors`` and one more
+#: output column is appended; no existing column's expression is touched.
+_R1_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    (
+        "THEN NULL\n                         ELSE q2_value END",
+        "THEN q2_value\n                         ELSE q2_value END",
+    ),
+    (
+        "THEN NULL\n                         ELSE q3_value END",
+        "THEN q3_value\n                         ELSE q3_value END",
+    ),
+    (
+        "            n4.standalone_value AS neighbor4_value\n",
+        "            n4.standalone_value AS neighbor4_value,\n"
+        "            n1.standalone_source_conflict AS neighbor1_conflict,\n"
+        "            n2.standalone_source_conflict AS neighbor2_conflict,\n"
+        "            n3.standalone_source_conflict AS neighbor3_conflict\n",
+    ),
+    (
+        "        END AS ttm_available_from\n    FROM with_neighbors\n",
+        "        END AS ttm_available_from,\n"
+        "        CASE\n"
+        "            WHEN metric_kind IN ('direct_interim', 'cumulative_reported')\n"
+        "             AND standalone_value IS NOT NULL AND neighbor1_value IS NOT NULL\n"
+        "             AND neighbor2_value IS NOT NULL AND neighbor3_value IS NOT NULL\n"
+        "            THEN COALESCE(standalone_source_conflict, FALSE)\n"
+        "                 OR COALESCE(neighbor1_conflict, FALSE)\n"
+        "                 OR COALESCE(neighbor2_conflict, FALSE)\n"
+        "                 OR COALESCE(neighbor3_conflict, FALSE)\n"
+        "        END AS ttm_includes_conflict\n"
+        "    FROM with_neighbors\n",
+    ),
+)
+
+
+def build_fin_quarterly_metric_vintage_dlr_sql(
+    *,
+    vintage_view: str = SMVF_DL_TABLE,
+    pairing_tolerance: float = 0.0,
+    semantics: str = SEMANTICS_V1,
+) -> str:
+    """The ``_dl`` quarterly SQL with rule R1 and the ``ttm_includes_conflict`` column.
+
+    R1 (18 §8.1): when a direct_interim metric's quarterly value and the cumulative value of
+    the same filing disagree, Q2/Q3 keep the reported quarterly value instead of NULL; the
+    ``standalone_source_conflict`` flag stays TRUE. Q4 and availability dates are unchanged.
+    Raises :class:`OriginalSqlDriftError` unless every expected text of the original builder
+    occurs exactly once.
+    """
+    sql = build_fin_quarterly_metric_vintage_dl_sql(
+        vintage_view=vintage_view, pairing_tolerance=pairing_tolerance, semantics=semantics
+    )
+    for old, new in _R1_REPLACEMENTS:
+        hits = sql.count(old)
+        if hits != 1:
+            raise OriginalSqlDriftError(
+                f"fin_quarterly_metric_vintage_dlr: expected the original text {old!r} exactly "
+                f"once, found {hits}x; financial_quarters changed, so rule R1 must be rewritten"
+            )
+        sql = sql.replace(old, new)
+    return sql
+
+
+def register_fin_quarterly_metric_vintage_dlr_view(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    view_name: str = FQMV_DLR_TABLE,
+    vintage_view: str = SMVF_DL_TABLE,
+    pairing_tolerance: float = 0.0,
+    semantics: str = SEMANTICS_V1,
+) -> str:
+    """A view over the R1 quarterly SQL (no parquet; tests and parity checks)."""
+    sql = build_fin_quarterly_metric_vintage_dlr_sql(
+        vintage_view=vintage_view, pairing_tolerance=pairing_tolerance, semantics=semantics
+    )
+    con.execute(f"CREATE OR REPLACE VIEW {view_name} AS {sql}")
+    return view_name
+
+
+def materialize_fin_quarterly_metric_vintage_dlr(
+    con: duckdb.DuckDBPyConnection,
+    config: LakeConfig,
+    *,
+    vintage_view: str = SMVF_DL_TABLE,
+    pairing_tolerance: float = 0.0,
+    force: bool = False,
+    semantics: str = SEMANTICS_V1,
+) -> str:
+    """Build and register ``fin_quarterly_metric_vintage_dlr`` as a cached parquet mart."""
+    sql = build_fin_quarterly_metric_vintage_dlr_sql(
+        vintage_view=vintage_view, pairing_tolerance=pairing_tolerance, semantics=semantics
+    )
+    plan = MartPlan(
+        plan_id=PLAN_SINGLE,
+        final_sql=sql,
+        semantics_version=semantics,
+        metadata=(*_R1_VARIANT_METADATA, ("vintage_view", vintage_view)),
+    )
+    materialize(con, config, FQMV_DLR_TABLE, sql, force=force, plan=plan)
+    return register_mart_view(con, config, FQMV_DLR_TABLE)

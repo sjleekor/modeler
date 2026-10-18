@@ -192,7 +192,7 @@ def test_default_sql_builds_every_mart_and_parses() -> None:
     sql = ds.build_kr_next_panel_sql("main", include_labels=True)
     assert len(duckdb.extract_statements(sql)) == 1
     for needle in (
-        "fin_quarterly_metric_vintage_dl",  # vintage with delisted names
+        "fin_quarterly_metric_vintage_dlr",  # vintage with delisted names + R1 (18 §8.1)
         "dim_stock_pit_daily",  # PIT view
         "krx_security_flow_raw",
         "dart_filing_receipt_raw",
@@ -205,7 +205,7 @@ def test_default_sql_builds_every_mart_and_parses() -> None:
     custom = ds.KrNextViews(vintage_view="my_vintage", pit_view="my_pit", flow_raw="my_flow")
     sql2 = ds.build_kr_next_panel_sql("main", views=custom)
     assert "my_vintage" in sql2 and "my_pit" in sql2 and "my_flow" in sql2
-    assert "fin_quarterly_metric_vintage_dl" not in sql2
+    assert "fin_quarterly_metric_vintage_dlr" not in sql2
 
 
 def test_bad_arguments() -> None:

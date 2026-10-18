@@ -10,7 +10,7 @@ registered views) and a polars wrapper. Pieces, in order:
 1. **Marts** — built inline as CTEs from the same ``build_*_sql`` functions the mart
    materializers use, only for the marts the chosen feature set reads (``COLUMN_MART``):
    ``feat_price_v2``, ``feat_price`` (the four legacy columns), ``feat_flow_v2`` (main set only),
-   ``feat_fin_v2`` (vintage ``_dl``), ``feat_market_cap`` and ``feat_filing_activity``.
+   ``feat_fin_v2`` (vintage ``_dlr``, 18 §8.1), ``feat_market_cap`` and ``feat_filing_activity``.
    ``mart_overrides`` swaps a CTE for an already registered mart view.
 2. **Universe** (C3-2) — ``build_universe_raw_price_sql(tradable_universe_filter())`` ->
    ``universe_terminal`` exclusion -> ``build_one_per_company_sql``; rows with
@@ -121,8 +121,9 @@ class KrNextViews:
     #: the PIT view built by ``build_stock_pit_nonempty_sql`` (registered under this name)
     pit_view: str = "dim_stock_pit_daily"
     flow_raw: str = "krx_security_flow_raw"
-    #: ``fin_quarterly_metric_vintage_dl`` (C2: the ``_dl`` vintage with delisted names)
-    vintage_view: str = "fin_quarterly_metric_vintage_dl"
+    #: ``fin_quarterly_metric_vintage_dlr``: the ``_dl`` vintage (delisted names) with rule R1,
+    #: which keeps the reported Q2/Q3 value on a quarterly/cumulative conflict (18 §8.1)
+    vintage_view: str = "fin_quarterly_metric_vintage_dlr"
     #: panel of (trade_date, ticker, market) that gives the filing mart its calendar
     filing_universe_view: str = "dim_universe_broad_daily"
     filing_receipt_view: str = "dart_filing_receipt_raw"
