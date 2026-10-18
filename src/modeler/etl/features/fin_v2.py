@@ -17,6 +17,20 @@ metrics, same-day candidates resolved to the latest fiscal period — and adds t
   from the equity's own filing;
 * NULL unless ``total_equity > 0`` and ``BASE_OK_SQL`` (the same gate as ``fin_scan``).
 
+Two more columns, from the same selected basis and gate:
+
+* ``fin_roa_v2`` = TTM earnings / ``total_assets``, with the same "same report" rule against the
+  ``total_assets`` ``rcept_no`` (controlling, else net income, else NULL); NULL unless
+  ``total_assets > 0``. ROE mixes leverage into the ratio and drops every firm with
+  ``equity <= 0``; assets are positive for firms ROE cannot score, so ROA keeps the deficit tail.
+* ``fin_capital_impaired_v2`` = ``total_equity <= 0`` (TRUE / FALSE; NULL when equity is
+  missing or ``BASE_OK`` fails), so the tail can include the capital-impaired firms that
+  ``fin_roe_v2`` drops.
+
+The vintage mart only holds firms still in ``stock_master``; the next preregistration passes
+``vintage_view="fin_quarterly_metric_vintage_dl"`` (``etl/marts/metric_vintages_delisted.py``)
+so delisted firms are covered too. The join is on ``ticker`` only, so nothing else changes.
+
 ``fin_vintage.py`` and ``fin_scan.py`` are not modified; the interval CTE text is theirs,
 with one column added.
 """
@@ -38,7 +52,7 @@ from modeler.etl.mart import materialize, register_mart_view
 
 FIN_V2_TABLE = "feat_fin_v2"
 
-_METRICS = ("total_equity", "controlling_net_income", "net_income")
+_METRICS = ("total_equity", "controlling_net_income", "net_income", "total_assets")
 
 _INTERVAL_SELECT = "ticker, metric_code, fs_basis, daily_value, value_lag_4q,"
 
@@ -106,7 +120,18 @@ def build_fin_v2_sql(
                  ELSE CASE WHEN r_controlling_net_income_ofs = r_total_equity_ofs
                            THEN v_controlling_net_income_ofs
                            WHEN r_net_income_ofs = r_total_equity_ofs THEN v_net_income_ofs END
-            END AS earnings
+            END AS earnings,
+            CASE WHEN v_net_income_cfs IS NOT NULL THEN v_total_assets_cfs
+                 ELSE v_total_assets_ofs END AS assets,
+            -- ROA numerator: same rule, against the total_assets filing
+            CASE WHEN v_net_income_cfs IS NOT NULL
+                 THEN CASE WHEN r_controlling_net_income_cfs = r_total_assets_cfs
+                           THEN v_controlling_net_income_cfs
+                           WHEN r_net_income_cfs = r_total_assets_cfs THEN v_net_income_cfs END
+                 ELSE CASE WHEN r_controlling_net_income_ofs = r_total_assets_ofs
+                           THEN v_controlling_net_income_ofs
+                           WHEN r_net_income_ofs = r_total_assets_ofs THEN v_net_income_ofs END
+            END AS earnings_for_assets
         FROM joined
     ),
     scored AS (
@@ -116,7 +141,10 @@ def build_fin_v2_sql(
     SELECT
         trade_date, ticker, market,
         CASE WHEN base_ok AND equity > 0 AND earnings IS NOT NULL
-             THEN earnings / equity END AS fin_roe_v2
+             THEN earnings / equity END AS fin_roe_v2,
+        CASE WHEN base_ok AND assets > 0 AND earnings_for_assets IS NOT NULL
+             THEN earnings_for_assets / assets END AS fin_roa_v2,
+        CASE WHEN base_ok AND equity IS NOT NULL THEN equity <= 0 END AS fin_capital_impaired_v2
     FROM scored
     """
 

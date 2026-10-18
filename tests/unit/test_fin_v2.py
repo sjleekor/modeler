@@ -170,6 +170,7 @@ def test_both_join_plans_return_the_same_rows() -> None:
                 _row(t, "net_income", ni, rcept, seq=seq, filed=filed),
                 _row(t, "controlling_net_income", ni - 1, rcept, seq=seq, filed=filed),
                 _row(t, "total_equity", eq, rcept, seq=seq, filed=filed),
+                _row(t, "total_assets", 500.0 + seq, rcept, seq=seq, filed=filed),
             ]
     con = _con(rows, ["A", "B"])
     for day in (d(2020, 3, 1), d(2020, 4, 1), d(2020, 9, 1)):
@@ -189,6 +190,94 @@ def test_both_join_plans_return_the_same_rows() -> None:
     coalesce, or_plan = _rows(JOIN_PLAN_COALESCE), _rows(JOIN_PLAN_OR)
     assert coalesce == or_plan
     assert any(r[3] is not None for r in coalesce) and any(r[3] is None for r in coalesce)
+    assert any(r[4] is not None for r in coalesce)
+    assert {r[5] for r in coalesce} >= {True, False}
+
+
+def _cols(con, *cols: str, plan: str | None = None) -> dict[str, tuple]:
+    sql = build_fin_v2_sql() if plan is None else build_fin_v2_sql(join_plan=plan)
+    return {
+        r[0]: r[1:]
+        for r in con.execute(f"SELECT ticker, {', '.join(cols)} FROM ({sql})").fetchall()
+    }
+
+
+def test_roa_same_report_branches_and_assets_guard() -> None:
+    rows = [
+        # C: controlling shares the assets filing -> controlling
+        _row("C", "controlling_net_income", 20.0, "R2"),
+        _row("C", "net_income", 90.0, "R1"),
+        _row("C", "total_assets", 400.0, "R2"),
+        # N: controlling is older, net income shares the assets filing -> net income
+        _row("N", "controlling_net_income", 20.0, "R1"),
+        _row("N", "net_income", 30.0, "R2"),
+        _row("N", "total_assets", 300.0, "R2"),
+        # X: neither shares the assets filing -> NULL
+        _row("X", "controlling_net_income", 20.0, "R1"),
+        _row("X", "net_income", 30.0, "R1"),
+        _row("X", "total_assets", 300.0, "R2"),
+        # Z / M: assets zero / missing -> NULL
+        _row("Z", "net_income", 30.0, "R1"),
+        _row("Z", "total_assets", 0.0, "R1"),
+        _row("M", "net_income", 30.0, "R1"),
+        # E: equity filed in another report than assets; ROA still uses the assets filing
+        _row("E", "net_income", 30.0, "R2"),
+        _row("E", "total_assets", 600.0, "R2"),
+        _row("E", "total_equity", 100.0, "R1"),
+    ]
+    out = _cols(_con(rows, ["C", "N", "X", "Z", "M", "E"]), "fin_roa_v2")
+    assert out["C"][0] == pytest.approx(0.05)
+    assert out["N"][0] == pytest.approx(0.1)
+    assert out["X"][0] is None
+    assert out["Z"][0] is None
+    assert out["M"][0] is None
+    assert out["E"][0] == pytest.approx(0.05)
+
+
+def test_roa_is_defined_where_roe_drops_negative_equity() -> None:
+    rows = [
+        _row("A", "net_income", -30.0, "R1"),
+        _row("A", "total_equity", -100.0, "R1"),
+        _row("A", "total_assets", 300.0, "R1"),
+    ]
+    roe, roa = _cols(_con(rows, ["A"]), "fin_roe_v2", "fin_roa_v2")["A"]
+    assert roe is None
+    assert roa == pytest.approx(-0.1)
+
+
+def test_capital_impaired_flag() -> None:
+    rows = [
+        _row("NEG", "net_income", 1.0, "R1"),
+        _row("NEG", "total_equity", -5.0, "R1"),
+        _row("ZERO", "net_income", 1.0, "R1"),
+        _row("ZERO", "total_equity", 0.0, "R1"),
+        _row("POS", "net_income", 1.0, "R1"),
+        _row("POS", "total_equity", 5.0, "R1"),
+        _row("NOEQ", "net_income", 1.0, "R1"),
+        _row("HALT", "net_income", 1.0, "R1"),
+        _row("HALT", "total_equity", -5.0, "R1"),
+    ]
+    con = _con(rows, ["NEG", "ZERO", "POS", "NOEQ", "HALT"])
+    con.execute("UPDATE dim_price_quality_daily SET is_halted = TRUE WHERE ticker = 'HALT'")
+    out = _cols(con, "fin_capital_impaired_v2")
+    assert out["NEG"][0] is True
+    assert out["ZERO"][0] is True
+    assert out["POS"][0] is False
+    assert out["NOEQ"][0] is None
+    assert out["HALT"][0] is None  # BASE_OK gate
+
+
+def test_new_columns_follow_the_planned_output() -> None:
+    con = _con([_row("A", "net_income", 1.0, "R1")], ["A"])
+    cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM ({build_fin_v2_sql()})").fetchall()]
+    assert cols == [
+        "trade_date",
+        "ticker",
+        "market",
+        "fin_roe_v2",
+        "fin_roa_v2",
+        "fin_capital_impaired_v2",
+    ]
 
 
 def test_fin_scan_sql_text_is_unchanged() -> None:
