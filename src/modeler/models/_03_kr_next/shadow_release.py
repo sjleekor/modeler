@@ -5,10 +5,13 @@ copy-and-verify, ``release.json``, refuse if the output exists) but *separate*: 
 release has exactly three models hard-coded (``release_build.JOBS``), so this one does not
 touch it. Nothing here imports ``modeler.serving``.
 
-What is copied: the import closure of ``shadow`` and of this module inside the
-``modeler`` package (static AST walk of ``import`` / ``from ... import``, every package
-``__init__.py`` on the way included) and, optionally, the frozen bundle (file by file, each
-checked against the sha256 the bundle's ``manifest.json`` promises). Third-party packages
+What is copied: the import closure of ``ROOT_MODULES`` (shadow, shadow_prepare, views, build_panel,
+forward, this module) inside the ``modeler`` *and* ``collector`` packages (the server venv has no
+collector; ``--collector-root`` is the collector repository), plus the allowlisted package data
+those modules read via ``importlib.resources`` (``DATA_FILES``). The walk is static AST
+(``import`` / ``from ... import``, every package ``__init__.py`` on the way included). The frozen
+bundle is optional (file by file, each checked against the sha256 the bundle's ``manifest.json``
+promises). Third-party packages
 (polars, duckdb, scikit-learn, scipy, numpy, joblib) come from the runtime venv, not from here.
 
 Release layout::
@@ -45,10 +48,24 @@ from modeler.models._03_kr_next import bundle as bundle_mod
 
 SCHEMA = "kr-next-shadow-release.v1"
 ROOT_MODULE = "modeler.models._03_kr_next.shadow"
-#: the release also ships this tool, so a server can ``verify`` a release with its own code
-ROOT_MODULES = (ROOT_MODULE, "modeler.models._03_kr_next.shadow_release")
+#: the release also ships this tool, so a server can ``verify`` a release with its own code.
+#: Server jobs: ``shadow`` (score), ``shadow_prepare`` (+ ``views``, ``build_panel``), ``forward``
+#: (evaluation). ``train`` is not a root (training runs on the Mac); it ships only because
+#: ``build_panel`` imports ``require_frozen_tag`` from it.
+ROOT_MODULES = (
+    ROOT_MODULE,
+    "modeler.models._03_kr_next.shadow_release",
+    "modeler.models._03_kr_next.shadow_prepare",
+    "modeler.models._03_kr_next.views",
+    "modeler.models._03_kr_next.build_panel",
+    "modeler.models._03_kr_next.forward",
+)
 ENTRYPOINT = "modeler.models._03_kr_next.shadow:main"
-TOP_PACKAGES = ("modeler",)
+TOP_PACKAGES = ("modeler", "collector")
+#: package data the closure may read through ``importlib.resources.files`` (release paths; same
+#: allowlist as ``serving/release_build.DATA_FILES``). A ``files(...) / "x"`` use in the closure
+#: that resolves outside this list stops the build.
+DATA_FILES = ("src/collector/kr/infra/calendar/data/holidays_krx.csv",)
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -112,19 +129,73 @@ def _imports(path: Path, module: str, is_package: bool) -> tuple[set[str], set[s
     return out, opt
 
 
-def import_closure(modeler_root: Path, root_modules: tuple[str, ...] = ROOT_MODULES) -> list[str]:
-    """Sorted paths (relative to ``modeler_root``, e.g. ``src/modeler/etl/lake.py``)."""
-    src = Path(modeler_root) / "src"
+def _resource_uses(path: Path) -> list[tuple[str, tuple[str, ...]]]:
+    """``files("pkg") / "a" / "b"`` uses in a file: ``[("pkg", ("a", "b"))]``.
+
+    A bare ``files("pkg")`` yields ``("pkg", ())`` so the package is shipped. Arguments that are
+    not string literals cannot be resolved and stop the build.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    parent = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+
+    def literal(node: ast.AST) -> str:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        raise ShadowReleaseError(f"files() use that is not a string literal: {path}:{node.lineno}")
+
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id != "files":
+            continue
+        if len(node.args) != 1:
+            raise ShadowReleaseError(
+                f"files() use that is not a string literal: {path}:{node.lineno}"
+            )
+        parts: list[str] = []
+        cur: ast.AST = node
+        up = parent.get(id(cur))
+        while isinstance(up, ast.BinOp) and isinstance(up.op, ast.Div) and up.left is cur:
+            parts.append(literal(up.right))
+            cur, up = up, parent.get(id(up))
+        out.append((literal(node.args[0]), tuple(parts)))
+    return out
+
+
+def _src_dirs(modeler_root: Path, collector_root: Path | None) -> dict[str, Path]:
+    dirs = {"modeler": Path(modeler_root) / "src"}
+    if collector_root is not None:
+        dirs["collector"] = Path(collector_root) / "src"
+    return dirs
+
+
+def closure(
+    modeler_root: Path,
+    collector_root: Path | None = None,
+    root_modules: tuple[str, ...] = ROOT_MODULES,
+) -> tuple[list[str], list[str]]:
+    """``(python_files, data_files)``, sorted release paths (``src/<pkg>/...``).
+
+    Follows imports into ``modeler`` and ``collector``; ``collector_root`` is the collector
+    repository (when verifying: the release itself). Data files are the allowlisted package data
+    that ``importlib.resources.files`` uses in the closure reach; each must exist.
+    """
+    srcs = _src_dirs(modeler_root, collector_root)
     seen: dict[str, Path] = {}
+    data: set[str] = set()
     stack = [(m, True) for m in root_modules]
     while stack:
         mod, required = stack.pop()
-        if mod in seen or mod.split(".")[0] not in TOP_PACKAGES:
+        top = mod.split(".")[0]
+        if mod in seen or top not in TOP_PACKAGES:
             continue
-        f = _module_file(src, mod)
+        if top not in srcs:
+            raise ShadowReleaseError(f"imported module {mod} needs a collector_root")
+        f = _module_file(srcs[top], mod)
         if f is None:
             if required:
-                raise ShadowReleaseError(f"imported module {mod} is not in {src}")
+                raise ShadowReleaseError(f"imported module {mod} is not in {srcs[top]}")
             continue  # an attribute of a module (``from x import name``), not a module
         seen[mod] = f
         parts = mod.split(".")
@@ -133,16 +204,52 @@ def import_closure(modeler_root: Path, root_modules: tuple[str, ...] = ROOT_MODU
         req, opt = _imports(f, mod, f.name == "__init__.py")
         stack.extend((m, True) for m in sorted(req))
         stack.extend((m, False) for m in sorted(opt))
-    return sorted(p.relative_to(modeler_root).as_posix() for p in seen.values())
+        for pkg, rest in _resource_uses(f):
+            stack.append((pkg, True))  # the resource package is shipped too
+            if not rest:
+                continue
+            rel = "src/" + "/".join([*pkg.split("."), *rest])
+            if rel not in DATA_FILES:
+                raise ShadowReleaseError(f"package data is not in the reviewed allowlist: {rel}")
+            data.add(rel)
+    py = sorted(f"src/{p.relative_to(srcs[m.split('.')[0]]).as_posix()}" for m, p in seen.items())
+    for rel in sorted(data):
+        source = _source_of(
+            rel, srcs["modeler"].parent, srcs.get("collector", srcs["modeler"]).parent
+        )
+        if source.is_symlink() or not source.is_file():
+            raise ShadowReleaseError(f"package data file is missing: {rel}")
+    return py, sorted(data)
+
+
+def import_closure(
+    modeler_root: Path,
+    root_modules: tuple[str, ...] = ROOT_MODULES,
+    collector_root: Path | None = None,
+) -> list[str]:
+    """Sorted python files of the closure (see ``closure``)."""
+    return closure(modeler_root, collector_root, root_modules)[0]
+
+
+def _source_of(rel: str, modeler_root: Path, collector_root: Path | None) -> Path:
+    top = rel.split("/")[1]
+    root = modeler_root if top == "modeler" else collector_root
+    if root is None:
+        raise ShadowReleaseError(f"{rel} needs a collector_root")
+    return Path(root) / rel
 
 
 # --------------------------------------------------------------------------- reviewed list
 
 
-def source_manifest_text(modeler_root: Path) -> str:
-    """sha256sum lines (``<hex>  modeler/<path>``) of the closure, for the reviewer."""
-    root = Path(modeler_root)
-    lines = [f"{sha256_file(root / rel)}  modeler/{rel}" for rel in import_closure(root)]
+def source_manifest_text(modeler_root: Path, collector_root: Path) -> str:
+    """sha256sum lines (``<hex>  modeler/<path>`` or ``collector/<path>``) of closure and data."""
+    mroot, croot = Path(modeler_root), Path(collector_root)
+    py, data = closure(mroot, croot)
+    lines = [
+        f"{sha256_file(_source_of(rel, mroot, croot))}  {rel.split('/')[1]}/{rel}"
+        for rel in [*py, *data]
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -198,33 +305,38 @@ def _copy_bundle(source_dir: Path, target_dir: Path) -> str:
 def build_release(
     *,
     modeler_root: Path,
+    collector_root: Path,
     source_manifest: Path,
     output: Path,
     bundle_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Copy the reviewed closure (and the bundle) to ``output``; refuses an existing path."""
-    modeler_root, output = Path(modeler_root), Path(output)
+    modeler_root, collector_root = Path(modeler_root), Path(collector_root)
+    output = Path(output)
     parent = output.parent.resolve(strict=True)
     final = parent / output.name
     if os.path.lexists(final):
         raise ShadowReleaseError(f"output path already exists: {final}")
     listed = read_source_manifest(source_manifest)
-    rels = import_closure(modeler_root)
+    rels, data_rels = closure(modeler_root, collector_root)
     if not rels:
         raise ShadowReleaseError("import closure is empty")
     stage = Path(tempfile.mkdtemp(prefix=f".{final.name}.build-", dir=parent))
     try:
         inventory: list[dict[str, str]] = []
-        for rel in rels:
-            source = modeler_root / rel
+        data_inventory: list[dict[str, str]] = []
+        for rel in [*rels, *data_rels]:
+            source = _source_of(rel, modeler_root, collector_root)
             digest = sha256_file(source)
-            key = f"modeler/{rel}"
+            key = f"{rel.split('/')[1]}/{rel}"
             if key not in listed:
                 raise ShadowReleaseError(f"file is not in the reviewed source manifest: {key}")
             if listed[key] != digest:
                 raise ShadowReleaseError(f"file SHA-256 differs from the reviewed manifest: {key}")
             _copy_verified(source, stage / rel, digest, rel)
-            inventory.append({"path": rel, "sha256": digest})
+            (data_inventory if rel in data_rels else inventory).append(
+                {"path": rel, "sha256": digest}
+            )
         bundle_block = None
         if bundle_dir is not None:
             bundle_block = {
@@ -237,6 +349,7 @@ def build_release(
             "entrypoint": ENTRYPOINT,
             "source_manifest_sha256": sha256_file(source_manifest),
             "files": inventory,
+            "data_files": data_inventory,
             "code_sha256": code_inventory_sha256([(i["path"], i["sha256"]) for i in inventory]),
             "bundle": bundle_block,
         }
@@ -271,11 +384,20 @@ def verify_release(release: Path) -> dict[str, Any]:
     if code_inventory_sha256(pairs) != meta["code_sha256"]:
         raise ShadowReleaseError("code_sha256 does not match the file list")
     try:
-        copied = import_closure(release)  # same walk, now over the release tree
+        # same walk, now over the release tree (modeler and collector both resolve inside it)
+        copied, copied_data = closure(release, release)
     except ShadowReleaseError as exc:
         raise ShadowReleaseError(f"release is not closed under its own imports: {exc}") from exc
     if copied != sorted(p for p, _ in pairs):
         raise ShadowReleaseError("release is not closed under its own imports (file list)")
+    data_paths = []
+    for item in meta.get("data_files", []):
+        f = release / item["path"]
+        if not f.is_file() or sha256_file(f) != item["sha256"]:
+            raise ShadowReleaseError(f"release data file missing or changed: {item['path']}")
+        data_paths.append(item["path"])
+    if copied_data != sorted(data_paths):
+        raise ShadowReleaseError("release is not closed under its own imports (data files)")
     bundle_ok = None
     if meta.get("bundle"):
         manifest = release / meta["bundle"]["path"]
@@ -285,6 +407,12 @@ def verify_release(release: Path) -> dict[str, Any]:
         bundle_ok = True
     return {
         "python_file_count": len(pairs),
+        "data_file_count": len(data_paths),
+        "collector_modules": sorted(
+            p[len("src/") : -len(".py")].replace("/", ".")
+            for p, _ in pairs
+            if p.startswith("src/collector/")
+        ),
         "code_sha256": meta["code_sha256"],
         "bundle_verified": bundle_ok,
     }
@@ -295,8 +423,10 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     m = sub.add_parser("manifest", help="print the sha256sum lines of the closure for review")
     m.add_argument("--modeler-root", required=True, type=Path)
+    m.add_argument("--collector-root", required=True, type=Path)
     b = sub.add_parser("build")
     b.add_argument("--modeler-root", required=True, type=Path)
+    b.add_argument("--collector-root", required=True, type=Path)
     b.add_argument("--source-manifest", required=True, type=Path)
     b.add_argument("--output", required=True, type=Path)
     b.add_argument("--bundle", type=Path, default=None)
@@ -305,13 +435,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.cmd == "manifest":
-            sys.stdout.write(source_manifest_text(args.modeler_root))
+            sys.stdout.write(source_manifest_text(args.modeler_root, args.collector_root))
             return 0
         if args.cmd == "verify":
             print(json.dumps(verify_release(args.release), sort_keys=True, indent=2))
             return 0
         summary = build_release(
             modeler_root=args.modeler_root,
+            collector_root=args.collector_root,
             source_manifest=args.source_manifest,
             output=args.output,
             bundle_dir=args.bundle,

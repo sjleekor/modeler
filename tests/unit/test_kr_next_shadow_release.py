@@ -9,6 +9,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import collector
 import polars as pl
 import pytest
 
@@ -17,17 +18,18 @@ from modeler.models._03_kr_next import shadow_release as sr
 from tests.unit.test_kr_next_shadow import SESSIONS, bundle_dir, make_panel  # noqa: F401
 
 MODELER_ROOT = Path(__file__).resolve().parents[2]
+COLLECTOR_ROOT = Path(collector.__file__).resolve().parents[2]  # the repo holding src/collector
 
 
 @pytest.fixture(scope="module")
 def reviewed(tmp_path_factory) -> Path:
     path = tmp_path_factory.mktemp("rev") / "sources.sha256"
-    path.write_text(sr.source_manifest_text(MODELER_ROOT), encoding="utf-8")
+    path.write_text(sr.source_manifest_text(MODELER_ROOT, COLLECTOR_ROOT), encoding="utf-8")
     return path
 
 
 def test_closure_contains_what_shadow_needs_and_nothing_of_serving():
-    files = sr.import_closure(MODELER_ROOT)
+    files = sr.closure(MODELER_ROOT, COLLECTOR_ROOT)[0]
     for need in (
         "src/modeler/__init__.py",
         "src/modeler/models/__init__.py",
@@ -40,17 +42,36 @@ def test_closure_contains_what_shadow_needs_and_nothing_of_serving():
         "src/modeler/models/_03_kr_next/feature_set.py",
         "src/modeler/etl/universe_terminal.py",
         "src/modeler/etl/labels_entry.py",
+        "src/modeler/models/_03_kr_next/shadow_prepare.py",
+        "src/modeler/models/_03_kr_next/views.py",
+        "src/modeler/models/_03_kr_next/forward.py",
+        "src/modeler/models/_03_kr_next/build_panel.py",
+        "src/collector/__init__.py",
+        "src/collector/lake.py",
+        "src/collector/kr/shared/__init__.py",
+        "src/collector/kr/infra/calendar/__init__.py",
     ):
         assert need in files, need
     assert not [f for f in files if "/serving/" in f]
     assert "src/modeler/models/_03_kr_next/shadow_release.py" in files  # ships its own verifier
-    assert not [f for f in files if f.endswith("train.py")]
+    # train is not a root, but build_panel imports it (require_frozen_tag), so the file ships
+    # as a module only; training itself still runs on the Mac
+    assert "src/modeler/models/_03_kr_next/train.py" in files
+    # collector sources only from the allowed top package, data file is reported separately
+    assert not [f for f in files if f.endswith(".csv")]
+    assert sr.closure(MODELER_ROOT, COLLECTOR_ROOT)[1] == [
+        "src/collector/kr/infra/calendar/data/holidays_krx.csv"
+    ]
 
 
 def test_release_is_built_verified_and_importable_from_its_own_dir(tmp_path, reviewed, bundle_dir):  # noqa: F811
     out = tmp_path / "rel"
     summary = sr.build_release(
-        modeler_root=MODELER_ROOT, source_manifest=reviewed, output=out, bundle_dir=bundle_dir
+        modeler_root=MODELER_ROOT,
+        collector_root=COLLECTOR_ROOT,
+        source_manifest=reviewed,
+        output=out,
+        bundle_dir=bundle_dir,
     )
     assert summary["bundle_verified"] is True and summary["python_file_count"] > 20
     meta = json.loads((out / "release.json").read_text())
@@ -73,6 +94,36 @@ def test_release_is_built_verified_and_importable_from_its_own_dir(tmp_path, rev
     assert res.returncode == 0, res.stderr
     mods = json.loads(res.stdout.strip().splitlines()[-1])
     assert mods and all(f and f.startswith(str(out / "src")) for f in mods.values()), mods
+
+    # server-like isolation: -I (no env path, no cwd), only the release src on sys.path; the
+    # collector must resolve inside the release and the holiday CSV must load from it
+    iso = (
+        "import sys, json\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import collector, modeler\n"
+        "from modeler.models._03_kr_next import views, shadow_prepare, forward\n"
+        "h, _meta = views.load_holidays()\n"
+        "from collector.kr.shared import get_trading_days\n"
+        "print(json.dumps({'collector': collector.__file__, 'views': views.__file__,\n"
+        "                  'n': len(h), 'td': callable(get_trading_days),\n"
+        "                  'prep': shadow_prepare.__file__, 'fwd': forward.__file__}))\n"
+    )
+    res = subprocess.run(
+        [sys.executable, "-I", "-c", iso, str(out / "src")],
+        cwd=tmp_path,
+        env={"PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout.strip().splitlines()[-1])
+    for key in ("collector", "views", "prep", "fwd"):
+        assert got[key].startswith(str(out / "src")), (key, got)
+    assert got["n"] > 100 and got["td"] is True
+    assert sr.verify_release(out)["collector_modules"]
+    assert [i["path"] for i in meta["data_files"]] == [
+        "src/collector/kr/infra/calendar/data/holidays_krx.csv"
+    ]
 
     # and a real day scored through the release's CLI, bundle taken from the release
     d = SESSIONS[5]
@@ -113,7 +164,12 @@ def test_refuses_existing_output_and_leaves_it_alone(tmp_path, reviewed):
     out.mkdir()
     (out / "keep.txt").write_text("x")
     with pytest.raises(sr.ShadowReleaseError, match="already exists"):
-        sr.build_release(modeler_root=MODELER_ROOT, source_manifest=reviewed, output=out)
+        sr.build_release(
+            modeler_root=MODELER_ROOT,
+            collector_root=COLLECTOR_ROOT,
+            source_manifest=reviewed,
+            output=out,
+        )
     assert (out / "keep.txt").read_text() == "x"
     assert [p.name for p in tmp_path.iterdir()] == ["rel"]
 
@@ -124,19 +180,34 @@ def test_unreviewed_or_changed_source_stops_the_build(tmp_path, reviewed):
     short = tmp_path / "short.sha256"
     short.write_text("\n".join(x for i, x in enumerate(lines) if i != shadow_line) + "\n")
     with pytest.raises(sr.ShadowReleaseError, match="not in the reviewed"):
-        sr.build_release(modeler_root=MODELER_ROOT, source_manifest=short, output=tmp_path / "a")
+        sr.build_release(
+            modeler_root=MODELER_ROOT,
+            collector_root=COLLECTOR_ROOT,
+            source_manifest=short,
+            output=tmp_path / "a",
+        )
     bad = list(lines)
     bad[shadow_line] = "0" * 64 + bad[shadow_line][64:]
     wrong = tmp_path / "wrong.sha256"
     wrong.write_text("\n".join(bad) + "\n")
     with pytest.raises(sr.ShadowReleaseError, match="differs from the reviewed"):
-        sr.build_release(modeler_root=MODELER_ROOT, source_manifest=wrong, output=tmp_path / "b")
+        sr.build_release(
+            modeler_root=MODELER_ROOT,
+            collector_root=COLLECTOR_ROOT,
+            source_manifest=wrong,
+            output=tmp_path / "b",
+        )
     assert sorted(p.name for p in tmp_path.iterdir()) == ["short.sha256", "wrong.sha256"]
 
 
 def test_verify_detects_a_changed_file_and_an_incomplete_closure(tmp_path, reviewed):
     out = tmp_path / "rel"
-    sr.build_release(modeler_root=MODELER_ROOT, source_manifest=reviewed, output=out)
+    sr.build_release(
+        modeler_root=MODELER_ROOT,
+        collector_root=COLLECTOR_ROOT,
+        source_manifest=reviewed,
+        output=out,
+    )
     target = out / "src/modeler/models/_03_kr_next/preprocess.py"
     original = target.read_text()
     target.write_text(original + "\n# edited\n")
@@ -167,6 +238,7 @@ def test_bundle_copy_checks_the_manifest_pins(tmp_path, reviewed, bundle_dir):  
     with pytest.raises(sr.ShadowReleaseError, match="differs before copy"):
         sr.build_release(
             modeler_root=MODELER_ROOT,
+            collector_root=COLLECTOR_ROOT,
             source_manifest=reviewed,
             output=tmp_path / "r",
             bundle_dir=broken,
@@ -176,3 +248,34 @@ def test_bundle_copy_checks_the_manifest_pins(tmp_path, reviewed, bundle_dir):  
 
 def test_date_in_module_docstring_is_not_used():
     assert date(2026, 11, 2) in SESSIONS
+
+
+def test_missing_data_file_stops_build_and_verify(tmp_path, reviewed):
+    out = tmp_path / "rel"
+    sr.build_release(
+        modeler_root=MODELER_ROOT,
+        collector_root=COLLECTOR_ROOT,
+        source_manifest=reviewed,
+        output=out,
+    )
+    csv = out / "src/collector/kr/infra/calendar/data/holidays_krx.csv"
+    csv.unlink()
+    with pytest.raises(
+        sr.ShadowReleaseError, match="data file missing|package data file is missing"
+    ):
+        sr.verify_release(out)
+    # a collector root without the data file stops the build before anything is written
+    fake = tmp_path / "coll"
+    fake_src = fake / "src"
+    import shutil
+
+    shutil.copytree(COLLECTOR_ROOT / "src" / "collector", fake_src / "collector")
+    (fake_src / "collector/kr/infra/calendar/data/holidays_krx.csv").unlink()
+    with pytest.raises(sr.ShadowReleaseError, match="package data file is missing"):
+        sr.build_release(
+            modeler_root=MODELER_ROOT,
+            collector_root=fake,
+            source_manifest=reviewed,
+            output=tmp_path / "rel2",
+        )
+    assert not (tmp_path / "rel2").exists()
