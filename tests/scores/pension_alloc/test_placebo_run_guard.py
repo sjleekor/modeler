@@ -108,6 +108,7 @@ def _git(root, *a):
 
 
 def _repo(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     _git(tmp_path, "init", "-q")
     _git(tmp_path, "config", "user.email", "a@b.c")
     _git(tmp_path, "config", "user.name", "t")
@@ -117,29 +118,108 @@ def _repo(tmp_path):
     return tmp_path
 
 
-def test_guard_requires_tag_and_clean_tree(tmp_path):
-    r = _repo(tmp_path)
-    with pytest.raises(guard.NotFrozenError, match="태그"):
-        guard.require_frozen_tag(r)
-    _git(r, "tag", guard.FROZEN_TAG)
-    sha = guard.require_frozen_tag(r)
-    assert len(sha) == 40
-    (r / "f.txt").write_text("changed")
+def test_guard_requires_both_tags_and_clean_modeler_tree(tmp_path):
+    mod = _repo(tmp_path / "mod")
+    my = _repo(tmp_path / "my")
+    with pytest.raises(guard.NotFrozenError, match="modeler.*태그"):
+        guard.require_frozen_tag(mod, my)
+    _git(mod, "tag", guard.FROZEN_TAG)
+    with pytest.raises(guard.NotFrozenError, match="my.*태그"):
+        guard.require_frozen_tag(mod, my)
+    _git(my, "tag", guard.FROZEN_TAG)
+    out = guard.require_frozen_tag(mod, my)
+    assert len(out["code_sha"]) == 40 and out["my_tag"]["commit"] != ""
+    assert out["modeler_tag"]["tag_object"] and out["my_tag"]["tag_object"]
+    (mod / "f.txt").write_text("changed")
     with pytest.raises(guard.NotFrozenError, match="미커밋"):
-        guard.require_frozen_tag(r)
+        guard.require_frozen_tag(mod, my)
     # 태그가 HEAD가 아닌 옛 커밋에 있으면 실패
-    _git(r, "commit", "-qam", "d")
+    _git(mod, "commit", "-qam", "d")
     with pytest.raises(guard.NotFrozenError):
-        guard.require_frozen_tag(r)
+        guard.require_frozen_tag(mod, my)
+    # my에 새 커밋이 생겨도 실패
+    _git(mod, "tag", "-f", guard.FROZEN_TAG)
+    guard.require_frozen_tag(mod, my)
+    (my / "f.txt").write_text("y")
+    _git(my, "commit", "-qam", "e")
+    with pytest.raises(guard.NotFrozenError, match="my"):
+        guard.require_frozen_tag(mod, my)
 
 
 def test_main_refuses_before_touching_data(monkeypatch):
+    import pathlib
+
     import modeler.scores.etf_baseline.run as base_run
 
     def boom(*a, **k):
         raise AssertionError("실제 자료를 읽었습니다")
 
     monkeypatch.setattr(base_run, "prepare", boom)
-    monkeypatch.setattr(guard, "_repo_root", lambda: __import__("pathlib").Path("/nonexistent-x"))
+    monkeypatch.setattr(RUN.D, "load_inputs", boom)
+    monkeypatch.setattr(RUN.D, "schema_only", boom)
+    monkeypatch.setattr(guard, "_repo_root", lambda: pathlib.Path("/nonexistent-x"))
     with pytest.raises(guard.NotFrozenError):
-        RUN.main()
+        RUN.main([])
+
+
+def test_schema_only_runs_without_guard(monkeypatch, capsys):
+    def boom(*a, **k):
+        raise AssertionError("가드를 불렀습니다")
+
+    monkeypatch.setattr(guard, "require_frozen_tag", boom)
+    monkeypatch.setattr(RUN.D, "schema_only", lambda root: "SCHEMA")
+    monkeypatch.setattr(RUN.I, "stock_data_root", lambda: None)
+    assert RUN.main(["--schema-only"]) == 0
+    assert capsys.readouterr().out.strip() == "SCHEMA"
+
+
+def test_main_calls_guard_first_then_loads(monkeypatch):
+    order = []
+
+    def g():
+        order.append("guard")
+        return {"code_sha": "x"}
+
+    def load(root):
+        order.append("load")
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(guard, "require_frozen_tag", g)
+    monkeypatch.setattr(RUN.D, "load_inputs", load)
+    monkeypatch.setattr(RUN.I, "stock_data_root", lambda: None)
+    with pytest.raises(RuntimeError):
+        RUN.main([])
+    assert order == ["guard", "load"]
+
+
+def test_decided_constants_and_config():
+    assert RUN.LAMBDAS == (0.0, 5.0, 15.0, 35.0, 70.0, 150.0)
+    assert RUN.GAMMAS == (0.001, 0.01, 0.1)
+    assert RUN.JM_SEEDS == tuple(range(20261018, 20261028)) and RUN.JM_MAX_ITER == 100
+    cfg = RUN.jm_config()
+    assert cfg.feature_warmup == 252 and cfg.label_rule == "compound"
+    assert cfg.lambdas == RUN.LAMBDAS and cfg.window_len == 3000 and cfg.val_months == 96
+    import os
+
+    assert os.environ["OMP_NUM_THREADS"] == "1"
+
+
+def test_cash_returns_forward_fill_rate_with_staleness_limit():
+    from datetime import date
+
+    import polars as pl
+
+    from modeler.scores.pension_alloc import data as D
+
+    days = [
+        date(2020, 1, 1) + __import__("datetime").timedelta(days=k) for k in (0, 1, 2, 5, 6, 30, 31)
+    ]
+    rates = pl.DataFrame(
+        {"date": [date(2019, 12, 31)], "realtime_start": [date(2019, 12, 31)], "value": [3.65]}
+    )
+    r = D.cash_returns(rates, days)
+    assert np.isnan(r[0])
+    # 금리 3.65%/365 = 0.01%/일, 달력일 수로 복리: 0->1 하루, 2->5 사흘 (앞 값으로 채움)
+    assert r[1] == pytest.approx(1e-4 * 1) and r[3] == pytest.approx(1e-4 * 3)
+    # 구간 시작 세션의 관측이 14일 넘게 오래되면 NaN: 1월 7일(7일)은 되고 1월 31일(31일)은 안 된다
+    assert r[5] == pytest.approx(1e-4 * 24) and np.isnan(r[6])

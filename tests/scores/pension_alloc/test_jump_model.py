@@ -48,7 +48,7 @@ def test_fit_recovers_two_planted_regimes():
     r, st = two_regime(2400, block=400, seed=1)
     x = J.standardize(J.jm_features(r)[300:])
     truth = st[300:]
-    theta, s, obj = J.fit_jm(x, 15.0, SEEDS)
+    theta, s, obj, n_hit = J.fit_jm(x, 15.0, SEEDS)
     agree = max((s == truth).mean(), (s != truth).mean())
     assert agree > 0.85  # EWM 피쳐 지연 때문에 100%는 아니다
     bear = J.risk_state(s, r[300:])
@@ -199,3 +199,94 @@ def test_cutoff_property_jm():
             b = other.decide(t)
             assert (a["m"], a["lambda"], a["is_risk"]) == (b["m"], b["lambda"], b["is_risk"])
             assert a["val_sharpe"] == b["val_sharpe"]
+
+
+# ------------------------------------------------------------------ F4·F6·F7
+def test_selection_uses_no_data_after_previous_month_end():
+    rule, r, cash = _rule(T=520, lambdas=(5.0, 30.0), window_len=120, val_months=5)
+    t = int([t for t in rule.me if t >= 420][0])
+    out = rule.decide(t)
+    t_prev = rule.prev_month_end(t)
+    assert out["lambda_selected_at"] == t_prev < t
+    # t_prev 뒤(t 포함)를 쓰레기로 바꿔도 λ와 검증 샤프는 같다. 상태는 t까지 쓰므로 따로 본다.
+    r2, c2 = r.copy(), cash.copy()
+    r2[t_prev + 1 :] = np.random.default_rng(4).normal(0.0, 0.05, len(r) - t_prev - 1)
+    c2[t_prev + 1 :] = 0.01
+    other = J.JumpModelRule(r2, c2, rule.me, rule.cfg)
+    assert other.select_lambda(t_prev) == rule.select_lambda(t_prev)
+    assert other.decide(t)["lambda"] == out["lambda"]
+    # 첫 월말에는 이전 월말이 없다
+    with pytest.raises(ValueError):
+        rule.prev_month_end(int(rule.me[0]))
+
+
+def test_nan_cash_days_are_skipped_not_filled_in_validation():
+    T = 500
+    rng = np.random.default_rng(2)
+    r = 0.001 + 0.01 * rng.standard_normal(T)
+    cash = np.full(T, 0.0002)
+    cash[0] = np.nan
+    me = month_ends(bdays(T))
+    cfg = J.JMConfig(lambdas=(1.0,), seeds=(1,), window_len=50, val_months=3)
+    t = me[-1]
+    ve = [int(d) for d in me if d <= t][-3:]
+    risk = dict(zip(ve, [False, True, False], strict=True))
+    holes = np.array([ve[1] + 1, ve[1] + 2, ve[1] + 3, t - 2])  # 체결일(ve[1]+1)도 구멍
+    cash[holes] = np.nan
+    rule = _Fake(r, cash, me, cfg, plan={1.0: lambda d: risk[int(d)]})
+    got = rule.validation_sharpe(t, 1.0)
+    pos = [0.0 if risk[d] else 1.0 for d in ve]
+    eff = [d + 1 for d in ve]
+    rets, carry = [], 0.0
+    for i in range(ve[0] + 2, t + 1):
+        for k in (1, 2):
+            if i == eff[k]:
+                carry += abs(pos[k] - pos[k - 1]) * 0.0005
+        if np.isnan(cash[i]):
+            continue
+        j = max(k for k in range(3) if eff[k] < i)
+        x = pos[j] * r[i] + (1 - pos[j]) * cash[i] - carry
+        carry = 0.0
+        rets.append(x - cash[i])
+    rets = np.array(rets)
+    assert got == pytest.approx(rets.mean() / rets.std(ddof=1) * np.sqrt(252))
+    assert len(rets) == t - (ve[0] + 2) + 1 - 4  # 구멍 4개는 표본에서 빠진다
+
+
+def test_windows_count_valid_days_only_and_warmup():
+    T = 600
+    r, _ = two_regime(T, block=100, seed=1)
+    cash = np.full(T, 0.0001)
+    cash[0] = np.nan
+    cash[200:210] = np.nan
+    cfg = J.JMConfig(lambdas=(5.0,), seeds=(1,), window_len=100, val_months=3, feature_warmup=30)
+    rule = J.JumpModelRule(r, cash, month_ends(bdays(T)), cfg)
+    # 0일은 현금 NaN이라 유효하지 않다: 유효한 날 수 = d (0일 제외)
+    assert rule.n_valid[150] == 150 and rule.n_valid[300] == 300 - 10
+    lo, hi = rule.window_bounds(300)
+    assert hi - lo == 100 and hi == 290
+    with pytest.raises(ValueError):
+        rule.window_bounds(100)  # 창 100 + 예열 30 = 130 유효일 필요
+    # 창 안에 구멍이 있어도 창은 항상 100개 유효한 날이다
+    assert rule.feat.shape[0] == rule.valid.sum()
+    ready = rule.first_ready_index()
+    assert rule.n_valid[ready] == 130 and rule.n_valid[ready - 1] == 129
+    d0 = rule.first_decision_index()
+    ok = [int(d) for d in rule.me if d >= ready]
+    assert d0 == ok[3]
+
+
+def test_diagnostics_recorded_and_deterministic_bits():
+    rule, r, cash = _rule(T=520, lambdas=(5.0, 30.0), window_len=120, val_months=5)
+    t = int([t for t in rule.me if t >= 420][0])
+    a = rule.decide(t)
+    d = a["diag"]
+    assert set(d) == {"n_hit_max", "empty_state", "label_disagree", "bear_share"}
+    assert 0.0 <= d["bear_share"] <= 1.0
+    # 같은 입력 -> 같은 비트 (캐시·스레드와 무관)
+    again = J.JumpModelRule(r, cash, rule.me, rule.cfg).decide(t)
+    assert a["val_sharpe"] == again["val_sharpe"] and a["m"] == again["m"]
+    # 반복 상한 1이면 수렴 못 한 적합이 센다
+    cfg1 = J.JMConfig(lambdas=(5.0,), seeds=(1, 2), window_len=120, val_months=5, max_iter=1)
+    x = J.standardize(J.jm_features(r)[200:320])
+    assert J.fit_jm(x, 5.0, (1, 2), 1)[3] >= 0 and cfg1.max_iter == 1

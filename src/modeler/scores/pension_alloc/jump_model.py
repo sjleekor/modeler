@@ -14,7 +14,12 @@ Shu·Yu·Mulvey(2024) 설정을 옮겼다. 우리와 다른 점(사전등록이 
 * "누적 초과수익"(상태 이름): 기본은 그 상태로 분류된 날의 일 초과수익 합(``"sum"``).
   ``"compound"``는 복리(Π(1+r)−1).
 * λ 검증에서 Θ 재적합: 검증 월말마다 그 시점의 창으로 월말 재적합(결정일과 같은 방식).
-* 결측 CD91은 0으로 채운다(호출자가 null 세션을 미리 걸러야 하면 걸러서 넘긴다).
+* 현금(CD91)이 비거나 오래된 날(F7)은 NaN이다. 채우지 않고 기준선 장부처럼 그날을 표본에서
+  뺀다: 피쳐·창(3,000일)은 "유효한 날"만 이어 붙인 열에서 만들고, 검증 전략 수익도 그날을
+  빼되 그날 체결 비용은 다음 유효한 날 수익에 얹는다(장부와 같다).
+* λ는 한 달 늦춰 쓴다(F6): 월말 k의 상태는 월말 k−1에 고른 λ로 구한다(검증창도 k−1에서 끝남).
+* 예열(F4): 창 첫날은 유효한 날 열에서 ``feature_warmup``번째 이후여야 한다. 창은 항상 3,000일
+  전체이고 빈 상태·반복 상한 점검도 그 전체 창에서 한다.
 
 결정일 t의 신호는 t까지의 자료만 쓴다(§10 Q1 ② 시험으로 확인).
 """
@@ -129,10 +134,11 @@ def kmeanspp_centers(x: np.ndarray, k: int, rng: np.random.Generator) -> np.ndar
 
 def _fit_once(
     x: np.ndarray, lam: float, seed: int, max_iter: int, k: int = 2
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, float, bool]:
     rng = np.random.default_rng(seed)
     theta = kmeanspp_centers(x, k, rng)
     s, obj = viterbi_jump(x, theta, lam)
+    hit_max = True  # 상태열이 안 바뀌어 멈추지 못하고 반복 상한에 닿으면 True
     for _ in range(max_iter):
         new = theta.copy()
         for j in range(k):
@@ -143,25 +149,28 @@ def _fit_once(
         theta = new
         if np.array_equal(s2, s):
             obj = obj2
+            hit_max = False
             break
         s, obj = s2, obj2
-    return theta, s, obj
+    return theta, s, obj, hit_max
 
 
 def fit_jm(
     x: np.ndarray, lam: float, seeds: tuple[int, ...], max_iter: int = 100
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, float, int]:
     """``len(seeds)``번 k-means++ 초기화로 돌려 목적함수가 가장 낮은 적합을 남긴다.
 
-    동점이면 앞선 시드. 반환: (Θ (2, d), 상태열, 목적함수).
+    동점이면 앞선 시드. 반환: (Θ (2, d), 상태열, 목적함수, 반복 상한(max_iter)에 닿은 시드 수).
     """
     best = None
+    n_hit = 0
     for sd in seeds:
         fit = _fit_once(x, lam, sd, max_iter)
+        n_hit += int(fit[3])
         if best is None or fit[2] < best[2] - 1e-12:
             best = fit
     assert best is not None
-    return best
+    return best[0], best[1], best[2], n_hit
 
 
 def online_last_state(x: np.ndarray, theta: np.ndarray, lam: float) -> int:
@@ -193,8 +202,8 @@ def risk_state(states: np.ndarray, excess: np.ndarray, rule: str = "sum") -> int
 # --------------------------------------------------------------------------- 규칙
 @dataclass(frozen=True)
 class JMConfig:
-    lambdas: tuple[float, ...]  # λ 격자 — 미정(§10.2 결정 1), 기본값 없음
-    seeds: tuple[int, ...]  # k-means++ 시드 목록 — 미정(§10.2 결정 3), 기본값 없음
+    lambdas: tuple[float, ...]  # λ 격자 — 기본값 없음(진입점이 run.LAMBDAS를 넘긴다)
+    seeds: tuple[int, ...]  # k-means++ 시드 목록 — 기본값 없음
     window_len: int = 3000  # 원문 l = 3000 (§3.1)
     val_months: int = 96  # 8년 검증창
     max_iter: int = 100
@@ -202,8 +211,8 @@ class JMConfig:
     val_delay: int = 1  # 검증 전략 1세션 지연
     m_risk: float = 0.5  # 위험 상태 위험 몫 배수 (§10 Q4)
     m_safe: float = 1.0
-    label_rule: str = "sum"
-    feature_warmup: int = 0
+    label_rule: str = "sum"  # 진입점은 F5에 따라 "compound"
+    feature_warmup: int = 0  # 진입점은 F4에 따라 252
 
     def __post_init__(self) -> None:
         if not self.lambdas or not self.seeds:
@@ -213,8 +222,8 @@ class JMConfig:
 class JumpModelRule:
     """R-JM. ``decide(t)``는 인덱스 t까지의 자료만 쓴다.
 
-    ``kospi_ret``·``cash_ret``: 같은 달력의 일수익(길이 T). ``month_ends``: 월 마지막 거래일의
-    인덱스(오름차순, t는 이 안에 있어야 한다).
+    ``kospi_ret``·``cash_ret``: 같은 달력의 일수익(길이 T, 결측은 NaN). ``month_ends``: 월 마지막
+    거래일의 인덱스(오름차순, t는 이 안에 있어야 한다).
     """
 
     def __init__(
@@ -225,12 +234,31 @@ class JumpModelRule:
         cfg: JMConfig,
     ):
         self.kospi = np.asarray(kospi_ret, dtype=float)
-        self.cash = np.nan_to_num(np.asarray(cash_ret, dtype=float), nan=0.0)
-        self.excess = self.kospi - self.cash
-        self.feat = jm_features(self.excess)  # 인과적이라 전체를 한 번에 만들어도 t 뒤를 안 본다
+        self.cash = np.asarray(cash_ret, dtype=float)
+        excess = self.kospi - self.cash
+        self.valid = ~np.isnan(excess)
+        self.n_valid = np.cumsum(self.valid)  # d일까지 유효한 날 수
+        self.ex_v = excess[self.valid]
+        # 인과적이라 전체를 한 번에 만들어도 t 뒤를 안 본다
+        self.feat = jm_features(self.ex_v)
         self.me = np.asarray(sorted(month_ends), dtype=int)
         self.cfg = cfg
         self._cache: dict[tuple[int, float], bool] = {}
+        self.diag: dict[tuple[int, float], dict] = {}
+
+    # -- 창 ------------------------------------------------------------------------
+    def window_bounds(self, d: int) -> tuple[int, int]:
+        """d일 창의 유효한 날 열 위치 [lo, hi)."""
+        hi = int(self.n_valid[d])
+        lo = hi - self.cfg.window_len
+        if lo < self.cfg.feature_warmup:
+            raise ValueError(f"{d}: 창({self.cfg.window_len}일)+예열이 모자랍니다")
+        return lo, hi
+
+    def first_ready_index(self) -> int:
+        """창이 처음 쓸 수 있게 되는 날 인덱스(예열 포함)."""
+        need = self.cfg.window_len + self.cfg.feature_warmup
+        return int(np.searchsorted(self.n_valid, need, side="left"))
 
     # -- 월말 d, λ의 위험 여부 (창은 d까지만) -------------------------------------
     def is_risk(self, d: int, lam: float) -> bool:
@@ -238,15 +266,21 @@ class JumpModelRule:
         if key in self._cache:
             return self._cache[key]
         cfg = self.cfg
-        lo = d - cfg.window_len + 1
-        if lo < cfg.feature_warmup:
-            raise ValueError(f"{d}: 창({cfg.window_len}일)+예열이 모자랍니다")
-        x = standardize(self.feat[lo : d + 1])
-        theta, states, _ = fit_jm(x, lam, cfg.seeds, cfg.max_iter)
-        bear = risk_state(states, self.excess[lo : d + 1], cfg.label_rule)
+        lo, hi = self.window_bounds(d)
+        x = standardize(self.feat[lo:hi])
+        ex = self.ex_v[lo:hi]
+        theta, states, _, n_hit = fit_jm(x, lam, cfg.seeds, cfg.max_iter)
+        bear = risk_state(states, ex, cfg.label_rule)
+        alt = risk_state(states, ex, "compound" if cfg.label_rule == "sum" else "sum")
         last = online_last_state(x, theta, lam)
         out = last == bear
         self._cache[key] = out
+        self.diag[key] = {
+            "n_hit_max": n_hit,
+            "empty_state": bool(len(set(states.tolist())) < 2),
+            "label_disagree": bool(alt != bear),
+            "bear_share": float((states == bear).mean()),
+        }
         return out
 
     # -- λ 선택 ---------------------------------------------------------------------
@@ -257,7 +291,10 @@ class JumpModelRule:
         return me[-self.cfg.val_months :]
 
     def validation_sharpe(self, t: int, lam: float) -> float:
-        """검증창 0/1 전략(위험 상태면 CD91)의 연환산 샤프. 수익은 t까지만."""
+        """검증창 0/1 전략(위험 상태면 CD91)의 연환산 샤프. 수익은 t까지만.
+
+        현금·KOSPI가 빈 날은 표본에서 빼고, 그날 체결 비용은 다음 유효한 날에 얹는다.
+        """
         cfg = self.cfg
         ve = self.val_month_ends(t)
         pos = np.array([0.0 if self.is_risk(int(d), lam) else 1.0 for d in ve])
@@ -269,20 +306,26 @@ class JumpModelRule:
         eff = ve + cfg.val_delay
         j = np.searchsorted(eff, days, side="left") - 1
         p = pos[j]
-        r = p * self.kospi[days] + (1.0 - p) * self.cash[days]
-        # 체결일 종가에 포지션 변화분 × 편도 비용
+        k, c = self.kospi[days], self.cash[days]
+        r = p * k + (1.0 - p) * c
+        cost = np.zeros(len(days))
         for jj in range(1, len(ve)):
             day = int(eff[jj])
             if start <= day <= t:
-                r[day - start] -= abs(pos[jj] - pos[jj - 1]) * cfg.val_cost
-        ex = r - self.cash[days]
+                cost[day - start] += abs(pos[jj] - pos[jj - 1]) * cfg.val_cost
+        ok = ~(np.isnan(k) | np.isnan(c))
+        cum = np.cumsum(cost)[ok]
+        cost_on = np.diff(np.concatenate([[0.0], cum]))
+        ex = r[ok] - cost_on - c[ok]
+        if len(ex) < 2:
+            return float("-inf")
         sd = ex.std(ddof=1)
         if sd < 1e-15:
             return 0.0
         return float(ex.mean() / sd * np.sqrt(TD))
 
     def select_lambda(self, t: int) -> tuple[float, dict[float, float]]:
-        """검증 샤프가 가장 높은 λ. 동점이면 더 큰 λ (§10 Q5)."""
+        """검증 샤프가 가장 높은 λ. 동점이면 더 큰 λ (§10 Q5). 검증창은 t에서 끝난다."""
         sh = {float(lam): self.validation_sharpe(t, lam) for lam in self.cfg.lambdas}
         best = None
         for lam in sorted(sh):  # 오름차순으로 훑으며 >= 로 갱신 → 동점은 큰 λ
@@ -292,16 +335,34 @@ class JumpModelRule:
         return best, sh
 
     # -- 결정 -----------------------------------------------------------------------
+    def prev_month_end(self, t: int) -> int:
+        pos = int(np.searchsorted(self.me, t))
+        if pos >= len(self.me) or self.me[pos] != t or pos < 1:
+            raise ValueError(f"{t}은 이전 월말이 있는 월말 결정일이어야 합니다")
+        return int(self.me[pos - 1])
+
     def decide(self, t: int) -> dict:
-        lam, sh = self.select_lambda(t)
+        """월말 t의 결정. λ는 이전 월말 t'에 고른 값(F6), 상태는 t까지의 창으로 구한다."""
+        t_prev = self.prev_month_end(t)
+        lam, sh = self.select_lambda(t_prev)
         risk = self.is_risk(t, lam)
         return {
             "t": t,
+            "lambda_selected_at": t_prev,
             "lambda": lam,
             "is_risk": risk,
             "m": self.cfg.m_risk if risk else self.cfg.m_safe,
             "val_sharpe": sh,
+            "diag": self.diag.get((t, float(lam))),
         }
+
+    def first_decision_index(self) -> int:
+        """첫 결정일 t: 이전 월말 t'의 검증창(월말 ``val_months``개) 안 첫 월말이 창을 갖는 날."""
+        ready = self.first_ready_index()
+        ok = [int(d) for d in self.me if d >= ready]
+        if len(ok) < self.cfg.val_months + 1:
+            raise ValueError("첫 결정일을 만들 월말이 모자랍니다")
+        return ok[self.cfg.val_months]  # ok[0..val-1]이 검증창, 그다음 월말이 첫 결정
 
     def m_path(self, decisions: list[int]) -> np.ndarray:
         return np.array([self.decide(t)["m"] for t in decisions])
