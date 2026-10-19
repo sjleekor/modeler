@@ -173,7 +173,9 @@ class Lake:
         end_idx: dict[str, int] | None = None,
         ca: set[tuple[str, int]] | None = None,
         bump: dict[tuple[str, int], float] | None = None,
+        upper_lock: set[tuple[str, int]] | None = None,
     ):
+        self.upper_lock = upper_lock or set()
         self.tickers = [f"{i:06d}" for i in range(n_tickers)]
         self.last_idx = last_idx
         self.k200_rate = k200_rate
@@ -206,6 +208,8 @@ class Lake:
                 if self.is_halted(t, j):
                     prev = self.px[t][j - 1]
                     rows.append((S[j], t, "KOSPI" if i % 3 else "KOSDAQ", 0.0, 0.0, 0.0, prev, 0))
+                elif (t, j) in self.upper_lock:  # flat bar at the limit: open=high=low=close
+                    rows.append((S[j], t, "KOSPI" if i % 3 else "KOSDAQ", c, c, c, c, 1000))
                 else:
                     rows.append(
                         (S[j], t, "KOSPI" if i % 3 else "KOSDAQ", c, c * 1.01, c * 0.99, c, 1000)
@@ -720,6 +724,40 @@ def test_g_at_check_differing_from_the_final_value_is_flagged():
 
 
 # --------------------------------------------------------------------------- append-only
+
+
+def test_upper_limit_lock_at_entry_close_is_excluded_from_g_with_renormalized_weights(env):
+    env.grid([GRID0, GRID0 + 20])
+    basket = w_of(env.day(5)["basket"])
+    in_basket = [t for t in env.day(5)["preds"].sort("rank")["ticker"].to_list() if t in basket]
+    lock_t, halt_t = in_basket[0], in_basket[1]
+    # +35% flat bar on the D0 close (above the 30% limit minus the lock margin): label untradable
+    lake = Lake(bump={(lock_t, 5): 1.35}, upper_lock={(lock_t, 5)}, halted={halt_t: [(5, 5)]})
+    run(env, lake)
+    p0 = mpoints(env).row(0, named=True)
+    ok = {t: w for t, w in basket.items() if t not in (lock_t, halt_t)}
+    gross = sum(w * lake.ret(t, 5, 25) for t, w in ok.items()) / sum(ok.values())
+    # without the rule the locked name would carry its (bumped-entry) return into G
+    assert lake.ret(lock_t, 5, 25) < 0.0
+    assert p0["gross"] == pytest.approx(gross, abs=1e-12)
+    assert p0["n_excluded"] == 2 and p0["n_untradable_entry"] == 2
+    assert p0["n_basket_no_label"] == 0
+    assert p0["excluded_weight"] == pytest.approx(basket[lock_t] + basket[halt_t])
+    assert p0["g"] == pytest.approx(gross - lake.bench(5, 25) - COST, abs=1e-12)
+    # the label side counts the same two names as untradable
+    assert json.loads(p0["exit_kind_counts"])["untradable"] == 2
+
+
+def test_halt_only_entry_keeps_n_untradable_entry_one_and_g_as_before(env):
+    env.grid([GRID0])
+    basket = w_of(env.day(5)["basket"])
+    halt_t = next(iter(basket))
+    lake = Lake(halted={halt_t: [(5, 5)]})
+    run(env, lake)
+    p0 = mpoints(env).row(0, named=True)
+    e = expected_g(lake, basket, 5, 25, 1.0)
+    assert p0["gross"] == pytest.approx(e["gross"], abs=1e-12)
+    assert p0["n_excluded"] == 1 and p0["n_untradable_entry"] == 1
 
 
 def test_append_only_rows_and_revisions(env):

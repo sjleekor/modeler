@@ -18,7 +18,10 @@ Definitions fixed here (all from the draft; the open choices are marked *choice*
   holding window ``D_k`` close -> ``D_{k+1}`` close, where ``D_{k+1}`` = ``D0 + 20(k+1)`` sessions
   even when that record is missing; ``evaluate.holding_returns`` on the daily closes of the lake
   (halted/delisted frozen at the last non-halt close, untradable at entry excluded and the weights
-  renormalized); benchmark = KOSPI 200 close to close (``krx_index_daily``, ``idx_nm`` = the fixed
+  renormalized; "untradable at entry" is the c1 label kind ``untradable`` of the signal date, so an
+  upper-limit lock at the ``D_k`` close counts, counted in ``n_untradable_entry``; a basket name
+  without any label row keeps the ``holding_returns`` rule and is counted in ``n_basket_no_label``);
+  benchmark = KOSPI 200 close to close (``krx_index_daily``, ``idx_nm`` = the fixed
   benchmark of ``feature_set``) on the same two dates; one-way turnover of ``D_k`` =
   ``one_way_turnover(target_k, drift(previous counted basket over D_prev -> D_k))`` (first build:
   1.0; when grid points in between are missing the basket was carried, so the drift runs over the
@@ -136,6 +139,8 @@ SCHEMA: dict[str, Any] = {
     "turnover_warning": pl.Boolean,
     "excluded_weight": pl.Float64,
     "n_excluded": pl.Int64,
+    "n_untradable_entry": pl.Int64,
+    "n_basket_no_label": pl.Int64,
     "n_basket": pl.Int64,
     "first_build": pl.Boolean,
     "carried_span": pl.Boolean,
@@ -174,6 +179,8 @@ VALUE_COLS: tuple[str, ...] = (
     "turnover",
     "excluded_weight",
     "n_excluded",
+    "n_untradable_entry",
+    "n_basket_no_label",
     "n_basket",
     "first_build",
     "carried_span",
@@ -593,7 +600,16 @@ def _compute(
             cl = _closes(con, v, dk, nxt, cands)
             hold = ev.holding_returns(cl, dk, nxt, cands)
             bench = k200[nxt] / k200[dk] - 1.0
-            gp = ev.g_point({t: w for t, w in target.items()}, hold, bench, turnover)
+            t_k = date.fromisoformat(rec["t"])
+            lab = labels_all.filter(pl.col("trade_date") == t_k).drop("trade_date")
+            # the label rule decides entry: a basket name whose c1 label kind for t_k is
+            # ``untradable`` (halt / no row / upper-limit lock at the D_k close) is excluded
+            # from G like the label does; ``holding_returns`` alone misses the upper-limit lock
+            kind_of = dict(zip(lab["ticker"].to_list(), lab[KIND].to_list(), strict=True))
+            untr = sorted(t for t in target if kind_of.get(t) == "untradable")
+            no_label = [t for t in target if t not in kind_of]
+            hold_g = {**hold, **dict.fromkeys(untr)}
+            gp = ev.g_point(dict(target), hold_g, bench, turnover)
             row.update(
                 g=_num(gp["g"]),
                 gross=_num(gp["gross"]),
@@ -601,13 +617,17 @@ def _compute(
                 cost=gp["cost"],
                 excluded_weight=gp["excluded_weight"],
                 n_excluded=int(gp["n_excluded"]),
+                n_untradable_entry=len(untr),
+                n_basket_no_label=len(no_label),
             )
-            t_k = date.fromisoformat(rec["t"])
-            lab = labels_all.filter(pl.col("trade_date") == t_k).drop("trade_date")
             row["g_ready_at"] = p["matured_at"]
             row["matured_at"] = p["matured_at"]
             row["state"] = "matured"
-            row["pending_tickers"] = _label_cells(row, preds, lab, hold, gp, bench, dk, n_draws)
+            # random baskets draw from the same candidates under the same entry rule as the model
+            # basket: every untradable candidate (not only basket names) has no holding return
+            untr_all = [t for t, k in kind_of.items() if k == "untradable"]
+            hold_rb = {**hold, **dict.fromkeys(untr_all)}
+            row["pending_tickers"] = _label_cells(row, preds, lab, hold_rb, gp, bench, dk, n_draws)
             rows.append(row)
         return {"rows": rows, "data_date": data_date}
     finally:
