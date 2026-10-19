@@ -58,6 +58,12 @@ Definitions fixed here (all from the draft; the open choices are marked *choice*
   labels get decided or a close is revised. Rows are never rewritten
   (the file is rewritten atomically with the old rows verified byte-equal, there is no in-place
   edit). A missing point is appended once.
+* **KOSPI 200 close missing (decisions #9.4)**: while the K200 close of ``D_k`` or ``D_{k+1}`` is
+  absent the point stays unmatured; once the lake has stock data ``BENCH_MISSING_SESSIONS`` (20)
+  sessions after ``D_{k+1}`` and a K200 close is still absent, the point becomes a missing point
+  with ``reason = "bench_missing"`` (appended once, like every other missing point). A missing
+  point is final: a later matured computation of the same grid date (late data) is not appended
+  and is only reported as ``late_after_missing`` in the run summary.
 * **Checks**: ``checks/<check_date>.json`` from ``evaluate.check_decision`` on the points that are
   matured **as of the check date** (the lake truncated at the check date, so a later value cannot
   leak in). Write-once.
@@ -88,7 +94,9 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import numpy as np
 import polars as pl
+from scipy import stats
 
 from modeler.etl.label_gate import DEFAULT_ALLOWED_KINDS, apply_label_gate
 from modeler.etl.labels import LabelSpec
@@ -103,6 +111,8 @@ BUNDLE_TAG_NAME = "kr-next-bundle-frozen"
 POINTS_FILE = "points.parquet"
 CHECKS_DIR = "checks"
 INDEX_LAG_SESSIONS = 1
+#: sessions after D_{k+1} (stock data in the lake) after which a missing K200 close = missing point
+BENCH_MISSING_SESSIONS = 20
 N_DRAWS = 1000
 
 #: the label parameters of ``dataset.build_kr_next_panel_sql`` (a test pins them to its defaults)
@@ -115,6 +125,7 @@ LABEL_PARAMS: dict[str, int] = {
 END_HALT_HAIRCUT = 0.0
 PENDING_KINDS = ("censored",)
 PENDING = "pending"  # excluded-row kind of an undecided label
+BENCH_MISSING = "bench_missing"  # reason of a point whose K200 close never arrived
 #: kinds whose decision needs the end of the series: matured the session after the end date
 
 
@@ -535,6 +546,13 @@ def _compute(
             counted = counting.get(p["D"].isoformat())
             p["counted"] = counted is not None
             p["matured_at"] = maturity(ordered, p["next"]) if p["next"] else None
+            lim = _shift(ordered, p["next"], BENCH_MISSING_SESSIONS) if p["next"] else None
+            p["bench_missing"] = bool(
+                counted is not None
+                and lim is not None
+                and lim <= data_date
+                and not (p["D"] in k200 and p["next"] in k200)
+            )
             p["ready"] = bool(
                 counted is not None
                 and p["next"] is not None
@@ -565,6 +583,9 @@ def _compute(
             assert_forward_point(dk, tag_time)
             if not p["counted"]:
                 rows.append(_missing_row(k, dk, nxt, data_date, code_sha))
+                continue
+            if p["bench_missing"]:
+                rows.append(_missing_row(k, dk, nxt, data_date, code_sha, BENCH_MISSING))
                 continue
             ld = loaded[dk]
             rec, preds, basket = ld["record"], ld["predictions"], ld["basket"]
@@ -662,7 +683,12 @@ def _base_row(
 
 
 def _missing_row(
-    k: int, dk: date, nxt: date | None, data_date: date, code_sha: str
+    k: int,
+    dk: date,
+    nxt: date | None,
+    data_date: date,
+    code_sha: str,
+    reason: str = "no_valid_record",
 ) -> dict[str, Any]:
     row: dict[str, Any] = {c: None for c in SCHEMA}
     row.update(
@@ -670,7 +696,7 @@ def _missing_row(
         grid_date=dk,
         next_grid_date=nxt,
         status="missing",
-        reason="no_valid_record",
+        reason=reason,
         revision=1,
         computed_data_date=data_date,
         code_inventory_sha256=code_sha,
@@ -756,7 +782,7 @@ def _missing_reasons(lines: Sequence[Mapping[str, Any]], rows: list[dict[str, An
     for line in lines:
         by_d.setdefault(line["D"], []).append(line)
     for r in rows:
-        if r["state"] == "missing":
+        if r["state"] == "missing" and r["reason"] != BENCH_MISSING:
             att = by_d.get(r["grid_date"].isoformat(), [])
             r["reason"] = "only_invalid_attempts" if att else "no_record"
 
@@ -776,9 +802,16 @@ def _frame(rows: Sequence[Mapping[str, Any]]) -> pl.DataFrame:
 
 
 def plan_appends(
-    existing: pl.DataFrame, computed: Sequence[Mapping[str, Any]]
+    existing: pl.DataFrame,
+    computed: Sequence[Mapping[str, Any]],
+    late_after_missing: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """New rows to append: first maturity, a changed final value, or a first missing point."""
+    """New rows to append: first maturity, a changed final value, or a first missing point.
+
+    A grid date that already has a missing row is final (decisions: no revival by late data, so
+    inclusion cannot depend on the outcome): a later matured computation for it is not appended;
+    its grid date is added to ``late_after_missing`` (run log only, never ``points.parquet``).
+    """
     latest: dict[Any, dict[str, Any]] = {}
     for r in existing.sort(["grid_date", "revision"]).to_dicts():
         latest[(r["grid_date"], r["status"] == "missing")] = r
@@ -789,6 +822,10 @@ def plan_appends(
                 out.append({**r, "revision": 1})
             continue
         if r["state"] != "matured":
+            continue
+        if (r["grid_date"], True) in latest:
+            if late_after_missing is not None:
+                late_after_missing.append(r["grid_date"].isoformat())
             continue
         old = latest.get((r["grid_date"], False))
         if old is None:
@@ -845,6 +882,66 @@ def check_frame(rows: Sequence[Mapping[str, Any]]) -> pl.DataFrame:
     )
 
 
+#: base effect scenario of the Q7 power column (assumptions, not external estimates; draft ST-15)
+POWER_SCENARIO: dict[str, dict[str, float]] = {
+    "g": {"effect": 0.005, "sd": 0.04},  # +0.5% / month, sd 4%
+    "tail_diff": {"effect": -0.01, "sd": 0.03},  # -1% / month, sd 3%
+}
+STAT_ALPHA = 0.025
+
+
+def _clean_values(values: Sequence[Any]) -> list[float]:
+    return [float(v) for v in values if v is not None and not math.isnan(float(v))]
+
+
+def one_sided_power(n: int, effect: float, sd: float, alpha: float = STAT_ALPHA) -> float | None:
+    """Power of the one-sided one-sample t-test at ``n`` points (noncentral t).
+
+    Direction follows the sign of ``effect`` (H1 mean > 0 for positive, < 0 for negative).
+    ``None`` for ``n < 2`` or ``sd <= 0``.
+    """
+    if n < 2 or sd <= 0:
+        return None
+    crit = float(stats.t.ppf(1 - alpha, n - 1))
+    ncp = abs(effect) * math.sqrt(n) / sd
+    return float(stats.nct.sf(crit, n - 1, ncp))
+
+
+def cell_stats(values: Sequence[Any], cell: str) -> dict[str, Any]:
+    """Record-only numbers of one cell over the matured points (decisions #6, Q7).
+
+    ``cell`` is ``"g"`` (one-sided 97.5% t LOWER bound), ``"tail_diff"`` (one-sided 97.5% t UPPER
+    bound) or ``"rank_ic"`` (two-sided 95% t interval). Always the cumulative ``mean`` and ``n``
+    (non-null values); bounds are ``None`` for ``n < 2``. ``power`` is the power at that ``n`` of
+    the one-sided t-test under the base scenario (:data:`POWER_SCENARIO`); the rank IC has none.
+    This never feeds ``evaluate.check_decision``.
+    """
+    v = _clean_values(values)
+    n = len(v)
+    out: dict[str, Any] = {"n": n, "mean": (sum(v) / n) if n else None}
+    if cell in POWER_SCENARIO:
+        sc = POWER_SCENARIO[cell]
+        out["power_base"] = one_sided_power(n, sc["effect"], sc["sd"])
+        out["power_scenario"] = {**sc, "alpha": STAT_ALPHA, "test": "one-sided t"}
+    se = None
+    if n >= 2:
+        se = float(np.std(v, ddof=1)) / math.sqrt(n)
+    if cell == "g":
+        crit = float(stats.t.ppf(1 - STAT_ALPHA, n - 1)) if n >= 2 else None
+        out["lower_975_one_sided"] = out["mean"] - crit * se if crit is not None else None
+    elif cell == "tail_diff":
+        crit = float(stats.t.ppf(1 - STAT_ALPHA, n - 1)) if n >= 2 else None
+        out["upper_975_one_sided"] = out["mean"] + crit * se if crit is not None else None
+    elif cell == "rank_ic":
+        crit = float(stats.t.ppf(0.975, n - 1)) if n >= 2 else None
+        out["ci95_two_sided"] = (
+            [out["mean"] - crit * se, out["mean"] + crit * se] if crit is not None else None
+        )
+    else:
+        raise ValueError(f"unknown cell {cell!r}")
+    return out
+
+
 NOTE = (
     "이 판정은 검정력 50% 미만의 탐색 판정입니다. 모델 중단은 제안이며 사용자 확인 뒤에만 합니다."
 )
@@ -861,7 +958,24 @@ def build_check(
     data_date: date,
     code_sha: str,
 ) -> dict[str, Any]:
-    """The check report of ``check_date`` from the points as computed as of that date."""
+    """The check report of ``check_date`` from the points as computed as of that date.
+
+    A grid date that ``points.parquet`` already declares missing (any reason) is final: it is
+    never counted, even if the as-of computation would mature it (late data); it is listed under
+    ``missing`` with the reason of the points row.
+    """
+    declared = {
+        r["grid_date"]: r["reason"]
+        for r in final_points.filter(pl.col("status") == "missing")
+        .sort(["grid_date", "revision"])
+        .to_dicts()
+    }
+    rows = [
+        {**r, "state": "missing", "reason": declared[r["grid_date"]]}
+        if r["state"] == "matured" and r["grid_date"] in declared
+        else r
+        for r in rows
+    ]
     frame = check_frame(rows)
     decision = ev.check_decision(frame, check_date)
     final_latest: dict[Any, dict[str, Any]] = {}
@@ -913,6 +1027,12 @@ def build_check(
         "missing": miss,
         "turnover_warning": ev.turnover_warning(turn),
         "requires_user_confirmation": bool(decision["stop_proposal"]),
+        "cell_stats": {
+            "g": cell_stats(frame["g"].to_list(), "g"),
+            "tail_diff": cell_stats(frame["tail_diff"].to_list(), "tail_diff"),
+            "rank_ic": cell_stats(frame["rank_ic"].to_list(), "rank_ic"),
+            "record_only": True,
+        },
         "note": NOTE,
         "inputs": {
             "bundle_tag_time": tag_time,
@@ -997,7 +1117,9 @@ def run_forward(
         )
         _missing_reasons(lines, res["rows"])
         existing = read_points(points_path)
-        new_rows = plan_appends(existing, res["rows"])
+        late: list[str] = []
+        new_rows = plan_appends(existing, res["rows"], late)
+        summary["late_after_missing"] = late
         summary["new_rows"] = append_points(points_path, new_rows)
         summary["revisions"] = [
             (r["grid_date"].isoformat(), r["status"], r["revision"]) for r in new_rows

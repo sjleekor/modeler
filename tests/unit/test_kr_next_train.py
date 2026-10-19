@@ -138,11 +138,15 @@ def test_inner_validation_is_last_20_percent_of_training_dates():
 
 
 def _matrix(scores: list[list[float]], points=None) -> tr.ScoreMatrix:
+    """2-D input [point, fold] gets one seed; 3-D input is [point, fold, seed]."""
     points = points or tr.GRID[: len(scores)]
     s = np.array(scores, dtype=float)
+    if s.ndim == 2:
+        s = s[:, :, None]
     return tr.ScoreMatrix(
         points=[dict(p) for p in points],
         fold_ids=list(range(1, s.shape[1] + 1)),
+        seeds=list(range(s.shape[2])),
         scores=s,
         best_iter=np.full(s.shape, 50),
     )
@@ -203,8 +207,61 @@ def test_selection_outside_one_se_is_not_taken():
 
 def test_final_max_iter_is_median_of_best_iterations():
     m = _matrix([[0.0] * 5])
-    m.best_iter = np.array([[10, 30, 20, 100, 40]])
+    m.best_iter = np.array([[10, 30, 20, 100, 40]])[:, :, None]
     assert tr.final_max_iter(m, 0) == 30
+
+
+def test_final_max_iter_is_median_over_folds_and_seeds_rounded_half_up():
+    m = _matrix(np.zeros((1, 2, 2)))
+    m.best_iter = np.array([[[10, 11], [20, 20]]])  # median of 10,11,20,20 = 15.5 -> 16
+    assert tr.final_max_iter(m, 0) == 16
+    m.best_iter = np.zeros((1, 2, 2), dtype=int)
+    assert tr.final_max_iter(m, 0) == 1  # minimum 1
+
+
+def test_selection_uses_seed_and_fold_mean():
+    s = np.full((16, 3, 2), 0.0)
+    s[2] = [[0.10, 0.12], [0.10, 0.12], [0.10, 0.12]]  # mean 0.11
+    s[5] = [[0.2, 0.0], [0.2, 0.0], [0.2, 0.0]]  # mean 0.10
+    assert tr.select_point(_matrix(s))["best_index"] == 2
+
+
+def test_selection_band_is_dominated_by_seed_se_when_larger():
+    pts = list(tr.GRID)
+    idx = {tuple(p.values()): i for i, p in enumerate(pts)}
+    best = idx[(0.1, 31, 200, 0.0)]
+    reg = idx[(0.03, 15, 1000, 1.0)]  # the most regularized point
+    s = np.full((16, 4, 5), -1.0)
+    # best: identical across folds (fold SE 0) but seeds spread -> seed SE large
+    seed_vals = np.array([0.00, 0.10, 0.02, 0.08, 0.05])  # mean 0.05, sd ~0.0395, SE ~0.0177
+    s[best] = np.tile(seed_vals, (4, 1))
+    s[reg] = 0.05 - 0.012  # 0.012 below the best: outside fold SE (0), inside seed SE
+    sel = tr.select_point(_matrix(s, pts))
+    assert sel["fold_se"] == pytest.approx(0.0, abs=1e-12)
+    assert sel["seed_se"] == pytest.approx(np.std(seed_vals, ddof=1) / np.sqrt(5))
+    assert sel["se"] == sel["seed_se"]
+    assert sel["best_index"] == best and sel["index"] == reg
+    # with a gap larger than the band the best point stays
+    s[reg] = 0.05 - 0.03
+    assert tr.select_point(_matrix(s, pts))["index"] == best
+
+
+def test_selection_band_is_dominated_by_fold_se_when_larger():
+    pts = list(tr.GRID)
+    idx = {tuple(p.values()): i for i, p in enumerate(pts)}
+    best = idx[(0.1, 31, 200, 0.0)]
+    s = np.full((16, 4, 3), -1.0)
+    s[best] = np.array([0.0, 0.1, 0.0, 0.1])[:, None]  # same value on every seed
+    sel = tr.select_point(_matrix(s, pts))
+    assert sel["seed_se"] == pytest.approx(0.0, abs=1e-12)
+    assert sel["se"] == sel["fold_se"] > 0
+
+
+def test_selection_reports_seed_spread_of_chosen_point():
+    s = np.full((16, 3, 3), 0.0)
+    s[4] = np.array([[0.1, 0.2, 0.3]] * 3)
+    sel = tr.select_point(_matrix(s))
+    assert sel["seed_sd"] == pytest.approx(0.1)
 
 
 # --------------------------------------------------------------- CV / determinism / fits
@@ -214,9 +271,10 @@ POINTS2 = [tr.GRID[0], tr.GRID[-1]]
 
 def test_cv_grid_shape_and_signal():
     panel = make_panel()
-    m = tr.cv_grid(panel, SMALL, points=POINTS2)
-    assert m.scores.shape == (2, 5)
-    assert m.best_iter.shape == (2, 5)
+    m = tr.cv_grid(panel, SMALL, points=POINTS2, seeds=(0, 1))
+    assert m.scores.shape == (2, 5, 2)
+    assert m.best_iter.shape == (2, 5, 2)
+    assert m.seeds == [0, 1]
     assert (m.best_iter >= 1).all() and (m.best_iter <= tr.MAX_ITER).all()
     assert np.nanmean(m.scores) > 0.1  # the fake signal is learnable
     d = m.to_dict()
@@ -233,33 +291,75 @@ def test_cv_valid_label_end_max_limits_validation_rows():
         assert (ends[fi.valid] <= np.datetime64(cutoff)).all()
 
 
-def test_determinism_check_passes_across_seeds_0_to_4():
+def test_default_seeds_are_0_to_4():
+    assert tr.SEEDS == (0, 1, 2, 3, 4)
+    assert tr.FINAL_SEED == 0
+
+
+def test_determinism_check_same_seed_twice_is_identical():
     panel = make_panel()
-    out = tr.determinism_check(panel, tr.GRID[0], range(5), SMALL)
+    out = tr.determinism_check(panel, tr.GRID[0], SMALL, seed=0)
     assert out["identical"] is True
-    assert out["seeds"] == [0, 1, 2, 3, 4]
+    assert out["seed"] == 0 and out["repeats"] == 2
 
 
-def test_determinism_check_detects_a_seed_dependent_model(monkeypatch):
+def test_determinism_check_detects_nondeterminism(monkeypatch):
     panel = make_panel()
     real = tr._fit_early
+    calls = {"n": 0}
 
     class Noisy:
-        def __init__(self, m, seed):
-            self.m, self.seed = m, seed
+        def __init__(self, m, k):
+            self.m, self.k = m, k
             self.validation_score_ = m.validation_score_
 
         def staged_predict(self, X):
             for p in self.m.staged_predict(X):
-                yield p + self.seed * 1e-3
+                yield p + self.k * 1e-3
 
     def fake(ctx, fi, point, seed=0):
         m, best = real(ctx, fi, point, seed=seed)
-        return Noisy(m, seed), best
+        calls["n"] += 1
+        return Noisy(m, calls["n"]), best
 
     monkeypatch.setattr(tr, "_fit_early", fake)
     with pytest.raises(AssertionError):
-        tr.determinism_check(panel, tr.GRID[0], range(3), SMALL)
+        tr.determinism_check(panel, tr.GRID[0], SMALL)
+
+
+def test_seeds_differ_above_200k_rows_but_same_seed_is_identical():
+    """sklearn HGB bins on a random 2e5-row subsample when n > 2e5, so the seed matters."""
+    rng = np.random.default_rng(1)
+    n = 260_000
+    X = rng.normal(size=(n, 2))
+    y = X[:, 0] + rng.normal(size=n)
+    pt = {
+        "learning_rate": 0.1,
+        "max_leaf_nodes": 15,
+        "min_samples_leaf": 200,
+        "l2_regularization": 0.0,
+    }
+    nv = 20_000
+
+    def fit(seed: int):
+        m = tr._hgb(pt, max_iter=5, early=True, seed=seed)
+        m.fit(X[:-nv], y[:-nv], X_val=X[-nv:], y_val=y[-nv:])
+        return m.predict(X[-nv:])
+
+    p0, p0b, p1 = fit(0), fit(0), fit(1)
+    assert np.array_equal(p0, p0b)
+    assert not np.array_equal(p0, p1)
+
+
+def test_cv_grid_records_all_point_fold_seed_cells_and_json():
+    panel = make_panel()
+    m = tr.cv_grid(panel, SMALL, points=POINTS2, seeds=(0, 3))
+    assert m.scores.shape == (2, 5, 2) and m.seeds == [0, 3]
+    d = m.to_dict()
+    assert d["axes"] == ["point", "fold", "seed"] and d["seeds"] == [0, 3]
+    assert np.array(d["fold_mean_scores"]).shape == (2, 5)
+    assert d["mean_scores"] == pytest.approx(np.nanmean(m.scores, axis=(1, 2)).tolist())
+    json.dumps(d)
 
 
 def test_fit_final_uses_fixed_max_iter_without_early_stopping():
@@ -296,7 +396,7 @@ def test_null_mask_nulls_columns_where_flag_true_before_ranking():
     with pytest.raises(ValueError):
         tr.prepare_panel(panel, SMALL, null_mask=("fin_ttm_conflict_v2", ["zzz"]))
     # the refit path accepts the mask too
-    tr.cv_point(panel, tr.GRID[0], SMALL, null_mask=("fin_ttm_conflict_v2", ["f_a"]))
+    tr.cv_point(panel, tr.GRID[0], SMALL, seeds=(0,), null_mask=("fin_ttm_conflict_v2", ["f_a"]))
 
 
 def test_fit_ridge_and_cv_ridge():
@@ -502,7 +602,9 @@ def test_cli_end_to_end_on_synthetic_panel(tmp_path):
     repo = _prereg_repo(tmp_path / "prereg", tag=True)
     cols = list(fs.NOFLOW_COLS)
     assert len(cols) == 30
-    panel = make_panel(cols=cols, label_name="label_end_date_c1_20d", extra_flag=True, n_dates=230)
+    panel = make_panel(
+        cols=cols, label_name="label_end_date_c1_20d", extra_flag=True, n_dates=230, n_tickers=16
+    )
     pp = tmp_path / "panel.parquet"
     panel.write_parquet(pp)
     doc = tmp_path / "prereg.md"
@@ -533,8 +635,11 @@ def test_cli_end_to_end_on_synthetic_panel(tmp_path):
     assert m["feature_cols"] == cols
     assert m["snapshot_id"] == "snap-synth"
     assert len(m["score_matrix"]["points"]) == 16
-    assert np.array(m["score_matrix"]["scores"]).shape == (16, 5)
-    assert m["determinism"]["identical"] is True
+    assert np.array(m["score_matrix"]["scores"]).shape == (16, 5, 5)
+    assert m["score_matrix"]["seeds"] == [0, 1, 2, 3, 4]
+    assert m["seeds"] == [0, 1, 2, 3, 4] and m["final_seed"] == 0
+    assert m["seed_spread"]["seed_sd_of_fold_mean"] >= 0
+    assert m["determinism"]["identical"] is True and m["determinism"]["seed"] == 0
     assert m["prereg_doc_sha256"] and len(m["prereg_doc_sha256"]) == 64
     assert m["trials"] == {"hgb_grid_points": 16, "ridge": 1}
     assert "r1_sensitivity" in m and len(m["r1_sensitivity"]["fold_scores"]) == 5

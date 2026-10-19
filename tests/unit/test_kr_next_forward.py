@@ -174,8 +174,10 @@ class Lake:
         ca: set[tuple[str, int]] | None = None,
         bump: dict[tuple[str, int], float] | None = None,
         upper_lock: set[tuple[str, int]] | None = None,
+        k200_missing: set[int] | None = None,
     ):
         self.upper_lock = upper_lock or set()
+        self.k200_missing = k200_missing or set()
         self.tickers = [f"{i:06d}" for i in range(n_tickers)]
         self.last_idx = last_idx
         self.k200_rate = k200_rate
@@ -244,6 +246,8 @@ class Lake:
         )
         irows = []
         for j in range(0, self.last_idx + 1):
+            if j in self.k200_missing:
+                continue
             irows.append((S[j], "kospi", "KOSPI", "코스피 200", self.k200[j], self.k200[j]))
             irows.append((S[j], "kospi", "KOSPI", "코스피", 1.0, 1.0))  # decoy
         con.executemany("INSERT INTO krx_index_daily VALUES (?,?,?,?,?,?)", irows)
@@ -723,6 +727,206 @@ def test_g_at_check_differing_from_the_final_value_is_flagged():
     }
 
 
+# --------------------------------------------------------------------------- Q7 cell stats
+
+
+def _rows_for_stats(gs, tails, ics):
+    return [
+        {
+            "state": "matured",
+            "grid_date": S[5 + 20 * i],
+            "matured_at": S[26 + 20 * i],
+            "g": g,
+            "tail_diff": t,
+            "rank_ic": ic,
+            "n_pending": 0,
+            "excluded_tail": "{}",
+            "excluded_rest": "{}",
+            "turnover": 1.0,
+        }
+        for i, (g, t, ic) in enumerate(zip(gs, tails, ics, strict=True))
+    ]
+
+
+def _empty_final():
+    return pl.DataFrame(schema=fw.SCHEMA)
+
+
+GS = [0.02, -0.01, 0.005, 0.03, -0.02, 0.01, 0.0, 0.015]
+TS = [-0.02, 0.01, -0.005, -0.03, 0.02, -0.01, 0.0, -0.015]
+ICS = [0.05, -0.02, 0.03, 0.08, -0.04, 0.01, 0.02, 0.06]
+
+
+def test_cell_stats_g_lower_bound_tail_upper_bound_and_ic_interval_by_hand():
+    n = len(GS)
+    tc = stats.t.ppf(0.975, n - 1)
+    g = fw.cell_stats(GS, "g")
+    m, se = np.mean(GS), np.std(GS, ddof=1) / np.sqrt(n)
+    assert g["n"] == n and g["mean"] == pytest.approx(m)
+    assert g["lower_975_one_sided"] == pytest.approx(m - tc * se)
+    assert "upper_975_one_sided" not in g and "ci95_two_sided" not in g
+    t = fw.cell_stats(TS, "tail_diff")
+    m, se = np.mean(TS), np.std(TS, ddof=1) / np.sqrt(n)
+    assert t["upper_975_one_sided"] == pytest.approx(m + tc * se)
+    ic = fw.cell_stats(ICS, "rank_ic")
+    m, se = np.mean(ICS), np.std(ICS, ddof=1) / np.sqrt(n)
+    assert ic["ci95_two_sided"] == pytest.approx([m - tc * se, m + tc * se])
+    assert "power_base" not in ic
+
+
+def test_cell_stats_skips_null_nan_and_handles_tiny_n():
+    g = fw.cell_stats([0.01, None, float("nan"), 0.03], "g")
+    assert g["n"] == 2 and g["mean"] == pytest.approx(0.02)
+    one = fw.cell_stats([0.01], "g")
+    assert one["n"] == 1 and one["lower_975_one_sided"] is None and one["power_base"] is None
+    zero = fw.cell_stats([], "tail_diff")
+    assert zero["n"] == 0 and zero["mean"] is None and zero["upper_975_one_sided"] is None
+    with pytest.raises(ValueError):
+        fw.cell_stats([1.0, 2.0], "nope")
+
+
+@pytest.mark.parametrize("cell,effect,sd", [("g", 0.005, 0.04), ("tail_diff", -0.01, 0.03)])
+def test_power_matches_noncentral_t_and_simulation(cell, effect, sd):
+    assert fw.POWER_SCENARIO[cell] == {"effect": effect, "sd": sd}
+    rng = np.random.default_rng(7)
+    for n in (2, 8, 24, 36):
+        pw = fw.cell_stats([0.0] * n, cell)["power_base"]
+        crit = stats.t.ppf(0.975, n - 1)
+        ncp = abs(effect) * np.sqrt(n) / sd
+        assert pw == pytest.approx(stats.nct.sf(crit, n - 1, ncp))
+        x = rng.normal(abs(effect), sd, size=(40000, n))
+        tstat = x.mean(axis=1) / (x.std(axis=1, ddof=1) / np.sqrt(n))
+        assert pw == pytest.approx(float((tstat > crit).mean()), abs=0.012)
+    p = [fw.cell_stats([0.0] * n, cell)["power_base"] for n in (2, 8, 24, 36)]
+    assert (
+        p == sorted(p) and p[0] < p[-1] and p[-1] < 0.5
+    )  # weak at 36 points: why the note says < 50%
+
+
+def test_build_check_adds_cell_stats_and_leaves_the_decision_alone():
+    rows = _rows_for_stats(GS, TS, ICS)
+    rep = fw.build_check(
+        S[200],
+        rows,
+        _empty_final(),
+        tag_time=TAG_TIME,
+        prereg_tag="t",
+        ledger_lines=1,
+        data_date=S[200],
+        code_sha="x",
+    )
+    cs = rep["cell_stats"]
+    assert cs["record_only"] is True
+    assert cs["g"] == fw.cell_stats(GS, "g")
+    assert cs["tail_diff"] == fw.cell_stats(TS, "tail_diff")
+    assert cs["rank_ic"] == fw.cell_stats(ICS, "rank_ic")
+    assert "탐색" in rep["note"]
+    # the decision is exactly what evaluate.check_decision says on the same frame
+    assert rep["decision"] == ev.check_decision(fw.check_frame(rows), S[200])
+    json.dumps(rep, default=str)
+
+
+def test_cell_stats_use_only_matured_points_of_the_check():
+    rows = _rows_for_stats(GS[:3], TS[:3], ICS[:3])
+    rows.append({**rows[0], "state": "pending", "g": 9.0})
+    rows.append({**rows[0], "state": "missing", "g": 8.0, "reason": "bench_missing"})
+    rep = fw.build_check(
+        S[200],
+        rows,
+        _empty_final(),
+        tag_time=TAG_TIME,
+        prereg_tag="t",
+        ledger_lines=1,
+        data_date=S[200],
+        code_sha="x",
+    )
+    assert rep["cell_stats"]["g"]["n"] == 3
+    assert rep["missing"][0]["reason"] == "bench_missing"
+
+
+# --------------------------------------------------------------------------- K200 missing
+
+
+def cd_idx(d: date) -> int:
+    return S.index(d)
+
+
+def _p0(env: Env) -> pl.DataFrame:
+    """Rows of grid date D0 (the file also holds no_record rows of the uncounted grid dates)."""
+    return points(env).filter(pl.col("grid_date") == S[GRID0])
+
+
+def test_missing_k200_keeps_the_point_unmatured_until_20_sessions_after_next_grid(env):
+    env.grid([GRID0])
+    # K200 of D_{k+1} (idx 25) absent; lake through idx 44: 19 sessions after D_{k+1}
+    run(env, Lake(last_idx=44, k200_missing={25}))
+    assert _p0(env).height == 0  # unmatured: nothing appended
+    # through idx 45: exactly 20 sessions after D_{k+1}: now a missing point
+    run(env, Lake(last_idx=45, k200_missing={25}))
+    pts = _p0(env)
+    assert pts["status"].to_list() == ["missing"]
+    r = pts.row(0, named=True)
+    assert r["reason"] == "bench_missing" and r["matured_at"] is None
+    assert r["g"] is None and r["revision"] == 1
+    # append-only: a second run adds nothing, and the row is never rewritten
+    before = points(env)
+    assert run(env, Lake(last_idx=50, k200_missing={25}))["new_rows"] == 0
+    assert points(env).equals(before)
+
+
+def test_late_k200_after_a_missing_point_does_not_revive_it(env):
+    env.grid([GRID0])
+    res = run(env, Lake(last_idx=45, k200_missing={25}))
+    assert res["late_after_missing"] == []
+    assert _p0(env)["reason"].to_list() == ["bench_missing"]
+    path = env.fdir / fw.POINTS_FILE
+    before = path.read_bytes()
+    res = run(env, Lake(last_idx=50))  # the K200 close of idx 25 has arrived
+    assert res["new_rows"] == 0
+    assert res["late_after_missing"] == [S[GRID0].isoformat()]
+    assert path.read_bytes() == before
+    assert _p0(env)["status"].to_list() == ["missing"]
+
+
+def test_check_does_not_count_a_point_declared_missing_when_k200_arrives_later(env):
+    env.grid([GRID0, GRID0 + 20])
+    run(env, Lake(last_idx=45, k200_missing={25}))  # D0 -> bench_missing, final
+    miss = _p0(env)
+    assert miss["reason"].to_list() == ["bench_missing"]
+    cd = ev.check_dates(sessions=S)[0]
+    lake = Lake(last_idx=cd_idx(cd))  # K200 close of idx 25 is now present
+    res = run(env, lake, check_dates=[cd])
+    assert res["late_after_missing"] == [S[GRID0].isoformat()]
+    rep = json.loads((env.fdir / "checks" / f"{cd.isoformat()}.json").read_text())
+    counted = [p["grid_date"] for p in rep["points"]]
+    assert S[GRID0].isoformat() not in counted
+    assert {m["grid_date"]: m["reason"] for m in rep["missing"]}[
+        S[GRID0].isoformat()
+    ] == "bench_missing"
+    # the decision equals the one computed without the point at all
+    pts = rep["points"]
+    assert [p["grid_date"] for p in pts] == [S[GRID0 + 20].isoformat()]
+    assert rep["decision"]["n_matured"] == len(pts)
+    assert rep["cell_stats"]["g"]["n"] == len(pts)
+
+
+def test_missing_k200_of_the_entry_date_counts_the_same(env):
+    env.grid([GRID0])
+    run(env, Lake(last_idx=45, k200_missing={5}))
+    pts = _p0(env)
+    assert pts["status"].to_list() == ["missing"] and pts["reason"].to_list() == ["bench_missing"]
+
+
+def test_k200_present_matures_normally_and_other_missing_reason_is_unchanged(env):
+    env.grid([GRID0, GRID0 + 40])
+    run(env, Lake(last_idx=70))
+    pts = points(env).sort("grid_date", "revision")
+    assert pts.filter(pl.col("grid_date") == S[5])["status"].to_list() == ["matured"]
+    miss = pts.filter(pl.col("status") == "missing")
+    assert set(miss["reason"].to_list()) == {"no_record"}  # idx 25, 65 never written
+    assert "bench_missing" not in points(env)["reason"].to_list()
+
+
 # --------------------------------------------------------------------------- append-only
 
 
@@ -814,6 +1018,10 @@ def test_plan_appends_rules():
     assert [(r["grid_date"], r["revision"]) for r in out] == [(S[5], 4), (S[25], 1), (S[45], 1)]
     old2 = pl.concat([old, fw._frame([{**miss, "revision": 1}])])
     assert fw.plan_appends(old2, [miss]) == []
+    late: list[str] = []
+    revive = {**same, "grid_date": S[45], "g": 0.3}
+    assert fw.plan_appends(old2, [revive], late) == []
+    assert late == [S[45].isoformat()]
 
 
 # --------------------------------------------------------------------------- checks

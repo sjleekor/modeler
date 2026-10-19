@@ -26,8 +26,9 @@ Choices where the spec was silent (also listed in the task report):
   trees (``staged_predict``), so the CV score matches a model refit with ``max_iter = best``.
 * The score of a (point, fold) is the mean over validation dates of the per-date Spearman
   (both markets in one cross-section); validation rows need ``trainable`` and ``y``.
-* "within one fold-SE" = best mean minus the sample standard error (ddof 1, over folds) of the
-  best point's fold scores.
+* Every (point, fold) is fit with seeds 0..4 (decisions 2026-10-19 #2). The point score is the mean
+  over seeds and folds; the tie band is max(fold SE, seed SE) of the best point (ddof 1).
+  The bundle model is one fit with random_state 0.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ import hashlib
 import itertools
 import subprocess
 import sys
+import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -72,7 +74,9 @@ RIDGE_ALPHA = 100.0
 TRAIN_START = date(2017, 1, 1)
 CV_END_DEFAULT = date(2025, 7, 31)
 PREREG_TAG = "kr-next-frozen"
-DETERMINISM_SEEDS = tuple(range(5))
+SEEDS: tuple[int, ...] = tuple(range(5))
+#: the bundle model is ONE fit with this seed, declared before any result (decisions #2)
+FINAL_SEED = 0
 
 GRID_AXES: dict[str, tuple[float | int, ...]] = {
     "learning_rate": (0.03, 0.1),
@@ -283,8 +287,8 @@ def mean_date_spearman(dates: np.ndarray, pred: np.ndarray, y: np.ndarray) -> fl
     return float(per.mean()) if len(per) else float("nan")
 
 
-def _score_fold(ctx: _Ctx, fi: _FoldIdx, point: dict[str, Any]) -> tuple[float, int]:
-    model, best = _fit_early(ctx, fi, point)
+def _score_fold(ctx: _Ctx, fi: _FoldIdx, point: dict[str, Any], seed: int = 0) -> tuple[float, int]:
+    model, best = _fit_early(ctx, fi, point, seed=seed)
     pred = _predict_at(model, ctx.X[fi.valid], best)
     return mean_date_spearman(ctx.dates[fi.valid], pred, ctx.y[fi.valid]), best
 
@@ -294,20 +298,42 @@ def _score_fold(ctx: _Ctx, fi: _FoldIdx, point: dict[str, Any]) -> tuple[float, 
 
 @dataclass
 class ScoreMatrix:
-    """Grid result: ``scores[p, f]`` and ``best_iter[p, f]`` for point ``p`` and fold ``f``."""
+    """Grid result: ``scores[p, f, s]`` and ``best_iter[p, f, s]`` (point, fold, seed).
+
+    HGB is NOT seed-free: with more than 200k fit rows the binning thresholds come from a random
+    subsample whose draw depends on ``random_state`` (decisions 2026-10-19 #2, reverting G-10).
+    """
 
     points: list[dict[str, Any]]
     fold_ids: list[int]
+    seeds: list[int]
     scores: np.ndarray
     best_iter: np.ndarray
+
+    def __post_init__(self) -> None:
+        if self.scores.ndim != 3 or self.best_iter.shape != self.scores.shape:
+            raise ValueError("scores and best_iter must both be [point, fold, seed]")
+
+    def fold_means(self) -> np.ndarray:
+        """[point, fold]: mean over seeds."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # a fold can be all-NaN
+            return np.nanmean(self.scores, axis=2)
+
+    def point_means(self) -> np.ndarray:
+        """[point]: mean over folds and seeds."""
+        return np.nanmean(self.scores, axis=(1, 2))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "points": self.points,
             "fold_ids": self.fold_ids,
+            "seeds": self.seeds,
+            "axes": ["point", "fold", "seed"],
             "scores": self.scores.tolist(),
             "best_iter": self.best_iter.tolist(),
-            "mean_scores": np.nanmean(self.scores, axis=1).tolist(),
+            "fold_mean_scores": self.fold_means().tolist(),
+            "mean_scores": self.point_means().tolist(),
         }
 
 
@@ -316,42 +342,64 @@ def cv_grid(
     feature_cols: Sequence[str] = DEFAULT_FEATURES,
     *,
     points: Sequence[dict[str, Any]] = GRID,
+    seeds: Sequence[int] = SEEDS,
     null_mask: NullMask | None = None,
     valid_label_end_max: date | None = None,
     prepared: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> ScoreMatrix:
-    """Score every grid point on every fold (G-11). ``prepared=True`` skips the rank transform."""
+    """Score every grid point on every fold with every seed (G-11).
+
+    ``prepared=True`` skips the rank transform.
+    """
     prep = panel if prepared else prepare_panel(panel, feature_cols, null_mask=null_mask)
     ctx = _context(prep, feature_cols, valid_label_end_max)
+    seeds = [int(s) for s in seeds]
     nf = len(ctx.folds)
-    scores = np.full((len(points), nf), np.nan)
-    iters = np.zeros((len(points), nf), dtype=int)
+    scores = np.full((len(points), nf, len(seeds)), np.nan)
+    iters = np.zeros((len(points), nf, len(seeds)), dtype=int)
     for p, point in enumerate(points):
         for f, fi in enumerate(ctx.folds):
-            scores[p, f], iters[p, f] = _score_fold(ctx, fi, point)
+            for k, seed in enumerate(seeds):
+                scores[p, f, k], iters[p, f, k] = _score_fold(ctx, fi, point, seed)
         if progress:
             progress(f"point {p + 1}/{len(points)} {point}: mean {np.nanmean(scores[p]):.5f}")
     return ScoreMatrix(
         points=[dict(p) for p in points],
         fold_ids=[fi.fold.fold_id for fi in ctx.folds],
+        seeds=seeds,
         scores=scores,
         best_iter=iters,
     )
 
 
-def select_point(matrix: ScoreMatrix) -> dict[str, Any]:
-    """Best mean score; among points within one fold-SE of it prefer the more regularized (G-11).
+def _sd_over(values: np.ndarray) -> tuple[float, float]:
+    """(sd with ddof 1, standard error) of the non-NaN values; (0, 0) with fewer than two."""
+    v = values[~np.isnan(values)]
+    if len(v) < 2:
+        return 0.0, 0.0
+    sd = float(np.std(v, ddof=1))
+    return sd, sd / float(np.sqrt(len(v)))
 
-    Returns ``{"index", "point", "mean", "best_index", "se", "candidates"}``.
+
+def select_point(matrix: ScoreMatrix) -> dict[str, Any]:
+    """Best seed-and-fold mean; among points within the tie band prefer the more regularized.
+
+    Tie band = max(fold SE, seed SE) of the best point: fold SE = sd over folds of the seed-mean
+    (ddof 1) / sqrt(n_folds); seed SE = sd over seeds of the fold-mean (ddof 1) / sqrt(n_seeds).
+    Ties are then broken by ``TIE_PREFERENCE`` (G-11, decisions #2).
+
+    Returns ``{"index", "point", "mean", "best_index", "se", "fold_se", "seed_se", "seed_sd",
+    "candidates"}`` where ``se`` is the band width and ``seed_sd`` is the seed spread of the
+    *chosen* point (sd over seeds of its fold-mean scores).
     """
-    means = np.nanmean(matrix.scores, axis=1)
+    means = matrix.point_means()
     if np.all(np.isnan(means)):
         raise ValueError("no grid point has a score")
     best = int(np.nanargmax(means))
-    row = matrix.scores[best]
-    row = row[~np.isnan(row)]
-    se = float(np.std(row, ddof=1) / np.sqrt(len(row))) if len(row) > 1 else 0.0
+    _, fold_se = _sd_over(matrix.fold_means()[best])
+    _, seed_se = _sd_over(np.nanmean(matrix.scores[best], axis=0))
+    se = max(fold_se, seed_se)
     cand = [i for i in range(len(means)) if not np.isnan(means[i]) and means[i] >= means[best] - se]
 
     def key(i: int) -> tuple:
@@ -363,54 +411,60 @@ def select_point(matrix: ScoreMatrix) -> dict[str, Any]:
         )
 
     chosen = min(cand, key=key)
+    seed_sd, _ = _sd_over(np.nanmean(matrix.scores[chosen], axis=0))
     return {
         "index": chosen,
         "point": dict(matrix.points[chosen]),
         "mean": float(means[chosen]),
         "best_index": best,
         "se": se,
+        "fold_se": fold_se,
+        "seed_se": seed_se,
+        "seed_sd": seed_sd,
         "candidates": cand,
     }
 
 
 def final_max_iter(matrix: ScoreMatrix, index: int) -> int:
-    """Median best iteration over the folds of the chosen point (G-11)."""
+    """Median best iteration over folds and seeds of the chosen point, round half up (G-11)."""
     return max(1, int(np.floor(float(np.median(matrix.best_iter[index])) + 0.5)))
 
 
 def determinism_check(
     panel: pl.DataFrame,
     point: dict[str, Any],
-    seeds: Sequence[int] = DETERMINISM_SEEDS,
     feature_cols: Sequence[str] = DEFAULT_FEATURES,
     *,
+    seed: int = 0,
     null_mask: NullMask | None = None,
     valid_label_end_max: date | None = None,
     prepared: bool = False,
 ) -> dict[str, Any]:
-    """Fit the last fold with each ``random_state``; the predictions must be identical (G-10)."""
+    """Fit the last fold twice with the same seed; predictions and best_iter must be identical.
+
+    The same seed must reproduce (other seeds may legitimately differ, decisions #2). A mismatch
+    raises ``AssertionError`` (stop and report, no rule change).
+    """
     prep = panel if prepared else prepare_panel(panel, feature_cols, null_mask=null_mask)
     ctx = _context(prep, feature_cols, valid_label_end_max)
     fi = ctx.folds[-1]
-    ref: np.ndarray | None = None
-    ref_best: int | None = None
-    for seed in seeds:
+    runs: list[tuple[np.ndarray, int]] = []
+    for _ in range(2):
         model, best = _fit_early(ctx, fi, point, seed=seed)
-        pred = _predict_at(model, ctx.X[fi.valid], best)
-        if ref is None:
-            ref, ref_best = pred, best
-        elif best != ref_best or not np.array_equal(pred, ref):
-            raise AssertionError(
-                f"predictions differ for random_state={seed} vs {seeds[0]} "
-                f"(best iter {best} vs {ref_best}, max abs diff "
-                f"{float(np.max(np.abs(pred - ref))):.3g})"
-            )
+        runs.append((_predict_at(model, ctx.X[fi.valid], best), best))
+    (p0, b0), (p1, b1) = runs
+    if b0 != b1 or not np.array_equal(p0, p1):
+        raise AssertionError(
+            f"two fits with random_state={seed} differ "
+            f"(best iter {b0} vs {b1}, max abs diff {float(np.max(np.abs(p0 - p1))):.3g})"
+        )
     return {
-        "seeds": list(seeds),
+        "seed": seed,
+        "repeats": 2,
         "identical": True,
         "fold_id": fi.fold.fold_id,
         "n_valid_rows": int(len(fi.valid)),
-        "best_iter": ref_best,
+        "best_iter": b0,
     }
 
 
@@ -445,7 +499,7 @@ def fit_final(
     """All trainable rows from ``start_date``, fixed ``max_iter``, no early stopping (G-12)."""
     prep = panel if prepared else prepare_panel(panel, feature_cols, null_mask=null_mask)
     rows = _final_rows(prep, start_date, end_date)
-    model = _hgb(point, max_iter=int(max_iter), early=False)
+    model = _hgb(point, max_iter=int(max_iter), early=False, seed=FINAL_SEED)
     model.fit(
         bundle_mod.model_matrix(rows, list(feature_cols)),
         rows.get_column(Y_COL).cast(pl.Float64).to_numpy(),
@@ -500,21 +554,23 @@ def cv_point(
     point: dict[str, Any],
     feature_cols: Sequence[str] = DEFAULT_FEATURES,
     *,
+    seeds: Sequence[int] = SEEDS,
     null_mask: NullMask | None = None,
     valid_label_end_max: date | None = None,
 ) -> dict[str, Any]:
-    """CV of one point (used by the R1 sensitivity): fold scores and best iterations."""
+    """CV of one point (R1 sensitivity): seed-mean fold scores, median-over-seeds best iters."""
     m = cv_grid(
         panel,
         feature_cols,
         points=[point],
+        seeds=seeds,
         null_mask=null_mask,
         valid_label_end_max=valid_label_end_max,
     )
     return {
-        "fold_scores": m.scores[0].tolist(),
-        "mean": float(np.nanmean(m.scores[0])),
-        "best_iter": m.best_iter[0].tolist(),
+        "fold_scores": m.fold_means()[0].tolist(),
+        "mean": float(m.point_means()[0]),
+        "best_iter": np.median(m.best_iter[0], axis=1).tolist(),
     }
 
 
@@ -623,11 +679,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     max_iter = final_max_iter(matrix, chosen["index"])
     log(f"chosen {point} max_iter={max_iter}")
     det = determinism_check(
-        prep_cv, point, DETERMINISM_SEEDS, cols, valid_label_end_max=cv_end, prepared=True
+        prep_cv, point, cols, seed=FINAL_SEED, valid_label_end_max=cv_end, prepared=True
     )
     ridge_cv = cv_ridge(prep_cv, cols, valid_label_end_max=cv_end, prepared=True)
     extra: dict[str, Any] = {
         "selection": {k: v for k, v in chosen.items() if k != "point"},
+        "seeds": list(SEEDS),
+        "final_seed": FINAL_SEED,
+        "seed_spread": {
+            "seed_sd_of_fold_mean": chosen["seed_sd"],
+            "seed_se": chosen["seed_se"],
+            "fold_se": chosen["fold_se"],
+            "note": "HGB binning subsample (n > 2e5 rows) depends on random_state",
+        },
+        "score_matrix_shape": list(matrix.scores.shape),
         "ridge_cv_fold_scores": ridge_cv,
         "cv_end": cv_end.isoformat(),
         "trials": {"hgb_grid_points": len(GRID), "ridge": 1},
