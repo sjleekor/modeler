@@ -198,6 +198,19 @@ gate는 `python -m modeler.serving.us_daily parity-check --rule det_a --output <
 | p99 순위 이동 | 1 이하 |
 | frozen 상위 100 안 최대 순위 이동 | 1 이하 |
 
+**v2 유니버스.** `parity-check`에 `--universe-version v2`(기본 v1)를 주면 위 v1 대조는 그대로 돌고 evidence에 `universe_v2` 절이 더해집니다. 절은 `--universe-v2-revision YYYY-MM-DD`로 고른 `universe_daily_v2` snapshot(기본은 최신)을 `verify_universe_v2_completion`으로 검사해 pin하고, golden 6일을 v2 멤버로 다시 만들어 동결본과 비교합니다. 기준은 `US_PARITY_V2_CRITERIA`이고 절 안에 적힙니다.
+
+| 검사 | 기준 |
+|---|---|
+| G1 | 만든 서빙 멤버 = `universe_daily_v2`의 `in_universe` 심볼에서 ADR을 뺀 것(봉인된 part 파일을 따로 읽음). 날짜별로 뺀 ADR 행 수를 `excluded_security_type_rows`에 적음 |
+| G2 | 동결 키와 v2 키의 교집합에서 비재무 42개가 셀 단위로 같음 (v1 비재무 기준과 같은 비교·허용오차) |
+| G3 | 교집합에서 `price_ge_5` 동일 |
+| G4 | 동결에만 있는 키는 모두 서빙 비멤버, v2에만 있는 키는 모두 동결에 없는 서빙 멤버 |
+
+**서빙 v2는 ADR을 뺍니다(사용자 결정 2026-10-10, 규칙 이름 `v2-minus-adr`).** 서빙 멤버는 `universe_daily_v2`의 `in_universe` 멤버에서 `security_type == "adr"`를 뺀 것입니다. ADR은 재무·MIDAS 주문흐름이 v1의 펀드·채권·우선주처럼 거의 비어 있고, 탐색 모델이 ADR 없는 v1 패널로 학습돼서 측정 A5에서 LightGBM 상위 100의 17개가 ADR이었습니다. 서빙에만 적용하며 연구·forward v2 정의(ADR 포함, `modeler.us.panel.build_panel`)는 그대로입니다. `security_type`이 null인 멤버는 ADR이 아니므로 남깁니다. 규칙은 `us_daily.UNIVERSE_V2_SERVING_RULE`·`SERVING_V2_EXCLUDED_SECURITY_TYPES`이고, v2 prepare의 `prep_hash`와 manifest에 `universe_v2_serving_rule`·`universe_v2_excluded_security_types`로 적힙니다. evidence의 `universe_v2` 절에도 `serving_rule`·`excluded_security_types`가 적히고, 현재 상수와 다르거나 없으면 `us_parity_v2_failures`와 `validate_parity_evidence`가 거부합니다(ADR 제외 이전에 만든 v2 evidence는 쓸 수 없고 다시 돌려야 합니다).
+
+점수·순위 비교는 v2에 적용하지 않습니다(모델 입력이 유니버스 안 순위 변환이라서). 행 수, v1에만 있는 행(`security_type`·`exclusion_reason`별)과 v2에만 있는 행(`security_type`별), 교집합의 재무 11개 차이 셀, 피쳐별 null 비율은 기록만 하고 판정하지 않습니다. v1 절과 v2 절이 모두 통과해야 `status`가 `score_equivalent`입니다. **v2 서빙 prepare(`us_universe_version` = `v2`)에는 통과한 `universe_v2` 절이 있는 evidence가 필요하고, 그 절의 `rule_version`이 prepare가 읽을 `universe_daily_v2` completion의 `rule_version`과 같아야 합니다.** collector의 v2 규칙이 바뀌면 parity를 다시 돌립니다. v1 모드 evidence에는 `universe_v2` 절이 없고 모양도 그대로입니다.
+
 2026-09-30 실행 결과는 `score_equivalent`입니다. evidence는 `/home/whi/tmp/daily_market_briefing_20260929/us_parity_det_a_20260930/parity_det_a_20260930.json`(sha256 `b0c8b41db3978f1569e171d3bf67e901a5ef88644fcfadb7308a920f7952e058`)입니다. 코드가 바뀌면 `financial_code_hash`가 달라져 evidence를 다시 만들어야 합니다.
 
 서빙이 열리는 조건은 모두 맞아야 합니다.

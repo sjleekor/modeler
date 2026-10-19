@@ -590,6 +590,73 @@ US_PARITY_CRITERIA: dict[str, float | int] = {
 }
 US_PARITY_MODELS = ("lightgbm", "ridge")
 
+# `parity-check --universe-version v2`가 evidence에 더하는 `universe_v2` 절의 기준.
+# v1 기준(US_PARITY_CRITERIA)은 건드리지 않는다. 절 안에 이 값이 그대로 적히고,
+# `us_parity_v2_failures`가 절 안 수치에서 판정을 다시 계산한다.
+US_PARITY_V2_CRITERIA: dict[str, int] = {
+    "golden_dates": 6,
+    "g1_member_mismatch_symbols": 0,
+    "g2_non_financial_diff_cells": 0,
+    "g3_eligible_mismatch_rows": 0,
+    "g4_unexplained_keys": 0,
+    "min_common_keys_per_date": 1,
+}
+US_PARITY_V2_PASSED = "passed"
+
+# 서빙 v2 멤버십 규칙(사용자 결정 2026-10-10, 측정 A5): v2 서빙은 `universe_daily_v2`의
+# in_universe 멤버에서 ADR을 뺀다. ADR은 재무·MIDAS 주문흐름이 v1의 펀드·채권·우선주처럼
+# 95~99% 비고, 탐색 모델이 ADR 없는 v1 패널로 학습돼 A5에서 LightGBM 상위 100의 17개가 ADR이었다.
+# 서빙에만 적용한다. 연구·forward v2 정의(D2, `modeler.us.panel.build_panel`)는 ADR을 포함한 채 그대로다.
+# parity evidence의 v2 절에 이 규칙이 적히고, 다른 규칙으로 만든 evidence는 거부된다.
+SERVING_V2_EXCLUDED_SECURITY_TYPES: tuple[str, ...] = ("adr",)
+UNIVERSE_V2_SERVING_RULE = "v2-minus-adr"
+
+
+def us_parity_v2_failures(block: Any) -> list[str]:
+    """Re-derive the v2 block's pass/fail (G1-G4) from its recorded numbers."""
+    if not isinstance(block, dict):
+        return ["malformed"]
+    failures: list[str] = []
+    c = US_PARITY_V2_CRITERIA
+    if block.get("criteria") != c:
+        failures.append("criteria differ from code constants")
+    if not (isinstance(block.get("snapshot_date"), str) and block["snapshot_date"]):
+        failures.append("snapshot_date")
+    sha = block.get("completion_sha256")
+    if not (isinstance(sha, str) and len(sha) == 64):
+        failures.append("completion_sha256")
+    if not (isinstance(block.get("rule_version"), str) and block["rule_version"]):
+        failures.append("rule_version")
+    if block.get("serving_rule") != UNIVERSE_V2_SERVING_RULE:
+        failures.append("serving_rule")
+    if block.get("excluded_security_types") != list(SERVING_V2_EXCLUDED_SECURITY_TYPES):
+        failures.append("excluded_security_types")
+    per_date = block.get("per_date")
+    if not isinstance(per_date, list) or len(per_date) != c["golden_dates"]:
+        failures.append("per_date missing")
+        return failures
+    try:
+        g1 = sum(d["g1_missing_symbols"] + d["g1_extra_symbols"] + d["g1_duplicate_symbols"]
+                 for d in per_date)
+        g3 = sum(d["g3_eligible_mismatch_rows"] for d in per_date)
+        g4 = sum(d["g4_unexplained_frozen_only"] + d["g4_unexplained_v2_only"] for d in per_date)
+        too_few = [d["date"] for d in per_date if d["common_keys"] < c["min_common_keys_per_date"]]
+        non_fin = block["non_financial"]
+        g2_ok = non_fin["keys_equal"] is True and non_fin["diff_cells"] == c["g2_non_financial_diff_cells"]
+    except (KeyError, TypeError):
+        return failures + ["malformed"]
+    if g1 != c["g1_member_mismatch_symbols"]:
+        failures.append("g1_members")
+    if not g2_ok:
+        failures.append("g2_non_financial")
+    if g3 != c["g3_eligible_mismatch_rows"]:
+        failures.append("g3_eligible")
+    if g4 != c["g4_unexplained_keys"]:
+        failures.append("g4_key_accounting")
+    if too_few:
+        failures.append("common_keys")
+    return failures
+
 
 def us_parity_failures(evidence: dict[str, Any]) -> list[str]:
     """Re-derive pass/fail from the recorded numbers; never trust the recorded status."""
@@ -634,6 +701,8 @@ def us_parity_failures(evidence: dict[str, Any]) -> list[str]:
             failures.append(f"{name}:malformed")
             continue
         failures.extend(f"{name}:{key}" for key, ok in checks.items() if not ok)
+    if "universe_v2" in evidence:
+        failures.extend(f"universe_v2:{f}" for f in us_parity_v2_failures(evidence["universe_v2"]))
     return failures
 
 

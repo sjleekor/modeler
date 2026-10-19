@@ -4,6 +4,9 @@
 #   us-prepare.sh [--run-date YYYY-MM-DD]     (default: today in Asia/Seoul)
 #   SERVING_ROOT  serving root (default /home/whi/apps/market-briefing/serving)
 #   BOOTSTRAP_PYTHON  date/hash helper only (default python3)
+#   ops.json us_universe_version  "v1" (default when absent) or "v2": which universe the native is
+#       built from (universe_daily or universe_daily_v2).  Anything else exits 10.  Only v2 adds
+#       --universe-version to prepare; a prepared native counts as done only when its version matches.
 #
 # A = expected US session of run date + 1 day (us_expected session), never guessed from data.
 # When the lake does not cover A yet (the 2026-10-01 case), the script no longer stops: it prepares
@@ -85,6 +88,7 @@ print(pins["parity_evidence"]["path"])
 print(pins["parity_evidence"]["sha256"])
 print(today.isoformat())
 print((today + timedelta(days=1)).isoformat())
+print(ops.get("us_universe_version", "v1"))
 PY
 ) || fail 10 "cannot read ops.json/pins.json"
 release_root=$(printf '%s\n' "$fields" | sed -n 1p)
@@ -93,6 +97,9 @@ evidence=$(printf '%s\n' "$fields" | sed -n 3p)
 evidence_sha=$(printf '%s\n' "$fields" | sed -n 4p)
 today=$(printf '%s\n' "$fields" | sed -n 5p)
 report_date=$(printf '%s\n' "$fields" | sed -n 6p)
+universe_version=$(printf '%s\n' "$fields" | sed -n 7p)
+[ "$universe_version" = v1 ] || [ "$universe_version" = v2 ] \
+  || fail 10 "ops.json us_universe_version must be v1 or v2 (got: $universe_version)"
 [ -x "$python" ] && [ -d "$release_root/src" ] || fail 10 "python or release src missing"
 
 command -v flock >/dev/null 2>&1 || fail 10 "flock not found"
@@ -126,9 +133,10 @@ mode, a = sys.argv[1], date.fromisoformat(sys.argv[2])
 if mode == "resolve":
     # A' = the newest session <= A that the pinned prices and universe snapshots both cover.
     from modeler.serving import us_daily as u
-    found = u.latest_complete_session(a)
+    found = u.latest_complete_session(a, universe_version=sys.argv[3])
+    v2 = f" universe_v2 max {found['universe_v2_max']}" if "universe_v2_max" in found else ""
     print(f"  requested A={found['requested']} prices max {found['prices_max']} "
-          f"universe max {found['universe_max']} -> resolved {found['resolved']}", file=sys.stderr)
+          f"universe max {found['universe_max']}{v2} -> resolved {found['resolved']}", file=sys.stderr)
     if found["resolved"] is None:
         sys.exit(3)
     print(found["resolved"])
@@ -150,6 +158,7 @@ if mode == "prepared-ok":
                 and native.get("serving_eligible") is True and native.get("diagnostic_only") is False
                 and native.get("code_hash") == code_hash
                 and native.get("raw_feature_parity_evidence_sha256") == sys.argv[3]
+                and native.get("universe_version", "v1") == sys.argv[4]
                 and us_native_block_reason(native) is None):
             print(manifest)
             sys.exit(0)
@@ -162,7 +171,7 @@ export STOCK_DATA_ROOT="$SERVING_ROOT/stock_data"
 
 log "checking what the lake covers (requested A=$A)"
 rc=0
-A_prime=$("$python" -c "$helper" resolve "$A") || rc=$?
+A_prime=$("$python" -c "$helper" resolve "$A" "$universe_version") || rc=$?
 if [ "$rc" -eq 3 ]; then
   fail 20 "the lake covers no completed US session (prices_daily or universe_daily is empty; see line above)"
 elif [ "$rc" -ne 0 ]; then
@@ -173,21 +182,26 @@ if [ "$A_prime" != "$A" ]; then
   log "WARNING the lake does not cover A=$A yet; preparing A'=$A_prime instead (the selector marks it stale with its lag)"
 fi
 
-if ready=$("$python" -c "$helper" prepared-ok "$A_prime" "$evidence_sha"); then
+if ready=$("$python" -c "$helper" prepared-ok "$A_prime" "$evidence_sha" "$universe_version"); then
   log "A'=$A_prime already prepared and serving-eligible, skipping: $ready"
   exit 0
 fi
 
 log "preparing A'=$A_prime (timeout 1800s, cpus $cpus)"
+version_args=()
+if [ "$universe_version" != v1 ]; then
+  log "universe version $universe_version (ops.json us_universe_version)"
+  version_args=(--universe-version "$universe_version")
+fi
 rc=0
 out_file=$(mktemp "${TMPDIR:-/tmp}/us-prepare.XXXXXX")
 run_step timeout 1800 taskset -c "$cpus" "$python" -m modeler.serving.us_daily prepare \
   --as-of "$A_prime" --raw-feature-parity-status score_equivalent \
-  --raw-feature-parity-evidence "$evidence" > "$out_file" || rc=$?
+  --raw-feature-parity-evidence "$evidence" ${version_args[@]+"${version_args[@]}"} > "$out_file" || rc=$?
 out=$(cat "$out_file"); rm -f "$out_file"
 [ -z "$out" ] || echo "$out"
 [ "$rc" -eq 0 ] || fail "$rc" "prepare failed for A'=$A_prime (exit $rc)"
 
-ready=$("$python" -c "$helper" prepared-ok "$A_prime" "$evidence_sha") \
+ready=$("$python" -c "$helper" prepared-ok "$A_prime" "$evidence_sha" "$universe_version") \
   || fail 21 "prepare finished but no serving-eligible native input exists for A'=$A_prime"
 log "prepared: $ready"
