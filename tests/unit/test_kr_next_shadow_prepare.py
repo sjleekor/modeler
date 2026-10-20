@@ -591,3 +591,118 @@ def test_record_carries_the_panel_manifest(built, bundle_dir, tmp_path, capsys) 
         == hashlib.sha256(sh._json_dumps(built["manifest"]).encode()).hexdigest()
     )
     assert SEOUL  # (imported for the fixture module)
+
+
+# ------------------------------------------------- wrapper: kr-prepare fell back (exit 33)
+
+
+def _wrapper_env(tmp_path: Path, marker_dates: list[str]):
+    """Run-ready fake environment for kr-next-shadow.sh (no flock/python of the server needed)."""
+    import os
+    import sys
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "flock").write_text("#!/bin/sh\nexit 0\n")
+    fake_py = bin_dir / "fakepython"
+    scored = tmp_path / "scored.txt"
+    fake_py.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-m" ]; then\n'
+        '  case "$2" in\n'
+        "    *shadow_release) exit 0;;\n"
+        f'    *shadow) echo "$@" > "{scored}"; exit 0;;\n'
+        "  esac\n"
+        "fi\n"
+        f'exec "{sys.executable}" "$@"\n'
+    )
+    for f in (bin_dir / "flock", fake_py):
+        f.chmod(0o755)
+    release = tmp_path / "release"
+    (release / "src").mkdir(parents=True)
+    (release / "release.json").write_text("{}")
+    cal = tmp_path / "cal.json"
+    cal.write_text(
+        json.dumps(
+            {
+                "sessions": ["2024-12-27", "2024-12-30", "2024-12-31", "2025-01-02"],
+                "coverage_start": "2024-01-01",
+                "coverage_end": "2025-12-31",
+            }
+        )
+    )
+    prepared = tmp_path / "prepared"
+    for sd in marker_dates:
+        m = prepared / "kr" / f"score_date={sd}" / "prep_id=2025-01-02"
+        m.mkdir(parents=True)
+        (m / "completion.json").write_text("{}")
+    serving = tmp_path / "serving"
+    (serving / "config").mkdir(parents=True)
+    (serving / "config" / "ops.json").write_text(
+        json.dumps(
+            {"python": str(fake_py), "kr_calendar": str(cal), "prepared_root": str(prepared)}
+        )
+    )
+    shadow_root = tmp_path / "shadow"
+    panel = shadow_root / "panels_in" / "D=2025-01-02"
+    panel.mkdir(parents=True)
+    (panel / "panel.parquet").write_bytes(b"x")
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "SHADOW_RELEASE": str(release),
+        "SHADOW_ROOT": str(shadow_root),
+        "SERVING_ROOT": str(serving),
+        "BOOTSTRAP_PYTHON": sys.executable,
+        "SHADOW_WAIT_UNTIL": "00:00",  # no waiting: D is far in the past
+    }
+    return env, shadow_root, scored
+
+
+def _run_wrapper(env):
+    import subprocess
+
+    path = REPO_ROOT / "deploy/prod/bin/kr-next-shadow.sh"
+    return subprocess.run(
+        ["bash", str(path), "--report-date", "2025-01-02"], env=env, capture_output=True, text=True
+    )
+
+
+def test_wrapper_scores_when_the_marker_is_for_t(tmp_path) -> None:
+    env, root, scored = _wrapper_env(tmp_path, ["2024-12-31"])
+    r = _run_wrapper(env)
+    assert r.returncode == 0, r.stderr
+    assert scored.is_file() and "--date 2025-01-02" in scored.read_text()
+    assert not (root / "skips").exists() or not list((root / "skips").iterdir())
+
+
+def test_wrapper_exits_33_when_kr_prepare_fell_back(tmp_path) -> None:
+    env, root, scored = _wrapper_env(tmp_path, ["2024-12-30"])  # K' instead of t
+    r = _run_wrapper(env)
+    assert r.returncode == 33, r.stderr
+    assert not scored.exists()
+    assert not list((root / "records").glob("D=*"))
+    skip = json.loads((root / "skips" / "D=2025-01-02.json").read_text())
+    assert (skip["D"], skip["t"], skip["score_date"], skip["reason"]) == (
+        "2025-01-02",
+        "2024-12-31",
+        "2024-12-30",
+        "kr_prepare_fell_back",
+    )
+    assert skip["marker"].endswith("score_date=2024-12-30/prep_id=2025-01-02/completion.json")
+    # written once: a second run leaves the first file untouched
+    first = (root / "skips" / "D=2025-01-02.json").read_text()
+    (root / "skips" / "D=2025-01-02.json").write_text(first.replace("2024-12-30", "2024-12-27"))
+    changed = (root / "skips" / "D=2025-01-02.json").read_text()
+    assert _run_wrapper(env).returncode == 33
+    assert (root / "skips" / "D=2025-01-02.json").read_text() == changed
+    assert not list((root / "skips").glob("*.tmp*"))
+
+
+def test_wrapper_prefers_the_marker_of_t_among_several(tmp_path) -> None:
+    # glob order puts 2024-12-30 before 2024-12-31; the one equal to t must win
+    env, root, scored = _wrapper_env(tmp_path, ["2024-12-30", "2024-12-31"])
+    r = _run_wrapper(env)
+    assert r.returncode == 0, r.stderr
+    assert scored.is_file()
+    assert not (root / "skips").exists() or not list((root / "skips").iterdir())

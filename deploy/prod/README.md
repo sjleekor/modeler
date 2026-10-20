@@ -422,7 +422,7 @@ sj2 serving venv에는 `exchange_calendars`가 없습니다(2026-10-06 확인: p
 | 시각 | 평일 07:30 시작. kr-prepare 완료 마커(`prepared/kr/score_date=*/prep_id=<D>/completion.json`)를 30초마다 파일로만 확인하고 09:20까지 기다립니다. 04:00대 DART chain과 kr-prepare(약 41분), 06:30 fallback(약 07:11까지), 09:30 select, 10:00 run과 겹치지 않습니다 |
 | 피할 시간 | 22:50에서 24:00 사이 상태 변경 금지, OpenDART 운영 잡 22:10·23:30·04:00대 |
 | 락 | 자기 락 `shadow/locks/kr-next-shadow.lock`만 잡습니다. `kr-prepare.lock`은 기다리거나 잡지 않습니다 |
-| 종료 코드 | 0 정상(또는 락 중·휴장), 3 15:00 뒤에 써서 `valid=false`로 남김, 30 마커 없음, 31 패널 없음, 10 설정·release 검증 실패, 12 달력 밖 |
+| 종료 코드 | 0 정상(또는 락 중·휴장), 3 15:00 뒤에 써서 `valid=false`로 남김, 30 마커 없음, 31 패널 없음, 10 설정·release 검증 실패, 12 달력 밖, 33 kr-prepare가 t 대신 이전 세션으로 물러난 날(빠진 날로 두고 `shadow/skips/D=<D>.json`만 남김, 기록 없음) |
 | 마감 | 쓰기 마감은 D 15:00 KST. 그 전에 쓴 기록만 유효합니다(G-2). 같은 날 재실행은 `D=<D>/attempt-<n>/`에 따로 쌓이고 첫 유효 시도만 셉니다 |
 
 ### 아직 없는 것

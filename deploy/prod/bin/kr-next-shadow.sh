@@ -9,6 +9,8 @@
 #                         panels_in/D=<D>/panel.parquet   serving-mode panel of the signal day t
 #                                         (+ panel_manifest.json), written by the shadow prepare
 #                                         step (modeler.models._03_kr_next.shadow_prepare)
+#                         skips/D=<D>.json  days left out on purpose (exit 33); outside records/ so that
+#                                         `shadow verify` (which reads records/ only) never sees them
 #   SERVING_ROOT        briefing serving root, read only for config/ops.json (python, kr_calendar,
 #                       prepared_root)  (default /home/whi/apps/market-briefing/serving)
 #   SHADOW_WAIT_UNTIL   HH:MM KST, stop waiting for the kr-prepare marker (default 09:20)
@@ -31,7 +33,12 @@
 # Exit codes: 0 written and valid (or locked / not a session),
 #   2 usage, 10 config unreadable, 12 D or its previous day outside the KR calendar,
 #   30 no kr-prepare marker before SHADOW_WAIT_UNTIL, 31 panel missing, 3 record written after the
-#   15:00 deadline (invalid, kept for the record), other: the Python entrypoint's own code.
+#   15:00 deadline (invalid, kept for the record),
+#   33 kr-prepare fell back: its marker's score_date is not t (the session before D); the day is
+#   left out ("missing day", nothing substituted), skips/D=<D>.json is written once, no record,
+#   other: the Python entrypoint's own code.
+# t = the session right before D in the KR calendar (same as shadow.previous_session).  If several
+# markers exist for D, the one whose score_date == t is used; if none has it, exit 33.
 set -euo pipefail
 umask 027
 
@@ -104,24 +111,55 @@ d = date.fromisoformat(sys.argv[2])
 lo, hi = date.fromisoformat(cal["coverage_start"]), date.fromisoformat(cal["coverage_end"])
 if not (lo < d <= hi):
     sys.exit(3)
-print("session" if d in days else "closed")
+if d not in days:
+    print("closed")
+else:
+    prev = [x for x in days if x < d]
+    if not prev:
+        sys.exit(3)
+    print("session")
+    print(max(prev).isoformat())   # t, same definition as shadow.previous_session
 PY
 ) || rc=$?
 [ "$rc" -eq 0 ] || fail 12 "D=$D is outside the KR calendar $calendar"
+t=$(printf '%s\n' "$kind" | sed -n 2p)
+kind=$(printf '%s\n' "$kind" | sed -n 1p)
 if [ "$kind" != session ]; then log "D=$D is not a KR session; nothing to score"; exit 0; fi
 
 # ---- wait for the kr-prepare completion marker (poll the file only) --------------------------
 end_s=$(TZ=Asia/Seoul date -d "$D ${wait_until}:00" +%s 2>/dev/null || date -j -f '%Y-%m-%d %H:%M:%S' "$D ${wait_until}:00" +%s)
 marker=""
+fallback_marker=""
 while :; do
   for m in "$prepared_root"/kr/score_date=*/prep_id="$D"/completion.json; do
-    [ -f "$m" ] && marker=$m && break
+    [ -f "$m" ] || continue
+    sd=${m#*/score_date=}; sd=${sd%%/*}
+    if [ "$sd" = "$t" ]; then marker=$m; break; fi
+    [ -n "$fallback_marker" ] || fallback_marker=$m
   done
   [ -n "$marker" ] && break
+  [ -z "$fallback_marker" ] || break
   [ "$(TZ=Asia/Seoul date +%s)" -lt "$end_s" ] || fail 30 "no kr-prepare marker for D=$D before $wait_until KST"
   log "waiting for kr-prepare marker (poll ${poll}s, until $wait_until KST)"
   sleep "$poll"
 done
+if [ -z "$marker" ]; then
+  # kr-prepare fell back to an earlier session than t: leave D out, substitute nothing.
+  sd=${fallback_marker#*/score_date=}; sd=${sd%%/*}
+  mkdir -p "$SHADOW_ROOT/skips"
+  skip="$SHADOW_ROOT/skips/D=$D.json"
+  if [ ! -e "$skip" ]; then
+    tmp="$skip.tmp.$$"
+    "$boot" - "$D" "$t" "$sd" "$fallback_marker" >"$tmp" <<'PY'
+import json, sys
+print(json.dumps({"D": sys.argv[1], "t": sys.argv[2], "score_date": sys.argv[3],
+                  "reason": "kr_prepare_fell_back", "marker": sys.argv[4]}, indent=2))
+PY
+    ln "$tmp" "$skip" 2>/dev/null || true   # hard link: never overwrites an existing file
+    rm -f "$tmp"
+  fi
+  fail 33 "kr-prepare fell back for D=$D (score_date=$sd, t=$t); day left out, see $skip"
+fi
 log "kr-prepare marker: $marker"
 
 # ---- panel of the signal day ----------------------------------------------------------------
