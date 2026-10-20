@@ -24,7 +24,11 @@
 #   BOOTSTRAP_PYTHON    reads ops.json only (default python3)
 #
 # It waits for the kr-prepare completion marker prepared/kr/score_date=*/prep_id=<D>/completion.json
-# (the end of the 04:00 chain / 06:30 fallback run) by polling the file.  It NEVER waits on, takes
+# (the end of the 04:00 chain / 06:30 fallback run) by polling the file.  ANY score_date counts: the
+# marker only says "the raw export of D is finished".  Whether t is complete is not asked of
+# kr-prepare (its rule also needs the flow groups and may change with the briefing); the prepare
+# step checks it on this model's own input (price rows of t >= 0.97 x the session before t, in
+# modeler.models._03_kr_next.shadow_prepare, frozen with the release).  It NEVER waits on, takes
 # or inspects kr-prepare.lock: a held lock only means kr-prepare is still running, and the marker
 # decides.  Own lock: locks/kr-next-shadow.lock, non-blocking; a second run logs "locked", exits 0.
 # The last step is `exec`, so TERM/INT/HUP from Cronicle reach Python, and fd 9 (the lock) stays
@@ -32,13 +36,13 @@
 #
 # Exit codes: 0 written and valid (or locked / not a session),
 #   2 usage, 10 config unreadable, 12 D or its previous day outside the KR calendar,
-#   30 no kr-prepare marker before SHADOW_WAIT_UNTIL, 31 panel missing, 3 record written after the
-#   15:00 deadline (invalid, kept for the record),
-#   33 kr-prepare fell back: its marker's score_date is not t (the session before D); the day is
-#   left out ("missing day", nothing substituted), skips/D=<D>.json is written once, no record,
+#   30 no kr-prepare marker before SHADOW_WAIT_UNTIL, 31 panel missing / prepare failed, 3 record
+#   written after the 15:00 deadline (invalid, kept for the record),
+#   33 the prepare step found the price rows of t incomplete: the day is left out ("missing day",
+#   nothing substituted), skips/D=<D>.json is written once (by shadow_prepare; by this script with
+#   fewer fields when a SHADOW_PREPARE_CMD hook returned 33 without writing it), no record,
 #   other: the Python entrypoint's own code.
-# t = the session right before D in the KR calendar (same as shadow.previous_session).  If several
-# markers exist for D, the one whose score_date == t is used; if none has it, exit 33.
+# t = the session right before D in the KR calendar (same as shadow.previous_session).
 set -euo pipefail
 umask 027
 
@@ -129,38 +133,41 @@ if [ "$kind" != session ]; then log "D=$D is not a KR session; nothing to score"
 # ---- wait for the kr-prepare completion marker (poll the file only) --------------------------
 end_s=$(TZ=Asia/Seoul date -d "$D ${wait_until}:00" +%s 2>/dev/null || date -j -f '%Y-%m-%d %H:%M:%S' "$D ${wait_until}:00" +%s)
 marker=""
-fallback_marker=""
 while :; do
   for m in "$prepared_root"/kr/score_date=*/prep_id="$D"/completion.json; do
     [ -f "$m" ] || continue
-    sd=${m#*/score_date=}; sd=${sd%%/*}
-    if [ "$sd" = "$t" ]; then marker=$m; break; fi
-    [ -n "$fallback_marker" ] || fallback_marker=$m
+    marker=$m; break   # any score_date: the marker only means "the export of D is finished"
   done
-  [ -n "$marker" ] && break
-  [ -z "$fallback_marker" ] || break
+  [ -z "$marker" ] || break
   [ "$(TZ=Asia/Seoul date +%s)" -lt "$end_s" ] || fail 30 "no kr-prepare marker for D=$D before $wait_until KST"
   log "waiting for kr-prepare marker (poll ${poll}s, until $wait_until KST)"
   sleep "$poll"
 done
-if [ -z "$marker" ]; then
-  # kr-prepare fell back to an earlier session than t: leave D out, substitute nothing.
-  sd=${fallback_marker#*/score_date=}; sd=${sd%%/*}
-  mkdir -p "$SHADOW_ROOT/skips"
-  skip="$SHADOW_ROOT/skips/D=$D.json"
+log "kr-prepare marker: $marker"
+
+# prepare exit 33 = t incomplete, day left out.  shadow_prepare has written skips/D=<D>.json itself;
+# a hook may not have, so write a short one (never over an existing file).
+skip_or_fail() {
+  local rc=$1 what=$2
+  [ "$rc" -eq 33 ] || fail 31 "$what failed (exit $rc)"
+  local skip="$SHADOW_ROOT/skips/D=$D.json"
   if [ ! -e "$skip" ]; then
-    tmp="$skip.tmp.$$"
-    "$boot" - "$D" "$t" "$sd" "$fallback_marker" >"$tmp" <<'PY'
+    mkdir -p "$SHADOW_ROOT/skips"
+    local tmp="$skip.tmp.$$"
+    "$boot" - "$D" "$t" "$what" >"$tmp" <<'PY'
 import json, sys
-print(json.dumps({"D": sys.argv[1], "t": sys.argv[2], "score_date": sys.argv[3],
-                  "reason": "kr_prepare_fell_back", "marker": sys.argv[4]}, indent=2))
+print(json.dumps({"D": sys.argv[1], "t": sys.argv[2], "reason": "t_price_incomplete",
+                  "written_by": sys.argv[3]}, indent=2))
 PY
     ln "$tmp" "$skip" 2>/dev/null || true   # hard link: never overwrites an existing file
     rm -f "$tmp"
   fi
-  fail 33 "kr-prepare fell back for D=$D (score_date=$sd, t=$t); day left out, see $skip"
-fi
-log "kr-prepare marker: $marker"
+  fail 33 "$what: price rows of t=$t incomplete; day D=$D left out, see $skip"
+}
+
+# A day once left out stays left out (draft §10.2: a missing point is final, late data does not
+# bring it back), so an existing skips/D=<D>.json ends the run before anything is re-checked.
+[ ! -e "$SHADOW_ROOT/skips/D=$D.json" ] || fail 33 "D=$D was left out before, see $SHADOW_ROOT/skips/D=$D.json"
 
 # ---- panel of the signal day ----------------------------------------------------------------
 panel_dir="$SHADOW_ROOT/panels_in/D=$D"
@@ -169,7 +176,9 @@ if [ ! -f "$panel" ]; then
   mkdir -p "$panel_dir"
   if [ -n "${SHADOW_PREPARE_CMD:-}" ]; then
     log "building the panel: $SHADOW_PREPARE_CMD $D"
-    $SHADOW_PREPARE_CMD "$D" || fail 31 "SHADOW_PREPARE_CMD failed"
+    prc=0
+    $SHADOW_PREPARE_CMD "$D" || prc=$?
+    [ "$prc" -eq 0 ] || skip_or_fail "$prc" "SHADOW_PREPARE_CMD"
   else
     # default: shadow_prepare builds the derived views of the day's raw snapshot (once, under
     # $SHADOW_ROOT/views/D-<D>) and the serving panel of t.  Write-once; an existing panel is
@@ -181,7 +190,7 @@ if [ ! -f "$panel" ]; then
       --raw-lake "$raw_lake" --source "${SHADOW_RAW_SOURCE:-sj2_remote}" \
       --out-root "$SHADOW_ROOT" --sessions "$calendar" \
       --memory-limit "${SHADOW_PREPARE_MEMORY_LIMIT:-2GB}" \
-      --threads "${SHADOW_PREPARE_THREADS:-4}" || fail 31 "shadow_prepare failed"
+      --threads "${SHADOW_PREPARE_THREADS:-4}" || skip_or_fail "$?" "shadow_prepare"
   fi
 fi
 [ -f "$panel" ] || fail 31 "panel missing: $panel (the shadow prepare step has not written it)"

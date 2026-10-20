@@ -24,13 +24,23 @@ Commands::
 ``run`` builds ``<out_root>/views/D-<D>/`` from the snapshot ``snapshot_date=<D>`` of the lake
 when it is not there yet (a finished one is reused after its hashes check out), then prepares the
 panel. Exit codes: 0 written, 2 refused (existing panel, missing input, hash mismatch), 31 raw
-snapshot missing.
+snapshot missing, 33 the price rows of t are incomplete (see below).
+
+Completeness of t (this model's own input check, frozen here; the briefing's kr-prepare is not
+consulted): the day's raw snapshot must hold at least ``MIN_PRICE_TICKER_RATIO`` (0.97) as many
+``daily_ohlcv`` rows on t as on the session before t. Flows are not checked (the model does not
+use them). When it fails nothing is built, ``<out_root>/skips/D=<D>.json`` is written once
+(``reason`` = ``t_price_incomplete``) and the exit code is 33: the day is left out, nothing is
+substituted. The definition is a copy of ``modeler.serving.kr_reference.assess_session`` (price
+part): ``count(*)`` of ``daily_ohlcv`` rows per ``trade_date``, halted rows included, no
+filter; copied so later changes of the briefing code cannot move this frozen rule.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
@@ -60,6 +70,11 @@ DEFAULT_SOURCE = bp.DEFAULT_SOURCE
 DEFAULT_MEMORY_LIMIT = "2GB"
 DEFAULT_THREADS = 4
 EXIT_RAW_MISSING = 31
+EXIT_T_INCOMPLETE = 33
+#: Frozen copy of ``kr_reference.DEFAULT_MIN_TICKER_RATIO`` (= the collector gate's value).
+MIN_PRICE_TICKER_RATIO = 0.97
+SKIP_REASON = "t_price_incomplete"
+SKIPS_DIR = "skips"
 
 _SNAPSHOT_DIR = re.compile(r"^snapshot_date=(\d{4}-\d{2}-\d{2})$")
 _SOURCE_DIR = re.compile(r"^source=(.+)$")
@@ -67,6 +82,92 @@ _SOURCE_DIR = re.compile(r"^source=(.+)$")
 
 class PrepareRefused(RuntimeError):
     """A guard stopped the prepare step; the CLI turns it into exit code 2."""
+
+
+class PriceIncomplete(PrepareRefused):
+    """t has too few price rows against the session before it; the day is left out (exit 33)."""
+
+    def __init__(self, record: dict[str, Any]) -> None:
+        self.record = record
+        super().__init__(
+            f"price rows of t={record['t']} incomplete: {record['n_t']} vs "
+            f"{record['n_prev']} on {record['prev']} (ratio {record['ratio']}, "
+            f"threshold {record['threshold']})"
+        )
+
+
+def price_counts(raw_root: str | Path, days: Sequence[date]) -> dict[date, int]:
+    """``count(*)`` of ``daily_ohlcv`` rows per trade_date for ``days`` (same as kr_reference)."""
+    pattern = str(Path(raw_root) / "daily_ohlcv" / "**" / "*.parquet").replace("'", "''")
+    lits = ", ".join(f"DATE '{x.isoformat()}'" for x in days)
+    con = duckdb.connect()
+    try:
+        con.execute("SET threads = 2")
+        rows = con.execute(
+            f"SELECT trade_date, count(*) FROM read_parquet('{pattern}', hive_partitioning=false) "
+            f"WHERE trade_date IN ({lits}) GROUP BY trade_date"
+        ).fetchall()
+    except duckdb.IOException as exc:
+        raise FileNotFoundError(f"daily_ohlcv cannot be read under {raw_root}") from exc
+    finally:
+        con.close()
+    return {r[0]: int(r[1]) for r in rows}
+
+
+def check_price_complete(
+    d: date,
+    raw_root: str | Path,
+    sessions: Sequence[date],
+    *,
+    threshold: float = MIN_PRICE_TICKER_RATIO,
+) -> dict[str, Any]:
+    """Raise ``PriceIncomplete`` unless n_t / n_prev >= threshold; else return the numbers.
+
+    prev = the KR session before t (calendar). No previous session or no rows on prev means the
+    ratio cannot be judged, which kr_reference also rejects.
+    """
+    try:
+        t = previous_session(sessions, d)
+    except ShadowError as exc:
+        raise PrepareRefused(str(exc)) from exc
+    try:
+        prev: date | None = previous_session(sessions, t)
+    except ShadowError:
+        prev = None
+    counts = price_counts(raw_root, [t] + ([prev] if prev else []))
+    n_t = counts.get(t, 0)
+    n_prev = counts.get(prev, 0) if prev else 0
+    ratio = n_t / n_prev if n_prev else None
+    record = {
+        "D": d.isoformat(),
+        "t": t.isoformat(),
+        "prev": prev.isoformat() if prev else None,
+        "n_t": n_t,
+        "n_prev": n_prev,
+        "ratio": round(ratio, 6) if ratio is not None else None,
+        "threshold": threshold,
+        "reason": SKIP_REASON,
+        "raw": str(raw_root),
+    }
+    if ratio is None or ratio < threshold:
+        raise PriceIncomplete(record)
+    return record
+
+
+def write_skip(out_root: str | Path, record: dict[str, Any]) -> Path:
+    """Write ``<out_root>/skips/D=<D>.json`` once; an existing file is never overwritten."""
+    d = Path(out_root) / SKIPS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    final = d / f"D={record['D']}.json"
+    tmp = d / f".D={record['D']}.json.tmp.{os.getpid()}"
+    tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.link(tmp, final)  # a hard link never overwrites
+    except FileExistsError:
+        pass
+    finally:
+        tmp.unlink(missing_ok=True)
+    return final
 
 
 def panel_dir(out_root: str | Path, d: date) -> Path:
@@ -134,6 +235,7 @@ def prepare_day(
         raise PrepareRefused(f"panel already exists, not overwriting: {panel_final}")
 
     config = lake_config_for(raw)
+    check_price_complete(d, raw, sessions)  # raises PriceIncomplete (exit 33)
     try:
         vman = views_mod.verify_views(views_dir)
     except views_mod.ViewsRefused as exc:
@@ -261,6 +363,7 @@ def prepare_from_lake(
     raw = Path(raw_lake) / f"snapshot_date={d.isoformat()}" / f"source={source}"
     if not raw.is_dir():
         raise FileNotFoundError(f"raw snapshot of D is missing: {raw}")
+    check_price_complete(d, raw, sessions)  # before the views are built (cheap, exit 33)
     vdir = views_dir_for(out_root, d)
     if not (vdir / views_mod.MANIFEST_NAME).exists():
         if vdir.exists():  # a build that died before its manifest: not a finished build
@@ -325,6 +428,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except FileNotFoundError as exc:
         print(f"kr_next_shadow_prepare: {exc}", file=sys.stderr)
         return EXIT_RAW_MISSING
+    except PriceIncomplete as exc:
+        path = write_skip(a.out_root, exc.record)
+        print(f"kr_next_shadow_prepare: {exc}; day left out, see {path}", file=sys.stderr)
+        return EXIT_T_INCOMPLETE
     except (PrepareRefused, views_mod.ViewsRefused, ValueError, OSError) as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

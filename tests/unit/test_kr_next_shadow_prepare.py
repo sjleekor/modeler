@@ -593,10 +593,10 @@ def test_record_carries_the_panel_manifest(built, bundle_dir, tmp_path, capsys) 
     assert SEOUL  # (imported for the fixture module)
 
 
-# ------------------------------------------------- wrapper: kr-prepare fell back (exit 33)
+# ------------------------------------------------- wrapper: marker only, t incomplete (exit 33)
 
 
-def _wrapper_env(tmp_path: Path, marker_dates: list[str]):
+def _wrapper_env(tmp_path: Path, marker_dates: list[str], *, panel_exists: bool = True):
     """Run-ready fake environment for kr-next-shadow.sh (no flock/python of the server needed)."""
     import os
     import sys
@@ -611,6 +611,7 @@ def _wrapper_env(tmp_path: Path, marker_dates: list[str]):
         'if [ "$1" = "-m" ]; then\n'
         '  case "$2" in\n'
         "    *shadow_release) exit 0;;\n"
+        '    *shadow_prepare) exit "${FAKE_PREPARE_RC:-0}";;\n'
         f'    *shadow) echo "$@" > "{scored}"; exit 0;;\n'
         "  esac\n"
         "fi\n"
@@ -646,7 +647,8 @@ def _wrapper_env(tmp_path: Path, marker_dates: list[str]):
     shadow_root = tmp_path / "shadow"
     panel = shadow_root / "panels_in" / "D=2025-01-02"
     panel.mkdir(parents=True)
-    (panel / "panel.parquet").write_bytes(b"x")
+    if panel_exists:
+        (panel / "panel.parquet").write_bytes(b"x")
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -676,33 +678,172 @@ def test_wrapper_scores_when_the_marker_is_for_t(tmp_path) -> None:
     assert not (root / "skips").exists() or not list((root / "skips").iterdir())
 
 
-def test_wrapper_exits_33_when_kr_prepare_fell_back(tmp_path) -> None:
-    env, root, scored = _wrapper_env(tmp_path, ["2024-12-30"])  # K' instead of t
+def test_wrapper_scores_when_the_marker_is_for_a_fallback_session(tmp_path) -> None:
+    # kr-prepare stepped back to K' (flows late): the marker is only "the export finished"
+    env, root, scored = _wrapper_env(tmp_path, ["2024-12-30"])
+    r = _run_wrapper(env)
+    assert r.returncode == 0, r.stderr
+    assert scored.is_file() and "--date 2025-01-02" in scored.read_text()
+    assert not (root / "skips").exists() or not list((root / "skips").iterdir())
+
+
+def test_wrapper_exits_33_when_prepare_finds_t_incomplete(tmp_path) -> None:
+    env, root, scored = _wrapper_env(tmp_path, ["2024-12-31"], panel_exists=False)
+    env["FAKE_PREPARE_RC"] = "33"  # the default shadow_prepare step, faked
     r = _run_wrapper(env)
     assert r.returncode == 33, r.stderr
     assert not scored.exists()
     assert not list((root / "records").glob("D=*"))
     skip = json.loads((root / "skips" / "D=2025-01-02.json").read_text())
-    assert (skip["D"], skip["t"], skip["score_date"], skip["reason"]) == (
+    assert (skip["D"], skip["t"], skip["reason"]) == (
         "2025-01-02",
         "2024-12-31",
-        "2024-12-30",
-        "kr_prepare_fell_back",
+        "t_price_incomplete",
     )
-    assert skip["marker"].endswith("score_date=2024-12-30/prep_id=2025-01-02/completion.json")
     # written once: a second run leaves the first file untouched
-    first = (root / "skips" / "D=2025-01-02.json").read_text()
-    (root / "skips" / "D=2025-01-02.json").write_text(first.replace("2024-12-30", "2024-12-27"))
-    changed = (root / "skips" / "D=2025-01-02.json").read_text()
+    p = root / "skips" / "D=2025-01-02.json"
+    p.write_text(p.read_text().replace("2024-12-31", "2024-12-27"))
+    changed = p.read_text()
     assert _run_wrapper(env).returncode == 33
-    assert (root / "skips" / "D=2025-01-02.json").read_text() == changed
+    assert p.read_text() == changed
     assert not list((root / "skips").glob("*.tmp*"))
 
 
-def test_wrapper_prefers_the_marker_of_t_among_several(tmp_path) -> None:
-    # glob order puts 2024-12-30 before 2024-12-31; the one equal to t must win
+def test_wrapper_keeps_a_left_out_day_left_out(tmp_path) -> None:
+    # the prepare step would now pass, but the day was left out before: still 33, nothing scored
+    env, root, scored = _wrapper_env(tmp_path, ["2024-12-31"], panel_exists=False)
+    (root / "skips").mkdir()
+    (root / "skips" / "D=2025-01-02.json").write_text('{"reason": "t_price_incomplete"}')
+    r = _run_wrapper(env)
+    assert r.returncode == 33, r.stderr
+    assert not scored.exists()
+    assert not (root / "panels_in" / "D=2025-01-02" / "panel.parquet").exists()
+
+
+def _mk(p: Path) -> Path:
+    p.mkdir()
+    return p
+
+
+def test_wrapper_hook_exit_33_is_a_skip_and_other_failures_stay_31(tmp_path) -> None:
+    env, root, scored = _wrapper_env(tmp_path, ["2024-12-31"], panel_exists=False)
+    hook = tmp_path / "hook.sh"
+    hook.write_text("#!/bin/sh\nexit 33\n")
+    hook.chmod(0o755)
+    env["SHADOW_PREPARE_CMD"] = str(hook)
+    assert _run_wrapper(env).returncode == 33
+    assert (root / "skips" / "D=2025-01-02.json").is_file() and not scored.exists()
+    env2, root2, _ = _wrapper_env(_mk(tmp_path / "b"), ["2024-12-31"], panel_exists=False)
+    env2["FAKE_PREPARE_RC"] = "2"
+    assert _run_wrapper(env2).returncode == 31
+    assert not (root2 / "skips").exists()
+
+
+def test_wrapper_scores_with_two_markers(tmp_path) -> None:
     env, root, scored = _wrapper_env(tmp_path, ["2024-12-30", "2024-12-31"])
     r = _run_wrapper(env)
     assert r.returncode == 0, r.stderr
     assert scored.is_file()
     assert not (root / "skips").exists() or not list((root / "skips").iterdir())
+
+
+def test_wrapper_waits_then_exits_30_without_a_marker(tmp_path) -> None:
+    env, root, scored = _wrapper_env(tmp_path, [])
+    assert _run_wrapper(env).returncode == 30
+    assert not scored.exists()
+
+
+# ------------------------------------------------- shadow_prepare: price completeness of t
+
+
+def _raw_with_counts(tmp_path: Path, counts: dict[date, int]) -> Path:
+    raw = (
+        tmp_path
+        / "lake"
+        / "raw"
+        / "raw_postgres"
+        / "snapshot_date=2025-01-02"
+        / "source=sj2_remote"
+    )
+    rows = [(day, f"{i:06d}") for day, n in counts.items() for i in range(n)]
+    _write(raw, "daily_ohlcv", pl.DataFrame(rows, schema=["trade_date", "ticker"], orient="row"))
+    return raw
+
+
+_CAL = [date(2024, 12, 27), date(2024, 12, 30), date(2024, 12, 31), date(2025, 1, 2)]
+_DAYS = (date(2024, 12, 30), date(2024, 12, 31))  # prev, t of D=2025-01-02
+
+
+@pytest.mark.parametrize(
+    ("n_prev", "n_t", "ok"),
+    [(100, 97, True), (100, 96, False), (100, 100, True), (100, 130, True), (100, 0, False),
+     (0, 5, False), (2000, 1940, True), (2000, 1939, False)],
+)  # fmt: skip
+def test_price_ratio_boundary(tmp_path, n_prev, n_t, ok) -> None:
+    raw = _raw_with_counts(tmp_path, {_DAYS[0]: n_prev, _DAYS[1]: n_t, date(2025, 1, 2): 3})
+    if ok:
+        rec = sp.check_price_complete(date(2025, 1, 2), raw, _CAL)
+        assert (rec["n_t"], rec["n_prev"], rec["threshold"]) == (n_t, n_prev, 0.97)
+    else:
+        with pytest.raises(sp.PriceIncomplete) as ei:
+            sp.check_price_complete(date(2025, 1, 2), raw, _CAL)
+        r = ei.value.record
+        assert (r["n_t"], r["n_prev"], r["prev"], r["t"]) == (
+            n_t,
+            n_prev,
+            "2024-12-30",
+            "2024-12-31",
+        )
+        assert r["ratio"] == (round(n_t / n_prev, 6) if n_prev else None)
+
+
+def test_price_check_without_a_previous_session_is_refused(tmp_path) -> None:
+    raw = _raw_with_counts(tmp_path, {date(2024, 12, 27): 10, date(2024, 12, 30): 10})
+    with pytest.raises(sp.PriceIncomplete) as ei:  # t = first session of the calendar
+        sp.check_price_complete(date(2024, 12, 30), raw, _CAL)
+    assert ei.value.record["prev"] is None and ei.value.record["ratio"] is None
+
+
+def test_price_check_counts_all_rows_per_day_without_filters(tmp_path) -> None:
+    # halted rows (zero volume) count like any other row: count(*) per trade_date
+    raw = (
+        tmp_path
+        / "lake"
+        / "raw"
+        / "raw_postgres"
+        / "snapshot_date=2025-01-02"
+        / "source=sj2_remote"
+    )
+    rows = [(_DAYS[0], f"{i:06d}", 100.0) for i in range(100)]
+    rows += [(_DAYS[1], f"{i:06d}", 0.0 if i % 2 else 100.0) for i in range(97)]
+    _write(
+        raw,
+        "daily_ohlcv",
+        pl.DataFrame(rows, schema=["trade_date", "ticker", "volume"], orient="row"),
+    )
+    assert sp.check_price_complete(date(2025, 1, 2), raw, _CAL)["n_t"] == 97
+
+
+def test_cli_refuses_t_incomplete_writes_skip_once_and_builds_nothing(tmp_path, capsys) -> None:
+    raw = _raw_with_counts(tmp_path, {_DAYS[0]: 100, _DAYS[1]: 50})
+    lake = raw.parents[1]
+    out = tmp_path / "shadow"
+    cal = tmp_path / "cal.json"
+    cal.write_text(json.dumps({"sessions": [d.isoformat() for d in _CAL]}))
+    argv = ["run", "--date", "2025-01-02", "--raw-lake", str(lake), "--out-root", str(out),
+            "--sessions", str(cal)]  # fmt: skip
+    assert sp.main(argv) == 33
+    skip_path = out / "skips" / "D=2025-01-02.json"
+    skip = json.loads(skip_path.read_text())
+    assert skip == {
+        "D": "2025-01-02", "t": "2024-12-31", "prev": "2024-12-30", "n_t": 50, "n_prev": 100,
+        "ratio": 0.5, "threshold": 0.97, "reason": "t_price_incomplete", "raw": str(raw),
+    }  # fmt: skip
+    assert not (out / "views").exists() and not (out / "panels_in").exists()
+    first = skip_path.read_text()
+    skip_path.write_text(first.replace('"n_t": 50', '"n_t": 51'))
+    changed = skip_path.read_text()
+    assert sp.main(argv) == 33
+    assert skip_path.read_text() == changed  # never overwritten
+    assert not [p for p in (out / "skips").iterdir() if p.name != skip_path.name]
+    assert "left out" in capsys.readouterr().err

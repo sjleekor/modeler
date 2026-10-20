@@ -419,10 +419,10 @@ sj2 serving venv에는 `exchange_calendars`가 없습니다(2026-10-06 확인: p
 | 이름 | `market_briefing_kr_next_shadow` (제안) |
 | 실행 | 호스트 Python. 스크립트는 `exec <기존 wrapper와 같은 디렉터리>/kr-next-shadow.sh` 한 줄(중단 신호가 wrapper에 닿도록) |
 | `memory_limit` | 8GB를 명시합니다. 0이나 비우기는 전역 1GB로 돌아갑니다. 패널 빌드의 서버 메모리는 아직 재지 않았습니다(맥 실측은 아래) |
-| 시각 | 평일 07:30 시작. kr-prepare 완료 마커(`prepared/kr/score_date=*/prep_id=<D>/completion.json`)를 30초마다 파일로만 확인하고 09:20까지 기다립니다. 04:00대 DART chain과 kr-prepare(약 41분), 06:30 fallback(약 07:11까지), 09:30 select, 10:00 run과 겹치지 않습니다 |
+| 시각 | 평일 07:30 시작. kr-prepare 완료 마커(`prepared/kr/score_date=*/prep_id=<D>/completion.json`, score_date는 아무거나)를 30초마다 파일로만 확인하고 09:20까지 기다립니다. 마커는 "D의 raw 내보내기가 끝났다"는 신호로만 씁니다. t가 쓸 만한지는 `shadow_prepare`가 이 모델의 입력(`daily_ohlcv` 행 수)으로 직접 봅니다. 04:00대 DART chain과 kr-prepare(약 41분), 06:30 fallback(약 07:11까지), 09:30 select, 10:00 run과 겹치지 않습니다 |
 | 피할 시간 | 22:50에서 24:00 사이 상태 변경 금지, OpenDART 운영 잡 22:10·23:30·04:00대 |
 | 락 | 자기 락 `shadow/locks/kr-next-shadow.lock`만 잡습니다. `kr-prepare.lock`은 기다리거나 잡지 않습니다 |
-| 종료 코드 | 0 정상(또는 락 중·휴장), 3 15:00 뒤에 써서 `valid=false`로 남김, 30 마커 없음, 31 패널 없음, 10 설정·release 검증 실패, 12 달력 밖, 33 kr-prepare가 t 대신 이전 세션으로 물러난 날(빠진 날로 두고 `shadow/skips/D=<D>.json`만 남김, 기록 없음) |
+| 종료 코드 | 0 정상(또는 락 중·휴장), 3 15:00 뒤에 써서 `valid=false`로 남김, 30 마커 없음, 31 패널 없음, 10 설정·release 검증 실패, 12 달력 밖, 33 prepare 단계가 t의 가격 행이 덜 찼다고 본 날(t 가격 종목 수 < 직전 세션의 0.97배, 빠진 날로 두고 `shadow/skips/D=<D>.json`만 남김, 기록 없음. 그 파일이 있는 날은 다시 검사하지 않고 33 — 빠진 날은 확정) |
 | 마감 | 쓰기 마감은 D 15:00 KST. 그 전에 쓴 기록만 유효합니다(G-2). 같은 날 재실행은 `D=<D>/attempt-<n>/`에 따로 쌓이고 첫 유효 시도만 셉니다 |
 
 ### 아직 없는 것
