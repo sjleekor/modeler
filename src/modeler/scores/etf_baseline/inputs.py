@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from bisect import bisect_left
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -83,7 +84,18 @@ def load_etf_frames(csv_gz: Path, codes: list[str]) -> dict[str, pl.DataFrame]:
         csv_gz,
         columns=["BAS_DD", "ISU_CD", "TDD_CLSPRC", "LIST_SHRS"],
         infer_schema_length=0,
-    ).filter(pl.col("ISU_CD").is_in(codes))
+    )
+    return frames_from_strings(raw, codes)
+
+
+def frames_from_strings(raw: pl.DataFrame, codes: list[str]) -> dict[str, pl.DataFrame]:
+    """원문 문자열 열(``BAS_DD, ISU_CD, TDD_CLSPRC, LIST_SHRS``)에서 코드별 일봉을 만든다.
+
+    조사 사본 CSV와 정본 parquet이 같은 변환을 쓰도록 한곳에 둔다.
+    """
+    raw = raw.select("BAS_DD", "ISU_CD", "TDD_CLSPRC", "LIST_SHRS").filter(
+        pl.col("ISU_CD").is_in(codes)
+    )
     df = raw.with_columns(
         pl.col("BAS_DD").str.strptime(pl.Date, "%Y%m%d").alias("date"),
         _num("TDD_CLSPRC"),
@@ -119,8 +131,15 @@ def load_distributions(dist_json: Path, map_csv: Path, codes: list[str]) -> Dist
         if r.height != 1:
             raise InputError(f"{c}: 분배금 대응표에서 ISIN을 못 찾았습니다 (행 {r.height})")
         isin_by_code[c] = r["isin"][0]
-    code_by_isin = {v: k for k, v in isin_by_code.items()}
     data = json.loads(Path(dist_json).read_text())
+    return distributions_from_records(data, codes, isin_by_code)
+
+
+def distributions_from_records(
+    data: Iterable[dict], codes: list[str], isin_by_code: dict[str, str]
+) -> DistInfo:
+    """SEIBro 원문 칸 dict 목록에서 분배금 행을 만든다 (조사 사본·정본 공통)."""
+    code_by_isin = {v: k for k, v in isin_by_code.items() if v}
     info = DistInfo(isin_by_code=isin_by_code)
     rows, seen = [], set()
     for x in data:
@@ -236,24 +255,24 @@ def build_return_panel(
 
 
 # --------------------------------------------------------------------------- 현금
-def cd91_files(root: Path) -> list[Path]:
+def cd91_files(root: Path, snapshot: str = CD91_SNAPSHOT) -> list[Path]:
     base = (
         root
         / "kr/raw/raw_postgres"
-        / f"snapshot_date={CD91_SNAPSHOT}"
+        / f"snapshot_date={snapshot}"
         / "source=sj2_remote/common_feature_observation_raw"
     )
     return sorted(base.rglob("*.parquet"))
 
 
-def load_cash_account(root: Path, sessions: list[date]):
+def load_cash_account(root: Path, sessions: list[date], snapshot: str = CD91_SNAPSHOT):
     """MRS와 같은 경로: ``KrLake`` + ``load_kr_rates`` + ``build_cash_account``."""
     from modeler.etl.config import DataRoot
     from modeler.scores.common.cash import build_cash_account
     from modeler.scores.common.kr_inputs import COMMON_OBS_TABLE, KrLake, load_kr_rates
 
     lake = KrLake.resolve(
-        DataRoot(base=root / "kr"), snapshot_date=CD91_SNAPSHOT, tables=(COMMON_OBS_TABLE,)
+        DataRoot(base=root / "kr"), snapshot_date=snapshot, tables=(COMMON_OBS_TABLE,)
     )
     rates = load_kr_rates(lake, CD91_SERIES, sessions)
     if rates is None:
