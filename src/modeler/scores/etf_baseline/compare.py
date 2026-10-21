@@ -132,7 +132,8 @@ def compare_inputs(root: Path, src: dict) -> dict:
                 "dates_only_research": j.filter(pl.col("close_c").is_null()).height,
                 "dates_only_canonical": j.filter(pl.col("close").is_null()).height,
                 "close_diff_rows": both.filter(pl.col("close") != pl.col("close_c")).height,
-                "shares_diff_rows": j.filter(
+                # 양쪽에 다 있는 날만 센다(한쪽에만 있는 날은 dates_only_*가 센다)
+                "shares_diff_rows": both.filter(
                     pl.col("shares").fill_null(-1) != pl.col("shares_c").fill_null(-1)
                 ).height,
             }
