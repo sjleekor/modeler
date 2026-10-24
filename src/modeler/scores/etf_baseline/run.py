@@ -18,6 +18,7 @@ import numpy as np
 import polars as pl
 
 import modeler
+from modeler.scores.etf_baseline import canonical as C
 from modeler.scores.etf_baseline import inputs as I
 from modeler.scores.etf_baseline import lines as L
 from modeler.scores.etf_baseline.ledger import simulate
@@ -29,6 +30,8 @@ FIRST_DECISION = {"main": date(2012, 7, 31), "u2": date(2020, 8, 31)}
 COSTS = {"low": 0.0005, "high": 0.0030}  # 편도 (왕복 10bp·60bp)
 CODES = [L.DOM, L.US_MAIN, L.BOND3, L.BOND10, L.GOLD, L.US_U2]
 JUMP_STOP_FROM = date(2011, 7, 19)
+SOURCES = ("research", "canonical")
+CANON_OUTPUT_DIR = "kr/output/etf_baseline_canonical"  # 정본 결과. 조사 사본 결과 폴더와 다르다
 
 
 @dataclass
@@ -41,28 +44,82 @@ class Prepared:
     signal: L.RiskShareSignal
     end_idx: int
     files: dict[str, Path]
+    end_date: date = END_DATE
+    #: 원천 종류·정본 manifest 지문 등. 결과 manifest의 ``source``에 그대로 들어간다.
+    source: dict | None = None
+    #: 정본에서 읽은 parquet의 ``{상대 경로: sha256}`` (manifest 대조 뒤의 값)
+    canonical_files: dict[str, str] | None = None
 
 
-def prepare() -> Prepared:
+def prepare(
+    source: str = "research",
+    *,
+    end_date: date = END_DATE,
+    canonical_dir: Path | None = None,
+    dist_source: str | None = None,
+    obs_view: str = "latest",
+    cd91_snapshot: str = I.CD91_SNAPSHOT,
+) -> Prepared:
+    """입력을 읽어 수익 패널까지 만든다.
+
+    ``source=research``(기본)는 조사 사본, ``canonical``은 collector ``krx_baseline`` 정본에서
+    ETF 일봉·거래일(요청 기록의 ``day_kind``)·분배금을 읽는다. ``dist_source``로 분배금만
+    따로 고를 수 있다(기본은 ``source``와 같다). CD91 현금은 두 경우 모두 기존 경로다.
+    """
+    if source not in SOURCES:
+        raise ValueError(f"source는 {SOURCES} 중 하나입니다: {source!r}")
+    dist_source = dist_source or source
+    if dist_source not in SOURCES:
+        raise ValueError(f"dist_source는 {SOURCES} 중 하나입니다: {dist_source!r}")
     root = I.stock_data_root()
     mf = root / I.ETF_DIR / I.MANIFEST_FILE
     csv = root / I.ETF_DIR / I.ETF_FILE
     djson, dmap = root / I.DIST_FILE, root / I.MAP_FILE
-    days = [d for d in I.load_trading_days(mf) if d <= END_DATE]
-    frames = I.load_etf_frames(csv, CODES)
-    dist = I.load_distributions(djson, dmap, CODES)
+    files: dict[str, Path] = {}
+    src: dict = {"kind": source, "dist_kind": dist_source, "end_date": end_date.isoformat()}
+    store = None
+    if source == "canonical" or dist_source == "canonical":
+        store = C.CanonicalStore(C.canonical_base(root, canonical_dir))
+        src.update(
+            canonical_base=str(store.base),
+            canonical_manifests=store.manifest_digest(),
+            obs_view=obs_view,
+        )
+    if source == "research":
+        days = [d for d in I.load_trading_days(mf) if d <= end_date]
+        frames = I.load_etf_frames(csv, CODES)
+        files.update({"etf_daily": csv, "manifest_files": mf})
+    else:
+        days, cal = C.load_trading_days(store, end_date)
+        frames = C.load_etf_frames(store, CODES, obs_view)
+        src["calendar"] = cal
+    if dist_source == "research":
+        dist = I.load_distributions(djson, dmap, CODES)
+        files.update({"seibro_dist": djson, "dist_code_map": dmap})
+    else:
+        dist, win = C.load_distributions(store, CODES, end_date, obs_view)
+        src["dist_windows"] = win
+    if end_date not in set(days):
+        raise I.InputError(f"끝 날짜 {end_date}가 거래일 목록에 없습니다")
     panel = I.build_return_panel(days, frames, dist.rows)
-    acct = I.load_cash_account(root, days)
+    acct = I.load_cash_account(root, days, cd91_snapshot)
     cash_ret = I.daily_cash_returns(acct, len(days))
     sig = L.risk_share_signal(panel.ret[L.DOM], panel.ret[L.US_MAIN])
-    files = {
-        "etf_daily": csv,
-        "manifest_files": mf,
-        "seibro_dist": djson,
-        "dist_code_map": dmap,
-        **{f"cd91_{p.parent.name}": p for p in I.cd91_files(root)},
-    }
-    return Prepared(root, days, panel, dist, cash_ret, sig, days.index(END_DATE), files)
+    files.update({f"cd91_{p.parent.name}": p for p in I.cd91_files(root, cd91_snapshot)})
+    src["cd91_snapshot"] = cd91_snapshot
+    return Prepared(
+        root,
+        days,
+        panel,
+        dist,
+        cash_ret,
+        sig,
+        days.index(end_date),
+        files,
+        end_date,
+        src,
+        None if store is None else store.verified,
+    )
 
 
 def check(p: Prepared) -> tuple[dict, list[str]]:
@@ -84,8 +141,8 @@ def check(p: Prepared) -> tuple[dict, list[str]]:
         }
         if miss:
             stops.append(f"{c}: 구간 안 종가 없는 거래일 {len(miss)}개 (첫 {miss[0]})")
-        if p.panel.last_date[c] != END_DATE:
-            stops.append(f"{c}: 마지막 날 {p.panel.last_date[c]} != {END_DATE}")
+        if p.panel.last_date[c] != p.end_date:
+            stops.append(f"{c}: 마지막 날 {p.panel.last_date[c]} != {p.end_date}")
     rep["i2_split_candidates"] = p.panel.split_candidates
     rep["jumps_over_25pct_after_adjust"] = p.panel.jumps
     for j in p.panel.jumps:
@@ -211,13 +268,83 @@ def run_all(p: Prepared, out_dir: Path) -> dict:
     return {"results": results, "wfix": wfix_report}
 
 
+def add_source_args(ap: argparse.ArgumentParser) -> None:
+    """입력 원천을 고르는 인자. 비교 도구(compare.py)와 공유한다."""
+    ap.add_argument(
+        "--source",
+        choices=SOURCES,
+        default="research",
+        help="ETF 일봉·거래일 원천. research=조사 사본(기본), canonical=krx_baseline 정본",
+    )
+    ap.add_argument(
+        "--dist-source",
+        choices=SOURCES,
+        default=None,
+        help="분배금 원천. 기본은 --source와 같다 (혼합 모드는 따로 고른다)",
+    )
+    ap.add_argument(
+        "--canonical-dir",
+        type=Path,
+        default=None,
+        help="정본 저장소 경로. 기본은 $STOCK_DATA_ROOT/kr/raw/krx_baseline",
+    )
+    ap.add_argument(
+        "--obs-view",
+        choices=C.VIEWS,
+        default="latest",
+        help="정본 관측판. latest=키별 최신(기본), first=obs_seq=1 최초 관측본",
+    )
+    ap.add_argument(
+        "--end-date",
+        type=date.fromisoformat,
+        default=END_DATE,
+        help=f"기준선 끝 날짜(YYYY-MM-DD). 기본 {END_DATE}",
+    )
+    ap.add_argument(
+        "--cd91-snapshot", default=I.CD91_SNAPSHOT, help="CD91 raw_postgres 스냅샷 날짜"
+    )
+
+
+def prepare_from_args(a: argparse.Namespace) -> Prepared:
+    return prepare(
+        a.source,
+        end_date=a.end_date,
+        canonical_dir=a.canonical_dir,
+        dist_source=a.dist_source,
+        obs_view=a.obs_view,
+        cd91_snapshot=a.cd91_snapshot,
+    )
+
+
+def resolve_out_dir(p: Prepared, run_id: str, output_dir: Path | None) -> Path:
+    """결과 폴더. 정본 모드는 조사 사본 결과 폴더와 다른 곳이고, 이미 있으면 덮지 않는다."""
+    canonical = p.source is not None and (
+        p.source["kind"] == "canonical" or p.source["dist_kind"] == "canonical"
+    )
+    if output_dir is not None:
+        out = Path(output_dir)
+    else:
+        out = p.root / (CANON_OUTPUT_DIR if canonical else I.OUTPUT_DIR) / run_id
+    if canonical:
+        frozen = (p.root / I.OUTPUT_DIR).resolve()
+        if out.resolve() == frozen or frozen in out.resolve().parents:
+            raise I.InputError(f"정본 결과를 조사 사본 결과 폴더({frozen}) 안에 쓸 수 없습니다")
+        if out.exists() and any(out.iterdir()):
+            raise I.InputError(f"{out}: 이미 결과가 있습니다. 다른 --run-id를 쓰십시오")
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["check", "run"])
     ap.add_argument("--run-id", default=None)
+    ap.add_argument(
+        "--output-dir", type=Path, default=None, help="결과 폴더를 직접 지정 (기본은 원천별 폴더)"
+    )
+    add_source_args(ap)
     a = ap.parse_args(argv)
     print("modeler.__file__ =", modeler.__file__)
-    p = prepare()
+    p = prepare_from_args(a)
     rep, stops = check(p)
     print(json.dumps(rep, ensure_ascii=False, indent=1, default=str))
     if stops:
@@ -229,8 +356,11 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "check":
         return 0
     started = datetime.now()
-    run_id = a.run_id or started.strftime("run_%Y%m%d_%H%M%S")
-    out_dir = p.root / I.OUTPUT_DIR / run_id
+    canonical = p.source["kind"] == "canonical" or p.source["dist_kind"] == "canonical"
+    run_id = a.run_id or started.strftime(
+        "canon_%Y%m%d_%H%M%S" if canonical else "run_%Y%m%d_%H%M%S"
+    )
+    out_dir = resolve_out_dir(p, run_id, a.output_dir)
     out = run_all(p, out_dir)
     status = _git(
         "status",
@@ -248,10 +378,14 @@ def main(argv: list[str] | None = None) -> int:
         "code_branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
         "code_dirty": bool(status),
         "modeler_file": modeler.__file__,
-        "input_sha256": {k: I.sha256_file(v) for k, v in p.files.items()},
+        "source": p.source,
+        "input_sha256": {
+            **{k: I.sha256_file(v) for k, v in p.files.items()},
+            **{f"canonical:{k}": v for k, v in (p.canonical_files or {}).items()},
+        },
         "input_paths": {k: str(v) for k, v in p.files.items()},
         "params": {
-            "end_date": END_DATE.isoformat(),
+            "end_date": p.end_date.isoformat(),
             "first_decision": {k: v.isoformat() for k, v in FIRST_DECISION.items()},
             "one_way_cost": COSTS,
             "split_ratio_lo_hi": [I.SPLIT_LO, I.SPLIT_HI],
