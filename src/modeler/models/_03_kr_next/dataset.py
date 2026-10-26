@@ -60,6 +60,7 @@ from modeler.etl.universe import UniverseFilter, tradable_universe_filter
 from modeler.etl.universe_raw_price import build_universe_raw_price_sql
 from modeler.etl.universe_terminal import build_universe_v2_sql
 from modeler.models._03_kr_next import feature_set as fs
+from modeler.models._03_kr_next.liquidation_notice import build_liquidation_notice_sql
 
 FeatureSet = Literal["main", "noflow"]
 
@@ -100,6 +101,16 @@ UNIVERSE_FLAG_COLS: tuple[str, ...] = (
     "corp_code",
 )
 
+#: Serving 정리매매 rule columns (G-21, ``liquidation_notice.py``): carried in both modes.
+#: ``liq_notice_flag`` is never NULL; ``liq_notice_rcept_no`` is NULL unless flagged. Training
+#: keeps the rows (informational); the serving consumer drops flagged names from the candidates.
+LIQ_NOTICE_COLS: tuple[str, ...] = ("liq_notice_flag", "liq_notice_rcept_no")
+
+#: Non-feature columns read from a mart (never in ``NOFLOW_COLS`` / ``MAIN_COLS``).
+#: ``fin_ttm_conflict_v2``: the TTM earnings behind ``fin_roa_v2`` / ``fin_roe_v2`` includes a
+#: conflict quarter (G-14, R1 sensitivity). NULL when the vintage mart has no such column.
+MART_EXTRA_COLS: dict[str, tuple[str, ...]] = {"feat_fin_v2": ("fin_ttm_conflict_v2",)}
+
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -131,10 +142,12 @@ class KrNextViews:
     stock_master: str = "stock_master"
     dart_corp_master: str = "dart_corp_master"
     krx_index_daily: str = "krx_index_daily"
+    #: the vintage mart has ``ttm_includes_conflict`` (``_dlr``); False for ``_dl`` -> NULL column
+    vintage_has_conflict: bool = True
 
     def __post_init__(self) -> None:
         for name, value in self.__dict__.items():
-            if value is not None:
+            if isinstance(value, str):
                 _ident(value, name)
 
 
@@ -181,7 +194,10 @@ def _mart_sql(mart: str, v: KrNextViews) -> str:
         )
     if mart == "feat_fin_v2":
         return build_fin_v2_sql(
-            pit_view=v.pit_view, quality_view=v.quality_view, vintage_view=v.vintage_view
+            pit_view=v.pit_view,
+            quality_view=v.quality_view,
+            vintage_view=v.vintage_view,
+            vintage_has_ttm_conflict=v.vintage_has_conflict,
         )
     if mart == "feat_market_cap":
         return build_market_cap_sql(v.daily_market_cap, distortion_view=v.mcap_distortion_view)
@@ -231,11 +247,14 @@ def build_kr_next_panel_sql(
     min_end_gap_sessions: int = 1,
     end_halt_sessions: int = 20,
     terminal_tail_max: int = 10,
+    view_sql_out: dict[str, str] | None = None,
 ) -> str:
     """One SQL statement: the next KR model's panel (kept universe rows, features, labels).
 
     Columns, in order: ``trade_date, ticker, market``; the feature set's columns (NULL kept);
-    ``in_universe, in_universe_v2, raw_price_missing, keep_one_per_company, corp_code``; with
+    ``in_universe, in_universe_v2, raw_price_missing, keep_one_per_company, corp_code``;
+    ``fin_ttm_conflict_v2`` (R1 sensitivity, not a feature); ``liq_notice_flag``,
+    ``liq_notice_rcept_no`` (serving 정리매매 rule, both modes); with
     ``include_labels`` also ``y``, ``trainable`` and ``label_exit_kind_c1_{h}d``,
     ``label_end_date_c1_{h}d``, ``label_exit_lag_c1_{h}d`` (plus ``fwd_ret_c1_{h}d`` and
     ``raw_label_k200_c1_{h}d`` with ``keep_raw_label``). Rows: ``keep_one_per_company`` rows
@@ -246,6 +265,10 @@ def build_kr_next_panel_sql(
     one cross-section) among the ``trainable`` rows of that date; NULL on other rows.
     ``trainable`` = ``fwd`` not NULL and exit kind in ``allowed_kinds`` (``label_gate``);
     rows are never dropped for it.
+
+    ``view_sql_out``: if given, filled with ``{cte name: SELECT text}`` of every input view the
+    panel builds inline (marts, tail or label CTEs, universe, 정리매매 rule) for the build
+    manifest (G-22). An overridden mart records the ``SELECT *`` of its registered view.
 
     ``mart_overrides``: ``{mart name: registered view}`` to read an already built mart instead
     of building it inline. A mart must be unique on ``(trade_date, ticker, market)``
@@ -276,12 +299,14 @@ def build_kr_next_panel_sql(
     # --- marts (only those the set reads) -------------------------------------------------
     marts = [m for m in fs.MART_COLUMNS if any(fs.COLUMN_MART[c] == m for c in cols)]
     ctes: list[str] = []
+    parts: dict[str, str] = {}
     for m in marts:
         if m in overrides:
             body = f"SELECT * FROM {_ident(overrides[m], 'mart override')}"
         else:
             body = _mart_sql(m, v)
         ctes.append(f"kn_{m} AS (\n{body.strip()}\n)")
+        parts[f"kn_{m}"] = body.strip()
     if "feat_market_cap" in marts:
         ctes.append(
             "kn_mcap1 AS (\n"
@@ -312,9 +337,12 @@ def build_kr_next_panel_sql(
             **terminal_kw,
         )
         ctes.append(f"kn_label AS (\n{label_sql.strip()}\n)")
+        parts["kn_label"] = label_sql.strip()
         tail_relation = "kn_label"
     else:
-        ctes.append(f"kn_tail AS (\n{_terminal_tail_sql(spec, v, **terminal_kw).strip()}\n)")
+        tail_sql = _terminal_tail_sql(spec, v, **terminal_kw).strip()
+        ctes.append(f"kn_tail AS (\n{tail_sql}\n)")
+        parts["kn_tail"] = tail_sql
         tail_relation = "kn_tail"
 
     # --- universe -------------------------------------------------------------------------
@@ -327,6 +355,10 @@ def build_kr_next_panel_sql(
         market_cap_view=v.daily_market_cap,
     )
     ctes.append(f"kn_uni AS (\n{uni_sql.strip()}\n)")
+    parts["kn_uni"] = uni_sql.strip()
+    liq_sql = build_liquidation_notice_sql(v.filing_receipt_view, v.daily_ohlcv)
+    ctes.append(f"kn_liq AS (\n{liq_sql.strip()}\n)")
+    parts["kn_liq"] = liq_sql.strip()
 
     # --- panel: universe rows + marts, valid (non-halt) sessions only ----------------------
     flag_cols = ", ".join(f"u.{c}" for c in UNIVERSE_FLAG_COLS)
@@ -347,11 +379,16 @@ def build_kr_next_panel_sql(
                 f"AND {a}.ticker = u.ticker AND {a}.market = u.market"
             )
             select_feat += [f"{a}.{c}" for c in mine]
+            select_feat += [f"{a}.{c}" for c in MART_EXTRA_COLS.get(m, ())]
+    extra_mart = [c for m in marts for c in MART_EXTRA_COLS.get(m, ())]
     ctes.append(
         f"""kn_feat AS (
     SELECT u.trade_date, u.ticker, u.market, {flag_cols},
+           COALESCE(liq.liq_notice_flag, FALSE) AS liq_notice_flag,
+           liq.liq_notice_rcept_no AS liq_notice_rcept_no,
            {", ".join(select_feat)}
     FROM kn_uni u
+    LEFT JOIN kn_liq liq ON liq.trade_date = u.trade_date AND liq.ticker = u.ticker
     {chr(10).join("    " + j for j in joins).strip()}
     WHERE NOT u.is_halted
 )"""
@@ -374,7 +411,7 @@ def build_kr_next_panel_sql(
         where.append(f"trade_date <= DATE '{end_date}'")
     ctes.append(f"kn_sel AS (\n    SELECT * FROM kn_lag WHERE {' AND '.join(where)}\n)")
 
-    out_cols = [*KEYS, *cols, *UNIVERSE_FLAG_COLS]
+    out_cols = [*KEYS, *cols, *UNIVERSE_FLAG_COLS, *extra_mart, *LIQ_NOTICE_COLS]
     if not include_labels:
         final_from, extra = "kn_sel", []
     else:
@@ -411,6 +448,8 @@ def build_kr_next_panel_sql(
         if keep_raw_label:
             extra += [label["fwd"], label["raw"]]
     select = ", ".join([*out_cols, *extra])
+    if view_sql_out is not None:
+        view_sql_out.update(parts)
     return (
         "WITH\n"
         + ",\n".join(ctes)

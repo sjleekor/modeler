@@ -42,6 +42,14 @@ The vintage mart only holds firms still in ``stock_master``; the next preregistr
 ``vintage_view="fin_quarterly_metric_vintage_dl"`` (``etl/marts/metric_vintages_delisted.py``)
 so delisted firms are covered too. The join is on ``ticker`` only, so nothing else changes.
 
+One sensitivity column, ``fin_ttm_conflict_v2`` (G-14, R1): TRUE when the TTM earnings value behind
+``fin_roe_v2`` / ``fin_roa_v2`` on that row includes a conflict quarter, read from
+``ttm_includes_conflict`` of the vintage row the value came from (same basis, same ``rcept_no``
+selection as the ratio itself; the flag of the numerator that was picked). It is defined where
+at least one of the two ratios is non-NULL: TRUE if the earnings of a non-NULL ratio carry a
+conflict, else FALSE. With ``vintage_has_ttm_conflict=False`` (``_dl``, no such column) the column
+is NULL. It is not a model feature.
+
 ``fin_vintage.py`` and ``fin_scan.py`` are not modified; the interval CTE text is theirs,
 with one column added.
 """
@@ -85,15 +93,36 @@ def _selected(metric: str, alias: str) -> str:
 
 
 _INTERVAL_SELECT = "ticker, metric_code, fs_basis, daily_value, value_lag_4q,"
+_POINTS_TAIL = "            value_lag_4q\n        FROM "
+#: metrics whose TTM value can include a conflict quarter (the ROE / ROA numerators)
+_CONFLICT_METRICS = ("controlling_net_income", "net_income")
 
 
-def _intervals_with_rcept(vintage_view: str) -> str:
-    """``build_metric_intervals_cte`` with ``rcept_no`` added to ``metric_intervals``."""
+def _intervals_with_rcept(vintage_view: str, ttm_conflict: bool = False) -> str:
+    """``build_metric_intervals_cte`` with ``rcept_no`` (and ``conflict_flag``) added.
+
+    ``conflict_flag`` is the vintage row's ``ttm_includes_conflict``; it travels with
+    ``daily_value`` through ``metric_points`` and ``metric_intervals``, so it is the flag of the
+    very row the interval's value came from.
+    """
     cte = build_metric_intervals_cte(vintage_view, _METRICS)
     if cte.count(_INTERVAL_SELECT) != 1:
         raise RuntimeError("fin_vintage metric_intervals text changed; fin_v2 must be updated")
+    extra = ""
+    if ttm_conflict:
+        tail = f"{_POINTS_TAIL}{vintage_view}"
+        if cte.count(tail) != 1:
+            raise RuntimeError("fin_vintage metric_points text changed; fin_v2 must be updated")
+        cte = cte.replace(
+            tail,
+            "            value_lag_4q,\n"
+            "            ttm_includes_conflict AS conflict_flag\n"
+            f"        FROM {vintage_view}",
+        )
+        extra = " conflict_flag,"
     return cte.replace(
-        _INTERVAL_SELECT, "ticker, metric_code, fs_basis, daily_value, value_lag_4q, rcept_no,"
+        _INTERVAL_SELECT,
+        f"ticker, metric_code, fs_basis, daily_value, value_lag_4q, rcept_no,{extra}",
     )
 
 
@@ -103,8 +132,12 @@ def build_fin_v2_sql(
     quality_view: str = "dim_price_quality_daily",
     vintage_view: str = "fin_quarterly_metric_vintage",
     join_plan: str = JOIN_PLAN_COALESCE,
+    vintage_has_ttm_conflict: bool = False,
 ) -> str:
     """SQL producing ``feat_fin_v2`` (``fin_roe_v2``).
+
+    ``vintage_has_ttm_conflict``: the vintage view has ``ttm_includes_conflict`` (the ``_dlr``
+    mart); ``fin_ttm_conflict_v2`` is then filled, else it is a NULL boolean column.
 
     ``join_plan`` defaults to ``coalesce_join`` (hash join on ticker; 0.5 s against 361.7 s for
     the ``or`` text on the dev data, same rows). This is a new mart, so there is no hash
@@ -117,8 +150,43 @@ def build_fin_v2_sql(
         for m in _METRICS
         for b in FS_BASES
     )
+    if vintage_has_ttm_conflict:
+        value_cols += ",\n            " + ",\n            ".join(
+            f"m_{m}_{b.lower()}.conflict_flag AS c_{m}_{b.lower()}"
+            for m in _CONFLICT_METRICS
+            for b in FS_BASES
+        )
+        conflict_resolved = """,
+            -- conflict flag of the numerator each ratio picked (same branch as above)
+            CASE WHEN v_net_income_cfs IS NOT NULL
+                 THEN CASE WHEN r_controlling_net_income_cfs = r_total_equity_cfs
+                           THEN c_controlling_net_income_cfs
+                           WHEN r_net_income_cfs = r_total_equity_cfs THEN c_net_income_cfs END
+                 ELSE CASE WHEN r_controlling_net_income_ofs = r_total_equity_ofs
+                           THEN c_controlling_net_income_ofs
+                           WHEN r_net_income_ofs = r_total_equity_ofs THEN c_net_income_ofs END
+            END AS earnings_conflict,
+            CASE WHEN v_net_income_cfs IS NOT NULL
+                 THEN CASE WHEN r_controlling_net_income_cfs = r_total_assets_cfs
+                           THEN c_controlling_net_income_cfs
+                           WHEN r_net_income_cfs = r_total_assets_cfs THEN c_net_income_cfs END
+                 ELSE CASE WHEN r_controlling_net_income_ofs = r_total_assets_ofs
+                           THEN c_controlling_net_income_ofs
+                           WHEN r_net_income_ofs = r_total_assets_ofs THEN c_net_income_ofs END
+            END AS earnings_for_assets_conflict"""
+        conflict_out = """,
+        CASE WHEN (base_ok AND equity > 0 AND earnings IS NOT NULL)
+                  OR (base_ok AND assets > 0 AND earnings_for_assets IS NOT NULL)
+             THEN (COALESCE(earnings_conflict, FALSE)
+                   AND base_ok AND equity > 0 AND earnings IS NOT NULL)
+                  OR (COALESCE(earnings_for_assets_conflict, FALSE)
+                      AND base_ok AND assets > 0 AND earnings_for_assets IS NOT NULL)
+        END AS fin_ttm_conflict_v2"""
+    else:
+        conflict_resolved = ""
+        conflict_out = ",\n        CAST(NULL AS BOOLEAN) AS fin_ttm_conflict_v2"
     return f"""
-    WITH {_intervals_with_rcept(vintage_view)},
+    WITH {_intervals_with_rcept(vintage_view, vintage_has_ttm_conflict)},
     panel AS (
         SELECT
             pit.trade_date, pit.ticker, pit.market,
@@ -168,7 +236,7 @@ def build_fin_v2_sql(
             {_selected("operating_cash_flow", "ocf")},
             {_selected("cash_and_cash_equivalents", "cash")},
             CASE WHEN v_net_income_cfs IS NOT NULL THEN r_total_assets_cfs
-                 ELSE r_total_assets_ofs END AS assets_rcept
+                 ELSE r_total_assets_ofs END AS assets_rcept{conflict_resolved}
         FROM joined
     ),
     scored AS (
@@ -199,7 +267,7 @@ def build_fin_v2_sql(
              THEN cash / assets END AS fin_cash_ratio_v2,
         CASE WHEN base_ok AND assets > 0 AND revenue IS NOT NULL
                   AND revenue_rcept = assets_rcept
-             THEN revenue / assets END AS fin_asset_turnover_v2
+             THEN revenue / assets END AS fin_asset_turnover_v2{conflict_out}
     FROM scored
     """
 
@@ -213,6 +281,7 @@ def materialize_fin_v2(
     vintage_view: str = "fin_quarterly_metric_vintage",
     force: bool = False,
     join_plan: str = JOIN_PLAN_COALESCE,
+    vintage_has_ttm_conflict: bool = False,
 ) -> str:
     """Build + register the ``feat_fin_v2`` mart view. Returns the view name."""
     materialize(
@@ -224,6 +293,7 @@ def materialize_fin_v2(
             quality_view=quality_view,
             vintage_view=vintage_view,
             join_plan=join_plan,
+            vintage_has_ttm_conflict=vintage_has_ttm_conflict,
         ),
         force=force,
     )
