@@ -356,3 +356,79 @@ def test_rerunning_a_published_day_with_the_same_report_makes_no_new_commit(tmp_
     assert publication["publisher_status"] == "unchanged" and publication["reports_commit"] == head
     assert world.remote_head() == head and len(world.remote_log()) == count
     assert world.journal() is None
+
+
+def _wrapper_run(release: Path, config: Path, day: date, now: str) -> dict:
+    env = {**os.environ, "PYTHONPATH": str(release / "src")}
+    base = [sys.executable, "-m", "modeler.serving.daily_wrapper"]
+    tail = ["--config", str(config), "--report-date", day.isoformat(), "--fixture-now"]
+    select = subprocess.run([*base, "select", *tail, "2026-09-29T09:30:00+09:00"], cwd=release, env=env,
+                            text=True, capture_output=True, timeout=120)
+    assert select.returncode == 0, (select.stdout, select.stderr)
+    done = subprocess.run([*base, "run", *tail, now], cwd=release, env=env, text=True,
+                          capture_output=True, timeout=300)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    return json.loads(done.stdout)["stages"]
+
+
+def _unit_files(world: World, day: date) -> dict[str, bytes]:
+    root = world.checkout / _unit(day)
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def _pushed_files(world: World, day: date) -> set[str]:
+    listing = _git("--git-dir", str(world.bare), "ls-tree", "-r", "--name-only", "main", _unit(day))
+    return {line[len(_unit(day)) + 1:] for line in listing.splitlines()}
+
+
+def test_publisher_input_carries_the_explain_switch(tmp_path: Path) -> None:
+    from modeler.serving import daily_coordinator as dc
+
+    _release, config_path = e2e._setup(tmp_path)
+    _enable_publisher(tmp_path, config_path)
+    for value in (True, False):
+        body = {**json.loads(config_path.read_text()), "explain_enabled": value}
+        built = dc._reports_publisher_input(
+            body, D1, {"report_sha256": "a" * 64, "invocation_id": "i"}, tmp_path / "run")
+        assert built["explain_enabled"] is value
+
+
+def test_wrapper_run_with_explain_on_documents_the_synthetic_failure_and_still_publishes(
+        tmp_path: Path) -> None:
+    """Synthetic bundles are not the three real models, so explain ends in the documented failed
+    document (no svg assets); the unit still publishes and records the explain file it read."""
+    release, config = e2e._setup(tmp_path)
+    world = _enable_publisher(tmp_path, config)
+    body = json.loads(config.read_text())
+    body["explain_enabled"] = True
+    e2e._write(config, body)
+    stages = _wrapper_run(release, config, D1, "2026-09-29T10:00:00+09:00")
+    assert stages["explain"] == "failed" and stages["publication"] == "published"
+    run = tmp_path / "runs" / D1.isoformat()
+    state = json.loads((run / "coordinator-explain.json").read_text())
+    document = json.loads((run / f"explain-{D1}.json").read_text())
+    inference = json.loads((run / "coordinator-inference.json").read_text())
+    assert state["status"] == "failed"
+    assert document["report_sha256"] == inference["report_sha256"] == e2e._sha(run / f"report-{D1}.json")
+    assert document["invocation_id"] == inference["invocation_id"]
+    assert json.loads((run / "reports-publisher-config.json").read_text())["explain_enabled"] is True
+    local = _unit_files(world, D1)
+    assert not any(name.startswith("assets/") for name in local)
+    assert not any(name.startswith("assets/") for name in _pushed_files(world, D1))
+    document_sha = e2e._sha(run / f"explain-{D1}.json")  # the unit records which explain file it read
+    assert all(f"explain_sha256: {document_sha}" in data.decode()
+               for name, data in local.items() if name.endswith(".md"))
+
+
+def test_wrapper_run_with_explain_off_writes_no_explain_state_or_file(tmp_path: Path) -> None:
+    release, config = e2e._setup(tmp_path)
+    world = _enable_publisher(tmp_path, config)  # explain_enabled False
+    stages = _wrapper_run(release, config, D1, "2026-09-29T10:00:00+09:00")
+    assert "explain" not in stages and stages["publication"] == "published"
+    run = tmp_path / "runs" / D1.isoformat()
+    assert not (run / f"explain-{D1}.json").exists()
+    assert json.loads((run / "reports-publisher-config.json").read_text())["explain_enabled"] is False
+    local = _unit_files(world, D1)
+    assert not any(name.startswith("assets/") for name in local)
+    assert not any("explain_sha256" in data.decode() for data in local.values())
+    assert set(local) == _pushed_files(world, D1)

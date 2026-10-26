@@ -768,6 +768,7 @@ def _reports_publisher_input(config: dict[str, Any], day: date, render: dict[str
         "invocation_id": render["invocation_id"],
         "model_cards_path": str(_absolute(config, "model_cards_path")),
         "top_n": config.get("reports_top_n", 100),
+        "explain_enabled": config["explain_enabled"],  # off: the publisher reads no explain file
         **_security_names_roots(config),
     }
 
