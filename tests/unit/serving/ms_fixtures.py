@@ -166,7 +166,7 @@ def build_release_world(tmp_path: Path, monkeypatch, *, kr_snapshot_done: str | 
         "kr_calendar": str(kr_calendar), "us_calendar": str(us_calendar),
         "us_expected_source": str(expected), "opening_artifact": None,
         "market_sector_kr_root": str(world.kr_root), "market_sector_us_root": str(world.us_root),
-        "publisher_enabled": False, "external_verification_enabled": False,
+        "publisher_enabled": False, "external_verification_enabled": False, "explain_enabled": False,
         "reports_publisher": None, "reports_publisher_sha256": None, "reports_checkout": None,
         "reports_remote_url": None, "reports_repository": None, "reports_audience": None,
         "reports_branch": None, "reports_top_n": 100}

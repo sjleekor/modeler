@@ -35,6 +35,8 @@ REPORTS_BRANCH = "main"
 PUBLISHER_TIMEOUT_SECONDS = 300
 RUNNER_TIMEOUT_SECONDS = 1800
 MARKET_SECTOR_TIMEOUT_SECONDS = 900
+EXPLAIN_ENTRYPOINT = "modeler.serving.explain"
+EXPLAIN_TIMEOUT_SECONDS = 120
 MARKET_SECTOR_ROOT_KEYS = ("market_sector_kr_root", "market_sector_us_root")
 # 증권 이름 입력을 만들 레이크 root. 전용 키가 없으면 같은 레이크를 가리키는 시장·섹터 root를 씁니다.
 SECURITY_NAMES_ROOT_KEYS = (
@@ -183,6 +185,11 @@ def _config(path: Path) -> dict[str, Any]:
         raise ValueError("publisher_enabled must be explicit")
     if not isinstance(config.get("external_verification_enabled"), bool):
         raise ValueError("external_verification_enabled must be explicit")
+    if not isinstance(config.get("explain_enabled"), bool):
+        raise ValueError("explain_enabled must be explicit")
+    explain_timeout = config.get("explain_timeout_seconds", EXPLAIN_TIMEOUT_SECONDS)
+    if isinstance(explain_timeout, bool) or not isinstance(explain_timeout, int) or not 10 <= explain_timeout <= 1800:
+        raise ValueError("explain_timeout_seconds must be 10..1800")
     if config["publisher_enabled"]:
         _reports_publisher_config(config)
     return config
@@ -533,6 +540,121 @@ def market_sector_stage(config: dict[str, Any], day: date, now: datetime) -> dic
     return state
 
 
+def _explain_roots(config: dict[str, Any]) -> tuple[Path | None, Path | None]:
+    """The KR and US data roots explain reads prices from (read only); the market-sector roots first."""
+    out = []
+    for key, fallback in (("market_sector_kr_root", "security_names_kr_root"),
+                          ("market_sector_us_root", "security_names_us_root")):
+        source = key if config.get(key) is not None else fallback
+        out.append(_absolute(config, source) if config.get(source) is not None else None)
+    return out[0], out[1]
+
+
+def _retire_explain_document(path: Path) -> None:
+    """Set an earlier explain document of the same D aside; it is never reused (renamed, not deleted)."""
+    if path.is_file():
+        os.replace(path, path.with_name(f"{path.stem}.superseded-{_hash(path)[:12]}{path.suffix}"))
+
+
+def explain_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, Any]:
+    """Compute ``explain-D.json`` for the top-ranked stocks in a child process under a time limit.
+
+    Runs after inference (and market-sector). It reads the report and the pinned inputs only: no model,
+    score, rank or ``report-D.json`` byte changes.  A failure, a timeout or a crash ends in a ``failed``
+    document that carries this invocation's id and the report's hash (the renderer then says so); the
+    stage itself never raises into the run.  ``explain_enabled=false`` writes nothing and the unit renders
+    exactly as before.  A document of an earlier invocation is set aside, never reused.
+    """
+    run_root = _day_dir(config, day)
+    run_root.mkdir(parents=True, exist_ok=True)
+    state_path = run_root / "coordinator-explain.json"
+    document = run_root / f"explain-{day.isoformat()}.json"
+    _retire_explain_document(document)
+    if config["explain_enabled"] is not True:
+        state = {"report_date": day.isoformat(), "status": "disabled"}
+        _atomic(state_path, state)
+        return state
+    infer_state = _read(run_root / "coordinator-inference.json")
+    if infer_state.get("report_ready", infer_state.get("this_invocation_completed")) is not True or \
+            infer_state.get("failure_report") is True:
+        state = {"report_date": day.isoformat(), "status": "skipped", "reason": "no_model_report",
+                 "invocation_id": infer_state.get("invocation_id")}
+        _atomic(state_path, state)
+        return state
+    from . import explain as ex  # only an enabled stage needs the module
+
+    invocation_id = infer_state["invocation_id"]
+    report_sha = infer_state["report_sha256"]
+    release_name = Path(config["release_manifest"]).parent.name
+
+    def failed(reason: str, *, timed_out: bool = False, exit_code: int | None = None) -> dict[str, Any]:
+        body = ex.failure_document(unit=day.isoformat(), invocation_id=invocation_id,
+                                   report_sha256=report_sha, release=release_name, reason=reason)
+        raw = (json.dumps(body, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode()
+        sha = _install_ms_document(document, raw)
+        state = {"report_date": day.isoformat(), "status": "failed", "reason": reason, "timed_out": timed_out,
+                 "exit_code": exit_code, "invocation_id": invocation_id, "document_sha256": sha}
+        _atomic(state_path, state)
+        return state
+
+    try:
+        report_path = Path(infer_state["report_path"])
+        if _hash(report_path) != report_sha:
+            return failed("report_changed")
+        selected = _selected(config, day)
+        jobs_config, jobs_sha = selected["jobs_config"], selected["jobs_config_sha256"]
+        release = _read(_absolute(config, "release_manifest"))
+        release_root = Path(release["release_root"]).resolve(strict=True)
+        kr_root, us_root = _explain_roots(config)
+    except Exception as exc:
+        return failed(f"setup:{type(exc).__name__}")
+    scratch = run_root / f".explain-{day.isoformat()}.new"
+    scratch.unlink(missing_ok=True)
+    top_n = config.get("reports_top_n", 100)
+    argv = [str(_absolute(config, "python")), "-m", EXPLAIN_ENTRYPOINT, "run",
+            "--report-date", day.isoformat(), "--report", str(report_path), "--report-sha256", report_sha,
+            "--invocation-id", invocation_id, "--release", release_name,
+            "--jobs-config", jobs_config, "--jobs-config-sha256", jobs_sha,
+            "--prepared-root", str(_absolute(config, "prepared_root")),
+            "--top-n", str(top_n if isinstance(top_n, int) and not isinstance(top_n, bool) else 100),
+            "--output", str(scratch)]
+    if kr_root is not None:
+        argv += ["--kr-root", str(kr_root)]
+    if us_root is not None:
+        argv += ["--us-root", str(us_root)]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(release_root / "src")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    timeout = config.get("explain_timeout_seconds", EXPLAIN_TIMEOUT_SECONDS)
+    try:
+        done = run_group(argv, cwd=release_root, env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        scratch.unlink(missing_ok=True)
+        return failed("timeout", timed_out=True, exit_code=124)
+    except OSError as exc:
+        return failed(f"spawn:{type(exc).__name__}", exit_code=127)
+    if done.returncode != 0 or not scratch.is_file():
+        scratch.unlink(missing_ok=True)
+        return failed("exit_nonzero" if done.returncode else "output_missing", exit_code=done.returncode)
+    raw = scratch.read_bytes()
+    try:
+        body = json.loads(raw)
+        if (body.get("schema") != ex.SCHEMA or body.get("invocation_id") != invocation_id
+                or body.get("report_sha256") != report_sha or body.get("unit") != day.isoformat()
+                or body.get("status") not in {"ok", "partial", "failed"}):
+            raise ValueError("explain document identity")
+    except ValueError:
+        scratch.unlink(missing_ok=True)
+        return failed("output_invalid", exit_code=done.returncode)
+    os.replace(scratch, document)  # the child wrote scratch whole; the rename is the only publication
+    state = {"report_date": day.isoformat(), "status": body["status"], "invocation_id": invocation_id,
+             "document_sha256": hashlib.sha256(raw).hexdigest(),
+             "models": {k: v.get("status") for k, v in body["models"].items()}}
+    _atomic(state_path, state)
+    return state
+
+
 def _previous_private(config: dict[str, Any], day: date,
                       synthetic: bool) -> tuple[Path | None, dict[str, bytes] | None]:
     """Newest strictly earlier private view with the same fixture mode; never a public projection."""
@@ -842,8 +964,8 @@ def monitor_stage(config: dict[str, Any], day: date, *, attempt: int) -> dict[st
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="modeler-daily-coordinator")
-    parser.add_argument("stage", choices=("select", "infer", "market-sector", "render", "publish",
-                                          "monitor"))
+    parser.add_argument("stage", choices=("select", "infer", "market-sector", "explain", "render",
+                                          "publish", "monitor"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--report-date", type=date.fromisoformat, required=True)
     parser.add_argument("--attempt", type=int, default=0)
@@ -862,6 +984,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = infer_stage(config, args.report_date, now)
             elif args.stage == "market-sector":
                 result = market_sector_stage(config, args.report_date, now)
+            elif args.stage == "explain":
+                result = explain_stage(config, args.report_date, now)
             elif args.stage == "render":
                 result = render_stage(config, args.report_date)
             elif args.stage == "publish":
@@ -872,7 +996,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result["status"] in {"selected", "partial", "holiday", "holiday_skipped",
                                           "inferred", "inferred_partial", "rendered",
                                           "published", "verified", "publication_withheld",
-                                          "disabled", "market_sector_ready",
+                                          "disabled", "ok", "skipped", "market_sector_ready",
                                           "market_sector_partial"} else 1
     except Exception as exc:
         print(json.dumps({"status": "failed", "error_class": type(exc).__name__}), file=sys.stderr)
