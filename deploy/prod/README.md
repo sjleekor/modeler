@@ -129,6 +129,10 @@ python publish_reports.py sync --config runs/2026-10-07/reports-publisher-config
 
 결과는 stdout에 JSON 한 줄로 나옵니다. coordinator는 종료 코드 0이면 `coordinator-publication.json`의 `status`를 `published`로, 아니면 `publisher_failed`로 적고 `publisher_status`·`publisher_exit_code`·`local_done`을 같이 남깁니다. 성공하면 `reports_commit`(원격 `main`의 커밋)도 적습니다.
 
+### explain 단계
+
+`daily_wrapper run`이 `market_sector` 다음에 `explain_stage`를 부릅니다(단독 실행은 `daily_coordinator explain`). 별도 프로세스 그룹에서 `python -m modeler.serving.explain run`을 돌리고, 이 단계가 어떻게 끝나도 `render`·`publish`는 그대로 이어집니다. 모델·점수·순위·`report-D.json` 바이트는 건드리지 않습니다. 결과는 `run/explain-<D>.json`(`briefing-explain.v1`, 형식은 계획 §5.2.1)이고 `coordinator-explain.json`에 상태(`ok`·`partial`·`failed`·`disabled`·`skipped`)를 적습니다. 파일 안의 `invocation_id`·`report_sha256`이 그날 report와 다르면 표시 쪽이 버립니다. 가격은 시장·섹터 root(`market_sector_*_root`, 없으면 `security_names_*_root`)에서 읽습니다. **release의 검토 목록(`SOURCE_MANIFEST`)에 `modeler/src/modeler/serving/explain.py`가 있어야 release 빌드가 통과합니다.**
+
 ### ops 설정 키
 
 Pages용 `base_path`·`projection_root`·`previous_projection_dir`·`publisher_script(_sha256)`·`publisher_config`·`site_checkout`·`actions_repository`·`actions_workflow`·`public_manifest_url`은 없앴습니다. `publisher_enabled`가 `true`일 때 아래 키를 모두 검증합니다. `false`이면 검증하지 않고 `publish`는 `publication_withheld`로 끝납니다.
@@ -137,6 +141,8 @@ Pages용 `base_path`·`projection_root`·`previous_projection_dir`·`publisher_s
 |---|---|
 | `publisher_enabled` | 게시를 켤지. 명시해야 합니다 |
 | `external_verification_enabled` | monitor가 `git ls-remote`로 원격을 볼지 |
+| `explain_enabled` | 순위 근거·가격 흐름(`explain-D.json`)을 계산할지. 명시해야 합니다. `false`이면 파일을 만들지 않고 단위는 전과 바이트까지 같습니다. 이미 있던 같은 날 파일은 `explain-D.superseded-<sha>.json`으로 옮깁니다(지우지 않음) |
+| `explain_timeout_seconds` | explain 하위 프로세스 제한 시간(초, 10\~1800, 기본 120). 넘으면 프로세스 그룹을 끝내고 `failed` 문서를 남깁니다. 실행은 계속됩니다 |
 | `reports_repository` | `sjleekor/stock_reports`(다르면 멈춤) |
 | `reports_audience` | `owner_only`(다르면 멈춤) |
 | `reports_branch` | `main` |

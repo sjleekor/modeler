@@ -119,7 +119,7 @@ def _enable_publisher(
     body.update(
         {
             "publisher_enabled": True,
-            "external_verification_enabled": external_verification,
+            "external_verification_enabled": external_verification, "explain_enabled": False,
             "reports_publisher": str(script),
             "reports_publisher_sha256": e2e._sha(script),
             "reports_checkout": str(world.checkout),
