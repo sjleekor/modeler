@@ -23,6 +23,12 @@
 실패·stale 섹션에 붙입니다. 파일 경로와 sha256은 manifest·journal에 남고 동기화 단계는 같은 파일로
 다시 렌더합니다. 이미 올린 단위에 메모를 더하면 내용이 달라지므로 `--correct`가 있어야 올라갑니다.
 
+근거·그래프: run 디렉터리에 `explain-D.json`(`briefing-explain.v1`)이 있으면 로컬 단계가 읽어
+렌더러에 넘깁니다. 렌더러는 파일 안의 report sha256·invocation id가 이번 실행과 같을 때만 쓰고,
+다르면 "입력 불일치"로 적습니다. 경로와 sha256은 manifest·journal에 남고, 정정·재시도는 같은
+파일인지 확인하고 다시 읽습니다. 설정 `explain_enabled: false`이거나 파일이 없으면 읽지 않고,
+단위는 근거 기능이 없던 때와 바이트까지 같습니다. 단위 파일은 markdown 5개와 `assets/*.svg`입니다.
+
 release의 `modeler` 패키지가 `PYTHONPATH`에 있어야 합니다(coordinator가 맞춰 줍니다).
 이 스크립트와 `validate_reports.py`는 release 밖에 두고 sha256을 고정합니다.
 """
@@ -58,6 +64,7 @@ JOURNAL_VERSION = 1
 MAX_PUSH_ATTEMPTS = 3
 GIT_TIMEOUT = 120
 LOCAL_LOCK_WAIT_SECONDS = 60.0
+EXPLAIN_MAX_BYTES = 64 * 1024 * 1024
 KST = timezone(timedelta(hours=9))
 
 REQUIRED_KEYS = {"audience", "checkout_dir", "remote_name", "expected_remote_url", "branch"}
@@ -70,6 +77,7 @@ OPTIONAL_KEYS = {
     "security_names_us_root",
     "security_names_kr_root",
     "report_date",
+    "explain_enabled",
 }
 ALLOWED_KEYS = REQUIRED_KEYS | LOCAL_KEYS | OPTIONAL_KEYS
 # 증권 이름 입력(security-names.v1)을 레이크에서 만드는 데 쓰는 root. 시장별로 따로 받습니다.
@@ -175,6 +183,8 @@ def check_config(config: dict, *, need_local: bool, strict_remote: bool = True) 
     for _market, key in NAMES_ROOT_KEYS:
         if config.get(key) is not None:
             _absolute(config[key], key)
+    if "explain_enabled" in config and not isinstance(config["explain_enabled"], bool):
+        raise PublishError("explain_enabled must be true or false")
 
 
 def _absolute(value: object, label: str) -> Path:
@@ -363,14 +373,28 @@ def _unit_dir_local(markdown_dir: Path) -> Path:
 
 
 def _read_unit_files(directory: Path) -> dict | None:
+    """로컬 단위(markdown 5개 + `assets/*.svg`)를 읽습니다. 모양이 맞지 않으면 None입니다.
+
+    markdown은 텍스트, 그림은 바이트입니다. symlink, 모르는 파일, 그림 이름 규칙 밖의 항목이
+    하나라도 있으면 None입니다(단위가 바뀌었거나 없는 것으로 다룹니다).
+    """
     if directory.is_symlink() or not directory.is_dir():
         return None
-    files = {}
+    files: dict = {}
     for name in md.SECTION_FILES.values():
         path = directory / name
         if path.is_symlink() or not path.is_file():
             return None
         files[name] = path.read_text(encoding="utf-8")
+    for path in directory.iterdir():
+        if path.name in md.SECTION_FILES.values():
+            continue
+        if path.name != "assets" or path.is_symlink() or not path.is_dir():
+            return None
+    assets = md.read_asset_dir(directory)
+    if any(value == md.INVALID_ASSET for value in assets.values()):
+        return None
+    files.update(assets)
     return files
 
 
@@ -392,7 +416,11 @@ def _store_unit(markdown_dir: Path, files: dict) -> None:
     stage = Path(tempfile.mkdtemp(prefix=".unit-stage-", dir=markdown_dir))
     try:
         for name, text in files.items():
-            (stage / name).write_bytes(text.encode("utf-8"))
+            if md.is_asset_name(name):
+                (stage / "assets").mkdir(exist_ok=True)
+            elif "/" in name:
+                raise PublishError(f"unexpected unit file name: {name}")
+            (stage / name).write_bytes(md.as_bytes(text))
         target = _unit_dir_local(markdown_dir)
         if target.exists() or target.is_symlink():
             shutil.rmtree(target)
@@ -527,6 +555,13 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         return _reject_local(config, checkout, markdown_dir, ["운영자 메모가 일반 파일이 아닙니다"])
     if memo_file.is_file():
         memo_bytes = memo_file.read_bytes()
+    # 근거·그래프 입력. 꺼져 있거나 없으면 읽지 않습니다(근거 기능이 없던 때와 같은 단위).
+    explain_file = run_dir / f"explain-{unit}.json"
+    explain_bytes = None
+    if config.get("explain_enabled", True) and (explain_file.exists() or explain_file.is_symlink()):
+        explain_bytes = _read_explain(explain_file)
+    else:
+        explain_file = None
 
     # L2. 렌더합니다. 같은 입력을 다시 돌려 내용이 같으면 파일을 그대로 둡니다(generated_at 고정).
     md.reset_scrub_hits()
@@ -542,6 +577,8 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
             security_names=names["raw"],
             names_notes=names["notes"],
             operator_memo=memo_bytes,
+            explain=explain_bytes,
+            invocation_id=config["invocation_id"],
         )
         files = md.render_unit(ctx)
     except md.InputError as exc:
@@ -580,13 +617,22 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         "unit_sha256": unit_hash,
         "scrub_hits": len(md.SCRUB_HITS),
     }
-    memo_fields = {}
+    extra_fields = {}
     if memo_bytes is not None:  # 메모가 없으면 manifest·journal은 전과 같습니다
-        memo_fields = {
+        extra_fields = {
             "operator_memo_path": str(memo_file),
             "operator_memo_sha256": hashlib.sha256(memo_bytes).hexdigest(),
         }
-    manifest.update(memo_fields)
+    if explain_bytes is not None:  # 근거 입력이 없으면 manifest·journal은 전과 같습니다
+        explain = ctx.get("explain") or {}
+        extra_fields.update(
+            {
+                "explain_path": str(explain_file),
+                "explain_sha256": hashlib.sha256(explain_bytes).hexdigest(),
+                "explain_state": explain.get("state"),
+            }
+        )
+    manifest.update(extra_fields)
     _write_atomic(
         markdown_dir / "manifest.json",
         (json.dumps(manifest, sort_keys=True, ensure_ascii=False, indent=2) + "\n").encode(),
@@ -609,7 +655,7 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         "security_names_notes": names["notes"],
         "synthetic_fixture": envelope.get("synthetic_fixture") is True,
         "updated_at": now_kst(),
-        **memo_fields,
+        **extra_fields,
     }
     if old and old.get("commit"):
         # 커밋은 했지만 push하지 못한 단위입니다. 같은 내용이면 그대로 두고, 다르면 동기화 단계가
@@ -724,10 +770,14 @@ def _apply_unit(
         _touch(entry, state=REJECTED, detail=["고칠 단위가 저장소에 없습니다"])
         return REJECTED
     problems = md.validate_unit_files(unit, files, allow_synthetic=allow_synthetic)
+    if not problems and (udir.is_symlink() or (udir / "assets").is_symlink()):
+        problems = ["단위 폴더나 assets/가 symlink입니다"]
     if not problems:
         udir.mkdir(parents=True, exist_ok=True)
         for name, text in files.items():
             md.write_if_changed(udir / name, text)
+        if corrected:
+            md.remove_stale_assets(udir, files)  # 정정판에 없는 옛 그림은 지웁니다
         md.ensure_model_cards(checkout, cards, None)
         md.reindex(checkout, lambda message: None)
         problems = vr.validate_working_tree(
@@ -760,8 +810,18 @@ def _apply_unit(
     return "committed"
 
 
+def _read_explain(path: Path) -> bytes:
+    """근거 입력을 읽습니다. 일반 파일이 아니거나 너무 크면 빈 바이트를 돌려줍니다.
+
+    빈 바이트는 렌더러가 "근거 파일 형식 오류"로 그립니다. 근거 문제로 단위를 막지 않습니다.
+    """
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > EXPLAIN_MAX_BYTES:
+        return b""
+    return path.read_bytes()
+
+
 def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: str) -> dict:
-    """journal 항목에 적힌 입력(report, 시장·섹터)으로 렌더 입력을 다시 만듭니다."""
+    """journal 항목에 적힌 입력(report, 시장·섹터, 이름, 메모, 근거)으로 렌더 입력을 만듭니다."""
     run_dir = Path(entry["run_dir"])
     report_path = _regular_file(run_dir / f"report-{unit}.json", "report")
     report_bytes = report_path.read_bytes()
@@ -784,6 +844,14 @@ def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: 
         memo_bytes = memo_file.read_bytes()
         if hashlib.sha256(memo_bytes).hexdigest() != entry.get("operator_memo_sha256"):
             raise PublishError("operator memo changed since the local step")
+    explain_bytes = None
+    if entry.get("explain_path"):
+        explain_path = Path(entry["explain_path"])
+        if explain_path.parent != run_dir:
+            raise PublishError("explain input is outside the run directory")
+        explain_bytes = _read_explain(explain_path)
+        if hashlib.sha256(explain_bytes).hexdigest() != entry.get("explain_sha256"):
+            raise PublishError("explain input changed since the local step")
     try:
         return md.build_context(
             checkout,
@@ -796,6 +864,8 @@ def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: 
             security_names=names_bytes,
             names_notes=entry.get("security_names_notes"),
             operator_memo=memo_bytes,
+            explain=explain_bytes,
+            invocation_id=entry["invocation_id"],
         )
     except md.InputError as exc:
         raise PublishError(f"cannot render from the journaled inputs: {exc}") from None
