@@ -41,6 +41,17 @@ eval = [
     "lightgbm>=4.6,<5",      # 기준선 모델
     "matplotlib>=3.8",
 ]
+# 신경망·사전학습 모델 시험(my ml_methods 09의 "나"). 서빙 venv에는 넣지 않는다.
+# 사전학습 가중치는 커밋 SHA로 고정한 뒤에만 쓰고(09 §8 Q3), 비상업 라이선스 가중치는 쓰지 않는다(Q2).
+dl = [
+    "torch>=2.4",                  # 신경망 표 모델·시계열 딥러닝·ETF 샤프 직접 학습
+    "xgboost>=2.1",                # 표 형식 비교 모델
+    "catboost>=1.2",
+    "ngboost>=0.5",                # 분포 예측
+    "tabpfn>=2.0",                 # v2 가중치만(ModelVersion.V2). 2.5 이후 가중치는 비상업 약관이라 안 쓴다
+    "chronos-forecasting>=2.0",    # Chronos-Bolt·Chronos-2 (apache-2.0)
+    "transformers>=4.45",          # 한국어 임베딩(kf-deberta·bge-m3·multilingual-e5)
+]
 
 [tool.ruff]
 target-version = "py312"
