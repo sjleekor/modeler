@@ -27,7 +27,7 @@ import pandas as pd
 from modeler.etl.disclosures import PARSER_VERSION
 from modeler.etl.disclosures.calendar_util import NextTradingDay
 from modeler.etl.disclosures.contract import core_status, parse_contract_html
-from modeler.etl.disclosures.counterparty import build_index, classify_counterparty
+from modeler.etl.disclosures.counterparty import build_pit_index, classify_counterparty
 from modeler.etl.disclosures.docparse import read_zip_bytes
 from modeler.etl.disclosures.linking import Linker, title_class
 
@@ -223,7 +223,9 @@ def _parse_one(args: tuple) -> dict:
             row["notice_kind"] = (
                 "trading_halt"
                 if "거래정지" in meta["report_nm"]
-                else "progress" if "진행" in meta["report_nm"] else "other"
+                else "progress"
+                if "진행" in meta["report_nm"]
+                else "other"
             )
             row["parse_status"] = (
                 "ok" if f.get("title_in_doc") is not None or f["n_rows"] else "fail"
@@ -296,7 +298,11 @@ def run(limit: int | None = None, procs: int = 4) -> dict:
         glob.glob(str(raw_dir / "stock_master/**/*.parquet"), recursive=True)[0],
         columns=["ticker", "name"],
     )
-    idx = build_index(dm, sm, MASTER_SNAPSHOT)
+    snap_df = pd.read_parquet(raw_dir / "stock_master_snapshot")
+    snap_items = pd.read_parquet(
+        raw_dir / "stock_master_snapshot_items", columns=["snapshot_id", "ticker", "name"]
+    )
+    idx = build_pit_index(dm, sm, snap_df, snap_items, MASTER_SNAPSHOT)
 
     ev_rows = [r for r in rows if r["kind"] == "event"]
     ca_rows = [r for r in rows if r["kind"] == "cancel"]
@@ -307,7 +313,7 @@ def run(limit: int | None = None, procs: int = 4) -> dict:
     for r in ev_rows + ca_rows:
         if r["parse_status"] == "fail":
             continue
-        for part in classify_counterparty(r.get("counterparty_raw"), idx):
+        for part in classify_counterparty(r.get("counterparty_raw"), idx, r["rcept_dt"]):
             cp_out.append(
                 {
                     "rcept_no": r["rcept_no"],
@@ -393,6 +399,15 @@ def run(limit: int | None = None, procs: int = 4) -> dict:
             },
             "master_snapshot": MASTER_SNAPSHOT,
             "master_dir": str(raw_dir),
+            "stock_master_snapshot": {
+                "dir": str(raw_dir / "stock_master_snapshot"),
+                "items_dir": str(raw_dir / "stock_master_snapshot_items"),
+                "n_snapshots_raw": len(snap_df),
+                "n_snapshot_dates_used": len(idx.snaps),
+                "as_of_min": snap_df.as_of_date.min().isoformat(),
+                "as_of_max": snap_df.as_of_date.max().isoformat(),
+                "rule": "접수일 이하 최신 스냅샷(그 전이면 첫 것), 같은 날짜는 fetched_at 최신",
+            },
             "calendar": "daily_ohlcv.trade_date 고유 날짜 + 마지막 날 이후 평일 가정",
         },
         "n_targets": n_targets,

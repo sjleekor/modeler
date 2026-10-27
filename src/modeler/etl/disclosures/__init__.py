@@ -6,4 +6,4 @@
 그대로 ``collector/``로 옮길 수 있다.
 """
 
-PARSER_VERSION = "disclosure_contract_1.0.0"
+PARSER_VERSION = "disclosure_contract_1.1.0"

@@ -107,7 +107,7 @@ def _bin(y: int) -> str:
     return "2014-2017" if y <= 2017 else "2018-2021" if y <= 2021 else "2022-2026"
 
 
-def run(sample_exclude: Path | None = None) -> dict:
+def run(sample_exclude: Path | None = None, with_sample: bool = True) -> dict:
     root = data_root()
     out = root / "kr/output" / OUT_NAME
     ev = pd.read_parquet(out / "kr_contract_event.parquet")
@@ -353,12 +353,19 @@ def run(sample_exclude: Path | None = None) -> dict:
     listed = cp[cp.cp_class.str.startswith("listed")]
     S("cp_class", "listed_parts", len(listed))
     S("cp_class", "listed_docs", int(listed.rcept_no.nunique()))
+    for k in ("not_listed_at_date", "renamed_ticker_unverified", "foreign_subsidiary"):
+        S("cp_class", f"{k}_parts", int((cp.cp_class == k).sum()))
+    if "name_basis" in cp:
+        for k, v in listed.name_basis.value_counts().items():
+            S("cp_class", f"listed_name_basis_{k}", int(v))
 
     pd.DataFrame(summ, columns=["section", "name", "value"]).to_csv(
         out / "qa_summary.tsv", sep="\t", index=False
     )
 
-    # 대조용 표본
+    # 대조용 표본(1.1.0 재실행에서는 기존 표본을 덮지 않으려고 끌 수 있다)
+    if not with_sample:
+        return {"summary_rows": len(summ)}
     vs = _verify_sample(out, ev, ca, bad, pd.concat(unit), sample_exclude)
     return {"summary_rows": len(summ), **vs}
 

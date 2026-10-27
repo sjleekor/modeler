@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from bisect import bisect_right
 from dataclasses import dataclass, field
 
 _LEG = re.compile(
@@ -29,6 +30,35 @@ _FOREIGN_KW = re.compile(
     r"k\.k|kabushiki|株式会社|有限公司|公司)",
     re.I,
 )
+# 규칙 4: 괄호 안에 나라·지역·현지법인 표시가 있으면 모회사가 아니라 해외 법인이다.
+# 영문 법인명 병기("(Air Busan Co., Ltd)")는 해당 아니다(법인 접미어가 있으면 건너뛴다).
+FOREIGN_REGION_WORDS = (
+    "중국|china|인도|india|베트남|vietnam|미국|usa|america|유럽|europe|일본|japan|법인|"
+    "폴란드|헝가리|멕시코|브라질|태국|인도네시아|러시아|터키|체코|슬로바키아|독일|영국|캐나다|"
+    "호주|싱가포르|홍콩|대만|"
+    "상해|상하이|shanghai|북경|베이징|beijing|심천|선전|shenzhen|광저우|guangzhou|"
+    "쑤저우|suzhou|칭다오|qingdao|천진|톈진|tianjin|우한|wuhan|충칭|chongqing|난징|nanjing|"
+    "항저우|hangzhou|다롄|dalian|옌청|염성|시안|청두|chengdu|둥관|동관|dongguan|"
+    "후이저우|huizhou|옌타이|yantai|웨이하이|위해|선양|심양|장가항|yancheng"
+)
+_PAREN = re.compile(r"[(（]([^()（）]*)[)）]")
+_REGION_IN_PAREN = re.compile(FOREIGN_REGION_WORDS, re.I)
+_LEGAL_SUFFIX_EN = re.compile(
+    r"\b(co|ltd|inc|corp|corporation|company|limited|gmbh|llc|plc|s\.?a|ag|pte|sdn|bhd)\b\.?", re.I
+)
+
+
+def has_foreign_region_paren(s: str) -> bool:
+    """괄호 안에 지역·현지법인 표시가 있으면 참. 영문 법인명 병기는 제외한다."""
+    for m in _PAREN.finditer(unicodedata.normalize("NFKC", s or "")):
+        g = m.group(1)
+        if _LEGAL_SUFFIX_EN.search(g):
+            continue
+        if _REGION_IN_PAREN.search(g):
+            return True
+    return False
+
+
 # 쉼표 뒤가 법인 접미어면 이름 안의 쉼표(Co., Ltd.)라 나누지 않는다.
 _SPLIT = re.compile(
     r"\s*[,;，、/]\s*(?!\s*(?:Ltd|Inc|Co|Corp|LTD|INC|LLC|Limited|CO)\b)|\s+및\s+|\n"
@@ -108,8 +138,243 @@ def build_index(dart_corp_master, stock_master, snapshot: str) -> MasterIndex:
     return idx
 
 
+def _valid_name(name, ticker) -> str | None:
+    """스냅샷 종목명이 비었거나 종목코드와 같으면 이름을 모르는 것으로 본다."""
+    if not isinstance(name, str):
+        return None
+    n = name.strip()
+    return n if n and n != str(ticker).strip() else None
+
+
+@dataclass
+class _Snap:
+    as_of: str  # YYYYMMDD
+    tickers: frozenset
+    names: dict  # ticker -> 이름(유효한 것만)
+    exact: dict = field(default_factory=dict)  # n_exact -> {ticker}
+    norm: dict = field(default_factory=dict)
+
+
+@dataclass
+class PitIndex:
+    """공시 접수일 시점의 종목 목록(``stock_master_snapshot``)과 지금 이름 색인.
+
+    상장 여부는 접수일 이하 가장 늦은 스냅샷(첫 스냅샷 전이면 첫 스냅샷)에 종목이 있는지로 정한다.
+    """
+
+    now: MasterIndex
+    snaps: list  # as_of 오름차순 _Snap
+    cur_names: dict  # ticker -> 지금 이름들(stock_master.name·dart stock_name·corp_name)
+    t2c: dict  # ticker -> corp_code
+    snapshot: str = ""
+    _dates: list = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self._dates = [x.as_of for x in self.snaps]
+
+    def snap_at(self, rcept_dt: str) -> _Snap:
+        d = (rcept_dt or "").replace("-", "")
+        i = bisect_right(self._dates, d) - 1
+        return self.snaps[max(i, 0)]
+
+    def name_at(self, ticker: str, rcept_dt: str) -> str | None:
+        """접수일 이하 가장 늦은 스냅샷 중 이 종목에 이름이 있는 것의 이름. 없으면 None."""
+        d = (rcept_dt or "").replace("-", "")
+        i = bisect_right(self._dates, d) - 1
+        if i < 0:  # 첫 스냅샷 전 접수일은 첫 스냅샷 쪽으로 본다
+            i = 0
+            for j in range(i, len(self.snaps)):
+                n = self.snaps[j].names.get(ticker)
+                if n:
+                    return n
+            return None
+        for j in range(i, -1, -1):
+            n = self.snaps[j].names.get(ticker)
+            if n:
+                return n
+        return None
+
+
+def build_pit_index(
+    dart_corp_master, stock_master, snapshots, items, snapshot: str = ""
+) -> PitIndex:
+    """``snapshots``(snapshot_id·as_of_date·fetched_at)·``items``(snapshot_id·ticker·name)로 만든다.
+
+    같은 날짜 스냅샷이 여럿이면 ``fetched_at``이 가장 늦은 것 하나만 쓴다.
+    """
+    now = build_index(dart_corp_master, stock_master, snapshot)
+    t2c: dict[str, str] = {}
+    cur: dict[str, set] = {}
+    for r in dart_corp_master.itertuples():
+        tk = str(r.ticker).strip() if r.ticker not in (None, "") and str(r.ticker) != "None" else ""
+        if tk:
+            t2c.setdefault(tk, r.corp_code)
+            for nm in (r.corp_name, r.stock_name):
+                if isinstance(nm, str) and nm.strip():
+                    cur.setdefault(tk, set()).add(nm.strip())
+    for r in stock_master.itertuples():
+        tk = str(r.ticker).strip()
+        if isinstance(r.name, str) and r.name.strip():
+            cur.setdefault(tk, set()).add(r.name.strip())
+    sn = snapshots.copy()
+    sn["d8"] = [str(x)[:10].replace("-", "") for x in sn["as_of_date"]]
+    sn = sn.sort_values(["d8", "fetched_at"]).drop_duplicates("d8", keep="last")
+    by_id = {k: g for k, g in items.groupby("snapshot_id")}
+    snaps = []
+    for r in sn.itertuples():
+        g = by_id.get(r.snapshot_id)
+        if g is None:
+            continue
+        names, tickers = {}, set()
+        for tk, nm in zip(g["ticker"], g["name"]):
+            tk = str(tk).strip()
+            tickers.add(tk)
+            v = _valid_name(nm, tk)
+            if v:
+                names[tk] = v
+        sp = _Snap(as_of=r.d8, tickers=frozenset(tickers), names=names)
+        for tk, nm in names.items():
+            sp.exact.setdefault(n_exact(nm), set()).add(tk)
+            k = n_norm(nm)
+            if k:
+                sp.norm.setdefault(k, set()).add(tk)
+        snaps.append(sp)
+    return PitIndex(now=now, snaps=snaps, cur_names=cur, t2c=t2c, snapshot=snapshot)
+
+
+def _contains_ok(a: str, b: str) -> bool:
+    """정규화한 두 이름이 같거나 한쪽이 다른 쪽을 포함한다."""
+    x, y = n_norm(a), n_norm(b)
+    return bool(x) and bool(y) and (x == y or x in y or y in x)
+
+
+def classify_part_pit(name: str, idx: PitIndex, rcept_dt: str) -> dict:
+    """접수일 시점 기준 분류(결정 10_b 1~5번). 퍼지는 쓰지 않는다."""
+    s = (name or "").strip()
+    base = dict(
+        name_raw=s,
+        name_norm=n_norm(s),
+        cp_class="",
+        matched_corp_code=None,
+        matched_ticker=None,
+        match_method=None,
+        n_candidates=0,
+        ticker_ever=None,
+        candidate_tickers=None,
+        snapshot_as_of=None,
+        name_at_date=None,
+        name_basis=None,
+    )
+    if s in ("", "-", "해당없음", "해당 없음"):
+        return {**base, "cp_class": "missing"}
+    if has_foreign_region_paren(s):
+        return {**base, "cp_class": "foreign_subsidiary"}
+    snap = idx.snap_at(rcept_dt)
+    base["snapshot_as_of"] = f"{snap.as_of[:4]}-{snap.as_of[4:6]}-{snap.as_of[6:]}"
+    for k, dn, dnow, method in (
+        (n_exact(s), snap.exact, idx.now.exact, "exact"),
+        (n_norm(s), snap.norm, idx.now.norm, "normalized"),
+    ):
+        if not k:
+            continue
+        snap_t = set(dn.get(k, ()))  # 그때 이름으로 맞은 종목
+        now_ents = dnow.get(k, set())  # 지금 이름으로 맞은 (키, corp, ticker)
+        if not snap_t and not now_ents:
+            continue
+        # 후보를 정체(종목코드, 없으면 corp_code)로 묶는다.
+        cands: dict[str, dict] = {}
+        for tk in snap_t:
+            cands.setdefault(tk, dict(ticker=tk, corp=idx.t2c.get(tk), via_snap=True))
+        for _, cc, tk in now_ents:
+            key = tk or cc
+            c = cands.setdefault(key, dict(ticker=tk, corp=cc, via_snap=False))
+            c["corp"] = c["corp"] or cc
+        listed = [c for c in cands.values() if c["ticker"] and c["ticker"] in snap.tickers]
+        if len(listed) > 1:
+            return {
+                **base,
+                "cp_class": "ambiguous_name",
+                "match_method": method,
+                "n_candidates": len(listed),
+                "candidate_tickers": ",".join(sorted(c["ticker"] for c in listed)),
+            }
+        if len(listed) == 1:
+            c = listed[0]
+            tk = c["ticker"]
+            then = idx.name_at(tk, rcept_dt)
+            basis = "snapshot_name"
+            if not c["via_snap"]:
+                if then is None:
+                    basis = "current_name_then_unknown"
+                elif any(_contains_ok(then, cn) for cn in idx.cur_names.get(tk, ())):
+                    basis = "current_name_confirmed"
+                else:
+                    return {
+                        **base,
+                        "cp_class": "renamed_ticker_unverified",
+                        "matched_corp_code": c["corp"],
+                        "match_method": method,
+                        "n_candidates": 1,
+                        "candidate_tickers": tk,
+                        "name_at_date": then,
+                        "name_basis": "current_name_mismatch",
+                    }
+            return {
+                **base,
+                "cp_class": f"listed_pit_{method}",
+                "matched_corp_code": c["corp"],
+                "matched_ticker": tk,
+                "match_method": method + ("+then_name_unknown" if then is None else ""),
+                "n_candidates": 1,
+                "name_at_date": then,
+                "name_basis": basis,
+            }
+        # 후보 회사는 있는데 그때 상장 종목이 아니다.
+        with_tk = [c for c in cands.values() if c["ticker"]]
+        if with_tk:
+            corps = {c["corp"] for c in with_tk if c["corp"]}
+            return {
+                **base,
+                "cp_class": "not_listed_at_date",
+                "matched_corp_code": next(iter(corps)) if len(corps) == 1 else None,
+                "match_method": method,
+                "n_candidates": len(corps) if corps else len(with_tk),
+                "ticker_ever": ",".join(sorted(c["ticker"] for c in with_tk)),
+            }
+        corps = {c["corp"] for c in cands.values() if c["corp"]}
+        if len(corps) == 1:
+            return {
+                **base,
+                "cp_class": f"unlisted_dart_{method}",
+                "matched_corp_code": next(iter(corps)),
+                "match_method": method,
+                "n_candidates": 1,
+            }
+        return {
+            **base,
+            "cp_class": "ambiguous_name",
+            "match_method": method,
+            "n_candidates": len(corps),
+        }
+    return _unmatched_class(s, base)
+
+
+def _unmatched_class(s: str, base: dict) -> dict:
+    latin = len(re.findall(r"[A-Za-z]", s))
+    hang = len(re.findall(r"[가-힣]", s))
+    if (latin > hang and (_FOREIGN_KW.search(s) or latin >= 4)) or re.search(
+        r"유한공사|有限|株式", s
+    ):
+        return {**base, "cp_class": "foreign_or_latin_name"}
+    if _PUBLIC.search(s):
+        return {**base, "cp_class": "public_sector_unmatched"}
+    if _ANON.search(s) and not re.search(r"\(주\)|㈜|주식회사", s):
+        return {**base, "cp_class": "anonymous_descriptor"}
+    return {**base, "cp_class": "unmatched_korean_name"}
+
+
 def classify_part(name: str, idx: MasterIndex) -> dict:
-    """한 조각의 분류. 일치가 하나로 정해질 때만 ``matched_*``를 채운다."""
+    """한 조각의 분류(1.0.0 규칙, 시점 무관). 일치가 하나로 정해질 때만 ``matched_*``를 채운다."""
     s = (name or "").strip()
     base = dict(
         name_raw=s,
@@ -122,6 +387,8 @@ def classify_part(name: str, idx: MasterIndex) -> dict:
     )
     if s in ("", "-", "해당없음", "해당 없음"):
         return {**base, "cp_class": "missing"}
+    if has_foreign_region_paren(s):
+        return {**base, "cp_class": "foreign_subsidiary"}
     for k, d, method in ((n_exact(s), idx.exact, "exact"), (n_norm(s), idx.norm, "normalized")):
         cands = d.get(k) if k else None
         if cands:
@@ -143,26 +410,23 @@ def classify_part(name: str, idx: MasterIndex) -> dict:
                     "n_candidates": 1,
                 }
             return {**base, "cp_class": "ambiguous_name", "match_method": method, "n_candidates": n}
-    latin = len(re.findall(r"[A-Za-z]", s))
-    hang = len(re.findall(r"[가-힣]", s))
-    if (latin > hang and (_FOREIGN_KW.search(s) or latin >= 4)) or re.search(
-        r"유한공사|有限|株式", s
-    ):
-        return {**base, "cp_class": "foreign_or_latin_name"}
-    if _PUBLIC.search(s):
-        return {**base, "cp_class": "public_sector_unmatched"}
-    if _ANON.search(s) and not re.search(r"\(주\)|㈜|주식회사", s):
-        return {**base, "cp_class": "anonymous_descriptor"}
-    return {**base, "cp_class": "unmatched_korean_name"}
+    return _unmatched_class(s, base)
 
 
-def classify_counterparty(raw: str | None, idx: MasterIndex) -> list[dict]:
-    """상대방 문자열 전체 → 조각별 분류. 통째로 정확 일치하면 나누지 않는다."""
+def classify_counterparty(raw: str | None, idx, rcept_dt: str | None = None) -> list[dict]:
+    """상대방 문자열 전체 → 조각별 분류. 통째로 정확 일치하면 나누지 않는다.
+
+    ``idx``가 ``PitIndex``면 ``rcept_dt``(접수일) 시점 기준(1.1.0), ``MasterIndex``면 옛 규칙이다.
+    """
     s = (raw or "").strip()
-    whole = classify_part(s, idx)
+    if isinstance(idx, PitIndex):
+        cls = lambda x: classify_part_pit(x, idx, rcept_dt or "")  # noqa: E731
+    else:
+        cls = lambda x: classify_part(x, idx)  # noqa: E731
+    whole = cls(s)
     if whole["match_method"] and whole["n_candidates"] == 1:
         return [{**whole, "part_idx": 0}]
     parts = split_parts(s)
     if len(parts) <= 1:
         return [{**whole, "part_idx": 0}]
-    return [{**classify_part(p, idx), "part_idx": i} for i, p in enumerate(parts)]
+    return [{**cls(p), "part_idx": i} for i, p in enumerate(parts)]
