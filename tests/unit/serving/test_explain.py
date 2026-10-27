@@ -210,6 +210,22 @@ def test_top_features_skip_missing_values_and_report_the_tail_share():
     assert ties.shape == X.shape
 
 
+@pytest.mark.parametrize("bad", sorted(ex.CONTAMINATED_DISPLAY_FEATURES))
+def test_top_features_never_show_contaminated_financial_features(bad):
+    # the contaminated feature is the most extreme of all; the next ones fill the list
+    X = np.array([[0.001, 0.02, 0.9, 0.5]])
+    rank_cols = {bad: 0, "next1": 1, "next2": 2, "mid": 3}
+    got = ex.top_features(X[0], rank_cols, {}, {}, "s", set(), np.zeros(4), k=3)
+    names = [t["feature"] for t in got]
+    assert bad not in names
+    assert names == ["next1", "next2", "mid"]
+
+
+def test_contaminated_display_set_is_exactly_the_four_ttm_ratio_features():
+    assert ex.CONTAMINATED_DISPLAY_FEATURES == {
+        "fin_operating_margin", "fin_asset_turnover", "fin_operating_margin_v2", "fin_asset_turnover_v2"}
+
+
 # --------------------------------------------------------------------------- prices
 def _axis(n=61, end=date(2026, 10, 23)):
     out, d = [], end

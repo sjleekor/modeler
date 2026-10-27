@@ -41,6 +41,13 @@ N_SESSIONS = 61
 RETURN_HORIZONS = (5, 20, 60)
 TIE_MAX = 0.05
 TOP_FEATURES_K = 4
+# Display-only exclusion for the extreme-percentile list. The quarterly financial mart writes XBRL cumulative
+# values as 3-month values, so TTM-based operating margin / asset turnover are wrong after half-year and
+# 3-quarter reports. Scores and occlusion are unchanged (model inputs stay as trained, user decision 2026-10-27).
+# Basis: my/milestones/common/research/20261027_investment_research_agenda/05_prep_a_financial_target.md
+CONTAMINATED_DISPLAY_FEATURES = frozenset({
+    "fin_operating_margin", "fin_asset_turnover", "fin_operating_margin_v2", "fin_asset_turnover_v2",
+})
 KR_JUMP = (0.67, 1.33)  # price limit 30% x 1.10, as ``etl/quality.py``
 US_JUMP = (0.5, 2.0)
 KR_MODEL_ID = "kr_daily_h20_v1"
@@ -299,13 +306,14 @@ def top_features(xrow, rank_cols: dict[str, int], isna_cols: dict[str, int], nam
     """The k most extreme observed percentiles of one stock.
 
     Skipped: values that were missing (``*_isna`` = 1), 0/1 and two-valued columns, and columns where more
-    than 5% of the comparison set share the value (P1 F5: ``rank(min)`` makes 'lower 1%' out of ties).
+    than 5% of the comparison set share the value (P1 F5: ``rank(min)`` makes 'lower 1%' out of ties), and
+    ``CONTAMINATED_DISPLAY_FEATURES``.
     """
     import numpy as np
 
     cands = []
     for feature, j in rank_cols.items():
-        if feature in excluded:
+        if feature in excluded or feature in CONTAMINATED_DISPLAY_FEATURES:
             continue
         if isna_cols.get(feature) is not None and xrow[isna_cols[feature]] == 1:
             continue
