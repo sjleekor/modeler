@@ -422,8 +422,12 @@ def materialize_fin_quarterly_metric_vintage(
     pairing_tolerance: float = 0.0,
     force: bool = False,
     semantics: str = SEMANTICS_V1,
+    table_name: str = FQMV_TABLE,
 ) -> str:
     """Build + register ``fin_quarterly_metric_vintage`` as a cached parquet mart.
+
+    ``table_name`` is the mart name; pass a new one when ``vintage_view`` is a fact of a newer
+    semantics (``stock_metric_vintage_fact_v3``) so the existing mart is not overwritten.
 
     Requires ``vintage_view`` (B-2's ``stock_metric_vintage_fact``) already
     registered on ``con``.
@@ -439,5 +443,5 @@ def materialize_fin_quarterly_metric_vintage(
         None if semantics == SEMANTICS_V1
         else MartPlan(plan_id="single", final_sql=sql, semantics_version=semantics)
     )
-    materialize(con, config, FQMV_TABLE, sql, force=force, plan=plan)
-    return register_mart_view(con, config, FQMV_TABLE)
+    materialize(con, config, table_name, sql, force=force, plan=plan)
+    return register_mart_view(con, config, table_name)
