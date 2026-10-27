@@ -39,14 +39,15 @@ def _one(raw, idx, dt_):
 
 
 def test_not_listed_before_listing_and_after_delisting():
+    fill = [(f"9{k:05d}", f"채움{k}") for k in range(20)]  # 부분 스냅샷 규칙에 안 걸리게
     idx = _idx(
         {
-            "2016-01-29": [("000001", "가나다")],
-            "2018-01-31": [("000001", "가나다"), ("000002", "신규산업")],
-            "2020-01-31": [("000001", "가나다")],
+            "2016-01-29": [("000001", "가나다"), *fill],
+            "2018-01-31": [("000001", "가나다"), ("000002", "신규산업"), *fill],
+            "2020-01-31": [("000001", "가나다"), *fill],
         },
         [("C1", "000001", "가나다", "가나다"), ("C2", "000002", "신규산업", "신규산업")],
-        [("000001", "가나다"), ("000002", "신규산업")],
+        [("000001", "가나다"), ("000002", "신규산업"), *fill],
     )
     pre = _one("신규산업", idx, "20170601")  # 상장 전
     assert pre["cp_class"] == "not_listed_at_date"
@@ -167,3 +168,17 @@ def test_not_listed_with_several_old_tickers_keeps_all_tickers_ever():
     r = _one("(주)국민은행", idx, "20160301")
     assert r["cp_class"] == "not_listed_at_date" and r["matched_ticker"] is None
     assert r["ticker_ever"] == "031150,060000"
+
+
+def test_partial_snapshot_is_skipped():
+    full = [(f"{i:06d}", f"종목{i}") for i in range(10)]
+    snaps = {
+        "2020-01-31": full,
+        "2020-02-29": full[:5],  # 이웃 10개의 80% 미만 → 부분 스냅샷
+        "2020-03-31": full[:9],
+    }
+    idx = _idx(snaps, [], [])
+    assert [x.as_of for x in idx.snaps] == ["20200131", "20200331"]
+    assert idx.excluded == [("20200229", 5, 9)]
+    # 2020-03-10 공시는 부분 스냅샷이 아니라 1월 말 스냅샷을 쓴다
+    assert idx.snap_at("20200310").as_of == "20200131"

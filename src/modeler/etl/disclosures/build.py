@@ -404,6 +404,11 @@ def run(limit: int | None = None, procs: int = 4) -> dict:
                 "items_dir": str(raw_dir / "stock_master_snapshot_items"),
                 "n_snapshots_raw": len(snap_df),
                 "n_snapshot_dates_used": len(idx.snaps),
+                "partial_snapshot_rule": "종목 수 < 직전·직후 중 작은 값의 80%면 제외",
+                "excluded_partial_snapshots": [
+                    {"as_of": f"{d[:4]}-{d[4:6]}-{d[6:]}", "n_tickers": n, "neighbor_min": m}
+                    for d, n, m in idx.excluded
+                ],
                 "as_of_min": snap_df.as_of_date.min().isoformat(),
                 "as_of_max": snap_df.as_of_date.max().isoformat(),
                 "rule": "접수일 이하 최신 스냅샷(그 전이면 첫 것), 같은 날짜는 fetched_at 최신",

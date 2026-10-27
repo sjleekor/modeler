@@ -355,6 +355,14 @@ def run(sample_exclude: Path | None = None, with_sample: bool = True) -> dict:
     S("cp_class", "listed_docs", int(listed.rcept_no.nunique()))
     for k in ("not_listed_at_date", "renamed_ticker_unverified", "foreign_subsidiary"):
         S("cp_class", f"{k}_parts", int((cp.cp_class == k).sum()))
+    for e in (
+        mf.get("inputs", {}).get("stock_master_snapshot", {}).get("excluded_partial_snapshots", [])
+    ):
+        S(
+            "cp_class",
+            f"excluded_partial_snapshot_{e['as_of']}",
+            f"{e['n_tickers']} / {e['neighbor_min']}",
+        )
     if "name_basis" in cp:
         for k, v in listed.name_basis.value_counts().items():
             S("cp_class", f"listed_name_basis_{k}", int(v))

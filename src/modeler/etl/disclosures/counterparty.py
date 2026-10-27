@@ -167,6 +167,7 @@ class PitIndex:
     cur_names: dict  # ticker -> 지금 이름들(stock_master.name·dart stock_name·corp_name)
     t2c: dict  # ticker -> corp_code
     snapshot: str = ""
+    excluded: list = field(default_factory=list)  # [(as_of YYYYMMDD, 종목 수, 기준 종목 수)]
     _dates: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -193,6 +194,25 @@ class PitIndex:
             if n:
                 return n
         return None
+
+
+PARTIAL_SNAPSHOT_RATIO = 0.8
+
+
+def drop_partial_snapshots(snaps: list, ratio: float = PARTIAL_SNAPSHOT_RATIO):
+    """종목 수가 직전·직후 스냅샷 종목 수 중 작은 값의 ``ratio`` 미만이면 부분 스냅샷으로 뺀다.
+
+    이웃은 원래 목록 기준이다(연쇄 제외 없음). 맨 앞·맨 뒤는 이웃이 하나다.
+    """
+    n = [len(x.tickers) for x in snaps]
+    keep, out = [], []
+    for i, sp in enumerate(snaps):
+        nb = [n[j] for j in (i - 1, i + 1) if 0 <= j < len(n)]
+        if nb and n[i] < ratio * min(nb):
+            out.append((sp.as_of, n[i], min(nb)))
+        else:
+            keep.append(sp)
+    return keep, out
 
 
 def build_pit_index(
@@ -239,7 +259,10 @@ def build_pit_index(
             if k:
                 sp.norm.setdefault(k, set()).add(tk)
         snaps.append(sp)
-    return PitIndex(now=now, snaps=snaps, cur_names=cur, t2c=t2c, snapshot=snapshot)
+    snaps, excluded = drop_partial_snapshots(snaps)
+    return PitIndex(
+        now=now, snaps=snaps, cur_names=cur, t2c=t2c, snapshot=snapshot, excluded=excluded
+    )
 
 
 def _contains_ok(a: str, b: str) -> bool:
