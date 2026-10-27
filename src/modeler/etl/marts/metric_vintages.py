@@ -43,6 +43,7 @@ from collector.kr.shared import (
 from modeler.etl.config import LakeConfig
 from modeler.etl.lake import _sql_str_literal
 from modeler.etl.mart import MartPlan, materialize, register_mart_view
+from modeler.etl.marts.financial_quarters import DIRECT_INTERIM_METRICS
 
 SMVF_TABLE = "stock_metric_vintage_fact"
 _CAL_TABLE = "_metric_vintage_calendar"
@@ -159,7 +160,26 @@ def _rules_relation_sql(rules: list[MetricMappingRule], unit_by_code: dict[str, 
 #: has its own ``sql_hash`` and records ``semantics_version`` in the metadata.
 SEMANTICS_V1 = "v1"
 SEMANTICS_V2 = "v2"
-SEMANTICS_VERSIONS = (SEMANTICS_V1, SEMANTICS_V2)
+#: ``v3`` is ``v2`` plus one more change: an income-statement metric taken from XBRL in a
+#: quarterly / half-year / Q3 report reads the 3-month context, not the longest one (see
+#: :func:`_xbrl_income_quarter_sql`). Opt-in; ``v1`` and ``v2`` text is unchanged.
+SEMANTICS_V3 = "v3"
+SEMANTICS_VERSIONS = (SEMANTICS_V1, SEMANTICS_V2, SEMANTICS_V3)
+
+#: Mart-name suffix of the semantics that must not overwrite an older mart on disk.
+_SEMANTICS_TABLE_SUFFIX = {SEMANTICS_V3: "_v3"}
+
+
+def semantics_table_name(base: str, semantics: str) -> str:
+    """``base``; for ``v3`` ``base`` + ``_v3``, so a new meaning gets a new mart name."""
+    return base + _SEMANTICS_TABLE_SUFFIX.get(semantics, "")
+
+
+#: ``duration_days`` window of a 3-month XBRL context (real ones are 89-92 days).
+XBRL_QUARTER_MIN_DAYS = 80
+XBRL_QUARTER_MAX_DAYS = 100
+_XBRL_QUARTER_TARGET_DAYS = 91
+_INTERIM_REPRT_CODES = ("11013", "11012", "11014")
 
 #: Execution plans. ``single`` is one statement (today). ``staged`` computes the
 #: same rows in six steps, each written to parquet and re-read, because the
@@ -244,6 +264,35 @@ def _winner_tie_break(semantics: str) -> str:
     return f",\n            bsns_year ASC, {first_report_order_sql('reprt_code')} ASC"
 
 
+def _xbrl_income_quarter_sql() -> tuple[str, str]:
+    """``(candidate_rank, extra WHERE)`` of the XBRL branch under ``v3``.
+
+    ``v1``/``v2`` rank XBRL contexts by *longest duration* because the branch was written
+    for cash-flow items, which OpenDART reports year-to-date. The income metrics
+    (``DIRECT_INTERIM_METRICS``) arrive through the same branch, and
+    ``fin_quarterly_metric_vintage`` treats them as a direct 3-month value, so a half-year or
+    Q3 filing handed it the 6- or 9-month total. ``v3`` keeps those metrics on the 3-month
+    context (80-100 days, closest to 91 first) in the three interim reports and drops the
+    row when the filing has none -- falling back to the cumulative context would be the bug
+    again. The annual report (11011) and every cash-flow metric keep the longest duration.
+    """
+    metrics = "(" + ", ".join(f"'{m}'" for m in sorted(DIRECT_INTERIM_METRICS)) + ")"
+    reprts = "(" + ", ".join(f"'{c}'" for c in _INTERIM_REPRT_CODES) + ")"
+    is_quarter = f"r.metric_code IN {metrics} AND x.reprt_code IN {reprts}"
+    rank = (
+        f"CASE WHEN {is_quarter}\n"
+        f"                 THEN ABS({_XBRL_DURATION_DAYS} - {_XBRL_QUARTER_TARGET_DAYS}) * 1000\n"
+        f"                 ELSE -{_XBRL_DURATION_DAYS} * 1000 END\n"
+        f"            + {_XBRL_RANK_SQL}"
+    )
+    where = (
+        f"\n          AND NOT ({is_quarter}\n"
+        f"                   AND {_XBRL_DURATION_DAYS} NOT BETWEEN "
+        f"{XBRL_QUARTER_MIN_DAYS} AND {XBRL_QUARTER_MAX_DAYS})"
+    )
+    return rank, where
+
+
 def _vintage_sql_parts(
     *,
     financial_view: str,
@@ -282,6 +331,11 @@ def _vintage_sql_parts(
     period_type_xf = _period_type_expr("x.reprt_code")
     winner_tie_break = _winner_tie_break(semantics)
     availability_select = _availability_select(semantics)
+    if semantics == SEMANTICS_V3:
+        xbrl_rank_sql, xbrl_where_extra = _xbrl_income_quarter_sql()
+    else:
+        xbrl_rank_sql = f"-{_XBRL_DURATION_DAYS} * 1000 + {_XBRL_RANK_SQL}"
+        xbrl_where_extra = ""
 
     parts: dict[str, str] = {}
     parts["corp"] = f"""corp AS (
@@ -604,7 +658,7 @@ def _vintage_sql_parts(
             -- cash-flow-statement item, which OpenDART reports year-to-date
             -- (fin_quarterly_metric_vintage's `cumulative_reported` kind).
             -- Same convention the pairing CTE applies to sj_div='CF'.
-            -{_XBRL_DURATION_DAYS} * 1000 + {_XBRL_RANK_SQL} AS candidate_rank,
+            {xbrl_rank_sql} AS candidate_rank,
             pe.period_end_source, pe.period_end_conflict,
             NULL AS pairing_xbrl_value,
             NULL AS pairing_xbrl_source_key,
@@ -626,7 +680,7 @@ def _vintage_sql_parts(
         -- the current period's statement_period_end — a two-year-old number
         -- silently presented as this filing's (08 §4.3.2).
         WHERE x.value_numeric IS NOT NULL
-          AND x.period_end_effective = pe.period_end
+          AND x.period_end_effective = pe.period_end{xbrl_where_extra}
     )"""
     parts["winners"] = f"""winners AS (
         SELECT *
@@ -993,17 +1047,21 @@ def materialize_stock_metric_vintage_fact(
     ``stage_dir``, a directory owned by this run, so stage files are never reused
     across runs.
 
+    ``semantics="v3"`` writes ``stock_metric_vintage_fact_v3`` (a new mart name), never the
+    ``v1``/``v2`` one.
+
     With ``semantics="v2"`` pass a calendar that reaches past the newest receipt:
     a receipt whose next session is missing gets ``available_from = NULL``.
     """
     _register_calendar(con, trading_days)
+    table = semantics_table_name(SMVF_TABLE, semantics)
     materialize(
         con,
         config,
-        SMVF_TABLE,
+        table,
         build_stock_metric_vintage_fact_sql(**views, semantics=semantics),
         force=force,
         plan=build_stock_metric_vintage_fact_plan(semantics=semantics, plan=plan, **views),
         stage_dir=stage_dir,
     )
-    return register_mart_view(con, config, SMVF_TABLE)
+    return register_mart_view(con, config, table)

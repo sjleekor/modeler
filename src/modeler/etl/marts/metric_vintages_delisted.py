@@ -61,6 +61,7 @@ FQMV_DLR_TABLE = "fin_quarterly_metric_vintage_dlr"
 
 SEMANTICS_V1 = _mv.SEMANTICS_V1
 SEMANTICS_V2 = _mv.SEMANTICS_V2
+SEMANTICS_V3 = _mv.SEMANTICS_V3
 PLAN_SINGLE = _mv.PLAN_SINGLE
 PLAN_STAGED = _mv.PLAN_STAGED
 
@@ -240,16 +241,17 @@ def materialize_stock_metric_vintage_fact_dl(
     :func:`~modeler.etl.marts.metric_vintages.materialize_stock_metric_vintage_fact`.
     """
     _mv._register_calendar(con, trading_days)
+    table = _mv.semantics_table_name(SMVF_DL_TABLE, semantics)
     materialize(
         con,
         config,
-        SMVF_DL_TABLE,
+        table,
         build_stock_metric_vintage_fact_dl_sql(semantics=semantics, **views),
         force=force,
         plan=build_stock_metric_vintage_fact_dl_plan(semantics=semantics, plan=plan, **views),
         stage_dir=stage_dir,
     )
-    return register_mart_view(con, config, SMVF_DL_TABLE)
+    return register_mart_view(con, config, table)
 
 
 def build_fin_quarterly_metric_vintage_dl_sql(
@@ -298,8 +300,13 @@ def materialize_fin_quarterly_metric_vintage_dl(
     pairing_tolerance: float = 0.0,
     force: bool = False,
     semantics: str = SEMANTICS_V1,
+    table_name: str = FQMV_DL_TABLE,
 ) -> str:
     """Build and register ``fin_quarterly_metric_vintage_dl`` as a cached parquet mart.
+
+    ``table_name`` lets a quarterly mart built over a ``v3`` fact (``vintage_view`` =
+    ``stock_metric_vintage_fact_dl_v3``) be written under its own name; the quarterly
+    builder's ``semantics`` is its own axis (``v1``/``v2``) and has no ``v3``.
 
     Needs ``vintage_view`` (the ``_dl`` fact by default) registered on ``con``. The cache
     metadata records the variant and the upstream relation name.
@@ -313,8 +320,8 @@ def materialize_fin_quarterly_metric_vintage_dl(
         semantics_version=semantics,
         metadata=(*_VARIANT_METADATA, ("vintage_view", vintage_view)),
     )
-    materialize(con, config, FQMV_DL_TABLE, sql, force=force, plan=plan)
-    return register_mart_view(con, config, FQMV_DL_TABLE)
+    materialize(con, config, table_name, sql, force=force, plan=plan)
+    return register_mart_view(con, config, table_name)
 
 
 # --- R1: keep the reported quarterly value on a source conflict (18 §8.1) ---------------------
@@ -415,8 +422,12 @@ def materialize_fin_quarterly_metric_vintage_dlr(
     pairing_tolerance: float = 0.0,
     force: bool = False,
     semantics: str = SEMANTICS_V1,
+    table_name: str = FQMV_DLR_TABLE,
 ) -> str:
-    """Build and register ``fin_quarterly_metric_vintage_dlr`` as a cached parquet mart."""
+    """Build and register ``fin_quarterly_metric_vintage_dlr`` as a cached parquet mart.
+
+    ``table_name``: see :func:`materialize_fin_quarterly_metric_vintage_dl`.
+    """
     sql = build_fin_quarterly_metric_vintage_dlr_sql(
         vintage_view=vintage_view, pairing_tolerance=pairing_tolerance, semantics=semantics
     )
@@ -426,5 +437,5 @@ def materialize_fin_quarterly_metric_vintage_dlr(
         semantics_version=semantics,
         metadata=(*_R1_VARIANT_METADATA, ("vintage_view", vintage_view)),
     )
-    materialize(con, config, FQMV_DLR_TABLE, sql, force=force, plan=plan)
-    return register_mart_view(con, config, FQMV_DLR_TABLE)
+    materialize(con, config, table_name, sql, force=force, plan=plan)
+    return register_mart_view(con, config, table_name)
