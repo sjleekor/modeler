@@ -50,6 +50,8 @@ II. 사업의 내용(``SECTION-1`` 제목에 ``사업의 내용``) 안에서 찾
 * ``is_header``: ① 태그가 ``TH``이거나 ``THEAD`` 안이면 머리. ② 0번 행에 ①의 머리가 하나도
   없고 표가 2행 이상이며 0번 행에 숫자로 읽히는 셀이 없고 글자가 있는 셀이 있으면 0번 행을
   머리로 본다. ``tbl_header_rule``은 ``tag``(0번 행이 ①)·``first_row``(②)·``none``.
+  1.0.1: ②에서 0번 행 셀 rowspan 최댓값 k>1이면 1부터 k-1번 행도(숫자 셀이 있는 행 앞까지, 본문이
+  0행이 되면 제외) 머리로 보고 ``first_row_span``으로 적는다.
 * ``header_path_raw``(본문 셀만): 그 셀의 ``col_idx`` 열을 0번 행부터 내려가며 **연속한 머리
   셀**의 원문을 ``|``로 이은 것. 같은 원본 셀(rowspan)은 한 번만, 빈 글자는 건너뜀.
 * ``row_label_raw``(본문 셀만, ``col_idx>0``): 같은 행 0번 열 격자 셀의 원문.
@@ -69,7 +71,7 @@ import re
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
-BIZ_PARSER_VERSION = "disclosure_bizrpt_1.0.0"
+BIZ_PARSER_VERSION = "disclosure_bizrpt_1.0.1"
 
 SECTION_KEYS = (
     "main_products",
@@ -520,6 +522,22 @@ def table_cells(tb: RawTable) -> dict:
             for i in row0:
                 hdr[i] = True
             rule = "first_row"
+            # 1.0.1: 0번 행 셀의 rowspan 최댓값 k > 1이면 1~k-1번 행을 머리로 넓힌다.
+            # 숫자로 읽히는 셀이 있는 행에서 멈추고, 본문이 0행이 되면 넓히지 않는다.
+            k = min(max(placed[i]["rs"] for i in row0), nrows)
+            if k > 1:
+                stop = 1
+                while stop < k:
+                    if any(
+                        parse_num(p["cell"].text)[0] is not None for p in placed if p["r"] == stop
+                    ):
+                        break
+                    stop += 1
+                if 1 < stop < nrows:
+                    for i, p in enumerate(placed):
+                        if p["r"] < stop:
+                            hdr[i] = True
+                    rule = "first_row_span"
     # 열별 머리 경로: 0번 행부터 연속한 머리 셀
     paths: dict[int, str] = {}
 

@@ -131,6 +131,78 @@ def test_header_none_when_first_row_numeric_or_single_row():
     assert table_cells(tb1)["rule"] == "none"
 
 
+def _tbl(html: str):
+    return [b for b in scan_blocks(html).blocks if b[0] == "t"][0][1]
+
+
+def test_header_first_row_span_two_line_header():
+    html = (
+        "<TABLE>"
+        '<TR><TD ROWSPAN="2">구분</TD><TD COLSPAN="2">2023년</TD></TR>'
+        "<TR><TD>수량</TD><TD>금액</TD></TR>"
+        "<TR><TD>A</TD><TD>1</TD><TD>1,000</TD></TR>"
+        "</TABLE>"
+    )
+    info = table_cells(_tbl(html))
+    assert info["rule"] == "first_row_span"
+    c = {(x["row_idx"], x["col_idx"]): x for x in info["cells"]}
+    assert c[(1, 1)]["is_header"] and c[(1, 2)]["is_header"]
+    assert c[(1, 1)]["header_path_raw"] is None and c[(1, 1)]["row_label_raw"] is None
+    assert not c[(2, 2)]["is_header"]
+    assert c[(2, 2)]["header_path_raw"] == "2023년|금액"
+    assert c[(2, 1)]["row_label_raw"] == "A"
+
+
+def test_header_first_row_span_stops_at_numeric_row():
+    html = (
+        "<TABLE>"
+        '<TR><TD ROWSPAN="2">구분</TD><TD>금액</TD></TR>'
+        "<TR><TD>10</TD></TR>"
+        "<TR><TD>A</TD><TD>1</TD></TR>"
+        "</TABLE>"
+    )
+    info = table_cells(_tbl(html))
+    assert info["rule"] == "first_row"
+    c = {(x["row_idx"], x["col_idx"]): x for x in info["cells"]}
+    assert not c[(1, 1)]["is_header"]
+
+
+def test_header_first_row_span_three_rows():
+    html = (
+        "<TABLE>"
+        '<TR><TD ROWSPAN="3">구분</TD><TD COLSPAN="2">연도</TD></TR>'
+        '<TR><TD COLSPAN="2">상반기</TD></TR>'
+        "<TR><TD>수량</TD><TD>금액</TD></TR>"
+        "<TR><TD>A</TD><TD>1</TD><TD>2</TD></TR>"
+        "</TABLE>"
+    )
+    info = table_cells(_tbl(html))
+    assert info["rule"] == "first_row_span"
+    c = {(x["row_idx"], x["col_idx"]): x for x in info["cells"]}
+    assert all(c[k]["is_header"] for k in [(1, 1), (2, 1), (2, 2)])
+    assert not c[(3, 2)]["is_header"]
+    assert c[(3, 2)]["header_path_raw"] == "연도|상반기|금액"
+
+
+def test_header_first_row_span_not_expanded_when_no_body_left():
+    html = '<TABLE><TR><TD ROWSPAN="2">구분</TD><TD>금액</TD></TR><TR><TD>세부</TD></TR></TABLE>'
+    info = table_cells(_tbl(html))
+    assert info["rule"] == "first_row"
+    c = {(x["row_idx"], x["col_idx"]): x for x in info["cells"]}
+    assert c[(0, 0)]["is_header"] and not c[(1, 1)]["is_header"]
+
+
+def test_header_tag_rule_unchanged_by_span():
+    html = (
+        '<TABLE><TR><TH ROWSPAN="2">구분</TH><TH>금액</TH></TR>'
+        "<TR><TD>세부</TD></TR><TR><TD>A</TD><TD>1</TD></TR></TABLE>"
+    )
+    info = table_cells(_tbl(html))
+    assert info["rule"] == "tag"
+    c = {(x["row_idx"], x["col_idx"]): x for x in info["cells"]}
+    assert not c[(1, 1)]["is_header"]
+
+
 def test_unit_cell_not_in_header_path():
     html = (
         '<TABLE><TR><TH COLSPAN="2">(단위 : 천원)</TH></TR>'
@@ -353,7 +425,7 @@ def test_unit_in_table_first_row_and_single_cell_table_before():
 
 def test_unit_search_stops_at_section_boundary_and_long_paragraph():
     inner = (
-        "<P>(단위 : 원)</P><P>" + "가" * 250 + "</P>" "<TABLE><TR><TD>a</TD><TD>b</TD></TR></TABLE>"
+        "<P>(단위 : 원)</P><P>" + "가" * 250 + "</P><TABLE><TR><TD>a</TD><TD>b</TD></TR></TABLE>"
     )
     assert _unit_of(inner) == [(None, None)]
 
