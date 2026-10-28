@@ -513,7 +513,7 @@ def test_segment_ap_in_cell():
         [["가", "1,000 (3.4%)", "900 (3.0%)"], ["나", "2,000 (6.8%)", "1,900 (6.3%)"]],
     )
     a, rows = run("sales", cells)
-    assert a["adapter"] == "S-AP-in-cell" and not a["judged"]
+    assert a["adapter"] == "S-AP-in-cell" and a["judged"]
     r = [x for x in rows if x["fiscal_year"] == 2024][0]
     assert (r["amount_num"], r["ratio_pct"], r["amount_raw"]) == (1000.0, 3.4, "1,000 (3.4%)")
 

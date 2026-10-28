@@ -40,9 +40,17 @@ LLM·퍼지 매칭은 쓰지 않는다.
 * ``S-AP``        = ``A P`` 기간 머리 0~1개 (판정)
 * ``S-AP*n``      = ``(A P){n}`` n>=2, 쌍마다 기간 머리, 서로 다름 (판정)
 * ``S-A*nP*n``    = ``A{n} P{n}`` n>=2 — 판정 밖
-* ``S-AP-in-cell`` = ``M{n}`` — 판정 밖
+* ``S-AP-in-cell`` = ``M{n}`` — 판정 (메인 결정 1, 10-28 22시대)
 
 어디에도 안 맞는 표는 ``no_adapter``(해석 행을 만들지 않는다).
+
+메인 결정 (10-28 22시대, 1단계 검토 뒤)
+---------------------------------------
+1. ``S-AP-in-cell``을 판정 군에 넣는다(``JUDGED``). 계획서 §3.2에 처음부터 있던 어댑터이고 값을 보기 전에
+   정했다. 어댑터 정의는 바꾸지 않는다.
+2. ``period_inferred``는 그대로 둔다. 표에 기간 머리가 아예 없을 때만 당기로 두고 플래그를 붙인다.
+3. 머리 경로가 없는 고객 주석 표는 표 전체를 뺀다(``partial`` + ``no_adapter``).
+4. 결산월이 12가 아닌 문서는 ``fy_end_month`` 열로만 표시한다(``period_irregular``로 올리지 않는다).
 """
 
 from __future__ import annotations
@@ -75,6 +83,7 @@ JUDGED = frozenset(
         ("segment_sales", "S-A*n"),
         ("segment_sales", "S-AP"),
         ("segment_sales", "S-AP*n"),
+        ("segment_sales", "S-AP-in-cell"),
     }
 )
 
@@ -858,6 +867,8 @@ COMMON_COLS = [
     "period_idx",
     "tmpl_sig",
     "tmpl_group",
+    "adapter",
+    "judged",
     "unit_raw",
     "unit_src",
     "unit_status",
@@ -954,6 +965,7 @@ TABLE_COLS = {
     "segment_sales": COMMON_COLS + SEGMENT_COLS,
 }
 BOOL_COLS = {
+    "judged",
     "anonymized",
     "period_irregular",
     "period_conflict",
@@ -1039,6 +1051,8 @@ def _base_row(meta: dict, prof: Prof, key: tuple, ctx: dict) -> dict:
         table_idx=key[1],
         tmpl_sig=ctx["tmpl_sig"],
         tmpl_group=ctx["tmpl_group"],
+        adapter=ctx["adapter"],
+        judged=ctx["judged"],
         unit_raw=ctx["unit_raw"],
         unit_src=ctx["unit_src"],
         unit_status=ctx["unit_status"],
@@ -1058,6 +1072,8 @@ def _ctx(meta: dict, cells: list[dict], assign: dict, target: str) -> dict:
         "parse_status": assign["parse_status"],
         "tmpl_sig": assign["tmpl_sig"],
         "tmpl_group": f"{target}:{assign['adapter']}",
+        "adapter": assign["adapter"],
+        "judged": bool(assign["judged"]),
         "unit_raw": cells[0].get("unit_raw"),
         "unit_src": cells[0].get("unit_src"),
         "unit_status": ustat,

@@ -407,6 +407,130 @@ def run_interp(root: Path, snapshot: str, rcept_list: Path, out_dir: Path) -> di
     }
 
 
+FULL_NAMES = {
+    "customer": "kr_bizrpt_customer_row_all_candidates_diag",
+    "orderbook": "kr_bizrpt_orderbook_row_all_candidates_diag",
+    "segment_sales": "kr_bizrpt_segment_sales_row_all_candidates_diag",
+}
+
+
+def run_full(
+    root: Path,
+    snapshot: str,
+    out_dir: Path,
+    include_verify_sample: bool = False,
+    limit: int | None = None,
+) -> dict:
+    """모집단 전체 해석(2단계). 후보 전부(판정 군·판정 밖 어댑터)를 ``*_all_candidates_diag``로 쓴다.
+
+    진단용이다: ``derived/``에 올라갈 합격 군 표는 판정 뒤에 따로 만든다(결정 8). 문서 묶음마다 해석하고
+    바로 쓴다(메모리). ``include_verify_sample``을 켜야만 ``verify_sample/`` 문서를 포함한다.
+    """
+    t0 = time.time()
+    snap = snapshot_dir(root, snapshot)
+    index_path = snap / "kr_bizrpt_section_index.parquet"
+    cell_glob = str(snap / "kr_bizrpt_table_cell" / "**" / "*.parquet")
+    con = duckdb.connect()
+    ex, ex_files = excluded_docs(root)
+    docs, n_all, n_excl = population_docs(con, index_path, set() if include_verify_sample else ex)
+    if limit:
+        docs = docs[:limit]
+    doc_status = dict(
+        con.execute(
+            "select parse_status, count(distinct rcept_no) from read_parquet(?) group by 1",
+            [str(index_path)],
+        ).fetchall()
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    writers: dict[str, pq.ParquetWriter] = {}
+    schemas = {t: pa.schema([(c, _arrow_type(c)) for c in bi.TABLE_COLS[t]]) for t in bi.TARGETS}
+    for t in bi.TARGETS:
+        writers[t] = pq.ParquetWriter(
+            out_dir / f"{FULL_NAMES[t]}.parquet", schemas[t], compression="zstd"
+        )
+    counts: dict = collections.Counter()
+    row_status: dict = collections.Counter()
+    assigns: list[dict] = []
+    rows_by_table: dict[tuple, int] = collections.defaultdict(int)
+    try:
+        for i in range(0, len(docs), CHUNK_DOCS):
+            chunk = docs[i : i + CHUNK_DOCS]
+            by_target: dict[str, list[dict]] = {t: [] for t in bi.TARGETS}
+            for meta, sk, ti, cells in iter_tables(con, cell_glob, chunk):
+                a = bi.assign_table(sk, cells)
+                if a is None:
+                    continue
+                assigns.append(_assign_row(meta, sk, ti, a))
+                for r in bi.interp_table(meta, sk, ti, cells, a):
+                    by_target[a["target"]].append(r)
+                    rows_by_table[(meta["rcept_no"], sk, ti)] += 1
+            bi.mark_customer_dups(by_target["customer"])
+            bi.mark_table_dups(
+                by_target["segment_sales"], ("cat_path_raw", "period_idx", "amount_raw", "row_kind")
+            )
+            bi.mark_table_dups(
+                by_target["orderbook"],
+                ("item_raw", "total_amt_num", "delivered_amt_num", "backlog_amt_num", "row_kind"),
+            )
+            for t, rs in by_target.items():
+                cols = bi.TABLE_COLS[t]
+                if rs:
+                    writers[t].write_table(
+                        pa.Table.from_pylist(
+                            [{c: r.get(c) for c in cols} for r in rs], schema=schemas[t]
+                        )
+                    )
+                counts[t] += len(rs)
+                for r in rs:
+                    row_status[(t, r["parse_status"])] += 1
+    finally:
+        for w in writers.values():
+            w.close()
+    pq.write_table(
+        pa.Table.from_pylist(assigns, schema=pa.schema(ASSIGN_FIELDS)),
+        out_dir / "interp_assignment.parquet",
+        compression="zstd",
+    )
+    summarize(assigns, out_dir / "interp_assignment_summary.tsv")
+    doc_rows = bi.build_interp_doc(docs, assigns, rows_by_table)
+    pq.write_table(
+        pa.Table.from_pylist(doc_rows), out_dir / "kr_bizrpt_interp_doc.parquet", compression="zstd"
+    )
+    doc_status_counts = collections.Counter((r["target"], r["status"]) for r in doc_rows)
+    tbl_ad = collections.Counter((a["target"], a["adapter"]) for a in assigns)
+    manifest = {
+        "name": "interp_full_all_candidates_diag",
+        "note": "진단용 전체 후보 행(판정 전). derived/에 올리지 않는다. judged 열은 JUDGED 상수(판정 대상 군) 표시일 뿐 판정 결과가 아니다.",
+        "interp_version": bi.INTERP_VERSION,
+        "code_rev": code_rev(),
+        "created_at": dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(
+            timespec="seconds"
+        ),
+        "input_snapshot": str(snap),
+        "input_manifest_sha256": hashlib.sha256((snap / "manifest.json").read_bytes()).hexdigest()
+        if (snap / "manifest.json").exists()
+        else None,
+        "n_docs_in_index": n_all,
+        "include_verify_sample": include_verify_sample,
+        "n_docs_excluded": 0 if include_verify_sample else n_excl,
+        "excluded_files": [] if include_verify_sample else ex_files,
+        "n_docs_run": len(docs),
+        "doc_parse_status_index": {str(k): v for k, v in doc_status.items()},
+        "n_tables_assigned": len(assigns),
+        "tables_by_target_adapter": {f"{t}:{a}": n for (t, a), n in sorted(tbl_ad.items())},
+        "rows_by_target": dict(counts),
+        "rows_by_target_parse_status": {f"{t}:{s}": n for (t, s), n in sorted(row_status.items())},
+        "interp_doc_status": {f"{t}:{s}": n for (t, s), n in sorted(doc_status_counts.items())},
+        "outputs": {t: f"{FULL_NAMES[t]}.parquet" for t in bi.TARGETS}
+        | {"doc": "kr_bizrpt_interp_doc.parquet", "assignment": "interp_assignment.parquet"},
+        "elapsed_sec": round(time.time() - t0, 1),
+    }
+    (out_dir / "manifest_full.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
+    return manifest
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -420,8 +544,27 @@ def main(argv: list[str] | None = None) -> None:
     i.add_argument("--snapshot", default=SNAPSHOT_DEFAULT)
     i.add_argument("--rcept-list", type=Path, required=True)
     i.add_argument("--out", type=Path, required=True)
+    f = sub.add_parser("full", help="모집단 전체 해석(진단용 *_all_candidates_diag)")
+    f.add_argument("--snapshot", default=SNAPSHOT_DEFAULT)
+    f.add_argument("--out", type=Path, default=None)
+    f.add_argument(
+        "--include-verify-sample",
+        action="store_true",
+        help="verify_sample/ 문서까지 포함(기본: 제외)",
+    )
+    f.add_argument("--limit", type=int, default=None, help="시험용: 앞 N 문서만")
     args = ap.parse_args(argv)
     root = data_root()
+    if args.cmd == "full":
+        out = args.out or (root / "kr" / "output" / OUT_NAME)
+        print(
+            json.dumps(
+                run_full(root, args.snapshot, out, args.include_verify_sample, args.limit),
+                ensure_ascii=False,
+                indent=1,
+            )
+        )
+        return
     if args.cmd == "assign":
         out = args.out or (root / "kr" / "output" / OUT_NAME)
         res = run_assign(root, args.snapshot, out, args.limit)
