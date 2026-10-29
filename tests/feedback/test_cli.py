@@ -135,3 +135,10 @@ def test_server_uses_pinned_mapping_without_human_document_or_git(tmp_path):
     assert len(load_index(tmp_path / "out")["predictions"]) == 1
     mapping_file.write_bytes(mapping_file.read_bytes() + b" ")
     assert main(args) == 2
+
+
+def test_market_scopes_do_not_mix_index_rows(tmp_path):
+    args = argv(tmp_path)
+    assert main(args + ["--market", "US"]) == 0
+    assert load_index(tmp_path / "out")["predictions"] == []
+    assert load_index(tmp_path / "out")["publications"][0]["prediction_refs"] == []

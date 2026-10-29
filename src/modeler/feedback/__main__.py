@@ -43,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("build", "observe", "mapping"))
     parser.add_argument("--kind", choices=("briefing", "shadow"), default="briefing")
+    parser.add_argument("--market", choices=("KR", "US"), default="KR")
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--checkout", type=Path)
     parser.add_argument(
@@ -60,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
             raise FeedbackError("--output-root or PREDICTION_FEEDBACK_ROOT is required")
         if args.command == "observe" and (args.kind != "briefing" or args.checkout is None):
             raise FeedbackError("observe requires briefing source and --checkout")
+        if args.kind == "shadow" and args.market != "KR":
+            raise FeedbackError("P6 shadow is a KR source")
         if args.command != "mapping" and args.source_root is None:
             raise FeedbackError("--source-root is required for build/observe")
         sources = [p for p in (args.source_root, args.issues_document, args.mapping_file) if p]
@@ -111,6 +114,12 @@ def main(argv: list[str] | None = None) -> int:
             from .shadow import read_shadow
 
             batch = read_shadow(args.source_root, observed_at=observed_at, historical_link=True)
+        batch.predictions = [p for p in batch.predictions if p.get("market") == args.market]
+        selected = {p["prediction_ref"] for p in batch.predictions}
+        batch.findings = [f for f in batch.findings if f.get("prediction_ref") in selected]
+        for publication in batch.publications:
+            for key in ("prediction_refs", "report_prediction_refs"):
+                publication[key] = [ref for ref in publication.get(key, []) if ref in selected]
         # The server gets a read-only rules snapshot, not a second human-state document.
         mapping_raw = canonical_bytes(mapping)
         mapping_digest = sha256_bytes(mapping_raw)
@@ -123,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
                 "bytes": len(mapping_raw),
             }
         )
-        source_key = f"{args.kind}:{args.source_root.resolve()}"
+        source_key = f"{args.kind}:{args.market}:{args.source_root.resolve()}"
         manifest = commit_batch(
             args.output_root,
             batch,
