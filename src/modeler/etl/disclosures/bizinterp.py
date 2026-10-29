@@ -51,6 +51,14 @@ LLM·퍼지 매칭은 쓰지 않는다.
 2. ``period_inferred``는 그대로 둔다. 표에 기간 머리가 아예 없을 때만 당기로 두고 플래그를 붙인다.
 3. 머리 경로가 없는 고객 주석 표는 표 전체를 뺀다(``partial`` + ``no_adapter``).
 4. 결산월이 12가 아닌 문서는 ``fy_end_month`` 열로만 표시한다(``period_irregular``로 올리지 않는다).
+
+메인 대조 판정 (2026-10-29, 160표, 계획 12 "대조 결과")
+-------------------------------------------------------
+문턱: 행 정확도 점추정 90% 이상, 군마다 표 10개·행 60개 이상, 단위 오류 0. 합격 6개 군(``PASSED``):
+C-A*2 · C-AP*2 · O-QA3 · S-AP · S-AP*n · S-AP-in-cell. C-A(45행)·O-A3(57행)은 60행 미달로 판정하지
+못해 합격이 아니다. S-A*n은 89.8%로 불합격이다. 단위 오류는 0이다. 해석 규칙은 바꾸지 않았고,
+문서 단위 상태·승격 대상은 ``PASSED``만 쓴다.
+``JUDGED``는 판정 후보였던 군(표본 추출·``judged`` 열)이다.
 """
 
 from __future__ import annotations
@@ -81,6 +89,20 @@ JUDGED = frozenset(
         ("orderbook", "O-QA3"),
         ("orderbook", "O-A3"),
         ("segment_sales", "S-A*n"),
+        ("segment_sales", "S-AP"),
+        ("segment_sales", "S-AP*n"),
+        ("segment_sales", "S-AP-in-cell"),
+    }
+)
+
+# 메인 대조 판정을 통과한 군(2026-10-29, 160표, 계획 12 "대조 결과"). JUDGED의 부분집합이다.
+# C-A(45행)·O-A3(57행)은 60행 미달로 판정하지 못했고, S-A*n은 89.8%로 불합격이다.
+# 판정 못 한 군은 불합격과 같이 뺀다. 고객 어댑터의 ``+L`` 같은 접미사가 붙으면 합격 군이 아니다.
+PASSED = frozenset(
+    {
+        ("customer", "C-A*2"),
+        ("customer", "C-AP*2"),
+        ("orderbook", "O-QA3"),
         ("segment_sales", "S-AP"),
         ("segment_sales", "S-AP*n"),
         ("segment_sales", "S-AP-in-cell"),
@@ -696,6 +718,7 @@ def plan_customer(prof: Prof) -> dict:
     return {
         "adapter": adapter,
         "judged": judged,
+        "passed": (("customer", base) in PASSED) and not suffix,
         "name_col": first,
         "lead": lead_extra,
         "units": units,
@@ -745,6 +768,7 @@ def plan_segment(prof: Prof) -> dict:
     return {
         "adapter": adapter,
         "judged": ("segment_sales", adapter) in JUDGED,
+        "passed": ("segment_sales", adapter) in PASSED,
         "lead": lead,
         "tail": tail,
         "units": units,
@@ -795,6 +819,7 @@ def plan_orderbook(prof: Prof) -> dict:
             return {
                 "adapter": ad,
                 "judged": ("orderbook", ad) in JUDGED,
+                "passed": ("orderbook", ad) in PASSED,
                 "lead": lead,
                 "cols": dict(zip(gm, rest)),
                 "units": [],
@@ -818,6 +843,7 @@ def assign_table(section_key: str, cells: list[dict]) -> dict | None:
         "target": target,
         "adapter": NOT_IN_SCOPE,
         "judged": False,
+        "passed": False,
         "tmpl_sig": signature(prof),
         "n_body_rows": prof.n_body_rows,
         "n_periods": 1,
@@ -838,6 +864,7 @@ def assign_table(section_key: str, cells: list[dict]) -> dict | None:
         plan = plan_segment(prof)
     info["adapter"] = plan["adapter"]
     info["judged"] = bool(plan.get("judged"))
+    info["passed"] = bool(plan.get("passed"))
     if plan.get("units"):
         info["n_periods"] = len(plan["units"])
     if target == "customer" and plan.get("adapter") != NO_ADAPTER:
@@ -869,6 +896,7 @@ COMMON_COLS = [
     "tmpl_group",
     "adapter",
     "judged",
+    "passed",
     "unit_raw",
     "unit_src",
     "unit_status",
@@ -966,6 +994,7 @@ TABLE_COLS = {
 }
 BOOL_COLS = {
     "judged",
+    "passed",
     "anonymized",
     "period_irregular",
     "period_conflict",
@@ -1053,6 +1082,7 @@ def _base_row(meta: dict, prof: Prof, key: tuple, ctx: dict) -> dict:
         tmpl_group=ctx["tmpl_group"],
         adapter=ctx["adapter"],
         judged=ctx["judged"],
+        passed=ctx["passed"],
         unit_raw=ctx["unit_raw"],
         unit_src=ctx["unit_src"],
         unit_status=ctx["unit_status"],
@@ -1074,6 +1104,7 @@ def _ctx(meta: dict, cells: list[dict], assign: dict, target: str) -> dict:
         "tmpl_group": f"{target}:{assign['adapter']}",
         "adapter": assign["adapter"],
         "judged": bool(assign["judged"]),
+        "passed": bool(assign.get("passed")),
         "unit_raw": cells[0].get("unit_raw"),
         "unit_src": cells[0].get("unit_src"),
         "unit_status": ustat,
@@ -1449,8 +1480,8 @@ def build_interp_doc(
     """``kr_bizrpt_interp_doc`` — (rcept_no, target)별 한 행.
 
     ``assignments``: ``rcept_no``·``section_key``·``table_idx``·``target``·``adapter``·``unit_status``·
-    ``parse_status``·``judged``. ``rows_by_table``: 표 키 → 낸 행 수. ``passed_groups``: 판정을 통과한
-    ``tmpl_group``(``target:adapter``) 집합. None이면 판정 전이라 판정 대상(judged) 군을 통과로 본다.
+    ``parse_status``·``judged``. ``rows_by_table``: 표 키 → 낸 행 수. ``passed_groups``:
+    판정을 통과한 ``tmpl_group``(``target:adapter``) 집합. None이면 ``PASSED``(메인 대조 합격 군)를 통과로 본다.
     ``status``: ok · no_candidate · not_passed_template · unit_failed · parse_partial.
     """
     by_key: dict[tuple, list[dict]] = collections.defaultdict(list)
@@ -1466,7 +1497,9 @@ def build_interp_doc(
             for a in lst:
                 grp = f"{tg}:{a['adapter']}"
                 ok_grp = (
-                    (grp in passed_groups) if passed_groups is not None else bool(a.get("judged"))
+                    (grp in passed_groups)
+                    if passed_groups is not None
+                    else (tg, a["adapter"]) in PASSED
                 )
                 if a["adapter"] not in (NO_ADAPTER, NOT_IN_SCOPE) and ok_grp:
                     used.append(a)

@@ -605,7 +605,7 @@ def test_interp_doc_status():
             "section_key": "sales",
             "table_idx": 0,
             "target": "segment_sales",
-            "adapter": "S-A*n",
+            "adapter": "S-AP",
             "unit_status": "krw",
             "parse_status": "ok",
             "judged": True,
@@ -655,6 +655,99 @@ def test_interp_doc_status():
     # 판정 통과 군을 직접 주면 그 군만 쓴다
     out = bi.build_interp_doc(["d1"], asg, {("d1", "sales", 0): 7}, passed_groups=set())
     assert [r["status"] for r in out if r["target"] == "segment_sales"] == ["not_passed_template"]
+
+
+def test_passed_subset_of_judged():
+    assert bi.PASSED < bi.JUDGED
+    assert bi.JUDGED - bi.PASSED == {
+        ("customer", "C-A"),
+        ("orderbook", "O-A3"),
+        ("segment_sales", "S-A*n"),
+    }
+
+
+def _asg(adapter, target, rn="d1"):
+    return {
+        "rcept_no": rn,
+        "section_key": "x",
+        "table_idx": 0,
+        "target": target,
+        "adapter": adapter,
+        "unit_status": "krw",
+        "parse_status": "ok",
+        "judged": True,
+    }
+
+
+def test_judged_but_not_passed_is_not_passed_template():
+    for tg, ad in (("customer", "C-A"), ("segment_sales", "S-A*n"), ("orderbook", "O-A3")):
+        out = bi.build_interp_doc(["d1"], [_asg(ad, tg)], {("d1", "x", 0): 5})
+        r = [x for x in out if x["target"] == tg][0]
+        assert r["status"] == "not_passed_template"
+        assert (r["n_interpreted_tables"], r["n_rows"], r["tmpl_groups"]) == (0, 0, "")
+    out = bi.build_interp_doc(["d1"], [_asg("C-AP*2", "customer")], {("d1", "x", 0): 5})
+    r = [x for x in out if x["target"] == "customer"][0]
+    assert (r["status"], r["n_interpreted_tables"], r["n_rows"]) == ("ok", 1, 5)
+    assert r["tmpl_groups"] == "customer:C-AP*2"
+
+
+def test_passed_flag_on_tables():
+    # 합격 군
+    cells = _note(
+        ["구분", "당기|금액", "당기|비율", "전기|금액", "전기|비율"],
+        [
+            ["삼성전자", "1,000", "50.0%", "900", "45.0%"],
+            ["기타", "1,000", "50.0", "1,100", "55.0"],
+        ],
+    )
+    a, rows = run("major_customer_note_consol", cells)
+    assert a["adapter"] == "C-AP*2" and a["judged"] and a["passed"]
+    assert rows and all(r["passed"] and r["judged"] for r in rows)
+    # 판정 못 한 군(C-A)은 judged지만 passed가 아니다
+    cells = _note(["구분", "금액"], [["A사", "100"], ["B사", "50"]])
+    a, rows = run("major_customer_note_sep", cells)
+    assert a["adapter"] == "C-A" and a["judged"] and not a["passed"]
+    assert rows and all(r["judged"] and not r["passed"] for r in rows)
+    # 불합격 군(S-A*n)
+    cells = mk(
+        ["사업부문", "품목", "매출액|제 55 기", "매출액|제 54 기", "매출액|제 53 기"],
+        [["제빵", "빵류", "10", "20", "30"], ["제과", "과자류", "1", "2", "3"]],
+        "(단위 : 백만원)",
+    )
+    a, rows = run("sales", cells)
+    assert a["adapter"] == "S-A*n" and a["judged"] and not a["passed"]
+    assert rows and not any(r["passed"] for r in rows)
+    # 접미사(+L)가 붙으면 합격 군이 아니다
+    cells = _note(["구분", "영업부문", "당기", "전기"], [["A사", "X", "1", "2"]])
+    a, rows = run("major_customer_note_consol", cells)
+    assert a["adapter"] == "C-A*2+L" and not a["passed"]
+
+
+def test_run_full_passed_only_outputs(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    # run_full과 같은 걸러내기: diag에서 passed==True만
+    rows = []
+    for sec, cells in (
+        (
+            "major_customer_note_consol",
+            _note(["구분", "당기", "전기"], [["A사", "1", "2"]]),
+        ),
+        ("major_customer_note_sep", _note(["구분", "금액"], [["A사", "100"]])),
+    ):
+        _, rs = run(sec, cells)
+        rows += rs
+    cols = bi.TABLE_COLS["customer"]
+    from modeler.etl.disclosures.biz_interp_build import _arrow_type
+
+    schema = pa.schema([(c, _arrow_type(c)) for c in cols])
+    t = pa.Table.from_pylist([{c: r.get(c) for c in cols} for r in rows], schema=schema)
+    assert "passed" in t.column_names and "judged" in t.column_names
+    sub = t.filter(pa.array([bool(x) for x in t["passed"].to_pylist()]))
+    assert {g for g in sub["tmpl_group"].to_pylist()} == {"customer:C-A*2"}
+    assert {g for g in t["tmpl_group"].to_pylist()} == {"customer:C-A*2", "customer:C-A"}
+    pq.write_table(sub, tmp_path / "x.parquet")
 
 
 # ---------------------------------------------------------------- 개발 표본 회귀 (사본이 있을 때만)

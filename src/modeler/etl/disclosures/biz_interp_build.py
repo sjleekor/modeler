@@ -28,6 +28,7 @@ from pathlib import Path
 
 import duckdb
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from modeler.etl.disclosures import bizinterp as bi
@@ -413,6 +414,13 @@ FULL_NAMES = {
     "segment_sales": "kr_bizrpt_segment_sales_row_all_candidates_diag",
 }
 
+PASSED_NAMES = {
+    "customer": "kr_bizrpt_customer_row",
+    "orderbook": "kr_bizrpt_orderbook_row",
+    "segment_sales": "kr_bizrpt_segment_sales_row",
+}
+VERDICT_DATE = "2026-10-29"
+
 
 def run_full(
     root: Path,
@@ -423,7 +431,8 @@ def run_full(
 ) -> dict:
     """모집단 전체 해석(2단계). 후보 전부(판정 군·판정 밖 어댑터)를 ``*_all_candidates_diag``로 쓴다.
 
-    진단용이다: ``derived/``에 올라갈 합격 군 표는 판정 뒤에 따로 만든다(결정 8). 문서 묶음마다 해석하고
+    ``*_all_candidates_diag``는 진단용이다. 메인 대조 판정(``bizinterp.PASSED``)을 통과한 군만 걸러
+    ``kr_bizrpt_*_row.parquet``로 따로 쓴다(``derived/`` 승격 대상, 결정 8). 문서 묶음마다 해석하고
     바로 쓴다(메모리). ``include_verify_sample``을 켜야만 ``verify_sample/`` 문서를 포함한다.
     """
     t0 = time.time()
@@ -498,9 +507,30 @@ def run_full(
     )
     doc_status_counts = collections.Counter((r["target"], r["status"]) for r in doc_rows)
     tbl_ad = collections.Counter((a["target"], a["adapter"]) for a in assigns)
+    passed_counts: dict[str, int] = {}
+    passed_by_group: dict[str, int] = {}
+    for t in bi.TARGETS:
+        diag = pq.read_table(out_dir / f"{FULL_NAMES[t]}.parquet")
+        sub = diag.filter(pc.equal(diag["passed"], True))
+        pq.write_table(sub, out_dir / f"{PASSED_NAMES[t]}.parquet", compression="zstd")
+        passed_counts[t] = sub.num_rows
+        for g, n in collections.Counter(sub["tmpl_group"].to_pylist()).items():
+            passed_by_group[g] = n
     manifest = {
-        "name": "interp_full_all_candidates_diag",
-        "note": "진단용 전체 후보 행(판정 전). derived/에 올리지 않는다. judged 열은 JUDGED 상수(판정 대상 군) 표시일 뿐 판정 결과가 아니다.",
+        "name": "interp_full_diag_and_passed_rows",
+        "note": (
+            "*_all_candidates_diag.parquet = 진단용 전체 후보 행(쓰지 않음, derived/에 안 올린다). "
+            "judged 열은 JUDGED 상수(판정 후보 군) 표시일 뿐 판정 결과가 아니다. "
+            "kr_bizrpt_{customer,orderbook,segment_sales}_row.parquet = 메인 대조 판정 합격 군만"
+            "(passed==True, diag와 같은 스키마, derived 승격 대상)."
+        ),
+        "verdict_date": VERDICT_DATE,
+        "passed_groups": sorted(f"{t}:{a}" for t, a in bi.PASSED),
+        "judged_not_passed_groups": sorted(f"{t}:{a}" for t, a in bi.JUDGED - bi.PASSED),
+        "passed_rows_by_target": passed_counts,
+        "row_counts_by_file": {f"{FULL_NAMES[t]}.parquet": counts[t] for t in bi.TARGETS}
+        | {f"{PASSED_NAMES[t]}.parquet": passed_counts[t] for t in bi.TARGETS},
+        "passed_rows_by_group": dict(sorted(passed_by_group.items())),
         "interp_version": bi.INTERP_VERSION,
         "code_rev": code_rev(),
         "created_at": dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(
@@ -522,6 +552,7 @@ def run_full(
         "rows_by_target_parse_status": {f"{t}:{s}": n for (t, s), n in sorted(row_status.items())},
         "interp_doc_status": {f"{t}:{s}": n for (t, s), n in sorted(doc_status_counts.items())},
         "outputs": {t: f"{FULL_NAMES[t]}.parquet" for t in bi.TARGETS}
+        | {f"{t}_passed": f"{PASSED_NAMES[t]}.parquet" for t in bi.TARGETS}
         | {"doc": "kr_bizrpt_interp_doc.parquet", "assignment": "interp_assignment.parquet"},
         "elapsed_sec": round(time.time() - t0, 1),
     }
