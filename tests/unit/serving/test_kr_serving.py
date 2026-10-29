@@ -299,6 +299,45 @@ def test_top100_quality_flags_keep_original_ranks_and_prices_at_K() -> None:
     assert "K_price_jump_or_unknown" in jump["quality_reasons"]
     assert jump["K_simple_return"] == 0.35
     assert report["quality"]["top100_quality_review_rows"] == 1
+    assert report["quality"]["halt_window_review"] == "not_checked"
+
+
+def test_halt_inside_20d_window_flags_row_without_changing_ranks() -> None:
+    panel = pl.DataFrame(
+        {
+            "trade_date": [date(2026, 9, 28)] * 3,
+            "ticker": ["000001", "000002", "000003"],
+            "market": ["KOSPI"] * 3,
+            "px_ret_1d": [1.0, 2.0, 3.0],
+            "px_halt_ratio_20d": [0.0, 0.05, None],
+            "is_halted": [False, False, False],
+            "ca_price_jump_suspect": [False, False, False],
+            "ca_share_change_confirmed": [False, False, False],
+            "ca_rule_applicability_unknown": [False, False, False],
+            "simple_ret": [0.01, 0.02, 0.03],
+        },
+        schema_overrides={"trade_date": pl.Date},
+    )
+    prepared = {
+        "market": "KR", "feature_asof_date": "2026-09-28",
+        "model_config": {
+            "feature_set": "FS1h", "flow_variant": "lag1", "preprocess_profile": "rank",
+            "excluded_features": list(EXCLUDED_FEATURES),
+            "feature_time_contract": {"serving_applies_additional_lag": False},
+        },
+    }
+    report = score_cross_section(
+        bundle=_bundle(), panel=panel, report_date="2026-09-29",
+        decision_at="2026-09-29T10:00:00+09:00",
+        feature_asof_date="2026-09-28", prepared_manifest=prepared,
+    )
+    assert [row["symbol"] for row in report["rankings"]] == ["000003", "000002", "000001"]
+    by_symbol = {row["symbol"]: row for row in report["rankings"]}
+    assert by_symbol["000002"]["quality_reasons"] == ["W20_halt_in_window"]
+    assert by_symbol["000001"]["quality_review"] is False
+    assert by_symbol["000003"]["quality_review"] is False
+    assert report["quality"]["halt_window_review"] == "px_halt_ratio_20d_checked"
+    assert report["quality"]["top100_quality_review_rows"] == 1
 
 
 def test_scoring_preserves_kr_exchange_groups_for_cross_section_ranks() -> None:

@@ -208,6 +208,14 @@ def score_cross_section(
         (row["ticker"], row["market"]): row
         for row in panel.select(["ticker", "market", *sorted(audit_columns)]).iter_rows(named=True)
     } if audit_available else {}
+    # v1 price features take MIN(low) over the 20-row window, so a halted row (open/high/low 0)
+    # inflates px_high_low_range_20d. px_halt_ratio_20d uses the same halt definition and window,
+    # so > 0 marks exactly the contaminated rows. Flag only; ranks stay as scored.
+    window_available = "px_halt_ratio_20d" in panel.columns
+    halt_window_by_key = {
+        (row["ticker"], row["market"]): row["px_halt_ratio_20d"]
+        for row in panel.select(["ticker", "market", "px_halt_ratio_20d"]).iter_rows(named=True)
+    } if window_available else {}
     review_count = 0
     for row in rankings[:100]:
         audit = audit_by_key.get((row["symbol"], row["market"]))
@@ -224,6 +232,9 @@ def score_cross_section(
             if audit["ca_rule_applicability_unknown"] is None or audit["ca_rule_applicability_unknown"]:
                 reasons.append("K_price_rule_unknown")
             row["K_simple_return"] = audit["simple_ret"]
+        halt_ratio = halt_window_by_key.get((row["symbol"], row["market"]))
+        if halt_ratio is not None and halt_ratio > 0:
+            reasons.append("W20_halt_in_window")
         row["quality_review"] = bool(reasons)
         row["quality_reasons"] = reasons
         review_count += bool(reasons)
@@ -234,6 +245,7 @@ def score_cross_section(
         "management_state": "unverified",
         "halted_rows_at_K": halted,
         "price_jump_review": "K_quality_mart_checked" if audit_available else "not_checked",
+        "halt_window_review": "px_halt_ratio_20d_checked" if window_available else "not_checked",
         "top100_quality_review_rows": review_count,
         "D_management_and_halt_state": "unverified",
         "eligible_rows_scored": len(rankings),

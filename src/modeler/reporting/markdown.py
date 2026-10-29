@@ -65,6 +65,7 @@ KR_QUALITY_REASON_TEXT = {
     "K_share_change_or_unknown": "K 기준 상장주식수 변화 또는 확인 불가",
     "K_price_rule_unknown": "K 기준 가격 점검 규칙 적용 불가",
     "K_price_quality_unavailable": "K 기준 가격 품질 정보 없음",
+    "W20_halt_in_window": "최근 20거래일 안 거래정지 — 가격 피쳐 왜곡 가능",
 }
 # 내부 report 상태 -> front matter status (01 문서 §6, 지시서의 매핑)
 STATUS_MAP = {
@@ -2426,6 +2427,7 @@ QUALITY_SCALARS = (
     "management_state",
     "halted_rows_at_K",
     "price_jump_review",
+    "halt_window_review",
     "top100_quality_review_rows",
     "D_management_and_halt_state",
     "eligible_rows_scored",
