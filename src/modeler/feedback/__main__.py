@@ -41,11 +41,13 @@ def _verify_document_commit(document: Path, commit: str, blob: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("build", "observe", "mapping"))
+    parser.add_argument("command", choices=("build", "observe", "capture", "mapping"))
     parser.add_argument("--kind", choices=("briefing", "shadow"), default="briefing")
     parser.add_argument("--market", choices=("KR", "US"), default="KR")
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--checkout", type=Path)
+    parser.add_argument("--capture-settings", type=Path)
+    parser.add_argument("--partitioned", action="store_true")
     parser.add_argument(
         "--output-root", type=Path, default=os.environ.get("PREDICTION_FEEDBACK_ROOT")
     )
@@ -63,11 +65,21 @@ def main(argv: list[str] | None = None) -> int:
             raise FeedbackError("observe requires briefing source and --checkout")
         if args.kind == "shadow" and args.market != "KR":
             raise FeedbackError("P6 shadow is a KR source")
+        if args.command == "capture" and (args.kind != "briefing" or args.capture_settings is None):
+            raise FeedbackError("capture requires briefing source and --capture-settings")
         if args.command != "mapping" and args.source_root is None:
             raise FeedbackError("--source-root is required for build/observe")
         sources = [p for p in (args.source_root, args.issues_document, args.mapping_file) if p]
         if args.checkout is not None:
             sources.append(args.checkout)
+        capture_config = None
+        if args.command == "capture":
+            from .captured import session_config
+
+            capture_config = session_config(args.capture_settings, args.source_root.name)
+            sources.extend(
+                [args.capture_settings, Path(capture_config["feedback_capture"]["output_root"])]
+            )
         check_output_root(args.output_root, sources)
         document_batch = Batch()
         if args.mapping_file:
@@ -97,7 +109,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"mapping_sha256": sha256_bytes(raw), "rules": len(mapping["rules"])}))
             return 0
         observed_at = datetime.now(UTC).isoformat()
-        if args.command == "observe":
+        if args.command == "capture":
+            from .captured import read_captured
+
+            batch = read_captured(capture_config, observed_at=observed_at)
+        elif args.command == "observe":
             from .receipt import observe_publication
 
             batch, _ = observe_publication(args.source_root, args.checkout)
@@ -133,7 +149,14 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         source_key = f"{args.kind}:{args.market}:{args.source_root.resolve()}"
-        manifest = commit_batch(
+        commit = commit_batch
+        extra = {}
+        if args.partitioned:
+            from .partition import commit_day_batch
+
+            commit = commit_day_batch
+            extra["day"] = args.source_root.name
+        manifest = commit(
             args.output_root,
             batch,
             mapping=mapping,
@@ -141,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             source_roots=sources,
             observed_at=observed_at,
             issue_document_ref=f"{args.my_commit}:{args.issues_blob}",
+            **extra,
         )
         print(json.dumps({"run_id": manifest["run_id"], "counts": manifest["counts"]}))
         return 2 if batch.errors else 0

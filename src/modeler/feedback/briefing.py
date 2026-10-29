@@ -132,6 +132,10 @@ def _explain(
     if not item or not matches:
         return {}, None
     digest = matches[-1]
+    return _validated_explain(item, digest, sides, report_hash, invocation, day, batch)
+
+
+def _validated_explain(item, digest, sides, report_hash, invocation, day, batch):
     expected = sides.get("coordinator-explain.json", {}).get("document_sha256")
     manifest_hash = sides.get("markdown/manifest.json", {}).get("explain_sha256")
     errors = []
@@ -161,7 +165,7 @@ def _explain(
     ):
         errors.append("explain_release_mismatch")
     for reason in errors:
-        _error(batch, path.name, reason)
+        _error(batch, f"explain-{day}.json", reason)
     return ({}, None) if errors else (item, digest)
 
 
@@ -443,6 +447,35 @@ def read_briefing(
     sides = _sidecars(day_dir, batch)
     invocation = _invocation(report, sides, report_hash, day, batch)
     explain, explain_hash = _explain(day_dir, day, sides, report_hash, invocation, batch)
+    _adapt_predictions(
+        report,
+        day=day,
+        report_hash=report_hash,
+        invocation=invocation,
+        explain=explain,
+        explain_hash=explain_hash,
+        observed_at=observed_at,
+        historical_link=historical_link,
+        batch=batch,
+    )
+    _publication(day_dir, day, report_hash, invocation, sides, checkout, batch, observed_at)
+    return batch
+
+
+def _adapt_predictions(
+    report,
+    *,
+    day,
+    report_hash,
+    invocation,
+    explain,
+    explain_hash,
+    observed_at,
+    historical_link,
+    batch,
+):
+    """Shared daily-envelope adapter for saved files and immutable producer captures."""
+    report_name = f"report-{day}.json"
     seen = set()
     for model_index, model in enumerate(report["markets"]):
         source = f"{report_name}#markets/{model_index}"
@@ -613,5 +646,3 @@ def read_briefing(
                         "observed_at": observed_at,
                     }
                 )
-    _publication(day_dir, day, report_hash, invocation, sides, checkout, batch, observed_at)
-    return batch

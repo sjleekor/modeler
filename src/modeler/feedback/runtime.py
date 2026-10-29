@@ -13,6 +13,7 @@ from datetime import UTC, datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from . import preflight as preflight_provider
 from .core import Batch, FeedbackError, read_json, require_hash, require_timestamp, sha256_bytes
 from .store import check_output_root
 
@@ -87,6 +88,15 @@ def command(config, now):
         action = "build"
     else:
         local = now.astimezone(SEOUL)
+        if config.get("require_calendar_pin"):
+            from .bundle import pinned_sessions
+
+            sessions = pinned_sessions(
+                _absolute(config.get("calendar_file"), "calendar_file"),
+                config.get("calendar_sha256"),
+            )
+            if config.get("sessions") != sessions:
+                raise FeedbackError("runtime sessions differ from the pinned confirmed calendar")
         if config.get("not_before_date", "") < "2026-11-07":
             raise FeedbackError("incremental activation date cannot precede the F3 change window")
         if local.date().isoformat() < config["not_before_date"]:
@@ -97,7 +107,12 @@ def command(config, now):
             raise FeedbackError("today is not a pinned KR session")
         source = source / local.date().isoformat()
         action = "observe"
-        _completion(source)
+        if config.get("source_mode") == "publisher-capture":
+            action = "capture"
+        elif config.get("source_mode") is not None:
+            raise FeedbackError("unsupported incremental source mode")
+        if action == "observe":
+            _completion(source)
     output = _absolute(config.get("output_root"), "output_root")
     checkout = _absolute(config.get("checkout"), "checkout")
     mapping = _absolute(config.get("mapping_file"), "mapping_file")
@@ -105,7 +120,7 @@ def command(config, now):
     require_hash(config.get("mapping_sha256"))
     require_hash(config.get("my_commit"), length=40)
     require_hash(config.get("issues_blob"), length=40)
-    return [
+    args = [
         sys.executable,
         "-s",
         "-P",
@@ -131,6 +146,28 @@ def command(config, now):
         "--issues-blob",
         config["issues_blob"],
     ]
+    if action == "capture":
+        settings = _absolute(config.get("capture_settings"), "capture_settings")
+        from .captured import session_config
+
+        capture = session_config(settings, source.name)
+        _capture_completion(capture, source.name)
+        check_output_root(output, [settings, Path(capture["feedback_capture"]["output_root"])])
+        args += ["--capture-settings", str(settings)]
+    layout = config.get("storage_layout")
+    if layout == "day-partitioned.v1":
+        args.append("--partitioned")
+    elif layout is not None:
+        raise FeedbackError("unsupported storage layout")
+    return args
+
+
+def _capture_completion(config, day):
+    from .capture import read_capture
+
+    records = read_capture(config)["records"]
+    if not any(r.get("kind") == "publication_captured" and r.get("unit") == day for r in records):
+        raise FeedbackError("today's committed publication capture is missing")
 
 
 def _completion(source):
@@ -193,6 +230,56 @@ def _stop_group(process):
     process.wait()
 
 
+def _provider_enabled(config):
+    if config.get("mode") != "incremental":
+        return False
+    provider = config.get("preflight_provider")
+    enabled = False
+    if provider is not None:
+        if not isinstance(provider, dict) or type(provider.get("enabled")) is not bool:
+            raise FeedbackError("invalid preflight provider configuration")
+        enabled = provider["enabled"]
+    required = config.get("require_preflight_provider", False)
+    if type(required) is not bool or (required and not enabled):
+        raise FeedbackError("incremental runtime requires an enabled preflight provider")
+    return enabled
+
+
+def _refresh_preflight(config, clock, *, config_path):
+    """A failed observation never falls back to an older successful snapshot."""
+    try:
+        own_job_id = os.environ.get("FEEDBACK_JOB_ID")
+        if not own_job_id:
+            raise FeedbackError("scheduled preflight requires an explicit self job")
+        descriptor = os.environ.get("FEEDBACK_CRONICLE_KEY_FD")
+        key_fd = int(descriptor) if descriptor is not None else None
+        key = preflight_provider._read_key(key_fd)
+        payload = preflight_provider.poll_active_jobs(key)
+        state = preflight_provider.collect_preflight(
+            now=clock(),
+            jobs_payload=payload,
+            own_job_id=own_job_id,
+            expected_event_id=config["preflight_provider"].get("expected_event_id"),
+        )
+        path = _absolute(config.get("preflight_file"), "preflight_file")
+        protected = [
+            _absolute(config.get(name), name)
+            for name in ("source_root", "checkout", "mapping_file", "output_root")
+        ]
+        protected.append(config_path)
+        check_output_root(path.parent, protected)
+        preflight_provider.write_snapshot(path, state, output_root=path.parent)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        raise FeedbackError("preflight provider verification failed") from exc
+
+
+def _build_environment():
+    environment = os.environ.copy()
+    for name in ("FEEDBACK_CRONICLE_API_KEY", "FEEDBACK_CRONICLE_KEY_FD"):
+        environment.pop(name, None)
+    return environment
+
+
 def run_config(path, *, now=None, clock=None, popen=subprocess.Popen):
     clock = clock or ((lambda: now) if now is not None else (lambda: datetime.now(UTC)))
     now = clock()
@@ -207,7 +294,9 @@ def run_config(path, *, now=None, clock=None, popen=subprocess.Popen):
         print(json.dumps({"status": "disabled"}))
         return 0
     _code_pin(config)
-    preflight(config, now)
+    use_provider = _provider_enabled(config)
+    if not use_provider:
+        preflight(config, now)
     args = command(config, now)
     output = Path(config["output_root"])
     check_output_root(output, [path, Path(config["preflight_file"])])
@@ -221,6 +310,10 @@ def run_config(path, *, now=None, clock=None, popen=subprocess.Popen):
         previous = {}
 
         def stop(signum, _frame):
+            # poll_active_jobs reaps curl in its finally block. Ignore repeated signals
+            # before unwinding that block so cleanup cannot itself be interrupted.
+            for other in previous:
+                signal.signal(other, signal.SIG_IGN)
             raise _Stopped(signum)
 
         process = None
@@ -228,8 +321,11 @@ def run_config(path, *, now=None, clock=None, popen=subprocess.Popen):
             for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 previous[signum] = signal.signal(signum, stop)
             args = command(config, clock())
+            if use_provider:
+                _refresh_preflight(config, clock, config_path=path)
+                args = command(config, clock())
             preflight(config, clock())
-            process = popen(args, start_new_session=True)
+            process = popen(args, start_new_session=True, close_fds=True, env=_build_environment())
             return process.wait(timeout=timeout)
         except _Stopped as exc:
             for signum in previous:
@@ -254,8 +350,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         return run_config(args.config)
-    except (OSError, ValueError, KeyError) as exc:
-        print(f"feedback-runtime: {type(exc).__name__}: {exc}", file=sys.stderr)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        print("feedback-runtime: execution failed", file=sys.stderr)
         return 2
 
 

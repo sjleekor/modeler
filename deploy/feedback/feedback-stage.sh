@@ -73,5 +73,8 @@ for variable in "${!PYTHON@}"; do
 done
 export PYTHONPATH="$code_root/src"
 export PYTHONDONTWRITEBYTECODE=1
+# Cronicle lib/job.js sets JOB_ID=job.id. Runtime still verifies this exact record
+# and its expected event through the API before excluding only its own job.
+export FEEDBACK_JOB_ID="${FEEDBACK_JOB_ID:-${JOB_ID:-}}"
 args=(-s -P -m modeler.feedback.runtime --config "$config")
 exec "$python" "${args[@]}"

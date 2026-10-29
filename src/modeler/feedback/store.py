@@ -64,8 +64,11 @@ def check_output_root(root: Path, source_roots: list[Path]) -> Path:
         source = Path(source).resolve()
         if resolved.is_relative_to(source) or source.is_relative_to(resolved):
             raise FeedbackError("output and source roots must be disjoint")
-    if root.exists() and any(p.is_symlink() for p in root.rglob("*")):
-        raise FeedbackError("output contains symlinks")
+    if root.exists():
+        # Keep memory bounded by one directory while historical evidence grows.
+        for parent, directories, files in os.walk(root, followlinks=False):
+            if any((Path(parent) / name).is_symlink() for name in directories + files):
+                raise FeedbackError("output contains symlinks")
     return root
 
 

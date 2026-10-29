@@ -36,6 +36,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -120,6 +121,134 @@ def log(message: str) -> None:
 
 def now_kst() -> str:
     return datetime.now(KST).replace(microsecond=0).isoformat()
+
+
+def _feedback_event(mode: str, config: dict, entry: dict, unit: str, **evidence) -> dict | None:
+    """Optional, bounded observer. Its failure never changes the publisher result.
+
+    The setting is opt-in on the publisher process, including manual corrections.
+    No helper is imported or started when it is absent. The durable pre-push intent
+    belongs to feedback evidence, never to the publisher recovery journal.
+    """
+    settings = os.environ.get("FEEDBACK_CAPTURE_SETTINGS")
+    if not settings:
+        return None
+    process = None
+    handlers = {}
+    signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+    def stopped(sig, _frame):
+        for other in handlers:
+            signal.signal(other, signal.SIG_IGN)
+        raise SystemExit(128 + sig)
+
+    try:
+        checkout = Path(config["checkout_dir"])
+        request = {
+            "mode": mode,
+            "settings_path": settings,
+            "unit": unit,
+            "config": {
+                k: config[k]
+                for k in ("checkout_dir", "expected_remote_url", "remote_name", "branch")
+            },
+            "entry": {
+                k: entry[k]
+                for k in (
+                    "run_dir",
+                    "markdown_dir",
+                    "report_sha256",
+                    "invocation_id",
+                    "release",
+                    "unit_sha256",
+                    "commit",
+                    "revision",
+                )
+                if k in entry
+            },
+            **evidence,
+        }
+        origin = f"refs/remotes/{config['remote_name']}/{config['branch']}"
+        request.setdefault("previous_remote_head", rev(checkout, origin))
+        if mode != "prepare":
+            request.setdefault("remote_head", rev(checkout, origin))
+            request.setdefault("verified_by", datetime.now(KST).isoformat())
+            request["entry"].setdefault("commit", request["remote_head"])
+        raw = json.dumps(request, ensure_ascii=False, allow_nan=False).encode()
+        if len(raw) > 65536:
+            raise ValueError("oversized observer request")
+        for sig in signals:
+            handlers[sig] = signal.signal(sig, stopped)
+        environment = os.environ.copy()
+        inherited_pythonpath = environment.get("PYTHONPATH")
+        for name in list(environment):
+            if name.startswith("PYTHON"):
+                environment.pop(name)
+        if inherited_pythonpath:
+            environment["PYTHONPATH"] = inherited_pythonpath
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        code = environment.get("FEEDBACK_CAPTURE_CODE_ROOT")
+        if code:
+            root = Path(code)
+            if (
+                not root.is_absolute()
+                or ".." in root.parts
+                or any(p.is_symlink() for p in (root, *root.parents))
+            ):
+                raise ValueError("invalid observer code root")
+            module = root / "src/modeler/feedback/publisher_capture.py"
+            if not module.is_file() or module.is_symlink():
+                raise ValueError("observer code is unavailable")
+            environment["PYTHONPATH"] = str(root / "src")
+        for name in ("FEEDBACK_CRONICLE_API_KEY", "FEEDBACK_CRONICLE_KEY_FD"):
+            environment.pop(name, None)
+        process = subprocess.Popen(
+            [sys.executable, "-s", "-P", "-m", "modeler.feedback.publisher_capture"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=environment,
+        )
+        output, _ = process.communicate(raw, timeout=10)
+        if process.returncode or len(output) > 65536:
+            raise ValueError("observer failed")
+        response = json.loads(output)
+        if not isinstance(response, dict) or response.get("status") == "failed":
+            raise ValueError("invalid observer response")
+        return response
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        log("feedback capture failed; publication coverage awaits review")
+        return None
+    finally:
+        if process is not None:
+            # Mask repeated termination while reaping the entire observer group.
+            for sig in handlers:
+                signal.signal(sig, signal.SIG_IGN)
+            try:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                for stream in (process.stdin, process.stdout):
+                    if stream is not None:
+                        stream.close()
+            finally:
+                for sig, handler in handlers.items():
+                    signal.signal(sig, handler)
+        else:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
 
 
 # ---------------------------------------------------------------------------
@@ -923,6 +1052,7 @@ def _sync_round(
     units = journal["units"]
     _reconcile_local_commits(checkout, remote, branch, journal)
     for unit in [u for u, e in units.items() if e.pop("_pushed", False)]:
+        _feedback_event("reobserve", config, units[unit], unit)
         summary["units"][unit] = "published"
         del units[unit]
     write_journal(checkout, journal)
@@ -940,6 +1070,7 @@ def _sync_round(
                 reason=reason,
             )
             if outcome == "unchanged":
+                _feedback_event("reobserve", config, entry, unit)
                 summary["units"][unit] = "unchanged"
                 del units[unit]
             elif outcome in (REJECTED, CORRECTION_REQUIRED):
@@ -949,6 +1080,7 @@ def _sync_round(
     committed = {u: e for u, e in units.items() if e["state"] == PUSH_PENDING and e.get("commit")}
     if not rev_list(checkout, f"{origin_ref}..HEAD"):
         return "done"
+    intents = {u: _feedback_event("prepare", config, e, u) for u, e in committed.items()}
     try:
         push(checkout, remote, branch)
     except NonFastForward:
@@ -960,6 +1092,7 @@ def _sync_round(
         return "push_failed"
     git(checkout, "update-ref", origin_ref, "HEAD")  # 방금 push했으므로 원격 main과 같습니다.
     for unit in committed:
+        _feedback_event("published", config, committed[unit], unit, intent=intents[unit])
         summary["units"][unit] = "published"
         del units[unit]
     write_journal(checkout, journal)

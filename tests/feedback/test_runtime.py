@@ -197,3 +197,305 @@ def test_real_interruption_kills_child_group_and_leaves_index_unchanged(tmp_path
         for pid in pids:
             if _alive(pid):
                 os.kill(pid, signal.SIGKILL)
+
+
+INCREMENTAL_NOW = datetime(2026, 11, 9, 2, tzinfo=UTC)
+
+
+def provider_config(tmp_path, monkeypatch):
+    value = config(tmp_path)
+    state = tmp_path / "state/preflight.json"
+    state.parent.mkdir()
+    Path(value["preflight_file"]).replace(state)
+    value.update(
+        mode="incremental",
+        not_before_date="2026-11-07",
+        sessions=["2026-11-09"],
+        preflight_file=str(state),
+        preflight_provider={"enabled": True, "expected_event_id": "feedback-event"},
+        require_preflight_provider=True,
+    )
+    monkeypatch.setattr(runtime, "_completion", lambda source: None)
+    monkeypatch.setenv("FEEDBACK_JOB_ID", "feedback-self")
+    monkeypatch.setenv("FEEDBACK_CRONICLE_API_KEY", "synthetic-env-key")
+    actual_collect = runtime.preflight_provider.collect_preflight
+
+    def injected_collect(**kwargs):
+        return actual_collect(**kwargs, read_memory=lambda: 2**32, load=lambda: 0.1)
+
+    monkeypatch.setattr(runtime.preflight_provider, "collect_preflight", injected_collect)
+    return value
+
+
+def _self_payload():
+    return {
+        "code": 0,
+        "jobs": {"feedback-self": {"id": "feedback-self", "event": "feedback-event"}},
+    }
+
+
+def test_incremental_provider_refreshes_stale_snapshot_and_scrubs_build_environment(
+    tmp_path, monkeypatch
+):
+    value = provider_config(tmp_path, monkeypatch)
+    observations = []
+    proxy_names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+    proxy_state = {name: os.environ.get(name) for name in proxy_names}
+
+    def poll(key):
+        assert key == "synthetic-env-key"
+        observations.append("fresh-api")
+        return _self_payload()
+
+    monkeypatch.setattr(runtime.preflight_provider, "poll_active_jobs", poll)
+
+    class Child:
+        def wait(self, timeout):
+            return 0
+
+    def spawn(args, **kwargs):
+        assert observations == ["fresh-api"]
+        state = json.loads(Path(value["preflight_file"]).read_bytes())
+        assert state["observed_at"] == INCREMENTAL_NOW.isoformat()
+        assert state["excluded_own_job"] is True
+        assert state["active_jobs"] == []
+        assert "FEEDBACK_CRONICLE_API_KEY" not in kwargs["env"]
+        assert "FEEDBACK_CRONICLE_KEY_FD" not in kwargs["env"]
+        assert {name: kwargs["env"].get(name) for name in proxy_names} == proxy_state
+        assert kwargs["close_fds"] is True
+        assert kwargs["start_new_session"] is True
+        return Child()
+
+    assert runtime.run_config(write_config(tmp_path, value), now=INCREMENTAL_NOW, popen=spawn) == 0
+    assert os.environ["FEEDBACK_CRONICLE_API_KEY"] == "synthetic-env-key"
+
+
+@pytest.mark.parametrize("failure", ["api", "missing-self", "event", "other", "request"])
+def test_provider_failure_never_uses_old_success_or_spawns(tmp_path, monkeypatch, failure):
+    value = provider_config(tmp_path, monkeypatch)
+    snapshot = Path(value["preflight_file"])
+    old = json.loads(snapshot.read_bytes())
+    old["observed_at"] = INCREMENTAL_NOW.isoformat()
+    snapshot.write_text(json.dumps(old))
+
+    def poll(key):
+        payload = _self_payload()
+        if failure == "request":
+            raise OSError("synthetic-credential-in-exception")
+        if failure == "api":
+            payload["code"] = 1
+        elif failure == "missing-self":
+            payload["jobs"] = {}
+        elif failure == "event":
+            payload["jobs"]["feedback-self"]["event"] = "wrong-event"
+        elif failure == "other":
+            payload["jobs"]["other"] = {"id": "other", "event": "other-event"}
+        return payload
+
+    monkeypatch.setattr(runtime.preflight_provider, "poll_active_jobs", poll)
+
+    def no_spawn(*args, **kwargs):
+        pytest.fail("unverified provider spawned build child")
+
+    with pytest.raises(FeedbackError):
+        runtime.run_config(write_config(tmp_path, value), now=INCREMENTAL_NOW, popen=no_spawn)
+    if failure != "other":
+        assert json.loads(snapshot.read_bytes()) == old
+
+
+def test_provider_self_job_is_explicit_and_does_not_infer_cronicle_job_id(tmp_path, monkeypatch):
+    value = provider_config(tmp_path, monkeypatch)
+    monkeypatch.delenv("FEEDBACK_JOB_ID")
+    monkeypatch.setenv("JOB_ID", "feedback-self")
+    monkeypatch.setattr(
+        runtime.preflight_provider,
+        "poll_active_jobs",
+        lambda key: pytest.fail("missing explicit identity must fail before polling"),
+    )
+    with pytest.raises(FeedbackError, match="provider verification failed"):
+        runtime.run_config(write_config(tmp_path, value), now=INCREMENTAL_NOW)
+
+
+def test_provider_fd_precedes_environment_and_is_not_inherited_by_build(tmp_path, monkeypatch):
+    value = provider_config(tmp_path, monkeypatch)
+    key = tmp_path / "synthetic-key-fd"
+    key.write_bytes(b"synthetic-fd-key")
+
+    def poll(secret):
+        assert secret == "synthetic-fd-key"
+        return _self_payload()
+
+    monkeypatch.setattr(runtime.preflight_provider, "poll_active_jobs", poll)
+
+    class Child:
+        def wait(self, timeout):
+            return 0
+
+    def spawn(args, **kwargs):
+        assert kwargs["close_fds"] is True
+        assert "pass_fds" not in kwargs
+        assert "FEEDBACK_CRONICLE_KEY_FD" not in kwargs["env"]
+        return Child()
+
+    with key.open("rb") as stream:
+        monkeypatch.setenv("FEEDBACK_CRONICLE_KEY_FD", str(stream.fileno()))
+        assert (
+            runtime.run_config(write_config(tmp_path, value), now=INCREMENTAL_NOW, popen=spawn) == 0
+        )
+
+
+def test_operational_config_can_require_provider_without_changing_legacy_isolated(tmp_path):
+    value = config(tmp_path)
+    value.update(mode="incremental", require_preflight_provider=True)
+    with pytest.raises(FeedbackError, match="requires an enabled preflight provider"):
+        runtime.run_config(write_config(tmp_path, value), now=INCREMENTAL_NOW)
+    value["mode"] = "isolated"
+    assert runtime._provider_enabled(value) is False
+
+
+def test_disabled_runtime_does_not_read_provider_identity_or_credentials(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runtime,
+        "_provider_enabled",
+        lambda config: pytest.fail("disabled runner inspected provider"),
+    )
+    assert (
+        runtime.run_config(
+            write_config(
+                tmp_path,
+                {
+                    "schema": "prediction-feedback-runtime.v1",
+                    "enabled": False,
+                    "preflight_provider": {"enabled": True},
+                },
+            )
+        )
+        == 0
+    )
+
+
+def test_runtime_main_does_not_log_exception_credentials(tmp_path, monkeypatch, capsys):
+    def fail(path):
+        raise OSError("synthetic-secret-must-stay-private")
+
+    monkeypatch.setattr(runtime, "run_config", fail)
+    assert runtime.main(["--config", str(tmp_path / "runtime.json")]) == 2
+    assert capsys.readouterr().err == "feedback-runtime: execution failed\n"
+
+
+def test_term_during_provider_unwinds_before_build_and_restores_handlers(tmp_path, monkeypatch):
+    value = provider_config(tmp_path, monkeypatch)
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def poll(key):
+        # Exercise the real runtime signal handler with a mocked network boundary.
+        handler = signal.getsignal(signal.SIGTERM)
+        assert handler is not previous
+        handler(signal.SIGTERM, None)
+
+    monkeypatch.setattr(runtime.preflight_provider, "poll_active_jobs", poll)
+
+    def no_spawn(*args, **kwargs):
+        pytest.fail("interrupted provider spawned build")
+
+    assert (
+        runtime.run_config(write_config(tmp_path, value), now=INCREMENTAL_NOW, popen=no_spawn)
+        == 143
+    )
+    assert signal.getsignal(signal.SIGTERM) is previous
+
+
+def test_term_during_provider_reaps_curl_before_restoring_handlers(tmp_path, monkeypatch):
+    import io
+
+    value = provider_config(tmp_path, monkeypatch)
+    actual_poll = runtime.preflight_provider.poll_active_jobs
+    events = []
+
+    class InterruptedOutput(io.BytesIO):
+        def read(self, size):
+            handler = signal.getsignal(signal.SIGTERM)
+            handler(signal.SIGTERM, None)
+
+    class Curl:
+        stdin = io.BytesIO()
+        stdout = InterruptedOutput()
+        finished = False
+
+        def poll(self):
+            return 0 if self.finished else None
+
+        def kill(self):
+            assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
+            events.append("killed")
+
+        def wait(self):
+            self.finished = True
+            events.append("reaped")
+            return 0
+
+    child = Curl()
+    monkeypatch.setattr(
+        runtime.preflight_provider,
+        "poll_active_jobs",
+        lambda key: actual_poll(key, popen=lambda *a, **k: child),
+    )
+    assert runtime.run_config(write_config(tmp_path, value), now=INCREMENTAL_NOW) == 143
+    assert events == ["killed", "reaped"]
+    assert child.stdout.closed
+
+
+def test_provider_curl_timeout_is_reaped_without_spawning_build(tmp_path, monkeypatch):
+    import io
+
+    value = provider_config(tmp_path, monkeypatch)
+    actual_poll = runtime.preflight_provider.poll_active_jobs
+    events = []
+
+    class Curl:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(b'{"code":0,"jobs":{}}')
+        killed = False
+        finished = False
+
+        def poll(self):
+            return 0 if self.finished else None
+
+        def kill(self):
+            self.killed = True
+            events.append("killed")
+
+        def wait(self, timeout=None):
+            if not self.killed:
+                raise subprocess.TimeoutExpired("synthetic-curl", timeout)
+            self.finished = True
+            events.append("reaped")
+            return 0
+
+    child = Curl()
+    monkeypatch.setattr(
+        runtime.preflight_provider,
+        "poll_active_jobs",
+        lambda key: actual_poll(key, popen=lambda *a, **k: child),
+    )
+
+    def no_spawn(*args, **kwargs):
+        pytest.fail("timed out provider spawned build")
+
+    with pytest.raises(FeedbackError, match="provider verification failed"):
+        runtime.run_config(write_config(tmp_path, value), now=INCREMENTAL_NOW, popen=no_spawn)
+    assert events == ["killed", "reaped"]
+
+
+def test_provider_poll_cannot_carry_execution_past_change_window(tmp_path, monkeypatch):
+    value = provider_config(tmp_path, monkeypatch)
+    before = datetime(2026, 11, 9, 13, 44, 59, tzinfo=UTC)
+    after = before + timedelta(seconds=15)
+    ticks = iter([before, before, after, after])
+    monkeypatch.setattr(runtime.preflight_provider, "poll_active_jobs", lambda key: _self_payload())
+
+    def no_spawn(*args, **kwargs):
+        pytest.fail("provider polling crossed the allowed execution window")
+
+    with pytest.raises(FeedbackError, match="outside the post-briefing window"):
+        runtime.run_config(write_config(tmp_path, value), clock=lambda: next(ticks), popen=no_spawn)

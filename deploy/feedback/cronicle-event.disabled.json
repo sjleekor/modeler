@@ -1,11 +1,10 @@
 {
   "activation_not_before": "2026-11-07",
   "blocked_by": [
-    "source-consistent publication coverage capture",
-    "fresh read-only Cronicle preflight provider",
-    "pinned KR sessions and deployment bundle",
-    "multi-day index RSS and volume validation",
-    "separate change day from P4/P10/P11/collector"
+    "reviewed complete producer registry and controlled epoch",
+    "read-only Cronicle credential delivery at activation",
+    "separate change day from P4/P10/P11/collector",
+    "server check of final disabled bundle before activation"
   ],
   "enabled": false,
   "events": [
@@ -15,7 +14,7 @@
         "/home/whi/apps/prediction-feedback/releases/f3-v1/deploy/feedback/feedback-stage.sh"
       ],
       "catch_up": 0,
-      "category": null,
+      "category": "general",
       "enabled": 0,
       "environment": {
         "FEEDBACK_CODE_ROOT": "/home/whi/apps/prediction-feedback/releases/f3-v1",
@@ -25,9 +24,9 @@
       "id": "prediction_feedback_kr_incremental",
       "max_children": 1,
       "memory_limit": 536870912,
-      "plugin": null,
+      "plugin": "shellplug",
       "queue": 0,
-      "target": null,
+      "target": "maingrp",
       "timeout": 180,
       "timezone": "Asia/Seoul",
       "timing": {
@@ -48,6 +47,8 @@
       "title": "KR Prediction Feedback 10:35"
     }
   ],
+  "job_id_binding": "Cronicle lib/job.js JOB_ID -> wrapper FEEDBACK_JOB_ID -> exact API job/event verification",
+  "observed_live_fields_at": "2026-10-30T07:31:22+09:00",
   "requires_live_category_target_plugin_review": true,
   "schema": "prediction-feedback-cronicle-proposal.v1"
 }

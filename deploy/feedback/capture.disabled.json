@@ -1,0 +1,13 @@
+{
+  "schema": "prediction-feedback-capture-settings.v1",
+  "enabled": false,
+  "epoch_id": "activation-pending",
+  "output_root": "/home/whi/data/stock_data/kr/output/prediction_feedback/captures",
+  "producer_scope": {
+    "reviewed": false,
+    "registry_complete": false,
+    "controlled_epoch": false,
+    "registry_sha256": null,
+    "producers": []
+  }
+}
