@@ -27,13 +27,14 @@ ASSETS = {
     "assets/us-ridge-top20.svg",
 }
 # 근거 기능을 넣기 전 코드(modeler 0ebe1c8)로 같은 fixture를 렌더한 단위 해시입니다.
+# f1·f3은 R-7 문구(briefing-r7-kr-halt 4d7ac26)를 합친 뒤 다시 구했습니다 — 바뀐 곳은 kr-stocks.md 상태 줄 하나입니다.
 # 근거 입력이 없으면(absent·disabled) 출력이 이것과 바이트까지 같아야 합니다(계획 C7·§5.4).
 BEFORE_EXPLAIN = {
-    "f1_normal": "c60268250b0333246070ed2a3dbe94e4deee6958ea6a1fbaf2ad3ec75311925c",
+    "f1_normal": "3b53f45cbd94265a0a390331889fcd529802f50d9ecbcfb818e7792c1d7fbb58",
     "f2_kr_unavailable_us_stale": (
         "0ef37ca6d6f47a57c9098168d236b95318896ae3499d629d614b818a3c3b7eae"
     ),
-    "f3_replay": "2a01fd12b80cc457433dd7eb5697d865a08dbc8671c94c1d63e424342032db5f",
+    "f3_replay": "a3dc506be03fe395fd2b75573021b1ccfcfe5df5ef7340e5dc9e724b7b43f05c",
     "f4_all_failed": "47abc436c539e2fa0a81030313c59c4b1c60a7c22edab118945fa027228d8f8d",
     "f5_lag_over_limit": "3fdbd7a5d75ff0ebc136f7d122415772f6432968bf385c1091526a4ea5508cbe",
 }
