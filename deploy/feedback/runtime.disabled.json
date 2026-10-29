@@ -1,0 +1,31 @@
+{
+  "checkout": "/home/whi/apps/market-briefing/reports-checkout",
+  "code_files": {
+    "__init__.py": "b5940fe660dca3e0aea2ca247a219c4915f6dfe2c2818b32791f5082eecf128d",
+    "feedback/__init__.py": "3ea7ae76e671889bac9e683fd6c4d05f2c1b9c3bed3c65a5493ccde56962ab87",
+    "feedback/__main__.py": "b2a199bfe14407bdd296a2ae66f8079c33f87248bbc0b77dc0be057419a4eb4c",
+    "feedback/briefing.py": "00b4c3bb5c8a9671b83c4b519ad0ac89a1c57b0258c19639356d833f9cafb7a8",
+    "feedback/core.py": "9645891706e8c090afaf2a316d625b0a2da5a3d9627064a744e0b802267a6ce6",
+    "feedback/issues.py": "71f8e8ee7f2d819ecfd5e6599f6682973bf2a51af196e60f2393a0d00a090259",
+    "feedback/receipt.py": "380a1fd31c59b709b8c02ff3b644ba23acfc9344749bd7d053d0c85c2410b165",
+    "feedback/runtime.py": "c31710f034123f4005489eb87866b09c103a2160287a9887acafbf4d0e961a11",
+    "feedback/shadow.py": "2836586295f3cef72901b8b69b6777c170c172e511380dbc33d462aa53274ae6",
+    "feedback/store.py": "5d2015bdacc3ba17c2ef027276abd9a71317cd0cf0fbccb4e74fb96dc5483347",
+    "reporting/__init__.py": "8dd4ae151cc7889f1523b762f449e22a30f5655b0cef7c733b6d4ef0b80ce07f",
+    "reporting/markdown.py": "dc4c6df049b7907e2bbad57245c1270e2546308cf28c44dea820e6daae76009b"
+  },
+  "enabled": false,
+  "issues_blob": "5a5d295bb67186f9598b4ec4ad07d290c5dfe4d7",
+  "mapping_file": "/home/whi/apps/prediction-feedback/config/mapping.json",
+  "mapping_sha256": "a9b934a2c22c9f2443edf3a819c3b28f2eff22f413f45a19840bbda2dd3cf42a",
+  "memory_limit_bytes": 536870912,
+  "mode": "incremental",
+  "my_commit": "a7597f204dbb79065fe29a57b3a4935556020506",
+  "not_before_date": "2026-11-07",
+  "output_root": "/home/whi/data/stock_data/kr/output/prediction_feedback/v1",
+  "preflight_file": "/home/whi/apps/prediction-feedback/state/preflight.json",
+  "schema": "prediction-feedback-runtime.v1",
+  "sessions": [],
+  "source_root": "/home/whi/apps/market-briefing/serving/runs",
+  "timeout_seconds": 180
+}

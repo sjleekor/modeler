@@ -1,0 +1,53 @@
+{
+  "activation_not_before": "2026-11-07",
+  "blocked_by": [
+    "source-consistent publication coverage capture",
+    "fresh read-only Cronicle preflight provider",
+    "pinned KR sessions and deployment bundle",
+    "multi-day index RSS and volume validation",
+    "separate change day from P4/P10/P11/collector"
+  ],
+  "enabled": false,
+  "events": [
+    {
+      "argv": [
+        "/bin/bash",
+        "/home/whi/apps/prediction-feedback/releases/f3-v1/deploy/feedback/feedback-stage.sh"
+      ],
+      "catch_up": 0,
+      "category": null,
+      "enabled": 0,
+      "environment": {
+        "FEEDBACK_CODE_ROOT": "/home/whi/apps/prediction-feedback/releases/f3-v1",
+        "FEEDBACK_CONFIG": "/home/whi/apps/prediction-feedback/config/runtime.json",
+        "FEEDBACK_PYTHON": "/home/whi/apps/market-briefing/serving/venv/bin/python"
+      },
+      "id": "prediction_feedback_kr_incremental",
+      "max_children": 1,
+      "memory_limit": 536870912,
+      "plugin": null,
+      "queue": 0,
+      "target": null,
+      "timeout": 180,
+      "timezone": "Asia/Seoul",
+      "timing": {
+        "hours": [
+          10
+        ],
+        "minutes": [
+          35
+        ],
+        "weekdays": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "title": "KR Prediction Feedback 10:35"
+    }
+  ],
+  "requires_live_category_target_plugin_review": true,
+  "schema": "prediction-feedback-cronicle-proposal.v1"
+}
