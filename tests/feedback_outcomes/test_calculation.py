@@ -370,6 +370,105 @@ def test_incomplete_original_slots_never_shrink_or_promote(ranks):
     assert result["net"] is None
 
 
+@pytest.mark.parametrize("size", [20, 100])
+def test_missing_original_slot_preserves_known_execution_and_unknown_weights(size):
+    result = aggregate_cohort({"size": size}, rows_for(size)[:-1])
+    assert result["status"] == "source_incomplete"
+    assert result["mature"] is False
+    assert result["original_slot_count"] == size
+    assert result["resolved_slot_count"] == size - 1
+    assert result["missing_rank_count"] == 1
+    assert result["duplicate_rank_count"] == result["invalid_rank_row_count"] == 0
+    assert result["nominal_buy_weight"] == pytest.approx((size - 1) / size)
+    assert result["nominal_sell_weight"] == pytest.approx((size - 1) / size)
+    assert result["unresolved_weight"] == pytest.approx(1 / size)
+    assert all(result[key] is None for key in ("net", "benchmark", "excess", "gross", "cost"))
+
+
+def test_missing_and_present_unknown_slots_use_same_original_denominator():
+    rows = rows_for()[:-1]
+    rows[-1].update(net=None, gross=None, cost=None, exit_executed=False, status="exit_unresolved")
+    rows[-2].update(benchmark=None, excess=None)
+    result = aggregate_cohort({"size": 20}, rows)
+    assert result["status"] == "source_incomplete"
+    assert result["nominal_buy_weight"] == 0.95
+    assert result["nominal_sell_weight"] == 0.9
+    assert result["unresolved_weight"] == 0.15
+    assert result["resolved_slot_count"] == 17
+    assert result["net"] is result["benchmark"] is result["excess"] is None
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_duplicate_original_rank_is_unknown_without_selecting_a_candidate(reverse):
+    rows = rows_for()
+    duplicate = dict(rows[0], entry_executed=False, exit_executed=False)
+    rows.append(duplicate)
+    if reverse:
+        rows.reverse()
+    result = aggregate_cohort({"size": 20}, rows)
+    assert result["status"] == "source_incomplete"
+    assert result["missing_rank_count"] == 0
+    assert result["duplicate_rank_count"] == 1
+    assert result["invalid_rank_row_count"] == 0
+    assert result["resolved_slot_count"] == 19
+    assert result["nominal_buy_weight"] == result["nominal_sell_weight"] == 0.95
+    assert result["unresolved_weight"] == 0.05
+    assert result["net"] is None
+
+
+def test_duplicate_rank_and_missing_rank_each_count_one_original_unknown_slot():
+    rows = rows_for()[:-1]
+    rows.extend([dict(rows[0]), dict(rows[0])])
+    result = aggregate_cohort({"size": 20}, rows)
+    assert result["missing_rank_count"] == result["duplicate_rank_count"] == 1
+    assert result["nominal_buy_weight"] == result["nominal_sell_weight"] == 0.9
+    assert result["unresolved_weight"] == 0.1
+    assert result["resolved_slot_count"] == 18
+
+
+@pytest.mark.parametrize("bad_row", [None, {}, {"rank": True}, {"rank": "1"}, {"rank": 21}])
+def test_malformed_extra_row_does_not_add_original_execution_weight(bad_row):
+    result = aggregate_cohort({"size": 20}, rows_for() + [bad_row])
+    assert result["status"] == "source_incomplete"
+    assert result["invalid_rank_row_count"] == 1
+    assert result["missing_rank_count"] == result["duplicate_rank_count"] == 0
+    assert result["nominal_buy_weight"] == result["nominal_sell_weight"] == 1
+    assert result["unresolved_weight"] == 0
+    assert result["net"] is None
+
+
+@pytest.mark.parametrize("size", [20, 100])
+def test_empty_cohort_keeps_all_original_slots_unknown(size):
+    result = aggregate_cohort({"size": size}, [])
+    assert result["status"] == "source_incomplete"
+    assert result["missing_rank_count"] == size
+    assert result["resolved_slot_count"] == 0
+    assert result["nominal_buy_weight"] == result["nominal_sell_weight"] == 0
+    assert result["unresolved_weight"] == 1
+    assert result["net"] is None
+
+
+def test_summary_adds_incomplete_weights_to_other_cohorts_without_changing_means():
+    rows = rows_for()
+    available = aggregate_cohort({"size": 20}, rows)
+    incomplete = aggregate_cohort({"size": 20}, rows[:-1])
+    unresolved_rows = deepcopy(rows)
+    unresolved_rows[-1].update(net=None, status="exit_unresolved")
+    unresolved = aggregate_cohort({"size": 20}, unresolved_rows)
+    pending = aggregate_cohort({"size": 20}, rows_for(cutoff=ENTRY + "T18:00:00+09:00"))
+    secondary = aggregate_cohort({"size": 100}, rows_for(100)[:-1])
+    result = summarize([available, incomplete, unresolved, pending, secondary], rows)
+    assert result["top20"]["unresolved_weight"] == pytest.approx(1.1)
+    assert result["top20"]["total_cohort_count"] == 4
+    assert result["top20"]["mature_cohort_count"] == 2
+    assert result["top20"]["resolved_cohort_count"] == 1
+    assert result["top20"]["source_incomplete_cohort_count"] == 1
+    assert result["top20"]["pending_cohort_count"] == 1
+    assert result["top20"]["mean_net"] == pytest.approx(0.094)
+    assert result["top100"]["unresolved_weight"] == 0.01
+    assert result["top100"]["mean_net"] is None
+
+
 def test_top100_secondary_and_pending_cohort():
     result = aggregate_cohort({"size": 100}, rows_for(100))
     assert result["net"] == pytest.approx(0.094)

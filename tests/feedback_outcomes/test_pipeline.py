@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -177,3 +178,19 @@ def test_actual_evaluation_stays_blocked_without_source_bound_withdrawal_schema(
             cutoff=data["cutoff"],
             now=datetime.fromisoformat("2026-12-04T14:00:00+09:00"),
         )
+
+
+def test_ambiguous_first_publication_cannot_construct_a_price_adapter(monkeypatch):
+    from modeler.feedback_outcomes import pipeline
+
+    data = fixture()
+    first = data["events"][0]
+    first["coverage_status"] = "unknown"
+    later = deepcopy(first)
+    later.update(coverage_status="covered", verified_by="2026-11-04T10:06:00+09:00")
+    monkeypatch.setattr(
+        pipeline, "EndpointExtract", lambda *a, **kw: pytest.fail("ambiguous date read prices")
+    )
+    result = evaluate(data["calendar"], [later, first], None, cutoff=data["cutoff"], synthetic=True)
+    assert not result["rows"] and not result["cohorts"]
+    assert all(d["status"] == "pending" for d in result["decisions"])

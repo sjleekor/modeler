@@ -298,18 +298,36 @@ def aggregate_cohort(
     selected = [
         row
         for row in rows
-        if isinstance(row.get("rank"), int)
+        if isinstance(row, Mapping)
+        and isinstance(row.get("rank"), int)
         and not isinstance(row.get("rank"), bool)
         and 1 <= row["rank"] <= size
     ]
-    ranks = [row["rank"] for row in selected]
-    complete = len(selected) == size and set(ranks) == set(range(1, size + 1))
+    rank_counts = Counter(row["rank"] for row in selected)
+    missing = size - len(rank_counts)
+    duplicate = sum(count > 1 for count in rank_counts.values())
+    invalid = len(rows) - len(selected)
+    # A duplicated rank has no unambiguous original row. Do not pick the first
+    # candidate or count both executions against the same original weight.
+    unique = [row for row in selected if rank_counts[row["rank"]] == 1]
+    complete = missing == duplicate == invalid == 0
+    unknown = (
+        size
+        - len(unique)
+        + sum(
+            _number(row.get("net")) is None or _number(row.get("benchmark")) is None
+            for row in unique
+        )
+    )
     result = dict(cohort)
     result.update(
         size=size,
         slot_count=len(selected),
         original_slot_count=size,
         slot_weight=1 / size,
+        missing_rank_count=missing,
+        duplicate_rank_count=duplicate,
+        invalid_rank_row_count=invalid,
         mature=complete and all(row.get("mature") is True for row in selected),
         net=None,
         benchmark=None,
@@ -322,24 +340,14 @@ def aggregate_cohort(
             row.get("status") in _RESOLVED
             and _number(row.get("net")) is not None
             and _number(row.get("benchmark")) is not None
-            for row in selected
+            for row in unique
         ),
-        unresolved_weight=None,
-        nominal_buy_weight=None,
-        nominal_sell_weight=None,
+        unresolved_weight=unknown / size,
+        nominal_buy_weight=sum(row.get("entry_executed") is True for row in unique) / size,
+        nominal_sell_weight=sum(row.get("exit_executed") is True for row in unique) / size,
     )
     if not complete:
         return result
-    unknown = sum(
-        _number(row.get("net")) is None or _number(row.get("benchmark")) is None for row in selected
-    )
-    buy = sum(row.get("entry_executed") is True for row in selected) / size
-    sell = sum(row.get("exit_executed") is True for row in selected) / size
-    result.update(
-        unresolved_weight=unknown / size,
-        nominal_buy_weight=buy,
-        nominal_sell_weight=sell,
-    )
     if unknown == 0 and result["mature"]:
         result.update(
             net=_average([row.get("net") for row in selected]),

@@ -308,6 +308,7 @@ def select_cohorts(
     cohorts: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
     candidates: list[tuple[datetime, dict[str, Any], dict[str, Any]]] = []
+    uncertain_publications: dict[str, list[datetime]] = defaultdict(list)
     withdrawals = []
     for event in deepcopy(events):
         decision = {
@@ -331,6 +332,11 @@ def select_cohorts(
             decision["reasons"] = reasons
             if any(r in reasons for r in ("publication_unverified", "signal_session_unknown")):
                 decision["status"] = "pending"
+            # An otherwise eligible earlier report with unverified collection
+            # history cannot silently disappear from the first-report decision.
+            # Explicit failures/stale/other models remain ordinary exclusions.
+            if reasons == ["publication_unverified"]:
+                uncertain_publications[event["report_date"]].append(_instant(event["verified_by"]))
             continue
         candidates.append((_instant(event["verified_by"]), event, decision))
 
@@ -378,6 +384,12 @@ def select_cohorts(
     ):
         day, report_hash = event["report_date"], event["report_sha256"]
         earliest = min(item[0] for item in grouped[day])
+        if any(stamp <= earliest for stamp in uncertain_publications.get(day, [])):
+            decision.update(
+                status="pending",
+                reasons=["publication_unverified", "earlier_publication_unverified"],
+            )
+            continue
         tied = {item[1]["report_sha256"] for item in grouped[day] if item[0] == earliest}
         if len(tied) > 1 and day not in selected_dates:
             decision.update(status="pending", reasons=["ambiguous_first_publication"])

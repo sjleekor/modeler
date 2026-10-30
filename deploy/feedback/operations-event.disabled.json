@@ -1,0 +1,61 @@
+{
+  "schema": "prediction-feedback-operations-proposal.v1",
+  "is_cronicle_create_payload": false,
+  "enabled": false,
+  "activation_not_before": "2026-11-07",
+  "requires_fresh_server_review": true,
+  "requires_live_category_target_plugin_review": true,
+  "observed_live_fields_at": "2026-10-30T07:31:22+09:00",
+  "proposal_notes": [
+    "Review proposal only; not a Cronicle API create/update payload.",
+    "Use the existing event id only after fresh host, category, target and plugin review.",
+    "The release and dedicated current-UID-owned 0600 key path below are uninstalled placeholders.",
+    "Verify this explicit Python executable and host venv separately; no venv is copied or installed.",
+    "Before importing the launcher, bootstrap PYTHONPATH from this protected release/code/src explicitly.",
+    "Do not source a shell environment file or copy credentials using environment globs.",
+    "No key value or inherited credential FD belongs in this proposal environment.",
+    "Keep runtime and capture templates disabled; review complete producer registry and controlled epoch first.",
+    "Activation requires a separate change day from P4/P10/P11/collector."
+  ],
+  "blocked_by": [
+    "reviewed complete producer registry and controlled epoch",
+    "dedicated protected read-only Cronicle key provisioned separately",
+    "fresh server verification of final disabled bundle and dependency availability",
+    "separate production activation review on or after 2026-11-07"
+  ],
+  "events": [
+    {
+      "id": "prediction_feedback_kr_incremental",
+      "title": "KR Prediction Feedback 10:35",
+      "enabled": 0,
+      "category": "general",
+      "target": "maingrp",
+      "plugin": "shellplug",
+      "argv": [
+        "/home/whi/apps/market-briefing/serving/venv/bin/python",
+        "-s",
+        "-P",
+        "-m",
+        "modeler.feedback_operations.credential_launcher",
+        "--key-file",
+        "/home/whi/apps/prediction-feedback/secrets/UNPROVISIONED-dedicated-cronicle.key",
+        "--wrapper",
+        "/home/whi/apps/prediction-feedback/releases/operations-UNINSTALLED/code/deploy/feedback/feedback-stage.sh"
+      ],
+      "environment": {
+        "FEEDBACK_CODE_ROOT": "/home/whi/apps/prediction-feedback/releases/operations-UNINSTALLED/code",
+        "FEEDBACK_CONFIG": "/home/whi/apps/prediction-feedback/config/runtime.json",
+        "FEEDBACK_PYTHON": "/home/whi/apps/market-briefing/serving/venv/bin/python",
+        "PYTHONPATH": "/home/whi/apps/prediction-feedback/releases/operations-UNINSTALLED/code/src",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      },
+      "catch_up": 0,
+      "max_children": 1,
+      "queue": 0,
+      "timeout": 180,
+      "memory_limit": 536870912,
+      "timezone": "Asia/Seoul",
+      "timing": {"hours": [10], "minutes": [35], "weekdays": [1, 2, 3, 4, 5]}
+    }
+  ]
+}

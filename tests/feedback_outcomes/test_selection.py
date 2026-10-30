@@ -237,6 +237,70 @@ def test_invalid_report_does_not_take_first_slot(calendar):
     assert result["decisions"][1]["status"] == "selected"
 
 
+@pytest.mark.parametrize("coverage", ["unknown", "snapshot_only", "awaiting_coverage"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_earlier_unverified_history_holds_entire_date(calendar, coverage, reverse):
+    first = publication(coverage_status=coverage, verified_by="2026-11-04T10:04:00+09:00")
+    later = publication(
+        report_sha256="f" * 64,
+        invocation_id="later-report",
+        verified_by="2026-11-04T10:06:00+09:00",
+    )
+    events = [first, later]
+    result = choose(list(reversed(events)) if reverse else events, calendar)
+    assert result["cohorts"] == []
+    assert all(d["status"] == "pending" for d in result["decisions"])
+    selected_decision = next(
+        d for d in result["decisions"] if d["report_sha256"] == later["report_sha256"]
+    )
+    assert "earlier_publication_unverified" in selected_decision["reasons"]
+
+
+def test_unknown_history_at_same_time_also_blocks_later_candidate(calendar):
+    result = choose(
+        [
+            publication(coverage_status="unknown"),
+            publication(report_sha256="f" * 64, invocation_id="other"),
+        ],
+        calendar,
+    )
+    assert not result["cohorts"]
+
+
+def test_later_unknown_history_does_not_replace_a_verified_first_report(calendar):
+    first = publication()
+    later = publication(
+        coverage_status="unknown", report_sha256="f" * 64, verified_by="2026-11-04T10:06:00+09:00"
+    )
+    result = choose([later, first], calendar)
+    assert len(result["cohorts"]) == 2
+    assert {c["report_sha256"] for c in result["cohorts"]} == {first["report_sha256"]}
+
+
+def test_explicitly_invalid_unverified_report_does_not_poison_the_date(calendar):
+    bad = publication(
+        model_status="failed", coverage_status="unknown", verified_by="2026-11-04T10:04:00+09:00"
+    )
+    result = choose([bad, publication()], calendar)
+    assert len(result["cohorts"]) == 2
+
+
+def test_uncertain_date_does_not_consume_another_dates_sample(calendar):
+    first = publication(coverage_status="unknown")
+    second = publication(
+        report_date="2026-11-05",
+        feature_asof_date="2026-11-04",
+        decision_at="2026-11-05T10:00:00+09:00",
+        verified_by="2026-11-05T10:05:00+09:00",
+        collection_started_at="2026-11-05T10:01:00+09:00",
+        report_sha256="f" * 64,
+        invocation_id="another-date",
+    )
+    result = choose([first, second], calendar)
+    assert len(result["cohorts"]) == 2
+    assert {c["report_date"] for c in result["cohorts"]} == {"2026-11-05"}
+
+
 def test_ambiguous_simultaneous_reports_hold_entire_date(calendar):
     result = choose(
         [
