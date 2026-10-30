@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -253,7 +254,7 @@ def test_rejects_unsafe_key_file(case, monkeypatch, kind):
         key.unlink()
         os.mkfifo(key, 0o600)
     elif kind == "wrong_owner":
-        monkeypatch.setattr(launcher.os, "getuid", lambda: -1)
+        override_metadata(monkeypatch, key, st_uid=os.geteuid() + 1)
     else:
         original = launcher.os.open
 
@@ -335,3 +336,221 @@ def test_real_exec_pipe_survives_reviewed_bash_wrapper_without_key_environment(c
         "environment_key_absent": True,
         "eof": True,
     }
+
+
+class AlteredStat:
+    def __init__(self, original, **changes):
+        self.original = original
+        self.__dict__.update(changes)
+
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
+
+def override_metadata(monkeypatch, path, **changes):
+    identity = (path.stat().st_dev, path.stat().st_ino)
+    original_stat = launcher.os.stat
+    original_fstat = launcher.os.fstat
+
+    def alter(info):
+        if (info.st_dev, info.st_ino) == identity:
+            return AlteredStat(info, **changes)
+        return info
+
+    monkeypatch.setattr(launcher.os, "stat", lambda *a, **k: alter(original_stat(*a, **k)))
+    monkeypatch.setattr(launcher.os, "fstat", lambda *a, **k: alter(original_fstat(*a, **k)))
+
+
+def forbid_key_open(monkeypatch, key):
+    original = launcher.os.open
+
+    def guarded(path, *args, **kwargs):
+        assert os.fspath(path) not in (key.name, str(key)), "key opened before validation"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(launcher.os, "open", guarded)
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o707, 0o1777])
+@pytest.mark.parametrize("target", ["key", "wrapper", "config", "code", "python"])
+def test_untrusted_ancestor_rejected_before_key_open(case, monkeypatch, mode, target):
+    root, code, python, config, _, key = case
+    container = root / "untrusted"
+    container.mkdir()
+    destination = container / "deployment"
+    destination.mkdir()
+    original = {"key": key, "wrapper": WRAPPER, "config": config, "code": code, "python": python}[
+        target
+    ]
+    moved = destination / original.name
+    if target == "wrapper":
+        moved.write_bytes(original.read_bytes())
+    else:
+        original.rename(moved)
+    wrapper = moved if target == "wrapper" else WRAPPER
+    if target == "key":
+        key = moved
+    elif target in ("config", "code", "python"):
+        monkeypatch.setenv(
+            {
+                "config": "FEEDBACK_CONFIG",
+                "code": "FEEDBACK_CODE_ROOT",
+                "python": "FEEDBACK_PYTHON",
+            }[target],
+            str(moved),
+        )
+    container.chmod(mode)
+    forbid_key_open(monkeypatch, key)
+    with pytest.raises(launcher.LauncherError, match="directory protection"):
+        launcher.launch(key, wrapper, now=NOW, execve=never_exec)
+
+
+def test_wrong_owner_ancestor_rejected_before_key_open(case, monkeypatch):
+    override_metadata(monkeypatch, case[0], st_uid=os.geteuid() + 1)
+    forbid_key_open(monkeypatch, case[5])
+    with pytest.raises(launcher.LauncherError, match="directory protection"):
+        launcher.launch(case[5], WRAPPER, now=NOW, execve=never_exec)
+
+
+@pytest.mark.parametrize("target", ["wrapper", "config", "code", "python"])
+@pytest.mark.parametrize("mutation", ["group_write", "other_write", "wrong_owner"])
+def test_untrusted_runtime_leaf_rejected_before_key_open(case, monkeypatch, target, mutation):
+    wrapper = case[0] / "wrapper.sh"
+    wrapper.write_bytes(WRAPPER.read_bytes())
+    path = {
+        "wrapper": wrapper,
+        "config": case[3],
+        "code": case[1] / "src/modeler/reporting/markdown.py",
+        "python": case[2],
+    }[target]
+    if mutation == "wrong_owner":
+        override_metadata(monkeypatch, path, st_uid=os.geteuid() + 1)
+    else:
+        path.chmod(
+            stat.S_IMODE(path.stat().st_mode) | (0o020 if mutation == "group_write" else 0o002)
+        )
+    forbid_key_open(monkeypatch, case[5])
+    with pytest.raises(launcher.LauncherError, match="file protection"):
+        launcher.launch(case[5], wrapper, now=NOW, execve=never_exec)
+
+
+def test_root_sticky_container_allowed_only_above_deployment_root(tmp_path, monkeypatch):
+    container = tmp_path.resolve() / "container"
+    deployment = container / "deployment"
+    deployment.mkdir(parents=True)
+    payload = deployment / "payload"
+    payload.write_bytes(b"synthetic")
+    override_metadata(monkeypatch, container, st_uid=0, st_mode=stat.S_IFDIR | 0o1777)
+    assert launcher._read_regular(payload, 20, trusted=True, trust_root=deployment) == b"synthetic"
+    with pytest.raises(launcher.LauncherError, match="directory protection"):
+        launcher._inspect_path(container, directory=True)
+    with pytest.raises(launcher.LauncherError, match="directory protection"):
+        launcher._read_regular(payload, 20, trusted=True, trust_root=container)
+
+
+def test_key_parent_must_be_protected_even_when_root_sticky(case, monkeypatch):
+    parent = case[0] / "dedicated-key-parent"
+    parent.mkdir()
+    key = parent / case[5].name
+    case[5].rename(key)
+    override_metadata(monkeypatch, parent, st_uid=0, st_mode=stat.S_IFDIR | 0o1777)
+    forbid_key_open(monkeypatch, key)
+    with pytest.raises(launcher.LauncherError, match="directory protection"):
+        launcher.launch(key, WRAPPER, now=NOW, execve=never_exec)
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o707, 0o1777])
+def test_code_root_must_not_be_writable_even_if_root_owned(case, monkeypatch, mode):
+    override_metadata(monkeypatch, case[1], st_uid=0, st_mode=stat.S_IFDIR | mode)
+    forbid_key_open(monkeypatch, case[5])
+    with pytest.raises(launcher.LauncherError, match="directory protection"):
+        launcher.launch(case[5], WRAPPER, now=NOW, execve=never_exec)
+
+
+@pytest.mark.parametrize("mutation", ["ancestor", "leaf_mode", "leaf_owner"])
+def test_python_symlink_target_must_be_trusted(case, monkeypatch, mutation):
+    target_parent = case[0] / "interpreter-target"
+    target_parent.mkdir()
+    target = target_parent / "python"
+    case[2].rename(target)
+    case[2].symlink_to(target)
+    if mutation == "ancestor":
+        target_parent.chmod(0o777)
+    elif mutation == "leaf_mode":
+        target.chmod(0o777)
+    else:
+        override_metadata(monkeypatch, target, st_uid=os.geteuid() + 1)
+    forbid_key_open(monkeypatch, case[5])
+    with pytest.raises(launcher.LauncherError, match="protection"):
+        launcher.launch(case[5], WRAPPER, now=NOW, execve=never_exec)
+
+
+def test_python_symlink_preserves_original_runtime_path(case):
+    target = case[0] / "actual-python"
+    case[2].rename(target)
+    case[2].symlink_to(target)
+
+    def execute(_binary, _args, environment):
+        assert environment["FEEDBACK_PYTHON"] == str(case[2])
+        return 19
+
+    assert launcher.launch(case[5], WRAPPER, now=NOW, execve=execute) == 19
+
+
+def test_python_target_link_route_does_not_hide_untrusted_ancestor(case, monkeypatch):
+    target = case[0] / "actual-python"
+    case[2].rename(target)
+    unsafe = case[0] / "unsafe-link-route"
+    unsafe.mkdir()
+    (unsafe / "redirect").symlink_to(case[0], target_is_directory=True)
+    case[2].symlink_to(unsafe / "redirect" / target.name)
+    unsafe.chmod(0o777)
+    forbid_key_open(monkeypatch, case[5])
+    with pytest.raises(launcher.LauncherError, match="directory protection"):
+        launcher.launch(case[5], WRAPPER, now=NOW, execve=never_exec)
+
+
+def test_python_target_trusted_directory_link_is_supported(case):
+    target = case[0] / "actual-python"
+    case[2].rename(target)
+    link = case[0] / "trusted-directory-link"
+    link.symlink_to(case[0], target_is_directory=True)
+    case[2].symlink_to(link / target.name)
+    assert launcher.launch(case[5], WRAPPER, now=NOW, execve=lambda *_args: 29) == 29
+
+
+def test_python_target_parent_segments_follow_symlink_semantics(case, monkeypatch):
+    trusted = case[0] / "actual-python"
+    case[2].rename(trusted)
+    unsafe = case[0] / "unsafe-target"
+    (unsafe / "child").mkdir(parents=True)
+    (unsafe / trusted.name).write_bytes(trusted.read_bytes())
+    (unsafe / trusted.name).chmod(0o700)
+    redirect = case[0] / "redirect"
+    redirect.symlink_to(unsafe / "child", target_is_directory=True)
+    case[2].symlink_to(str(redirect) + "/../" + trusted.name)
+    unsafe.chmod(0o777)
+    forbid_key_open(monkeypatch, case[5])
+    with pytest.raises(launcher.LauncherError, match="directory protection"):
+        launcher.launch(case[5], WRAPPER, now=NOW, execve=never_exec)
+
+
+def test_disabled_does_not_open_key_with_untrusted_parent(case, monkeypatch):
+    case[4]["enabled"] = False
+    save_config(case)
+    parent = case[0] / "untrusted-key-parent"
+    parent.mkdir(mode=0o700)
+    key = parent / case[5].name
+    case[5].rename(key)
+    parent.chmod(0o777)
+    forbid_key_open(monkeypatch, key)
+    assert launcher.launch(key, WRAPPER, execve=lambda *_args: 13) == 13
+
+
+def test_untrusted_payload_reads_remain_available_for_rollback(tmp_path):
+    container = tmp_path.resolve() / "ordinary-payload"
+    container.mkdir(mode=0o700)
+    payload = container / "payload"
+    payload.write_bytes(b"synthetic")
+    container.chmod(0o777)
+    assert launcher._read_regular(payload, 20) == b"synthetic"

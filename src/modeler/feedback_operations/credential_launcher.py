@@ -56,27 +56,134 @@ def _identity(info):
     )
 
 
-def _read_regular(path, maximum, *, protected=False):
+def _trusted_owner(info):
+    return info.st_uid in (0, os.geteuid())
+
+
+def _check_directory(info, *, traversal):
+    writable = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    sticky_container = traversal and info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or not _trusted_owner(info)
+        or (writable and not sticky_container)
+    ):
+        raise LauncherError("untrusted directory protection")
+
+
+def _check_leaf(info):
+    if not _trusted_owner(info) or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise LauncherError("untrusted file protection")
+
+
+def _open_directory(path, *, trusted=False, trust_root=None):
     # Walk directories with openat/O_NOFOLLOW as well as checking path spelling.
     # A parent replaced with a symlink between validation and open cannot redirect us.
     directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-    descriptor = None
     try:
-        for component in path.parts[1:-1]:
+        if trusted:
+            _check_directory(os.fstat(directory), traversal=path != Path("/"))
+        current = Path("/")
+        for component in path.parts[1:]:
             next_directory = os.open(
                 component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory
             )
             os.close(directory)
             directory = next_directory
+            current /= component
+            if trusted:
+                _check_directory(
+                    os.fstat(directory),
+                    traversal=trust_root is None or not current.is_relative_to(trust_root),
+                )
+        return directory
+    except BaseException:
+        os.close(directory)
+        raise
+
+
+def _inspect_path(path, *, directory=False, trust_root=None):
+    if directory:
+        descriptor = _open_directory(path, trusted=True, trust_root=trust_root or path)
+        os.close(descriptor)
+        return
+    parent = _open_directory(path.parent, trusted=True, trust_root=trust_root)
+    descriptor = None
+    try:
+        before = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            raise LauncherError("invalid runtime paths")
+        _check_leaf(before)
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        if _identity(before) != _identity(os.fstat(descriptor)):
+            raise LauncherError("file changed during open")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _inspect_python(path):
+    # Keep the original argv/environment path: resolving a venv symlink for exec
+    # would change Python's virtual-environment discovery.
+    # Resolve links one at a time so a writable directory on the link's route
+    # cannot disappear from validation when its target is canonicalized.
+    candidate = path
+    for _ in range(40):
+        parts = candidate.parts
+        for index, component in enumerate(parts[1:], start=1):
+            parent_path = Path(*parts[:index])
+            if component == "..":
+                # Resolve earlier symlinks before interpreting '..'; normpath
+                # could otherwise validate a different executable than exec.
+                candidate = parent_path.parent / Path(*parts[index + 1 :])
+                break
+            parent = _open_directory(parent_path, trusted=True)
+            try:
+                before = os.stat(component, dir_fd=parent, follow_symlinks=False)
+                if stat.S_ISLNK(before.st_mode):
+                    if not _trusted_owner(before):
+                        raise LauncherError("untrusted interpreter link")
+                    target = os.readlink(component, dir_fd=parent)
+                    if _identity(before) != _identity(
+                        os.stat(component, dir_fd=parent, follow_symlinks=False)
+                    ):
+                        raise LauncherError("interpreter changed during validation")
+                    candidate = parent_path / target / Path(*parts[index + 1 :])
+                    break
+                if index < len(parts) - 1:
+                    _check_directory(before, traversal=index < len(parts) - 2)
+                else:
+                    _inspect_path(candidate, trust_root=candidate.parent)
+                    if not os.access(path, os.X_OK):
+                        raise LauncherError("invalid runtime paths")
+                    return
+            finally:
+                os.close(parent)
+        else:
+            raise LauncherError("invalid runtime paths")
+    raise LauncherError("interpreter link limit exceeded")
+
+
+def _read_regular(path, maximum, *, protected=False, trusted=False, trust_root=None):
+    # Rollback also uses this reader for ordinary payloads. Only launcher inputs
+    # opt into trust enforcement; protected credential reads always enforce it.
+    if protected and trust_root is None:
+        trust_root = path.parent
+    directory = _open_directory(path.parent, trusted=trusted or protected, trust_root=trust_root)
+    descriptor = None
+    try:
         before = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
         if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= maximum:
             raise LauncherError("invalid file")
         if protected and (
-            before.st_uid != os.getuid()
+            before.st_uid != os.geteuid()
             or stat.S_IMODE(before.st_mode) != 0o600
             or before.st_nlink != 1
         ):
             raise LauncherError("invalid credential file protection")
+        if trusted:
+            _check_leaf(before)
         descriptor = os.open(
             path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
         )
@@ -131,6 +238,7 @@ def _unique_object(items):
 def _code_pin(config, root):
     package = root / "src/modeler"
     feedback = _path(package / "feedback")
+    _inspect_path(feedback, directory=True, trust_root=root)
     required = {"__init__.py", "reporting/__init__.py", "reporting/markdown.py"}
     required.update(path.relative_to(package).as_posix() for path in feedback.glob("*.py"))
     pins = config.get("code_files")
@@ -142,7 +250,9 @@ def _code_pin(config, root):
             not isinstance(digest, str)
             or len(digest) != 64
             or any(char not in "0123456789abcdef" for char in digest)
-            or hashlib.sha256(_read_regular(_path(package / name), 4 * 1024 * 1024)).hexdigest()
+            or hashlib.sha256(
+                _read_regular(_path(package / name), 4 * 1024 * 1024, trusted=True, trust_root=root)
+            ).hexdigest()
             != digest
         ):
             raise LauncherError("code pin mismatch")
@@ -169,6 +279,8 @@ def launch(key_file, wrapper, *, now=None, execve=os.execve):
 
     The caller must provision a dedicated current-UID-owned 0600 key file separately.
     No network, service installation, environment sourcing, or activation is performed here.
+    Trust checks cover POSIX ownership and modes, not ACLs. A malicious process
+    running as the same UID can still replace trusted files after validation.
     """
     environment = os.environ.copy()
     for name in _CREDENTIAL_ENV:
@@ -179,19 +291,23 @@ def launch(key_file, wrapper, *, now=None, execve=os.execve):
     config_path = _path(environment.get("FEEDBACK_CONFIG", ""))
     python_path = _path(environment.get("FEEDBACK_PYTHON", ""), python=True)
     code_root = _path(environment.get("FEEDBACK_CODE_ROOT", ""))
-    if not python_path.is_file() or not os.access(python_path, os.X_OK) or not code_root.is_dir():
-        raise LauncherError("invalid runtime paths")
+    _inspect_python(python_path)
+    _inspect_path(code_root, directory=True)
     for name in (
         "src/modeler/__init__.py",
         "src/modeler/feedback/__init__.py",
         "src/modeler/feedback/runtime.py",
     ):
-        if not _path(code_root / name).is_file():
-            raise LauncherError("invalid runtime paths")
-    wrapper_bytes = _read_regular(wrapper_path, 64 * 1024)
+        _inspect_path(_path(code_root / name), trust_root=code_root)
+    wrapper_bytes = _read_regular(
+        wrapper_path, 64 * 1024, trusted=True, trust_root=wrapper_path.parent
+    )
     if hashlib.sha256(wrapper_bytes).hexdigest() != WRAPPER_SHA256:
         raise LauncherError("unreviewed wrapper")
-    config = json.loads(_read_regular(config_path, 1024 * 1024), object_pairs_hook=_unique_object)
+    config = json.loads(
+        _read_regular(config_path, 1024 * 1024, trusted=True, trust_root=config_path.parent),
+        object_pairs_hook=_unique_object,
+    )
     if (
         not isinstance(config, dict)
         or config.get("schema") != "prediction-feedback-runtime.v1"
