@@ -447,8 +447,12 @@ def test_publisher_input_carries_the_macro_switch(tmp_path: Path) -> None:
         assert built["macro_context_enabled"] is value
 
 
-def test_wrapper_run_with_macro_on_publishes_the_page_and_svg(tmp_path: Path) -> None:
-    """The calculation and renderer modules are stand-ins (``macro_fakes``) put into the release."""
+def test_wrapper_run_with_macro_on_but_no_market_sector_selection_publishes_a_notice(
+    tmp_path: Path,
+) -> None:
+    """This release has no market-sector section, so 09:30 select pins no selection document for
+    the macro calculation: the section fails with ``not_in_selection`` and the unit still goes out
+    with the failure notice (the ok path with a pinned document is in test_macro_context_stage)."""
     import macro_fakes as mk
 
     release, config = e2e._setup(tmp_path, extra_sources=mk.RELEASE_SOURCES)
@@ -457,20 +461,21 @@ def test_wrapper_run_with_macro_on_publishes_the_page_and_svg(tmp_path: Path) ->
     body["macro_context_enabled"] = True
     e2e._write(config, body)
     stages = _wrapper_run(release, config, D1, "2026-09-29T10:00:00+09:00")
-    assert stages["macro_context"] == "ok" and stages["publication"] == "published"
+    assert stages["macro_context"] == "failed" and stages["publication"] == "published"
     run = tmp_path / "runs" / D1.isoformat()
     document = json.loads((run / f"macro-{D1}.json").read_text())
     inference = json.loads((run / "coordinator-inference.json").read_text())
     assert document["invocation_id"] == inference["invocation_id"]
+    assert document["state"] == "failed" and document["reason"] == "not_in_selection"
     daily = json.loads((run / "reports-publisher-config.json").read_text())
     assert daily["macro_context_enabled"] is True
     pushed = _pushed_files(world, D1)
-    assert {"macro.md", "assets/macro-rates.svg"} <= pushed
+    assert "macro.md" in pushed and not any(name.startswith("assets/") for name in pushed)
     local = _unit_files(world, D1)
-    assert f"macro_sha256: {e2e._sha(run / f'macro-{D1}.json')}" in local["macro.md"].decode()
-    assert "[거시 흐름](macro.md)" in local["README.md"].decode()
+    assert "거시 흐름을 내지 못했습니다: not_in_selection." in local["macro.md"].decode()
+    assert "| [거시 흐름](macro.md) | 실패 |" in local["README.md"].decode()
     manifest = json.loads((run / "markdown" / "manifest.json").read_text())
-    assert manifest["macro_state"] == "ok"
+    assert manifest["macro_state"] == "failed"
     assert manifest["macro_path"] == str(run / f"macro-{D1}.json")
 
 

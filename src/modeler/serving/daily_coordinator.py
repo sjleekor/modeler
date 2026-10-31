@@ -667,10 +667,14 @@ def macro_context_stage(config: dict[str, Any], day: date, now: datetime) -> dic
     """Compute the display-only ``macro-D.json`` (거시 흐름) in a child process under a time limit.
 
     Runs after market-sector and explain, before render.  It needs the D selection only, not a
-    model report: a failure report still gets the section.  It never reads or changes
-    ``report-D.json``, ``market-sector-D.json`` or ``explain-D.json``.  A failure, a timeout or a
-    crash ends in a ``failed`` document (``modeler.scores.macro_context.failure_document``) that
-    carries this invocation's id; the stage never raises into the run.
+    model report: a failure report still gets the section.  The calculation reads the
+    market-sector selection document (``market-sector-selection.v1``, ``ms-selection.json``) that
+    09:30 select pinned, by path and SHA-256 from ``selection-state.json``'s ``market_sector``
+    block; without a usable block the section fails with the market-sector stage's reason codes.
+    It never reads or changes ``report-D.json``, ``market-sector-D.json`` or ``explain-D.json``.
+    A failure, a timeout or a crash ends in a ``failed`` document
+    (``modeler.scores.macro_context.failure_document``) that carries this invocation's id; the
+    stage never raises into the run.
     ``macro_context_enabled=false`` writes no document and the unit renders exactly as before.
     A document of an earlier invocation is set aside (renamed), never reused.
     """
@@ -718,10 +722,16 @@ def macro_context_stage(config: dict[str, Any], day: date, now: datetime) -> dic
         state = {"report_date": day.isoformat(), "status": "holiday"}
         _atomic(state_path, state)
         return state
+    block = selected.get("market_sector")
+    if not isinstance(block, dict):
+        return failed("not_in_selection")
+    if block.get("status") not in {"selected", "partial"}:
+        return failed(str(block.get("reason") or "inputs_unavailable"))
     try:
-        selection_path = (_absolute(config, "selection_root") / day.isoformat()
-                          / "selection-state.json")
-        selection_sha = _hash(selection_path)
+        selection_path = Path(block["selection"])
+        selection_sha = block["selection_sha256"]
+        if not isinstance(selection_sha, str) or _hash(selection_path) != selection_sha:
+            return failed("selection_changed")
         release = _read(_absolute(config, "release_manifest"))
         release_root = Path(release["release_root"]).resolve(strict=True)
     except Exception as exc:

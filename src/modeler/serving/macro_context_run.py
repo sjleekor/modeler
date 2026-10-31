@@ -3,7 +3,8 @@
 Plan: ``my/milestones/common/20261031_briefing_macro_context`` (§5.5 계산과 게시 경로, §9 M2-c).
 
 The coordinator starts this module in its own process group under a time limit.  It reads the D
-selection (``selection-state.json``, pinned at 09:30) whose SHA-256 the coordinator hands over,
+market-sector selection document (``market-sector-selection.v1``, ``ms-selection.json``, pinned at
+09:30 select) whose SHA-256 the coordinator hands over,
 calls ``modeler.scores.macro_context.build_document`` and writes ``document_bytes(body)`` to
 ``--output`` in one rename.  The section is display-only: no model, score, rank or report byte is
 read or changed here.  Any failure ends with a nonzero exit and no output; the coordinator then

@@ -39,8 +39,22 @@ def _run_dir(tmp_path: Path) -> Path:
     return tmp_path / "runs" / D.isoformat()
 
 
-def _selection(tmp_path: Path) -> Path:
+def _state_file(tmp_path: Path) -> Path:
     return tmp_path / "prepared" / "selections" / D.isoformat() / "selection-state.json"
+
+
+def _ms_block(tmp_path: Path) -> dict:
+    """The market-sector block 09:30 select wrote: the selection document the stage hands over."""
+    return json.loads(_state_file(tmp_path).read_text())["market_sector"]
+
+
+def _edit_block(tmp_path: Path, block) -> None:
+    state = json.loads(_state_file(tmp_path).read_text())
+    if block is None:
+        del state["market_sector"]
+    else:
+        state["market_sector"] = block
+    _state_file(tmp_path).write_text(json.dumps(state, sort_keys=True))
 
 
 def _set(config: Path, **changes) -> None:
@@ -146,7 +160,11 @@ def test_wrapper_run_computes_the_document_from_the_selection(tmp_path, world):
     state = json.loads((run / "coordinator-macro-context.json").read_text())
     assert doc["schema"] == mk.SCHEMA and doc["unit"] == D.isoformat() and doc["state"] == "ok"
     assert doc["invocation_id"] == run_state["invocation_id"] == state["invocation_id"]
-    assert doc["selection_sha256"] == _sha(_selection(tmp_path)) == state["selection_sha256"]
+    block = _ms_block(tmp_path)
+    assert block["status"] in {"selected", "partial"}
+    assert doc["selection_sha256"] == block["selection_sha256"] == state["selection_sha256"]
+    assert _sha(Path(block["selection"])) == block["selection_sha256"]
+    assert doc["seen_selection_schema"] == mk.MS_SELECTION_SCHEMA  # not selection-state.json
     assert doc["release"] == "frozen-release"
     assert state["document_sha256"] == _sha(run / f"macro-{D}.json")
     assert not list(run.glob(".macro-*"))
@@ -163,7 +181,8 @@ def test_macro_leaves_report_market_sector_and_explain_bytes_alone(tmp_path, wor
         run / f"report-{D}.json",
         run / f"market-sector-{D}.json",
         run / f"explain-{D}.json",
-        _selection(tmp_path),
+        _state_file(tmp_path),
+        Path(_ms_block(tmp_path)["selection"]),
     ]
     before = {path: _sha(path) for path in pinned}
     state = dc.macro_context_stage(config, D, NOW)
@@ -217,7 +236,7 @@ def test_a_crashed_child_leaves_a_failed_document_of_this_invocation(
     )
     assert doc["state"] == "failed" and doc["reason"] == "exit_nonzero"
     assert doc["invocation_id"] == infer_state["invocation_id"] != "old"
-    assert doc["selection_sha256"] == _sha(_selection(tmp_path))
+    assert doc["selection_sha256"] == _ms_block(tmp_path)["selection_sha256"]
     assert state["document_sha256"] == _sha(run / f"macro-{D}.json")
 
 
@@ -292,13 +311,93 @@ def test_no_selection_means_a_failed_document_without_a_selection_hash(tmp_path,
     _release, config_path = world
     _set(config_path, macro_context_enabled=True)
     config, infer_state = _infer(config_path)
-    _selection(tmp_path).unlink()
+    _state_file(tmp_path).unlink()
     early = datetime.fromisoformat(F.SELECT_AT)  # before 10:00 the stage cannot select by itself
     state = dc.macro_context_stage(config, D, early)
     doc = _doc(tmp_path)
     assert state["status"] == "failed" and state["reason"] == "selection_unavailable"
     assert doc["reason"] == "selection_unavailable" and doc["selection_sha256"] is None
     assert doc["invocation_id"] == infer_state["invocation_id"]
+
+
+def test_the_child_gets_the_market_sector_selection_document(tmp_path, world, fakes, monkeypatch):
+    _release, config_path = world
+    _set(config_path, macro_context_enabled=True)
+    config, _ = _infer(config_path)
+    seen = {}
+    orig = dc.run_group
+
+    def spy(argv, **kw):
+        seen["argv"] = argv
+        return orig(argv, **kw)
+
+    monkeypatch.setattr(dc, "run_group", spy)
+    assert dc.macro_context_stage(config, D, NOW)["status"] == "ok"
+    argv, block = seen["argv"], _ms_block(tmp_path)
+    selection = Path(argv[argv.index("--selection") + 1])
+    assert selection == Path(block["selection"]) and selection != _state_file(tmp_path)
+    assert argv[argv.index("--selection-sha256") + 1] == block["selection_sha256"]
+    body = json.loads(selection.read_text())
+    assert body["schema_version"] == mk.MS_SELECTION_SCHEMA and body["report_date"] == D.isoformat()
+    assert _doc(tmp_path)["seen_selection_schema"] == mk.MS_SELECTION_SCHEMA
+
+
+@pytest.mark.parametrize(
+    "block,reason",
+    [
+        (None, "not_in_selection"),
+        ("not-a-dict", "not_in_selection"),
+        ({"status": "unavailable", "reason": "kr_snapshot_missing"}, "kr_snapshot_missing"),
+        ({"status": "unavailable"}, "inputs_unavailable"),
+    ],
+)
+def test_without_a_usable_market_sector_block_the_section_fails(
+    tmp_path, world, fakes, block, reason
+):
+    _release, config_path = world
+    _set(config_path, macro_context_enabled=True)
+    config, infer_state = _infer(config_path)
+    _edit_block(tmp_path, block)
+    state = dc.macro_context_stage(config, D, NOW)
+    doc = _doc(tmp_path)
+    assert state["status"] == "failed" and state["reason"] == reason
+    assert doc["reason"] == reason and doc["selection_sha256"] is None
+    assert doc["invocation_id"] == infer_state["invocation_id"]
+
+
+def test_a_changed_selection_document_is_not_used(tmp_path, world, fakes, monkeypatch):
+    _release, config_path = world
+    _set(config_path, macro_context_enabled=True)
+    config, _ = _infer(config_path)
+    path = Path(_ms_block(tmp_path)["selection"])
+    path.write_bytes(path.read_bytes() + b" ")
+    called = []
+    monkeypatch.setattr(dc, "run_group", lambda argv, **kw: called.append(argv))
+    state = dc.macro_context_stage(config, D, NOW)
+    assert state["status"] == "failed" and state["reason"] == "selection_changed" and not called
+    assert _doc(tmp_path)["reason"] == "selection_changed"
+
+
+def test_wrapper_run_publishes_the_page_and_svg(tmp_path, world):
+    """Selection pinned at 09:30 → child → macro-D.json → publisher → macro.md and SVG pushed."""
+    import test_daily_multiday_publish as mp
+
+    release, config_path = world
+    reports = mp._enable_publisher(tmp_path, config_path)
+    _set(config_path, macro_context_enabled=True)
+    done = _wrapper(release, config_path, "run", F.RUN_AT)
+    assert done.returncode == 0, done.stderr
+    stages = json.loads(done.stdout)["stages"]
+    assert stages["macro_context"] == "ok" and stages["publication"] == "published"
+    run = _run_dir(tmp_path)
+    unit = reports.checkout / "reports" / "daily-briefing" / "2026" / "10" / D.isoformat()
+    assert (unit / "macro.md").is_file() and (unit / "assets" / "macro-rates.svg").is_file()
+    page = (unit / "macro.md").read_text()
+    assert f"macro_sha256: {_sha(run / f'macro-{D}.json')}" in page
+    assert "| [거시 흐름](macro.md) | 정상 |" in (unit / "README.md").read_text()
+    assert "거시 흐름은 [macro.md](macro.md)" in (unit / "market-sector.md").read_text()
+    manifest = json.loads((run / "markdown" / "manifest.json").read_text())
+    assert manifest["macro_state"] == "ok"
 
 
 def test_without_an_invocation_there_is_nothing_to_bind_to(tmp_path, world, fakes):

@@ -18,6 +18,7 @@ import sys
 import types
 
 SCHEMA = "briefing-macro.v1"
+MS_SELECTION_SCHEMA = "market-sector-selection.v1"
 CALC_MODULE = "modeler.scores.macro_context"
 RENDER_MODULE = "modeler.reporting.macro"
 
@@ -33,9 +34,13 @@ def _identity(unit, invocation_id, release, selection_sha256):
 
 
 def build_document(selection, *, unit, invocation_id, release, selection_sha256):
-    if selection.get("report_date") != unit:
+    # Like the real loader: only the market-sector selection document of the same D is accepted.
+    if selection.get("schema_version") != "market-sector-selection.v1":
+        raise ValueError("not a market-sector selection document")
+    if selection.get("report_date") != unit or not selection.get("input_cutoff"):
         raise ValueError("selection is for another day")
     return {**_identity(unit, invocation_id, release, selection_sha256), "state": "ok",
+            "seen_selection_schema": selection["schema_version"],
             "indicators": [{"id": "rate_us10y", "label": "US 10Y", "change_1m": -0.12}]}
 
 
@@ -105,7 +110,11 @@ def doc(unit: str, invocation_id: str, /, *, state: str = "ok", **changes) -> di
         )
     else:
         body = calc.build_document(
-            {"report_date": unit},
+            {
+                "schema_version": MS_SELECTION_SCHEMA,
+                "report_date": unit,
+                "input_cutoff": f"{unit}T09:30:00+09:00",
+            },
             unit=unit,
             invocation_id=invocation_id,
             release="r-test",
