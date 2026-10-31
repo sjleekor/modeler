@@ -3,6 +3,8 @@
 내부 report(`runs/D/report-D.json`)를 단위 폴더(README.md와 섹션 파일 넷)로 렌더하고,
 저장소 인덱스(자동 구간)를 다시 만들고, 저장소 트리를 검증합니다. 표준 라이브러리만 씁니다.
 근거 입력(`explain-D.json`)이 있으면 순위 표에 근거 칸을 더하고 `assets/*.svg`(svg.py)를 만듭니다.
+거시 흐름 입력(`macro-D.json`)이 있으면 `macro.md`와 `assets/macro-*.svg`(reporting/macro.py)를
+더합니다.
 템플릿과 문구는 전부 이 파일의 문자열입니다. release가 `.py` 말고는 복사하지 않기 때문입니다.
 
 원격에 접속하는 일은 여기 없습니다. 접속은 `deploy/reports/publish_reports.py`가 합니다.
@@ -247,6 +249,9 @@ SECTION_FILES = {
     "data-status": "data-status.md",
 }
 FILE_SECTIONS = {v: k for k, v in SECTION_FILES.items()}
+# 있을 때만 단위에 들어가는 섹션 파일입니다. 없으면 단위는 이 파일이 없던 때와 바이트까지 같습니다.
+OPTIONAL_SECTION_FILES = {"macro": "macro.md"}
+UNIT_FILE_SECTIONS = {**FILE_SECTIONS, **{v: k for k, v in OPTIONAL_SECTION_FILES.items()}}
 UNIT_FM_FIELDS = (
     "schema",
     "family",
@@ -1862,6 +1867,144 @@ def explain_table_lines(ctx: dict, m: dict, xm: dict, show_name: bool) -> list:
 
 
 # ---------------------------------------------------------------------------
+# 거시 흐름 (macro-D.json v1 — 20261031 계획 §5.5·§9 M2-c)
+#
+# 계산은 serving의 macro_context 단계가, 본문과 그림은 `modeler.reporting.macro.render`가 만듭니다.
+# 여기서는 입력을 확인하고 단위에 `macro.md`·`assets/macro-*.svg`를 더하기만 합니다. 점수·순위·다른
+# 섹션 값은 바꾸지 않습니다. 입력이 없으면(`None`: 껐거나 파일이 없음) 어떤 출력도 바뀌지 않습니다.
+# 입력이 맞지 않거나 렌더 결과가 단위 규칙에 걸리면 실패 안내로 바꿔 싣고, 단위는 막지 않습니다.
+# ---------------------------------------------------------------------------
+MACRO_SCHEMA = "briefing-macro.v1"
+MACRO_FILE = OPTIONAL_SECTION_FILES["macro"]
+MACRO_ASSET_RE = re.compile(r"^macro-[A-Za-z0-9._\-]+\.svg$")
+MACRO_FALLBACK = (
+    "# 거시 흐름\n\n거시 흐름을 표시하지 못했습니다 (렌더 오류). 점수·순위와는 관계없습니다.\n"
+)
+
+
+def _macro_failure_body(unit: str, invocation_id: object, release: str, reason: str) -> dict:
+    from modeler.scores.macro_context import failure_document
+
+    return failure_document(
+        unit=unit,
+        invocation_id=invocation_id if isinstance(invocation_id, str) else "",
+        release=release,
+        selection_sha256=None,
+        reason=reason,
+    )
+
+
+def _macro_problems(unit: str, text: object, svgs: object) -> list:
+    """렌더 결과가 단위 규칙(파일 이름·크기·금지 문자열·단위 안 링크·그림 규칙)에 맞는지 봅니다."""
+    if not isinstance(text, str) or not isinstance(svgs, dict):
+        return ["렌더 결과 형식"]
+    out = []
+    names = {}
+    for name, data in svgs.items():
+        if not isinstance(name, str) or not MACRO_ASSET_RE.match(name):
+            out.append(f"그림 이름 {name!r}")
+        elif not isinstance(data, (str, bytes)):
+            out.append(f"그림 내용 {name}")
+        else:
+            names["assets/" + name] = as_bytes(data)
+    if out:
+        return out
+    prefix = unit_rel(unit)
+    rel = f"{prefix}/{MACRO_FILE}"
+    inside = {f"{prefix}/{n}" for n in (*SECTION_FILES.values(), MACRO_FILE, *names)}
+
+    def exists(resolved: str) -> bool:
+        if resolved.startswith(prefix + "/"):
+            return resolved in inside
+        return allowed_path(resolved)
+
+    if len(text.encode("utf-8")) > MAX_FILE_BYTES:
+        out.append(f"{rel}: 파일이 1MB를 넘습니다")
+    for label, pattern in FORBIDDEN_PATTERNS:
+        if pattern.search(text):
+            out.append(f"{rel}: 금지 문자열이 있습니다 ({label})")
+    out += link_violations(rel, text, exists)
+    for name, data in names.items():
+        out += svg_violations(f"{prefix}/{name}", data)
+    return out
+
+
+def _render_macro(body: dict, unit: str) -> tuple[str, dict] | None:
+    """`render(body)`를 부릅니다. 규칙에 맞으면 (본문, {"assets/macro-*.svg": 바이트}),
+    아니면 None입니다."""
+    try:
+        from modeler.reporting.macro import render
+
+        text, svgs = render(body)
+        text = escape_tilde(scrub(text)) if isinstance(text, str) else text
+    except Exception:  # 렌더러 오류가 단위를 막지 않습니다
+        return None
+    if _macro_problems(unit, text, svgs):
+        return None
+    return text, {"assets/" + n: as_bytes(d) for n, d in sorted(svgs.items())}
+
+
+def load_macro(raw: bytes | None, unit: str, invocation_id: object, release: str) -> dict | None:
+    """거시 흐름 입력을 읽어 `ctx["macro"]`를 만듭니다. 입력이 없으면 None(출력 변화 없음).
+
+    파일 안의 `unit`·`invocation_id`가 이번 실행과 같을 때만 그대로 렌더합니다. 형식이 틀리거나
+    다른 실행의 파일이면 그 사유의 실패 문서로, 렌더 결과가 규칙에 걸리면 `render_rejected`
+    실패 문서로 바꿔 렌더합니다. 실패 렌더도 안 되면 고정 문구 한 장만 싣습니다.
+    """
+    if raw is None:
+        return None
+    digest = sha256_bytes(raw)
+    accepted = False
+    reason = None
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        doc = None
+    if not isinstance(doc, dict) or doc.get("schema") != MACRO_SCHEMA:
+        reason = "format_error"
+    elif (
+        doc.get("unit") != unit
+        or not isinstance(invocation_id, str)
+        or not invocation_id
+        or doc.get("invocation_id") != invocation_id
+    ):
+        reason = "input_mismatch"
+    else:
+        accepted = True
+    rendered = None
+    state = doc.get("state") if accepted else "failed"
+    if accepted:
+        rendered = _render_macro(doc, unit)
+        if rendered is None:
+            reason, state = "render_rejected", "failed"
+    if rendered is None:
+        try:
+            failure = _macro_failure_body(unit, invocation_id, release, reason)
+            rendered = _render_macro(failure, unit)
+        except Exception:
+            rendered = None
+    if rendered is None:
+        rendered = (MACRO_FALLBACK, {})
+    text, assets = rendered
+    return {
+        "state": state if isinstance(state, str) and state else "failed",
+        "reason": reason,
+        "sha": digest,
+        "accepted": accepted,
+        "text": text,
+        "assets": assets,
+    }
+
+
+def macro_status(ctx: dict) -> str | None:
+    """`macro.md` front matter의 status. 거시 흐름 입력이 없으면 None입니다."""
+    macro = ctx.get("macro")
+    if macro is None:
+        return None
+    return macro["state"] if macro["state"] in STATUS_KO else "failed"
+
+
+# ---------------------------------------------------------------------------
 # 본문 렌더링
 # ---------------------------------------------------------------------------
 def title_for(ctx: dict, base: str) -> str:
@@ -2257,7 +2400,7 @@ def render_ms(ctx: dict) -> tuple[list, dict]:
         lines += ["시장·섹터를 내지 못했습니다.", ""]
         lines += ["- " + r for r in sec["reason"]] + [""]
         lines += [DISCLAIMER, ""]
-        return lines, meta_extra
+        return lines + macro_link_lines(ctx), meta_extra
     ms, assets = sec["ms"], sec["assets"]
     if sec["status"] != "ok" and sec["reason"]:
         lines += ["> 주의: 일부 값이 비어 있습니다."] + ["> - " + r for r in sec["reason"]] + [""]
@@ -2338,7 +2481,14 @@ def render_ms(ctx: dict) -> tuple[list, dict]:
     )
     lines += ["", DISCLAIMER, ""]
     lines += render_ms_details(ms, assets)
-    return lines, meta_extra
+    return lines + macro_link_lines(ctx), meta_extra
+
+
+def macro_link_lines(ctx: dict) -> list:
+    """시장·섹터 맨 아래 거시 흐름 링크 한 줄. 거시 흐름 입력이 없으면 빈 목록입니다."""
+    if ctx.get("macro") is None:
+        return []
+    return [f"거시 흐름은 [{MACRO_FILE}]({MACRO_FILE})", ""]
 
 
 def render_ms_details(ms: dict, assets: list) -> list:
@@ -2906,6 +3056,8 @@ def render_summary(ctx: dict) -> tuple[list, dict]:
             "입력별 기준일·신선도·실패·출처",
         ],
     ]
+    if macro_status(ctx) is not None:  # 거시 흐름 입력이 없으면 표는 전과 같습니다
+        rows.insert(1, ["[거시 흐름](macro.md)", STATUS_KO[macro_status(ctx)], "표시 전용"])
     lines += md_table(["섹션", "상태", "기준일"], rows)
     lines += ["", "## 경고", ""]
     warnings = []
@@ -3096,7 +3248,39 @@ def render_unit(ctx: dict) -> dict:
         body = escape_tilde("\n".join(lines).rstrip("\n") + "\n")
         files[SECTION_FILES[section]] = front_matter(meta) + "\n" + body
     files.update(explain_assets(ctx))
+    files.update(macro_files(ctx))
     return files
+
+
+def macro_files(ctx: dict) -> dict:
+    """`macro.md`(텍스트)와 `assets/macro-*.svg`(바이트). 거시 흐름 입력이 없으면 빈 dict입니다."""
+    macro = ctx.get("macro")
+    if macro is None:
+        return {}
+    source = {"release": ctx["release"], "report_sha256": ctx["sha"]}
+    if macro["accepted"]:
+        source["macro_sha256"] = macro["sha"]
+    meta = {
+        "schema": SCHEMA,
+        "family": FAMILY,
+        "unit": ctx["unit"],
+        "section": "macro",
+        "title": title_for(ctx, "거시 흐름"),
+        "status": macro_status(ctx),
+        "markets": ["KR", "US"],
+        "decision_at": ctx["decision_iso"],
+        "generated_at": ctx["generated_at"],
+        "data_asof": {},
+        "models": [],
+        "revision": ctx["revision"],
+        "source": source,
+    }
+    if ctx["replay"]:
+        meta["historical_replay"] = True
+    if ctx["synthetic"]:
+        meta["synthetic_fixture"] = True
+    body = macro["text"].rstrip("\n") + "\n"
+    return {MACRO_FILE: front_matter(meta) + "\n" + body, **macro["assets"]}
 
 
 # ---------------------------------------------------------------------------
@@ -3140,11 +3324,11 @@ def read_asset_dir(udir: Path) -> dict:
 
 
 def read_existing(udir: Path) -> dict | None:
-    """기존 단위의 파일 집합: markdown 5개(텍스트)와 `assets/*.svg`(바이트)."""
+    """기존 단위의 파일 집합: markdown 5개와 있으면 `macro.md`(텍스트), `assets/*.svg`(바이트)."""
     if not udir.is_dir():
         return None
     texts: dict = {}
-    for name in SECTION_FILES.values():
+    for name in (*SECTION_FILES.values(), *OPTIONAL_SECTION_FILES.values()):
         path = udir / name
         if path.is_file():
             texts[name] = path.read_text(encoding="utf-8")
@@ -3209,6 +3393,7 @@ def build_context(
     operator_memo: bytes | None = None,
     explain: bytes | None = None,
     invocation_id: str | None = None,
+    macro: bytes | None = None,
 ) -> dict:
     """envelope(JSON 바이트)와 시장·섹터 입력으로 렌더 입력(ctx)을 만듭니다. 파일은 쓰지 않습니다.
 
@@ -3223,6 +3408,9 @@ def build_context(
     `report_sha256`이 `env_bytes`의 sha256과, `invocation_id`가 이 인자(없으면 envelope의
     값)와 같을 때만 근거·그래프를 그립니다. 다르면 "근거·그래프: 실패 — 입력 불일치"를 적고
     표는 지금 모양으로 냅니다. `None`이면 출력은 근거 기능이 없던 때와 바이트까지 같습니다.
+    `macro`는 `briefing-macro.v1` JSON 바이트(그날 `macro-D.json`)입니다. 있으면 단위에 `macro.md`와
+    `assets/macro-*.svg`를 더하고 README·시장·섹터에 링크를 답니다(`load_macro`). `None`이면 출력은
+    거시 흐름 기능이 없던 때와 바이트까지 같습니다.
     """
     env = load_json_bytes(env_bytes, "envelope")
     unit, decision = parse_envelope(env)
@@ -3302,6 +3490,9 @@ def build_context(
     if explain is not None:
         expected = invocation_id if invocation_id is not None else env.get("invocation_id")
         ctx["explain"] = load_explain(explain, unit, ctx["sha"], expected, (kr, us))
+    if macro is not None:
+        expected = invocation_id if invocation_id is not None else env.get("invocation_id")
+        ctx["macro"] = load_macro(macro, unit, expected, release)
     return ctx
 
 
@@ -3371,6 +3562,7 @@ def generate(
     memo_path: Path | None = None,
     explain_path: Path | None = None,
     invocation_id: str | None = None,
+    macro_path: Path | None = None,
 ) -> str:
     """단위 하나를 저장소 트리에 쓰고 인덱스를 다시 만듭니다. 수동·시험용입니다.
 
@@ -3383,6 +3575,7 @@ def generate(
     names_bytes = read_bytes(names_path, "증권 이름 입력") if names_path else None
     memo_bytes = read_bytes(memo_path, "운영자 메모") if memo_path else None
     explain_bytes = read_bytes(explain_path, "근거 입력") if explain_path else None
+    macro_bytes = read_bytes(macro_path, "거시 흐름 입력") if macro_path else None
     ctx = build_context(
         repo,
         env_bytes,
@@ -3395,6 +3588,7 @@ def generate(
         operator_memo=memo_bytes,
         explain=explain_bytes,
         invocation_id=invocation_id,
+        macro=macro_bytes,
     )
     unit = ctx["unit"]
     udir = unit_dir(repo, unit)
@@ -3431,15 +3625,22 @@ def generate(
 # 인덱스 재생성 (자동 구간만 다시 씁니다)
 # ---------------------------------------------------------------------------
 def remove_stale_assets(udir: Path, files: dict) -> list:
-    """새 파일 집합에 없는 `assets/` 항목을 지우고, 비면 `assets/`도 지웁니다. symlink는 따라가지 않습니다.
+    """새 파일 집합에 없는 `assets/` 항목을 지우고, 비면 `assets/`도 지웁니다.
 
-    같은 단위를 정정하거나 덮을 때 옛 그림이 남지 않게 합니다. 지운 이름 목록을 돌려줍니다.
+    symlink는 따라가지 않습니다. 새 파일 집합에 없는 선택 섹션 파일(`macro.md`)도 지웁니다.
+    같은 단위를 정정하거나 덮을 때 옛 그림·옛 거시 흐름이 남지 않게 합니다. 지운 이름 목록을
+    돌려줍니다.
     """
     assets = udir / "assets"
     removed = []
+    for name in OPTIONAL_SECTION_FILES.values():
+        path = udir / name
+        if name not in files and (path.is_file() or path.is_symlink()):
+            path.unlink()
+            removed.append(name)
     if assets.is_symlink():
         assets.unlink()
-        return ["assets"]
+        return removed + ["assets"]
     if not assets.is_dir():
         return removed
     for path in sorted(assets.iterdir()):
@@ -4149,7 +4350,7 @@ def allowed_path(rel: str) -> bool:
 def check_unit_fm(rel: str, meta: dict, match: re.Match) -> list:
     out = []
     year, month, unit, name = match.groups()
-    if name not in FILE_SECTIONS:
+    if name not in UNIT_FILE_SECTIONS:
         return [f"{rel}: 알 수 없는 섹션 파일 이름입니다"]
     for field in UNIT_FM_FIELDS:
         if field not in meta:
@@ -4164,8 +4365,8 @@ def check_unit_fm(rel: str, meta: dict, match: re.Match) -> list:
         out.append(f"{rel}: unit이 경로({unit})와 다릅니다")
     if unit[0:4] != year or unit[5:7] != month:
         out.append(f"{rel}: 단위 폴더가 연·월 폴더와 맞지 않습니다")
-    if meta["section"] != FILE_SECTIONS[name]:
-        out.append(f"{rel}: section이 파일 이름({FILE_SECTIONS[name]})과 다릅니다")
+    if meta["section"] != UNIT_FILE_SECTIONS[name]:
+        out.append(f"{rel}: section이 파일 이름({UNIT_FILE_SECTIONS[name]})과 다릅니다")
     if meta["status"] not in STATUS_KO:
         out.append(f"{rel}: status가 ok·partial·stale·failed가 아닙니다")
     if not isinstance(meta["title"], str) or not meta["title"]:
@@ -4368,7 +4569,7 @@ def validate(repo: Path | str, paths=None, *, allow_synthetic: bool = False) -> 
             touched_units.add(match.group(3))
     for unit in sorted(touched_units):
         metas = {}
-        for name in FILE_SECTIONS:
+        for name in UNIT_FILE_SECTIONS:
             file_path = unit_dir(repo, unit) / name
             if file_path.is_file() and not file_path.is_symlink():
                 metas[name] = read_fm(file_path) or {}
@@ -4400,7 +4601,7 @@ def validate_unit_files(unit: str, files: dict, *, allow_synthetic: bool = False
         if not name.endswith(".md"):
             if not is_asset_name(name):
                 violations.append(
-                    f"{rel}: 단위에 둘 수 없는 파일입니다 (markdown 5개와 assets/*.svg만)"
+                    f"{rel}: 단위에 둘 수 없는 파일입니다 (markdown 5개·macro.md와 assets/*.svg만)"
                 )
             elif not isinstance(text, (bytes, str)):
                 violations.append(f"{rel}: 그림 내용이 바이트가 아닙니다")
@@ -4446,6 +4647,11 @@ def main(argv: list | None = None) -> int:
         "--explain",
         type=Path,
         help="briefing-explain.v1 JSON (그날 explain-D.json. 없으면 근거·그래프 없이 렌더)",
+    )
+    parser.add_argument(
+        "--macro",
+        type=Path,
+        help="briefing-macro.v1 JSON (그날 macro-D.json. 없으면 거시 흐름 없이 렌더)",
     )
     parser.add_argument(
         "--invocation-id", help="근거 입력과 맞춰 볼 invocation id (없으면 envelope 값)"
@@ -4508,6 +4714,7 @@ def main(argv: list | None = None) -> int:
                     memo_path=args.operator_memo,
                     explain_path=args.explain,
                     invocation_id=args.invocation_id,
+                    macro_path=args.macro,
                 )
             elif not (args.init or args.reindex):
                 raise InputError("--envelope, --init, --reindex, --validate 중 하나가 필요합니다.")

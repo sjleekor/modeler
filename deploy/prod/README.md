@@ -78,6 +78,7 @@ Pages 공개 경로는 없앴습니다. `publish` 단계는 private 저장소 `s
 | 렌더러 | `src/modeler/reporting/markdown.py` (release 안) | report를 단위 폴더(`README.md`·`market-sector.md`·`kr-stocks.md`·`us-stocks.md`·`data-status.md`)로 렌더하고, 인덱스 자동 구간을 다시 쓰고, 트리를 검증합니다. 표준 라이브러리만 쓰고, 템플릿은 `.py` 문자열이라 release `DATA_FILES`를 늘리지 않습니다. **release 검토 목록(`SOURCE_MANIFEST`)에 이 파일을 넣어야 release 빌드가 통과합니다.** |
 | 그림 | `src/modeler/reporting/svg.py` (release 안) | 근거 입력(`explain-D.json`)이 있을 때 상위 20 그래프 `assets/*.svg`를 만듭니다(표준 라이브러리만, 같은 입력이면 같은 바이트, 스크립트·이벤트 속성·외부 참조 없음). 렌더러가 근거 입력이 있을 때만 import합니다. **release 검토 목록(`SOURCE_MANIFEST`)에 넣어야 합니다.** |
 | 증권 이름 | `src/modeler/reporting/security_names.py` (release 안) | 순위 종목의 이름 입력(`security-names.v1`)을 레이크에서 만듭니다. publisher 로컬 단계가 부릅니다(`publish_reports.py`가 import하므로 **release 검토 목록과 import 따라가기 진입 모듈에 넣어야 합니다**). polars는 함수 안에서 불러(serving venv에 있습니다) 패키지를 가볍게 둡니다. 수동으로는 `python -m modeler.reporting.security_names --envelope … --us-root … --kr-root … --out …` |
+| 거시 흐름 | `src/modeler/serving/macro_context_run.py`, `src/modeler/scores/macro_context/*.py`, `src/modeler/reporting/macro.py` (release 안) | 단계의 하위 프로세스, 계산, 렌더입니다. 렌더러는 거시 흐름 입력이 있을 때만 `macro.py`를 import합니다. **release 검토 목록(`SOURCE_MANIFEST`)에 셋 다 넣어야 release 빌드가 통과합니다** |
 | publisher | `deploy/reports/publish_reports.py` (release 밖, `serving/publisher/`로 복사, sha256 고정) | 로컬 단계와 동기화 단계 |
 | 검증기 | `deploy/reports/validate_reports.py` (같은 곳) | 경로 allowlist, front matter, 크기, 상대 링크, 과거 단위 보호, 서버 경로·비밀값, symlink |
 
@@ -134,6 +135,13 @@ python publish_reports.py sync --config runs/2026-10-07/reports-publisher-config
 
 `daily_wrapper run`이 `market_sector` 다음에 `explain_stage`를 부릅니다(단독 실행은 `daily_coordinator explain`). 별도 프로세스 그룹에서 `python -m modeler.serving.explain run`을 돌리고, 이 단계가 어떻게 끝나도 `render`·`publish`는 그대로 이어집니다. 모델·점수·순위·`report-D.json` 바이트는 건드리지 않습니다. 결과는 `run/explain-<D>.json`(`briefing-explain.v1`, 형식은 계획 §5.2.1)이고 `coordinator-explain.json`에 상태(`ok`·`partial`·`failed`·`disabled`·`skipped`)를 적습니다. 파일 안의 `invocation_id`·`report_sha256`이 그날 report와 다르면 표시 쪽이 버립니다. 가격은 시장·섹터 root(`market_sector_*_root`, 없으면 `security_names_*_root`)에서 읽습니다. **release의 검토 목록(`SOURCE_MANIFEST`)에 `modeler/src/modeler/serving/explain.py`가 있어야 release 빌드가 통과합니다.**
 
+### macro_context 단계 (거시 흐름, 표시 전용)
+
+| 일 | 어디서 |
+|---|---|
+| 거시 흐름 문서를 계산합니다 | `daily_wrapper run`의 `macro_context` 단계(`explain` 다음, `render` 전). 단독 실행은 `daily_coordinator macro-context`. 별도 프로세스 그룹에서 `python -m modeler.serving.macro_context_run run`이 09:30 select가 고정한 시장·섹터 selection 문서(`selection-state.json`의 `market_sector.selection`, `market-sector-selection.v1`, sha256 고정)를 `modeler.scores.macro_context.build_document`에 넘겨 `runs/<D>/macro-<D>.json`(`briefing-macro.v1`)을 씁니다. 모델 report가 없어도(실패 report여도) selection만 있으면 돕니다. `market_sector` 블록이 없거나 상태가 `selected`·`partial`이 아니면 시장·섹터 단계와 같은 사유(`not_in_selection`, 블록의 `reason`, 없으면 `inputs_unavailable`)로, 문서 sha256이 다르면 `selection_changed`로 `failed` 문서를 씁니다. 실패·시간 초과·비정상 종료면 `failure_document`로 `failed` 문서를 쓰고 실행은 계속됩니다. 시작할 때 같은 D의 기존 문서를 `macro-<D>.superseded-<sha12>.json`으로 옮깁니다. 상태는 `coordinator-macro-context.json`(`disabled`·`skipped`·`holiday`·`failed`·문서의 `state`) |
+| 단위에 싣습니다 | publisher 로컬 단계가 `macro-<D>.json`을 렌더러에 넘기고, 렌더러가 `modeler.reporting.macro.render`로 `macro.md`와 `assets/macro-*.svg`를 더합니다. README 섹션 표와 `market-sector.md` 맨 아래에 링크가 붙습니다. 파일 안의 `unit`·`invocation_id`가 이번 실행과 다르거나, 렌더 결과가 단위 규칙(그림 이름·200KB·금지 내용·링크)에 걸리면 실패 안내로 바꿔 싣습니다. 문서가 없거나 꺼져 있으면 단위·manifest·journal은 전과 바이트까지 같습니다 |
+
 ### ops 설정 키
 
 Pages용 `base_path`·`projection_root`·`previous_projection_dir`·`publisher_script(_sha256)`·`publisher_config`·`site_checkout`·`actions_repository`·`actions_workflow`·`public_manifest_url`은 없앴습니다. `publisher_enabled`가 `true`일 때 아래 키를 모두 검증합니다. `false`이면 검증하지 않고 `publish`는 `publication_withheld`로 끝납니다.
@@ -144,6 +152,8 @@ Pages용 `base_path`·`projection_root`·`previous_projection_dir`·`publisher_s
 | `external_verification_enabled` | monitor가 `git ls-remote`로 원격을 볼지 |
 | `explain_enabled` | 순위 근거·가격 흐름(`explain-D.json`)을 계산할지. 명시해야 합니다. `false`이면 파일을 만들지 않고 단위는 전과 바이트까지 같습니다. 이미 있던 같은 날 파일은 `explain-D.superseded-<sha>.json`으로 옮깁니다(지우지 않음) |
 | `explain_timeout_seconds` | explain 하위 프로세스 제한 시간(초, 10\~1800, 기본 120). 넘으면 프로세스 그룹을 끝내고 `failed` 문서를 남깁니다. 실행은 계속됩니다 |
+| `macro_context_enabled` | 거시 흐름(`macro-D.json`, `macro.md`)을 계산·게시할지. 명시해야 합니다. `false`이면 문서를 만들지 않고 단위는 전과 바이트까지 같습니다. 이미 있던 같은 날 문서는 `macro-D.superseded-<sha>.json`으로 옮깁니다(지우지 않음). publisher 날짜별 설정에도 같은 값이 갑니다 |
+| `macro_context_timeout_seconds` | 거시 흐름 하위 프로세스 제한 시간(초, 10\~1800, 기본 300). 넘으면 프로세스 그룹을 끝내고 `failed` 문서를 남깁니다. 실행은 계속됩니다 |
 | `reports_repository` | `sjleekor/stock_reports`(다르면 멈춤) |
 | `reports_audience` | `owner_only`(다르면 멈춤) |
 | `reports_branch` | `main` |

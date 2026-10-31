@@ -10,8 +10,8 @@ from pathlib import Path
 
 from .daily_coordinator import (
     SEOUL, _absolute, _config, _day_dir, _lock, _read,
-    ensure_selection, explain_stage, infer_stage, market_sector_stage, monitor_stage, publish_stage, render_stage,
-    select_stage,
+    ensure_selection, explain_stage, infer_stage, macro_context_stage, market_sector_stage,
+    monitor_stage, publish_stage, render_stage, select_stage,
 )
 from .daily_opening import prepare_opening
 
@@ -90,6 +90,14 @@ def main(argv: list[str] | None = None) -> int:
                         explain_status = "failed"
                     if explain_status != "disabled":  # off means the unit and this output stay as before
                         states["explain"] = explain_status
+                    # Macro context (거시 흐름) is display-only and needs the selection, not the
+                    # models: whatever happens, the run goes on with the unit as before.
+                    try:
+                        macro_status = macro_context_stage(config, day, now)["status"]
+                    except Exception:
+                        macro_status = "failed"
+                    if macro_status != "disabled":  # off: the unit and this output stay as before
+                        states["macro_context"] = macro_status
                     states["render"] = render_stage(config, day)["status"]
                     states["publication"] = publish_stage(config, day)["status"]
                     failed = failed or states["publication"] == "publisher_failed"

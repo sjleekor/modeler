@@ -28,6 +28,8 @@
   "external_verification_enabled": false,
   "explain_enabled": false,
   "explain_timeout_seconds": 120,
+  "macro_context_enabled": false,
+  "macro_context_timeout_seconds": 300,
   "reports_repository": "sjleekor/stock_reports",
   "reports_audience": "owner_only",
   "reports_branch": "main",
