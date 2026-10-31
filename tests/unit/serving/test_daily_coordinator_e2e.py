@@ -32,6 +32,11 @@ MODULES = (
     "modeler/reporting/site.py", "modeler/reporting/markdown.py",
     "modeler/reporting/security_names.py", "modeler/reporting/svg.py",
     "modeler/serving/explain.py", "modeler/serving/macro_context_run.py",
+    "modeler/scores/__init__.py", "modeler/scores/macro_context/__init__.py",
+    "modeler/scores/macro_context/spec.py", "modeler/scores/macro_context/document.py",
+    "modeler/scores/macro_context/calc.py", "modeler/scores/macro_context/summary.py",
+    "modeler/scores/macro_context/figures.py", "modeler/scores/macro_context/load.py",
+    "modeler/scores/macro_context/build.py", "modeler/reporting/macro.py",
 )
 ADAPTER = '''from modeler.serving.schema import report_template
 
