@@ -41,6 +41,7 @@ def build_document(selection, *, unit, invocation_id, release, selection_sha256)
         raise ValueError("selection is for another day")
     return {**_identity(unit, invocation_id, release, selection_sha256), "state": "ok",
             "seen_selection_schema": selection["schema_version"],
+            "header": {"daily_asof_max": unit},
             "indicators": [{"id": "rate_us10y", "label": "US 10Y", "change_1m": -0.12}]}
 
 

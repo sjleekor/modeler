@@ -214,7 +214,8 @@ def test_the_ok_unit_carries_page_figures_links_and_passes_every_check(tmp_path,
     assert {f"assets/{name}" for name in svgs} == figures
     # Links: every figure the page shows is in the unit, and every figure of the unit is shown.
     assert set(FIGURE_LINK.findall(page)) == figures
-    assert "| [거시 흐름](macro.md) | 정상 | 표시 전용 |" in tree["README.md"].decode()
+    asof = body["header"]["daily_asof_max"]
+    assert f"| [거시 흐름](macro.md) | 정상 | {asof} |" in tree["README.md"].decode()
     assert "거시 흐름은 [macro.md](macro.md)" in tree["market-sector.md"].decode()
     # SVG: name, size, no script / event / external reference.
     for name in figures:

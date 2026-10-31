@@ -8,6 +8,9 @@ selection(``market-sector-selection.v1``, 시장·섹터와 같은 것)이 고�
 
 * 한국: ``available_from_date <= D`` 행만. 같은 관측일이 여러 행이면 가용일이 가장 늦은 행이 값이다.
 * 미국: 빈 값을 뺀 뒤 날짜마다 ``realtime_start <= D`` 중 가장 늦은 vintage.
+* 지난 보고서 대비로 다시 계산하는 앞 날짜 d(< D)에서 미국은 ``realtime_start < d``다. 미국 날짜 d에
+  나온 vintage는 d 09:30 KST 보고서 뒤에 나왔기 때문이다. D 자체는 고정 snapshot이 D 09:30 KST
+  전에 끝나 ``realtime_start == D``인 행이 들어올 수 없으므로 ``<= D`` 그대로 둔다.
 """
 
 from __future__ import annotations
@@ -179,10 +182,12 @@ def load_macro_data(selection: dict[str, Any], D: dt.date) -> MacroData:
     )
 
 
-def view(rows: dict[str, list[tuple[dt.date, float, dt.date]]], d: dt.date):
+def view(rows: dict[str, list[tuple[dt.date, float, dt.date]]], d: dt.date, *,
+         before: bool = False):
     """``d`` 가용분의 보기. ``(최신 값 보기, 처음 값이 생긴 가용일 보기)``.
 
     행이 (관측일, 가용일) 오름차순이라 마지막 행이 가장 늦은 가용분, 처음 본 행이 첫 가용일이다.
+    ``before``이면 가용일이 ``d``보다 앞선 행만 쓴다(``가용일 < d``, 지난 보고서 대비의 미국 행).
     """
     cur: dict[str, dict[dt.date, tuple[float, dt.date]]] = {}
     first: dict[str, dict[dt.date, dt.date]] = {}
@@ -190,7 +195,7 @@ def view(rows: dict[str, list[tuple[dt.date, float, dt.date]]], d: dt.date):
         c: dict[dt.date, tuple[float, dt.date]] = {}
         f: dict[dt.date, dt.date] = {}
         for obs, v, af in lst:
-            if af > d:
+            if af > d or (before and af == d):
                 continue
             c[obs] = (v, af)
             f.setdefault(obs, af)

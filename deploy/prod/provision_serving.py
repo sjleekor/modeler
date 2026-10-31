@@ -400,7 +400,7 @@ def provision(plan: Plan) -> dict[str, Any]:
            # Why-this-rank evidence and price paths (explain-D.json): off until the owner turns it on.
            "explain_enabled": False,
            # Display-only macro context section (macro-D.json, macro.md): off until the owner
-           # turns it on.
+           # turns it on (a missing key also means off).
            "macro_context_enabled": False,
            # Market-sector section: the KR data root and the US lake link, read only.  Both null
            # (no --ms-bundle) leaves the section off and the unit says its input is missing.

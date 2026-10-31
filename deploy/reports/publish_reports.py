@@ -32,8 +32,9 @@
 거시 흐름: run 디렉터리에 `macro-D.json`(`briefing-macro.v1`)이 있으면 로컬 단계가 읽어
 렌더러에 넘기고, 단위에 `macro.md`와 `assets/macro-*.svg`가 더해집니다(README·시장·섹터에서
 링크). 점수·순위에 쓰지 않는 표시 전용입니다. 경로·sha256·상태는 manifest·journal에 `macro_*`로
-남고, 정정·재시도는 같은 파일인지 확인하고 다시 읽습니다. 설정 `macro_context_enabled: false`
-이거나 파일이 없으면 읽지 않고, 단위는 거시 흐름 기능이 없던 때와 바이트까지 같습니다.
+남고, 정정·재시도는 같은 파일인지 확인하고 다시 읽습니다. 설정 `macro_context_enabled`가
+`true`일 때만 읽습니다. 키가 없거나 `false`이거나 파일이 없으면 읽지 않고, 단위는 거시 흐름 기능이
+없던 때와 바이트까지 같습니다.
 
 release의 `modeler` 패키지가 `PYTHONPATH`에 있어야 합니다(coordinator가 맞춰 줍니다).
 이 스크립트와 `validate_reports.py`는 release 밖에 두고 sha256을 고정합니다.
@@ -580,7 +581,7 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
     # 거시 흐름 입력. 꺼져 있거나 없으면 읽지 않습니다(거시 흐름 기능이 없던 때와 같은 단위).
     macro_file = run_dir / f"macro-{unit}.json"
     macro_bytes = None
-    macro_on = config.get("macro_context_enabled", True)
+    macro_on = config.get("macro_context_enabled", False)  # 키가 없으면 꺼짐(표시 전용)
     if macro_on and (macro_file.exists() or macro_file.is_symlink()):
         macro_bytes = _read_macro(macro_file)
     else:

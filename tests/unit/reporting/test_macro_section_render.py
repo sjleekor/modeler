@@ -102,7 +102,7 @@ def test_ok_macro_adds_page_svg_and_links_only(tmp_path: Path, inputs: dict, fak
     assert files["market-sector.md"].replace("\n" + LINK + "\n", "") == plain["market-sector.md"]
     readme = [line for line in files["README.md"].split("\n") if not line.startswith(ROW)]
     assert "\n".join(readme) == plain["README.md"]
-    assert f"{ROW} 정상 | 표시 전용 |" in files["README.md"]
+    assert f"{ROW} 정상 | {UNIT} |" in files["README.md"]  # header.daily_asof_max
     assert files["market-sector.md"].rstrip("\n").endswith(LINK)
 
 
@@ -134,7 +134,7 @@ def test_failed_document_renders_the_failure_notice(tmp_path: Path, inputs: dict
     meta, text = md.parse_front_matter(files[md.MACRO_FILE])
     assert meta["status"] == "failed" and "macro_sha256" in meta["source"]
     assert "거시 흐름을 내지 못했습니다: timeout." in text
-    assert f"{ROW} 실패 | 표시 전용 |" in files["README.md"]
+    assert f"{ROW} 실패 | — |" in files["README.md"]  # a failure document has no header
     assert ctx["macro"]["state"] == "failed" and ctx["macro"]["accepted"] is True
     # 단위 상태는 거시 흐름과 무관합니다.
     _, plain = _render(tmp_path, inputs, None)
@@ -356,3 +356,23 @@ def test_cli_accepts_macro(tmp_path: Path, inputs: dict, fakes) -> None:
     )
     assert code == 0
     assert (md.unit_dir(repo, UNIT) / SVG).is_file()
+
+
+@pytest.mark.parametrize(
+    "header,cell",
+    [
+        ({"daily_asof_max": "2026-10-05"}, "2026-10-05"),
+        ({"daily_asof_max": None}, "—"),
+        ({"daily_asof_max": "not-a-date"}, "—"),
+        (None, "—"),
+    ],
+)
+def test_readme_row_shows_the_last_daily_asof(tmp_path: Path, inputs: dict, fakes, header, cell):
+    body = _doc(inputs)
+    if header is None:
+        body.pop("header")
+    else:
+        body["header"] = header
+    _, files = _render(tmp_path, inputs, body)
+    assert f"{ROW} 정상 | {cell} |" in files["README.md"]
+    assert md.validate_unit_files(UNIT, files) == []

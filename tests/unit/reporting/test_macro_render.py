@@ -203,3 +203,48 @@ def test_splice_lists_follow_body(rendered, tmp_path):
     for iid in ("us_3m", "credit_baa", "usd_index", "brent", "us_10y_real"):
         short = next(o["short_name"] for o in body["indicators"] if o["id"] == iid)
         assert f"- {short}: " in md
+
+
+def _yoy_gap(body: dict, iid: str = "kr_cpi") -> dict:
+    """Same state as calc's test_monthly_yoy_nan_when_comparison_month_missing_is_tolerated:
+    the month 12 months back is empty at the source, so the year-on-year value is NaN, its
+    display is None, the measure has no change/direction and no condition fires."""
+    gap = copy.deepcopy(body)
+    o = next(x for x in gap["indicators"] if x["id"] == iid)
+    o["value"].update(level=None, display=None)
+    for m in o["measures"]:
+        m["change"] = None
+        m.pop("direction", None)
+        m.pop("strong", None)
+    o["percentile"] = {"value": None, "reason": "비교할 달이 원천에 비어 있습니다"}
+    o["conditions"] = {"a": [], "b": None, "c": None, "d": None}
+    o["streak"] = None
+    return gap
+
+
+def test_monthly_value_missing_renders_dashes(body):
+    gap = _yoy_gap(body)
+    md, _ = macro.render(gap)
+    row = next(line for line in md.split("\n") if line.startswith("| 한 CPI 전년비 |"))
+    cells = [c.strip() for c in row.strip("|").split("|")]
+    assert cells[4] == "—"  # 최근값
+    assert cells[6].endswith(" —") and not any(a in cells[6] for a in "↑↓→")  # 추세: 화살표 없음
+    # 값은 있고 방향만 없으면 화살표 없이 값만 씁니다.
+    only_dir = copy.deepcopy(body)
+    o = next(x for x in only_dir["indicators"] if x["id"] == "kr_cpi")
+    m = next(x for x in o["measures"] if x["primary"])
+    m.pop("direction", None)
+    lines = macro.render(only_dir)[0].split("\n")
+    row = next(line for line in lines if line.startswith("| 한 CPI 전년비 |"))
+    trend = [c.strip() for c in row.strip("|").split("|")][6]
+    assert not any(a in trend for a in "↑↓→") and trend != f"{m['label']} —"
+
+
+def test_monthly_value_missing_does_not_reject_the_section(body):
+    from modeler.reporting import markdown as mdmod
+
+    gap = _yoy_gap(body)
+    raw = mc.document_bytes(gap)
+    loaded = mdmod.load_macro(raw, gap["unit"], gap["invocation_id"], gap["release"])
+    assert loaded["accepted"] is True and loaded["reason"] is None
+    assert loaded["state"] == gap["state"] and "render_rejected" not in loaded["text"]

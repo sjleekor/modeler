@@ -192,8 +192,10 @@ def _config(path: Path) -> dict[str, Any]:
     explain_timeout = config.get("explain_timeout_seconds", EXPLAIN_TIMEOUT_SECONDS)
     if isinstance(explain_timeout, bool) or not isinstance(explain_timeout, int) or not 10 <= explain_timeout <= 1800:
         raise ValueError("explain_timeout_seconds must be 10..1800")
-    if not isinstance(config.get("macro_context_enabled"), bool):
-        raise ValueError("macro_context_enabled must be explicit")
+    # Display-only section: a missing key means off (an old ops.json keeps working); a value that
+    # is there must be a bool.
+    if not isinstance(config.get("macro_context_enabled", False), bool):
+        raise ValueError("macro_context_enabled must be true or false")
     macro_timeout = config.get("macro_context_timeout_seconds", MACRO_CONTEXT_TIMEOUT_SECONDS)
     if (isinstance(macro_timeout, bool) or not isinstance(macro_timeout, int)
             or not 10 <= macro_timeout <= 1800):
@@ -663,7 +665,25 @@ def explain_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str,
     return state
 
 
+def _clear_macro_temps(run_root: Path, day: date) -> None:
+    """Remove this D's ``.macro-<D>.*`` temporaries (scratch output, a killed child's temp file)."""
+    for path in run_root.glob(f".macro-{day.isoformat()}.*"):
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+
+
 def macro_context_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, Any]:
+    """The macro_context stage; clears this D's temporaries before and after (see below)."""
+    run_root = _day_dir(config, day)
+    run_root.mkdir(parents=True, exist_ok=True)
+    _clear_macro_temps(run_root, day)
+    try:
+        return _macro_context_stage(config, day, now)
+    finally:
+        _clear_macro_temps(run_root, day)
+
+
+def _macro_context_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, Any]:
     """Compute the display-only ``macro-D.json`` (거시 흐름) in a child process under a time limit.
 
     Runs after market-sector and explain, before render.  It needs the D selection only, not a
@@ -675,7 +695,8 @@ def macro_context_stage(config: dict[str, Any], day: date, now: datetime) -> dic
     A failure, a timeout or a crash ends in a ``failed`` document
     (``modeler.scores.macro_context.failure_document``) that carries this invocation's id; the
     stage never raises into the run.
-    ``macro_context_enabled=false`` writes no document and the unit renders exactly as before.
+    ``macro_context_enabled`` false or absent writes no document and the unit renders exactly as
+    before.
     A document of an earlier invocation is set aside (renamed), never reused.
     """
     run_root = _day_dir(config, day)
@@ -683,7 +704,7 @@ def macro_context_stage(config: dict[str, Any], day: date, now: datetime) -> dic
     state_path = run_root / "coordinator-macro-context.json"
     document = run_root / f"macro-{day.isoformat()}.json"
     _retire_explain_document(document)
-    if config["macro_context_enabled"] is not True:
+    if config.get("macro_context_enabled", False) is not True:
         state = {"report_date": day.isoformat(), "status": "disabled"}
         _atomic(state_path, state)
         return state
@@ -893,8 +914,10 @@ def _reports_publisher_input(config: dict[str, Any], day: date, render: dict[str
         "model_cards_path": str(_absolute(config, "model_cards_path")),
         "top_n": config.get("reports_top_n", 100),
         "explain_enabled": config["explain_enabled"],  # off: the publisher reads no explain file
-        "macro_context_enabled": config["macro_context_enabled"],  # off: no macro file is read
         **_security_names_roots(config),
+        # Only when on: an off switch adds no key, so a publisher older than the section accepts
+        # the input (its check_config refuses unknown keys) and the publisher reads no macro file.
+        **({"macro_context_enabled": True} if config.get("macro_context_enabled") is True else {}),
     }
 
 

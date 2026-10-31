@@ -387,3 +387,27 @@ def test_failure_path_needs_no_heavy_imports():
         check=True,
     )
     assert out.stdout.strip() == "False"
+
+
+def test_vs_prev_recompute_excludes_us_rows_published_on_that_us_date(tmp_path):
+    """A US vintage with realtime_start == P (previous weekday) came out on US date P, after the
+    P 09:30 KST report: the recomputed P state must not see it. D itself still uses <= D."""
+    from modeler.scores.macro_context.build import compute_at
+    from modeler.scores.macro_context.load import load_macro_data
+    from modeler.scores.macro_context.summary import prev_weekday
+
+    P = prev_weekday(W.D)
+    us_extra = [("UNRATE", dt.date(2026, 8, 1), P, 8.88)]  # revision released on US date P
+    w = W.build_world(tmp_path, us_extra=us_extra)
+    data = load_macro_data(W.make_selection(w), W.D)
+
+    def unrate(res) -> float:
+        return next(o for o in res.mons if o["id"] == "us_unrate")["value"]["level"]
+
+    assert unrate(compute_at(data, P)) == 8.88  # the old rule (<= P) would have used it
+    assert unrate(compute_at(data, P, us_before=True)) != 8.88
+    assert unrate(compute_at(data, W.D)) == 8.88  # D: realtime_start <= D, unchanged
+    b = build(w)
+    assert by_id(b)["us_unrate"]["value"]["level"] == 8.88
+    assert b["checks"]["vs_prev_us_rule"] == "realtime_start < d"
+    assert "realtime_start < d" in b["rules"]["vs_prev"]["availability"]

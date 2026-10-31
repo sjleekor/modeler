@@ -111,16 +111,20 @@ def _doc(tmp_path: Path) -> dict:
     return json.loads((_run_dir(tmp_path) / f"macro-{D}.json").read_text())
 
 
-def test_config_requires_an_explicit_switch_and_a_sane_time_limit(tmp_path, world):
+def test_config_switch_is_off_when_absent_and_a_bool_when_present(tmp_path, world, fakes):
     _release, config_path = world
     body = json.loads(config_path.read_text())
     del body["macro_context_enabled"]
     config_path.write_text(json.dumps(body))
-    with pytest.raises(ValueError, match="macro_context_enabled must be explicit"):
-        dc._config(config_path)
-    _set(config_path, macro_context_enabled="yes")
-    with pytest.raises(ValueError, match="macro_context_enabled must be explicit"):
-        dc._config(config_path)
+    config = dc._config(config_path)  # an ops.json older than the section keeps working
+    assert "macro_context_enabled" not in config
+    config, _ = _infer(config_path)
+    assert dc.macro_context_stage(config, D, NOW)["status"] == "disabled"
+    assert not (_run_dir(tmp_path) / f"macro-{D}.json").exists()
+    for bad in ("yes", 1, None):
+        _set(config_path, macro_context_enabled=bad)
+        with pytest.raises(ValueError, match="macro_context_enabled must be true or false"):
+            dc._config(config_path)
     for bad in (5, 1801, True, "300"):
         _set(config_path, macro_context_enabled=True, macro_context_timeout_seconds=bad)
         with pytest.raises(ValueError, match="macro_context_timeout_seconds"):
@@ -398,6 +402,31 @@ def test_wrapper_run_publishes_the_page_and_svg(tmp_path, world):
     assert "거시 흐름은 [macro.md](macro.md)" in (unit / "market-sector.md").read_text()
     manifest = json.loads((run / "markdown" / "manifest.json").read_text())
     assert manifest["macro_state"] == "ok"
+
+
+def test_temporaries_of_this_day_are_cleared_before_and_after(tmp_path, world, fakes, monkeypatch):
+    """A child killed at the time limit can leave its mkstemp file (``.macro-<D>.<random>``):
+    the stage clears this D's ``.macro-<D>.*`` at start and end, and leaves other days alone."""
+    _release, config_path = world
+    _set(config_path, macro_context_enabled=True)
+    config, _ = _infer(config_path)
+    config["macro_context_timeout_seconds"] = 1
+    run = _run_dir(tmp_path)
+    stale = [run / f".macro-{D}.new", run / f".macro-{D}.k3j2x9"]
+    other = [run / ".macro-2026-10-06.new", run / ".macro-notes"]
+    for path in stale + other:
+        path.write_text("x")
+    left = run / f".macro-{D}.child-left"
+    script = f"open({str(left)!r}, 'w').write('partial'); import time; time.sleep(120)"
+    orig = dc.run_group
+    monkeypatch.setattr(
+        dc, "run_group", lambda argv, **kw: orig([sys.executable, "-c", script], **kw)
+    )
+    state = dc.macro_context_stage(config, D, NOW)
+    assert state["status"] == "failed" and state["timed_out"] is True
+    assert not any(path.exists() for path in [*stale, left])
+    assert all(path.exists() for path in other)
+    assert _doc(tmp_path)["reason"] == "timeout"
 
 
 def test_without_an_invocation_there_is_nothing_to_bind_to(tmp_path, world, fakes):

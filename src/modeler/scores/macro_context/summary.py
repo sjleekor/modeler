@@ -95,8 +95,9 @@ def level_text(o: dict[str, Any]) -> str | None:
     if o["id"] == "credit_baa" or o["display"]["level"] == "hide":
         return None
     if o["id"] in ("us_10y2y", "krus_10y"):
-        return neg(f"{v['level']:.2f}%p")
-    return neg(v["display"])
+        return None if v.get("level") is None else neg(f"{v['level']:.2f}%p")
+    # 월간 전년비는 12개월 전 달이 원천에 비었으면 값이 없다(display None).
+    return None if v.get("display") is None else neg(v["display"])
 
 
 def rep_text(o: dict[str, Any]) -> str:

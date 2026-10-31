@@ -191,9 +191,12 @@ class _Doc:
     @staticmethod
     def mcell(o: dict) -> str:
         m = next(x for x in o["measures"] if x["primary"])
-        txt = f"{ARROW[m['direction']]} {fmt_chg(m['change'], m['unit'])}"
-        if m.get("strong"):
-            txt = f"**{txt}**"
+        # 비교할 달이 원천에 비었으면 계산 모듈이 변화·방향을 비워 둔다: 값만, 값도 없으면 "—".
+        txt = fmt_chg(m.get("change"), m["unit"]) or "—"
+        if m.get("direction") in ARROW:
+            txt = f"{ARROW[m['direction']]} {txt}"
+            if m.get("strong"):
+                txt = f"**{txt}**"
         return f"{m['label']} {txt}"
 
     @staticmethod
@@ -277,7 +280,7 @@ class _Doc:
                     o["asof"],
                     o["release_date"],
                     o["status"],
-                    neg(o["value"]["display"]),
+                    "—" if o["value"].get("display") is None else neg(o["value"]["display"]),
                     self.mvalue(o, o["prev_value"]["level"]),
                     self.mcell(o),
                     st,
@@ -385,7 +388,10 @@ class _Doc:
                     parts.append(part)
                 a(f"- {self.short(iid)}: " + " · ".join(parts))
             a()
-        a("이전 상태는 저장된 보고서가 아니라 같은 입력을 그날 가용분으로 다시 계산한 값입니다.")
+        a(
+            "이전 상태는 저장된 보고서가 아니라 같은 입력을 그날 가용분으로 다시 계산한 값입니다. "
+            "미국 자료는 realtime_start가 그날보다 앞선 것만 씁니다."
+        )
         a()
 
     def detail(self) -> None:

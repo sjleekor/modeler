@@ -23,10 +23,18 @@ PAGE = md.MACRO_FILE
 SVG = "assets/macro-rates.svg"
 
 
+class MacroWorld(World):
+    """Daily publisher configs with the section switched on (the coordinator adds the key only
+    when it is on; a missing key means off)."""
+
+    def config(self, day: str, **overrides: object) -> dict:
+        return super().config(day, **{"macro_context_enabled": True, **overrides})
+
+
 @pytest.fixture()
 def world(tmp_path: Path, monkeypatch) -> World:
     mk.install(monkeypatch)
-    return World(tmp_path)
+    return MacroWorld(tmp_path)
 
 
 def unit_path(day: str) -> str:
@@ -108,6 +116,10 @@ def test_disabled_or_absent_macro_publishes_todays_unit_byte_for_byte(world: Wor
     assert local_names(world, D1) == sorted(FIVE)
     assert (world.runs / D1 / "markdown" / "manifest.json").read_bytes() == plain_manifest
     assert "macro_path" not in world.journal()["units"][D1]
+    absent = pr.local_step(World.config(world, D1))  # no key at all = off
+    assert absent["unit_sha256"] == plain["unit_sha256"]
+    assert local_names(world, D1) == sorted(FIVE)
+    assert (world.runs / D1 / "markdown" / "manifest.json").read_bytes() == plain_manifest
     on = pr.local_step(world.config(D1))
     assert on["unit_sha256"] != plain["unit_sha256"]
     with pytest.raises(pr.PublishError, match="macro_context_enabled"):

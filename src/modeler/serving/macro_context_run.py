@@ -23,9 +23,10 @@ import tempfile
 from pathlib import Path
 
 
-def _install(path: Path, raw: bytes) -> None:
+def _install(path: Path, raw: bytes, unit: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp = tempfile.mkstemp(prefix=".macro-", dir=path.parent)
+    # ``.macro-<D>.*``: the coordinator clears leftovers of a killed child by this name rule
+    fd, temp = tempfile.mkstemp(prefix=f".macro-{unit}.", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(raw)
@@ -63,7 +64,7 @@ def _run(args: argparse.Namespace) -> int:
     )
     if not isinstance(body, dict):
         raise TypeError("macro document must be a JSON object")
-    _install(Path(args.output), document_bytes(body))
+    _install(Path(args.output), document_bytes(body), args.report_date)
     print(json.dumps({"status": body.get("state")}, sort_keys=True))
     return 0
 

@@ -47,10 +47,14 @@ def jsonable(o: Any) -> Any:
     return o
 
 
-def compute_at(data: MacroData, d: dt.date) -> Computed:
-    """입력의 ``d`` 가용분으로 지표 전체를 계산한다."""
+def compute_at(data: MacroData, d: dt.date, *, us_before: bool = False) -> Computed:
+    """입력의 ``d`` 가용분으로 지표 전체를 계산한다.
+
+    ``us_before``이면 미국 행은 ``realtime_start < d``만 쓴다. 지난 보고서 대비로 앞 날짜 d를 다시
+    계산할 때다: 미국 날짜 d에 나온 vintage는 d 09:30 KST 보고서 때 아직 없었다.
+    """
     kr, kr_first = view(data.kr_rows, d)
-    us, us_first = view(data.us_rows, d)
+    us, us_first = view(data.us_rows, d, before=us_before)
     return compute(d, kr, us, kr_first, us_first)
 
 
@@ -85,6 +89,8 @@ def input_checks(data: MacroData, res: Computed) -> dict[str, Any]:
         "us_max_observation_le_D": bool(max(us_obs) <= D),
         "all_indicator_asof_le_D": not viol,
         "violations": viol,
+        # 지난 보고서 대비로 다시 계산하는 앞 날짜 d의 미국 행 규칙(통과 판정에는 안 씀)
+        "vs_prev_us_rule": "realtime_start < d",
     }
     c["overall_pass"] = bool(
         all(v for k, v in c.items() if k.startswith("all_") or k.endswith("_le_D"))
@@ -133,6 +139,9 @@ def rules_block() -> dict[str, Any]:
         "vs_prev": {
             "max_count": VS_PREV_MAX_COUNT,
             "method": "직전 평일을 같은 입력의 그날 가용분으로 다시 계산",
+            "availability": "다시 계산하는 날 d에서 한국은 available_from_date <= d, 미국은 "
+            "realtime_start < d(미국 날짜 d에 나온 자료는 d 09:30 KST 보고서 뒤에 나옴). "
+            "이번 보고서 D는 realtime_start <= D 그대로",
         },
         "splice": {
             "map": SPLICE_MAP,
@@ -158,7 +167,7 @@ def build_document(
         o["short_name"] = SHORT[o["id"]]
         o["display_name"] = DISP[o["id"]]
     summary = build_summary(res.inds, res.mons)
-    vsp = vs_prev(D, res, lambda d: compute_at(data, d))
+    vsp = vs_prev(D, res, lambda d: compute_at(data, d, us_before=True))
     stale_d = [o["id"] for o in res.inds if o["stale"]]
     header = dict(
         daily_asof_min=min(o["asof"] for o in res.inds),

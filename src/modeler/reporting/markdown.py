@@ -1986,7 +1986,10 @@ def load_macro(raw: bytes | None, unit: str, invocation_id: object, release: str
     if rendered is None:
         rendered = (MACRO_FALLBACK, {})
     text, assets = rendered
+    header = doc.get("header") if accepted else None
+    asof = good_date(header.get("daily_asof_max")) if isinstance(header, dict) else None
     return {
+        "asof": asof,  # README 섹션 표의 기준일 칸: 일간 지표의 마지막 기준일
         "state": state if isinstance(state, str) and state else "failed",
         "reason": reason,
         "sha": digest,
@@ -3057,7 +3060,8 @@ def render_summary(ctx: dict) -> tuple[list, dict]:
         ],
     ]
     if macro_status(ctx) is not None:  # 거시 흐름 입력이 없으면 표는 전과 같습니다
-        rows.insert(1, ["[거시 흐름](macro.md)", STATUS_KO[macro_status(ctx)], "표시 전용"])
+        asof = ctx["macro"].get("asof") or "—"
+        rows.insert(1, ["[거시 흐름](macro.md)", STATUS_KO[macro_status(ctx)], asof])
     lines += md_table(["섹션", "상태", "기준일"], rows)
     lines += ["", "## 경고", ""]
     warnings = []

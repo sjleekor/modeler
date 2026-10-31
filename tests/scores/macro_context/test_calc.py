@@ -359,3 +359,11 @@ def test_conds_a_b_c_from_periods():
         ],
     )
     assert calc.conds(o2)["b"] is None
+
+
+def test_view_before_drops_rows_available_on_the_day_itself():
+    d1 = dt.date(2026, 10, 1)
+    rows = {"S": [(d1, 1.0, dt.date(2026, 10, 2)), (d1, 2.0, dt.date(2026, 10, 27))]}
+    assert view(rows, dt.date(2026, 10, 27))[0]["S"][d1] == (2.0, dt.date(2026, 10, 27))
+    cur, _ = view(rows, dt.date(2026, 10, 27), before=True)
+    assert cur["S"][d1] == (1.0, dt.date(2026, 10, 2))
