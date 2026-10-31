@@ -9,7 +9,8 @@
 | 4 | 상대 링크 | modeler.reporting.markdown.validate |
 | 5 | 과거 단위 보호: 단위의 변경·삭제 거부(--correct한 단위만 예외) | check_change_set |
 
-검사 5의 예외: --correct한 단위는 정정판에 없는 옛 그림(`assets/*.svg`)을 지울 수 있습니다.
+검사 5의 예외: --correct한 단위는 정정판에 없는 옛 그림(`assets/*.svg`)과 `macro.md`를
+지울 수 있습니다.
 | 6 | 서버 경로·호스트명·키 모양 문자열 | modeler.reporting.markdown.validate |
 
 publisher는 동기화 단계에서 이 모듈의 `validate_working_tree`를 부릅니다. 수동으로는
@@ -137,6 +138,13 @@ def check_change_set(
             asset = md.ASSET_PATH_RE.match(path)
             if asset and asset.group(3) in corrected:
                 continue  # 정정판에서 빠진 옛 그림입니다. 정정을 허가한 단위만 지울 수 있습니다
+            optional = md.UNIT_PATH_RE.match(path)
+            if (
+                optional
+                and optional.group(4) in md.OPTIONAL_SECTION_FILES.values()
+                and optional.group(3) in corrected
+            ):
+                continue  # 정정판에서 빠진 거시 흐름(macro.md)입니다. 정정한 단위만 지웁니다
             problems.append(f"{path}: 삭제는 허용하지 않습니다 (단위와 문서는 지우지 않습니다)")
             continue
         if code not in ("A", "M"):

@@ -29,6 +29,12 @@
 파일인지 확인하고 다시 읽습니다. 설정 `explain_enabled: false`이거나 파일이 없으면 읽지 않고,
 단위는 근거 기능이 없던 때와 바이트까지 같습니다. 단위 파일은 markdown 5개와 `assets/*.svg`입니다.
 
+거시 흐름: run 디렉터리에 `macro-D.json`(`briefing-macro.v1`)이 있으면 로컬 단계가 읽어
+렌더러에 넘기고, 단위에 `macro.md`와 `assets/macro-*.svg`가 더해집니다(README·시장·섹터에서
+링크). 점수·순위에 쓰지 않는 표시 전용입니다. 경로·sha256·상태는 manifest·journal에 `macro_*`로
+남고, 정정·재시도는 같은 파일인지 확인하고 다시 읽습니다. 설정 `macro_context_enabled: false`
+이거나 파일이 없으면 읽지 않고, 단위는 거시 흐름 기능이 없던 때와 바이트까지 같습니다.
+
 release의 `modeler` 패키지가 `PYTHONPATH`에 있어야 합니다(coordinator가 맞춰 줍니다).
 이 스크립트와 `validate_reports.py`는 release 밖에 두고 sha256을 고정합니다.
 """
@@ -65,6 +71,7 @@ MAX_PUSH_ATTEMPTS = 3
 GIT_TIMEOUT = 120
 LOCAL_LOCK_WAIT_SECONDS = 60.0
 EXPLAIN_MAX_BYTES = 64 * 1024 * 1024
+MACRO_MAX_BYTES = 16 * 1024 * 1024
 KST = timezone(timedelta(hours=9))
 
 REQUIRED_KEYS = {"audience", "checkout_dir", "remote_name", "expected_remote_url", "branch"}
@@ -78,6 +85,7 @@ OPTIONAL_KEYS = {
     "security_names_kr_root",
     "report_date",
     "explain_enabled",
+    "macro_context_enabled",
 }
 ALLOWED_KEYS = REQUIRED_KEYS | LOCAL_KEYS | OPTIONAL_KEYS
 # 증권 이름 입력(security-names.v1)을 레이크에서 만드는 데 쓰는 root. 시장별로 따로 받습니다.
@@ -185,6 +193,8 @@ def check_config(config: dict, *, need_local: bool, strict_remote: bool = True) 
             _absolute(config[key], key)
     if "explain_enabled" in config and not isinstance(config["explain_enabled"], bool):
         raise PublishError("explain_enabled must be true or false")
+    if "macro_context_enabled" in config and not isinstance(config["macro_context_enabled"], bool):
+        raise PublishError("macro_context_enabled must be true or false")
 
 
 def _absolute(value: object, label: str) -> Path:
@@ -373,7 +383,7 @@ def _unit_dir_local(markdown_dir: Path) -> Path:
 
 
 def _read_unit_files(directory: Path) -> dict | None:
-    """로컬 단위(markdown 5개 + `assets/*.svg`)를 읽습니다. 모양이 맞지 않으면 None입니다.
+    """로컬 단위(markdown 5개, 있으면 `macro.md`, `assets/*.svg`)를 읽습니다. 모양이 틀리면 None.
 
     markdown은 텍스트, 그림은 바이트입니다. symlink, 모르는 파일, 그림 이름 규칙 밖의 항목이
     하나라도 있으면 None입니다(단위가 바뀌었거나 없는 것으로 다룹니다).
@@ -388,6 +398,11 @@ def _read_unit_files(directory: Path) -> dict | None:
         files[name] = path.read_text(encoding="utf-8")
     for path in directory.iterdir():
         if path.name in md.SECTION_FILES.values():
+            continue
+        if path.name in md.OPTIONAL_SECTION_FILES.values():
+            if path.is_symlink() or not path.is_file():
+                return None
+            files[path.name] = path.read_text(encoding="utf-8")
             continue
         if path.name != "assets" or path.is_symlink() or not path.is_dir():
             return None
@@ -562,6 +577,14 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         explain_bytes = _read_explain(explain_file)
     else:
         explain_file = None
+    # 거시 흐름 입력. 꺼져 있거나 없으면 읽지 않습니다(거시 흐름 기능이 없던 때와 같은 단위).
+    macro_file = run_dir / f"macro-{unit}.json"
+    macro_bytes = None
+    macro_on = config.get("macro_context_enabled", True)
+    if macro_on and (macro_file.exists() or macro_file.is_symlink()):
+        macro_bytes = _read_macro(macro_file)
+    else:
+        macro_file = None
 
     # L2. 렌더합니다. 같은 입력을 다시 돌려 내용이 같으면 파일을 그대로 둡니다(generated_at 고정).
     md.reset_scrub_hits()
@@ -579,6 +602,7 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
             operator_memo=memo_bytes,
             explain=explain_bytes,
             invocation_id=config["invocation_id"],
+            macro=macro_bytes,
         )
         files = md.render_unit(ctx)
     except md.InputError as exc:
@@ -630,6 +654,15 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
                 "explain_path": str(explain_file),
                 "explain_sha256": hashlib.sha256(explain_bytes).hexdigest(),
                 "explain_state": explain.get("state"),
+            }
+        )
+    if macro_bytes is not None:  # 거시 흐름 입력이 없으면 manifest·journal은 전과 같습니다
+        macro = ctx.get("macro") or {}
+        extra_fields.update(
+            {
+                "macro_path": str(macro_file),
+                "macro_sha256": hashlib.sha256(macro_bytes).hexdigest(),
+                "macro_state": macro.get("state"),
             }
         )
     manifest.update(extra_fields)
@@ -777,7 +810,7 @@ def _apply_unit(
         for name, text in files.items():
             md.write_if_changed(udir / name, text)
         if corrected:
-            md.remove_stale_assets(udir, files)  # 정정판에 없는 옛 그림은 지웁니다
+            md.remove_stale_assets(udir, files)  # 정정판에 없는 옛 그림·macro.md는 지웁니다
         md.ensure_model_cards(checkout, cards, None)
         md.reindex(checkout, lambda message: None)
         problems = vr.validate_working_tree(
@@ -820,8 +853,19 @@ def _read_explain(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def _read_macro(path: Path) -> bytes:
+    """거시 흐름 입력을 읽습니다. 일반 파일이 아니거나 너무 크면 빈 바이트를 돌려줍니다.
+
+    빈 바이트는 렌더러가 형식 오류 실패 안내로 그립니다. 거시 흐름 문제로 단위를 막지 않습니다.
+    """
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > MACRO_MAX_BYTES:
+        return b""
+    return path.read_bytes()
+
+
 def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: str) -> dict:
-    """journal 항목에 적힌 입력(report, 시장·섹터, 이름, 메모, 근거)으로 렌더 입력을 만듭니다."""
+    """journal 항목에 적힌 입력(report, 시장·섹터, 이름, 메모, 근거, 거시 흐름)으로 렌더 입력을
+    만듭니다."""
     run_dir = Path(entry["run_dir"])
     report_path = _regular_file(run_dir / f"report-{unit}.json", "report")
     report_bytes = report_path.read_bytes()
@@ -852,6 +896,14 @@ def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: 
         explain_bytes = _read_explain(explain_path)
         if hashlib.sha256(explain_bytes).hexdigest() != entry.get("explain_sha256"):
             raise PublishError("explain input changed since the local step")
+    macro_bytes = None
+    if entry.get("macro_path"):
+        macro_path = Path(entry["macro_path"])
+        if macro_path.parent != run_dir:
+            raise PublishError("macro input is outside the run directory")
+        macro_bytes = _read_macro(macro_path)
+        if hashlib.sha256(macro_bytes).hexdigest() != entry.get("macro_sha256"):
+            raise PublishError("macro input changed since the local step")
     try:
         return md.build_context(
             checkout,
@@ -866,6 +918,7 @@ def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: 
             operator_memo=memo_bytes,
             explain=explain_bytes,
             invocation_id=entry["invocation_id"],
+            macro=macro_bytes,
         )
     except md.InputError as exc:
         raise PublishError(f"cannot render from the journaled inputs: {exc}") from None
