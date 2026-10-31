@@ -20,6 +20,8 @@ CORRECTION_PARSER_VERSION = "disclosure_correction_1.0.0"
 
 _DATE = re.compile(r"(?<!\d)((?:19|20)\d{2})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})(?!\d)")
 _DATE8 = re.compile(r"(?<!\d)((?:19|20)\d{2})(\d{2})(\d{2})(?!\d)")
+_DATE_YY = re.compile(r"^\s*(\d{2})\s*\.\s*(\d{1,2})\s*\.\s*(\d{1,2})\s*\.?\s*$")
+_DATE_Y4MD = re.compile(r"^\s*(20\d{2})\s*\.\s*(\d{2})(\d{2})\s*$")
 _NUM = re.compile(r"^[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?$|^[-+]?\d+(?:\.\d+)?$")
 _ANCHOR = re.compile(r"<a\b[^>]*?href\s*=\s*[\"']([^\"']*)[\"'][^>]*>(.*?)</a>", re.I | re.S)
 _RCPNO = re.compile(r"rcpno=(\d{14})")
@@ -47,6 +49,15 @@ def parse_dates(s: str | None) -> list[str]:
         v = _valid(*map(int, m.groups()))
         if v:
             out.append(v)
+    if out:
+        return out
+    # 칸 전체가 짧은 날짜일 때만(문장 속 숫자는 안 읽음): "22.07.14" → 2022-07-14, "2025.0214"
+    m = _DATE_YY.match(s) or _DATE_Y4MD.match(s)
+    if m:
+        y, mo, d = map(int, m.groups())
+        v = _valid(y + 2000 if y < 100 else y, mo, d)
+        if v:
+            out.append(v)
     return out
 
 
@@ -69,10 +80,12 @@ def classify_item(label: str | None) -> tuple[str, bool]:
     kinds = []
     if "유보" in k:
         kinds.append("hold")
-    if "금액" in k or "계약내역" in k:
+    if "금액" in k:
         kinds.append("amount")
     if "매출액대비" in k or "매출액비" in k or "비율" in k:
         kinds.append("ratio")
+    if "최근매출" in k and "대비" not in k:
+        kinds.append("recent_sales")
     has_start, has_end = "시작일" in k, "종료일" in k
     if has_start and has_end:
         kinds.append("period")
@@ -86,10 +99,14 @@ def classify_item(label: str | None) -> tuple[str, bool]:
         kinds.append("counterparty")
     if "기타" in k and ("투자판단" in k or "참고" in k or "중요사항" in k):
         kinds.append("other_text")
+    # "2. 계약내역"은 절 이름이다. 다른 종류가 없을 때만 금액으로 본다(11-01 대조: 절 이름 때문에
+    # "계약내역 - 매출액대비(%)"·"계약내역 - 최근매출액"이 금액으로 분류되던 것을 고침, 계획 13 §13.2).
+    if not kinds and "계약내역" in k:
+        kinds.append("amount")
     if not kinds:
         return "unmapped", False
-    # 대표 분류: 유보 > 금액 > 기간 > 상대방 > 비율 > 기타
-    for c in ("hold", "amount", "period_end", "period_start", "period", "counterparty", "ratio"):
+    # 대표 분류: 유보 > 금액 > 기간 > 상대방 > 비율 > 최근 매출액 > 기타
+    for c in ("hold", "amount", "period_end", "period_start", "period", "counterparty", "ratio", "recent_sales"):
         if c in kinds:
             return c, len(set(kinds)) > 1
     return kinds[0], len(set(kinds)) > 1

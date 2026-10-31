@@ -73,6 +73,20 @@ def test_classify_item():
     assert classify_item("공시유보 사유")[0] == "hold"
     assert classify_item("10. 기타 투자판단에 참고할 사항") == ("other_text", False)
     assert classify_item("6. 주요 계약조건") == ("unmapped", False)
+    # 11-01 대조: "계약내역"은 절 이름 — 다른 종류가 있으면 금액으로 보지 않는다
+    assert classify_item("2. 계약내역 - 매출액 대비(%)") == ("ratio", False)
+    assert classify_item("2.계약내역 中 매출액대비(%)") == ("ratio", False)
+    assert classify_item("2.계약내역 - 최근 매출액(원)") == ("recent_sales", False)
+    assert classify_item("2. 계약내역") == ("amount", False)
+    assert classify_item("2. 계약내역 - 계약금액(원) - 매출액대비(%)") == ("amount", True)
+    assert classify_item("3.계약상대방 - 최근매출액(원)") == ("counterparty", True)
+
+
+def test_parse_dates_short_cell():
+    assert parse_dates("22.07.14") == ["2022-07-14"]
+    assert parse_dates("2025.0214") == ["2025-02-14"]
+    assert parse_dates("2021.02.29") == []
+    assert parse_dates("계약 1.2.3 항목") == []
 
 
 def test_title_family():
