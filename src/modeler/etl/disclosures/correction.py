@@ -99,14 +99,25 @@ def classify_item(label: str | None) -> tuple[str, bool]:
         kinds.append("counterparty")
     if "기타" in k and ("투자판단" in k or "참고" in k or "중요사항" in k):
         kinds.append("other_text")
-    # "2. 계약내역"은 절 이름이다. 다른 종류가 없을 때만 금액으로 본다(11-01 대조: 절 이름 때문에
-    # "계약내역 - 매출액대비(%)"·"계약내역 - 최근매출액"이 금액으로 분류되던 것을 고침, 계획 13 §13.2).
+    # "2. 계약내역"은 절 이름이다. 다른 종류가 없을 때만 금액으로 본다.
+    # 11-01 대조: 절 이름 때문에 "계약내역 - 매출액대비(%)"·"계약내역 - 최근매출액"이
+    # 금액으로 분류되던 것을 고침(계획 13 §13.2).
     if not kinds and "계약내역" in k:
         kinds.append("amount")
     if not kinds:
         return "unmapped", False
     # 대표 분류: 유보 > 금액 > 기간 > 상대방 > 비율 > 최근 매출액 > 기타
-    for c in ("hold", "amount", "period_end", "period_start", "period", "counterparty", "ratio", "recent_sales"):
+    order = (
+        "hold",
+        "amount",
+        "period_end",
+        "period_start",
+        "period",
+        "counterparty",
+        "ratio",
+        "recent_sales",
+    )
+    for c in order:
         if c in kinds:
             return c, len(set(kinds)) > 1
     return kinds[0], len(set(kinds)) > 1
