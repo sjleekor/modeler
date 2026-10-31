@@ -179,3 +179,27 @@ def test_sources_use_snapshot_date_from_inputs(rendered, body):
         f"KR 스냅샷 {kd}" in md
         and f"US macro_series 스냅샷 {body['inputs']['us']['snapshot_date']}" in md
     )
+
+
+def test_splice_lists_follow_body(rendered, tmp_path):
+    # 사본이 네 개뿐인 기본 body
+    md, _ = rendered
+    assert "| US 일간, 한국 표 사본으로 이음 (미 2년·10년, VIX, WTI) | 4 |" in md
+    assert "- 미 2년·10년·VIX·WTI의 최근 며칠은" in md
+
+    # 다섯 사본이 더 붙은 body: 이은 지표 아홉, macro_series만 쓴 지표는 10년-2년 하나
+    world = W.build_world(tmp_path, with_new_copies=True)
+    body = mc.build_document(W.make_selection(world), **KW)
+    md, _ = macro.render(body)
+    spliced = [o for o in body["indicators"] if (o.get("splice") or {}).get("copy_rows", 0) > 0]
+    assert len(spliced) == 9
+    rows = [r for r in md.split("\n") if r.startswith("| US 일간")]
+    assert len(rows) == 2 and "| 9 |" in rows[0] and "| 1 |" in rows[1]
+    for name in ("3개월물", "실질금리", "BAA", "달러지수", "브렌트", "VIX", "WTI"):
+        assert name in rows[0]
+    assert "macro_series만 (10년−2년)" in rows[1]
+    bullets = [r for r in md.split("\n") if r.startswith("- ") and "행" in r and "이음" not in r]
+    assert sum("macro_series 마지막 날" in b or "까지 macro_series" in b for b in bullets) == 9
+    for iid in ("us_3m", "credit_baa", "usd_index", "brent", "us_10y_real"):
+        short = next(o["short_name"] for o in body["indicators"] if o["id"] == iid)
+        assert f"- {short}: " in md

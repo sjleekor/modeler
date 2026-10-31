@@ -36,8 +36,19 @@ KR_DAILY_IDS = (
     "tv_kospi",
     "tv_kosdaq",
 )
-SPLICED_IDS = ("us_2y", "us_10y", "vix", "wti")
-WEEKLY_US_IDS = ("us_3m", "us_10y_real", "us_10y2y", "credit_baa", "usd_index", "brent")
+#: 입력 기준일 표·사본 이음 문구에 쓰는 줄임 이름. 없으면 짧은 이름(`short_name`)을 쓴다.
+ABBR = {
+    "us_2y": "미 2년",
+    "us_10y": "미 10년",
+    "vix": "VIX",
+    "wti": "WTI",
+    "us_3m": "3개월물",
+    "us_10y_real": "실질금리",
+    "us_10y2y": "10년−2년",
+    "credit_baa": "BAA",
+    "usd_index": "달러지수",
+    "brent": "브렌트",
+}
 FLOW_COLS = (("1주", "5세션"), ("1개월", "20세션"), ("3개월", "60세션"), ("6개월", "120세션(참고)"))
 
 
@@ -83,6 +94,34 @@ def _table(head: list[str], rows: list[list[str]], align: list[str] | None = Non
 
 def _hmd(iso: str) -> str:
     return f"{iso[5:7]}/{iso[8:10]}"
+
+
+def _names(objs: list[dict], sep: str) -> str:
+    """줄임 이름을 `ABBR` 순서대로 `sep`로 잇는다. 앞뒤가 모두 "미 "로 시작하면 뒤의 "미 "를 떼고 `·`로 붙인다."""
+    out = ""
+    prev = ""
+    rank = {k: i for i, k in enumerate(ABBR)}
+    for o in sorted(objs, key=lambda x: rank.get(x["id"], len(rank))):
+        name = ABBR.get(o["id"], o["short_name"])
+        if not out:
+            out = name
+        elif prev.startswith("미 ") and name.startswith("미 "):
+            out += "·" + name[2:]
+        else:
+            out += sep + name
+        prev = name
+    return out
+
+
+def _us_daily(inds: list[dict]) -> tuple[list[dict], list[dict]]:
+    """미국 원천 일간 지표를 (사본으로 이은 것, macro_series만 쓴 것)으로 나눈다.
+
+    미국 원천은 splice에 `macro_series_last_date`가 있는 지표이고, 이은 것은 `copy_rows > 0`이다.
+    """
+    us = [o for o in inds if (o.get("splice") or {}).get("macro_series_last_date")]
+    spliced = [o for o in us if o["splice"].get("copy_rows", 0) > 0]
+    ids = {o["id"] for o in spliced}
+    return spliced, [o for o in us if o["id"] not in ids]
 
 
 def _tilde(text: str) -> str:
@@ -453,11 +492,11 @@ class _Doc:
             return [o for o in self.inds if o["id"] in ids]
 
         grp("KR 일간 (ECOS 금리·환율·증시 자금)", pick(KR_DAILY_IDS))
-        grp("US 일간, 한국 표 사본으로 이음 (미 2년·10년, VIX, WTI)", pick(SPLICED_IDS))
-        grp(
-            "US 일간, macro_series만 (3개월물·실질금리·10년−2년·BAA·달러지수·브렌트)",
-            pick(WEEKLY_US_IDS),
-        )
+        spliced, weekly = _us_daily(self.inds)
+        if spliced:
+            grp(f"US 일간, 한국 표 사본으로 이음 ({_names(spliced, ', ')})", spliced)
+        if weekly:
+            grp(f"US 일간, macro_series만 ({_names(weekly, '·')})", weekly)
         grp("파생 (한미 10년 금리차)", pick(("krus_10y",)))
         for lab, src in (("US 월간 (macro_series)", "us_"), ("KR 월간 (공통 피쳐 표)", "kr_")):
             sel = [o for o in self.mons if o["id"].startswith(src)]
@@ -472,13 +511,16 @@ class _Doc:
         a = self.a
         a("### 사본 이음")
         a()
-        a(
-            "미 2년·10년·VIX·WTI는 macro_series 마지막 날 다음 날부터 한국 공통 피쳐 표의 사본으로 이었습니다."
-        )
-        a()
-        for o in self.inds:
-            s = o.get("splice")
-            if s and s.get("copy_series_id") and o["id"] in SPLICED_IDS:
+        spliced, _ = _us_daily(self.inds)
+        if spliced:
+            a(
+                f"{_names(spliced, '·')}는 macro_series 마지막 날 다음 날부터 "
+                "한국 공통 피쳐 표의 사본으로 이었습니다."
+            )
+            a()
+        for o in spliced:
+            s = o["splice"]
+            if s.get("copy_series_id"):
                 rounded = (
                     ", 사본 소수 둘째 자리 반올림" if s.get("copy_rounding") is not None else ""
                 )
@@ -524,9 +566,16 @@ class _Doc:
         a(
             "- 수준이 아닌 값(변화폭·방향·10년 백분위·합계·비율)은 ECOS·FRED 원자료를 가공한 값입니다."
         )
-        a(
-            "- 미 2년·10년·VIX·WTI의 최근 며칠은 한국 공통 피쳐 표의 사본으로 이었습니다(VIX 사본 원천은 FinanceDataReader)."
-        )
+        spliced, _ = _us_daily(self.inds)
+        if spliced:
+            vix = (
+                "(VIX 사본 원천은 FinanceDataReader)"
+                if any(o["id"] == "vix" for o in spliced)
+                else ""
+            )
+            a(
+                f"- {_names(spliced, '·')}의 최근 며칠은 한국 공통 피쳐 표의 사본으로 이었습니다{vix}."
+            )
         a(
             "- 신용 스프레드 수준과 거래대금 수준은 원천 약관과 이용 조건 때문에 싣지 않았습니다. 변화·백분위·비율만 적었습니다."
         )
