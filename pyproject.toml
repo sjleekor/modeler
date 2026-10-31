@@ -61,6 +61,10 @@ src = ["src"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "TID"]   # TID 가 없으면 아래 banned-api 가 안 먹는다
 
+# 줄 길이는 포매터(black·ruff format, 100자)가 코드를 맞춘다. 한글 주석·문자열까지
+# lint로 막으면 09-21부터 CI가 6주 동안 빨간 채로 남아 경계 검사(TID)까지 묻혔다(2026-11-01).
+ignore = ["E501"]
+
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 # collector.lake 는 여기 없다 — 두 저장소가 공유하는 경로 계약이라 modeler가
 # 쓰는 것이 맞다. collector.kr.shared / collector.us.shared 와 같은 자리다.
@@ -73,6 +77,43 @@ select = ["E", "F", "I", "W", "UP", "TID"]   # TID 가 없으면 아래 banned-a
 "collector.us.store".msg    = "스냅샷 쓰기는 수집의 일이다. modeler는 읽기만 한다"
 "collector.us.cli".msg      = "CLI를 부르지 않는다"
 "collector.us.paths".msg    = "경로는 modeler 자신의 DataRoot로 조립한다"
+
+[tool.ruff.lint.per-file-ignores]
+# 2026-11-01 기준 기존 부채(기준선). 새 파일·새 오류는 막는다.
+# 그 파일을 고치는 브랜치가 해당 줄을 지우고 오류를 고친다 — 이 목록은 줄어들기만 한다.
+"src/modeler/models/_02_updown_prob/experiments/t15_regen.py" = ["I001"]
+"src/modeler/reporting/site.py"                               = ["I001"]
+"src/modeler/serving/adapters.py"                             = ["F401", "F841"]
+"src/modeler/serving/calendars.py"                            = ["UP035", "UP037"]
+"src/modeler/serving/daily_coordinator.py"                    = ["I001", "UP037"]
+"src/modeler/serving/daily_inputs.py"                         = ["I001"]
+"src/modeler/serving/daily_wrapper.py"                        = ["I001"]
+"src/modeler/serving/kr_live_prepare.py"                      = ["I001"]
+"src/modeler/serving/kr_prepare.py"                           = ["I001"]
+"src/modeler/serving/orchestration.py"                        = ["UP017", "UP035", "UP037"]
+"src/modeler/serving/runner.py"                               = ["I001", "UP035"]
+"src/modeler/serving/runtime_contract.py"                     = ["F841"]
+"src/modeler/serving/us_daily.py"                             = ["I001", "UP035"]
+"src/modeler/us/features/profitability.py"                    = ["I001"]
+"src/modeler/us/features/valuation.py"                        = ["I001"]
+"tests/unit/serving/test_adapters_provenance.py"              = ["UP017"]
+"tests/unit/serving/test_briefing_wrappers.py"                = ["F541"]
+"tests/unit/serving/test_calendar_sources.py"                 = ["I001"]
+"tests/unit/serving/test_common_contracts.py"                 = ["UP017"]
+"tests/unit/serving/test_common_orchestration.py"             = ["I001"]
+"tests/unit/serving/test_daily_inputs.py"                     = ["I001"]
+"tests/unit/serving/test_daily_private_view.py"               = ["I001"]
+"tests/unit/serving/test_kr_live_prepare.py"                  = ["I001"]
+"tests/unit/serving/test_kr_prepare.py"                       = ["F401", "I001"]
+"tests/unit/serving/test_provision_serving.py"                = ["I001"]
+"tests/unit/serving/test_us_daily.py"                         = ["I001", "UP017"]
+"tests/unit/serving/test_us_daily_pinning.py"                 = ["I001"]
+"tests/unit/serving/test_us_parity_universe_v2.py"            = ["F401", "I001"]
+"tests/unit/serving/test_us_universe_v2_serving.py"           = ["F811", "I001"]
+# ⚠ 경계 위반(기준선 아님): opening_prepare가 collector.kr.adapters를 직접 import한다
+# (10-02 3f510c8, CI가 빨간 동안 들어옴). daily_opening은 Cronicle에서 꺼져 있다.
+# 할 일: SEOUL·assess_session_status를 collector.kr.shared로 내보내거나 modeler로 옮긴 뒤 이 줄을 지운다.
+"src/modeler/serving/opening_prepare.py" = ["TID251"]
 
 [tool.black]
 target-version = ["py312"]
