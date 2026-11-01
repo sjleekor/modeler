@@ -23,7 +23,7 @@ jobs:
           path: collector
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.0
 
       # 시험이 lightgbm·skfolio·matplotlib(eval extra)을 직접 import한다. 러너 기본 파이썬(3.14)이
       # 아니라 맥 venv와 같은 3.12로 맞춘다(2026-11-01 — lint가 6주 만에 통과한 뒤 처음 드러남).
