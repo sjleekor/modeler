@@ -110,10 +110,6 @@ ignore = ["E501"]
 "tests/unit/serving/test_us_daily_pinning.py"                 = ["I001"]
 "tests/unit/serving/test_us_parity_universe_v2.py"            = ["F401", "I001"]
 "tests/unit/serving/test_us_universe_v2_serving.py"           = ["F811", "I001"]
-# ⚠ 경계 위반(기준선 아님): opening_prepare가 collector.kr.adapters를 직접 import한다
-# (10-02 3f510c8, CI가 빨간 동안 들어옴). daily_opening은 Cronicle에서 꺼져 있다.
-# 할 일: SEOUL·assess_session_status를 collector.kr.shared로 내보내거나 modeler로 옮긴 뒤 이 줄을 지운다.
-"src/modeler/serving/opening_prepare.py" = ["TID251"]
 
 [tool.black]
 target-version = ["py312"]
