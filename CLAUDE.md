@@ -29,6 +29,12 @@ uv run ruff check src/ tests/
 uv run black src/ tests/
 ```
 
+**CI(`.github/workflows/test.yml`)는 `--extra dev --extra eval`·파이썬 3.12로 lint와 시험을 돈다.**
+시험이 lightgbm·skfolio·matplotlib을 직접 import한다. ruff는 E501을 끄고, 2026-11-01에 있던
+오류를 `pyproject.toml`의 `per-file-ignores`에 기준선으로 올렸다. **그 파일을 고치는 브랜치는
+main에 합치기 전에 해당 줄을 지우고 오류를 고친다** — 목록은 줄어들기만 한다. 새 파일에는 예외를
+더하지 않는다. 경과는 [`../my/milestones/common/20261101_modeler_ci_lint_baseline.md`](../my/milestones/common/20261101_modeler_ci_lint_baseline.md).
+
 **무거운 것은 extra 로 분리했다.** 가격 입력이 붙기 전에는 기본만으로 충분하다.
 선택 근거는 [`90_stack_recommendation`](../my/milestones/us/research/libraries/90_stack_recommendation.md)에 있다.
 
