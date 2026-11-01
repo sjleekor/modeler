@@ -11,7 +11,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from collector.kr.adapters.kis_intraday import SEOUL, assess_session_status
+from modeler.serving.opening_session import SEOUL, assess_session_status
 
 
 def _bytes(value: dict[str, Any]) -> bytes:
