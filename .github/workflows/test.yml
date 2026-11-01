@@ -25,11 +25,11 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v10.3.0
 
-      # 시험이 lightgbm·skfolio·matplotlib(eval extra)을 직접 import한다. 러너 기본 파이썬(3.14)이
-      # 아니라 맥 venv와 같은 3.12로 맞춘다(2026-11-01 — lint가 6주 만에 통과한 뒤 처음 드러남).
+      # 시험이 lightgbm·skfolio·matplotlib(eval extra)을 직접 import한다.
+      # 파이썬은 운영 serving venv(uv 관리 CPython 3.14.8)와 같은 판으로 맞춘다(2026-11-01 사용자 결정 — 맥·CI·운영 3.14 통일).
       - name: Sync dependencies
         working-directory: modeler
-        run: uv sync --python 3.12 --extra dev --extra eval
+        run: uv sync --python 3.14.8 --extra dev --extra eval
 
       - name: Lint (banned-api 포함)
         working-directory: modeler
