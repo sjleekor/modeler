@@ -35,6 +35,15 @@ jobs:
         working-directory: modeler
         run: uv run ruff check src tests
 
+      # feedback 시험은 macOS 경로 /private/tmp를 쓴다(/tmp는 macOS에서 심볼릭 링크라 거부).
+      # 러너에 같은 권한(1777)의 실제 디렉터리를 만든다.
+      - name: Prepare /private/tmp
+        run: sudo mkdir -p /private/tmp && sudo chmod 1777 /private/tmp
+
+      # 서빙 e2e 시험은 운영과 같은 플랫폼(Linux x86_64)이면 서버 실측 runtime manifest를
+      # 그대로 쓴다. 러너는 서버가 아니므로 시험 자체의 탈출구로 현재 인터프리터를 잰다.
       - name: Test
         working-directory: modeler
+        env:
+          DAILY_E2E_PROBE_RUNTIME: "1"
         run: uv run pytest -q
