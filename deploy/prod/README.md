@@ -442,3 +442,60 @@ sj2 serving venv에는 `exchange_calendars`가 없습니다(2026-10-06 확인: p
 
 - **prepare 단계는 만들었습니다** (`shadow_prepare.py`·`views.py`, 브랜치 `kr-next-prepare`). wrapper는 `shadow/panels_in/D=<D>/panel.parquet`이 없고 `SHADOW_PREPARE_CMD`도 없으면 `shadow_prepare run`을 부릅니다. 이 명령은 D날 raw 스냅샷(`SHADOW_RAW_LAKE`, 기본 `$KR_STOCK_DATA_ROOT/kr/raw/raw_postgres`)에서 파생 뷰 넷(`views/D-<D>/`, 쓰기 한 번)을 만들고 신호일 t의 서빙 패널과 `panel_manifest.json`을 씁니다. DuckDB `memory_limit` 기본은 2GB, 스레드 4입니다(`SHADOW_PREPARE_MEMORY_LIMIT`·`SHADOW_PREPARE_THREADS`). 맥 실측(2025-07-30 패널, 4스레드): 한도 6GB는 최대 7.9GB, 4GB는 5.7GB, 2GB는 3.2GB를 쓰고 1GB는 메모리 부족으로 멈춥니다. Cronicle `memory_limit` 8GB 안에 들려고 2GB로 정했고 패널은 6GB와 같습니다. 뷰 빌드는 약 40초, 패널은 약 105초입니다. 뷰 디렉터리는 하루 약 0.3GB씩 늘어나므로 보관 기간은 따로 정해야 합니다.
 - 서버 시간·메모리 실측, release 반영, 첫 실행 점검은 사용자와 서버가 필요합니다. 동결(번들 태그) 전에 입력을 쌓지 않습니다.
+
+
+## P6′의 그림자 서빙 (초안 · 서버에는 반영하지 않음, Cronicle 이벤트 없음)
+
+P6′는 P6에서 재무 입력 마트만 바꾼 모델입니다. 가격·PIT·품질 뷰는 P6와 같은 파일이고, 재무는 PIT 마트 `fin_quarterly_metric_vintage_dlr_v4p`(상폐 종목을 남긴 v3 사실 표 기반)로 바꿨습니다. 위 P6 그림자 경로와 따로 돕니다. release, 루트, 락, 장부, Cronicle 이벤트를 모두 따로 둡니다. P6 쪽 파일은 읽지도 쓰지도 않습니다. 코드는 `src/modeler/models/_04_kr_next_p6prime/`에 있고, 채점과 기록 형식은 P6 코드를 그대로 부릅니다.
+
+| 조각 | 위치 |
+|---|---|
+| 뷰 폴더 빌드(P6 뷰 복사 + v3 사실 + v4p) | `modeler.models._04_kr_next_p6prime.inputs` (`build_p6prime_views`) |
+| prepare(뷰 둘과 서빙 패널) | `modeler.models._04_kr_next_p6prime.shadow_prepare` (`run`, `prepare`) |
+| 채점·장부 검증 | `modeler.models._04_kr_next_p6prime.shadow` (`score`, `verify`) |
+| release 빌더 | `modeler.models._04_kr_next_p6prime.shadow_release` (`manifest`, `build`, `verify`) |
+| 태그 검사 | `modeler.models._04_kr_next_p6prime.tags` |
+| wrapper 초안 | `deploy/prod/bin/kr-next-p6prime-shadow.sh` |
+
+### P6와 갈라지는 곳
+
+- **태그가 다릅니다.** 사전등록 태그는 `kr-next-p6prime-frozen`, 번들 태그는 `kr-next-p6prime-bundle-frozen`입니다. 번들 `manifest.json`의 `prereg_tag`가 `kr-next-p6prime-frozen`이 아니면 release 빌드와 `score`가 멈춥니다. P6 번들(`kr-next-frozen`)은 받지 않습니다.
+- **release가 서로를 거부합니다.** P6′ release는 스키마가 `kr-next-p6prime-shadow-release.v1`이고 `release.json`에 `"model": "kr-next-p6prime"`이 들어갑니다. P6 `shadow_release verify`는 P6′ release를, P6′ `verify`는 P6 release를 거부합니다.
+- **루트가 다릅니다.** `SHADOW_ROOT` 경로에 `p6prime`이 들어 있어야 합니다. 없으면 wrapper가 락을 만들기 전에 종료 코드 10으로 멈춥니다. 기본값은 `/home/whi/apps/market-briefing/shadow_p6prime`입니다. 락은 `locks/kr-next-p6prime-shadow.lock`으로 P6 락과 다른 파일입니다. Python 단계도 `p6prime`이 없는 루트와 장부를 거부합니다.
+- **패널은 P6′ 전용입니다.** `panels_in/D=<D>/`에 `panel_manifest.json`과 사이드카 `p6prime_panel.json`이 둘 다 있어야 채점합니다. P6 prepare가 만든 패널은 사이드카가 없어 거부됩니다. 사이드카에는 재무 파일이 v4p라는 사실, 뷰 폴더 manifest 해시, 고정값(pins) 일치 여부가 들어갑니다.
+- 기록 형식(`record.json`, `ledger.jsonl`)과 마감(D 15:00 KST), 시도 규칙은 P6와 같습니다. 기록의 `panel_manifest` 안에 `p6prime` 키가 하나 더 들어갑니다. `shadow verify`는 이 키와 P6′ 번들 태그도 확인합니다.
+
+### release 만들기 (맥, P6′ 번들이 동결된 뒤)
+
+P6와 같은 순서입니다. P6′ `manifest`와 `build`는 `--collector-root`도 받습니다.
+
+1. `python -m modeler.models._04_kr_next_p6prime.shadow_release manifest --modeler-root <modeler> --collector-root <collector>`가 닫힘 목록의 sha256 줄을 찍습니다. 사람이 검토해 `--source-manifest` 파일로 저장합니다.
+2. `python -m modeler.models._04_kr_next_p6prime.shadow_release build --modeler-root <modeler> --collector-root <collector> --source-manifest <검토 목록> --bundle <P6′ 동결 번들> --output <새 디렉터리>`. 출력 경로가 있으면 멈추고, 번들이 P6′ 번들이 아니어도 멈춥니다. 닫힘 목록의 시작점은 P6′의 `shadow`, `shadow_prepare`, `shadow_release`입니다. 이 셋이 부르는 P6 모듈(`_03_kr_next`의 `shadow`·`shadow_prepare`·`views`·`build_panel`·`shadow_release`)과 v3 사실·v4p 마트 코드가 목록에 같이 들어옵니다.
+3. 서버에서도 `PYTHONPATH=<release>/src python -m modeler.models._04_kr_next_p6prime.shadow_release verify --release <디렉터리>`로 같은 검사를 합니다. wrapper가 실행 때마다 부릅니다.
+
+서버의 release 디렉터리는 git 밖에 있습니다. 11-02에 만든 release는 `shadow_release_20261102`이고 `code_sha256`은 `4abd9cfe0e8c85f4a423b56430f579764af2e08956aa55f9ad2e613af029f3fc`입니다.
+
+### 제안하는 Cronicle 이벤트 (생성은 사용자 승인 뒤)
+
+| 항목 | 값 |
+|---|---|
+| 이름 | `market_briefing_kr_next_p6prime_shadow` (제안) |
+| 실행 | 호스트 셸 플러그인. 스크립트는 `exec <기존 wrapper와 같은 디렉터리>/kr-next-p6prime-shadow.sh` 한 줄(중단 신호가 wrapper에 닿도록) |
+| `memory_limit` | 10GB를 명시합니다. 0이나 비우기는 전역 1GB로 돌아갑니다. 맥 실측 최대 RSS가 5.41GB라 P6 이벤트(8GB)보다 높게 잡았습니다. 서버 메모리는 아직 재지 않았습니다 |
+| 시각 | 평일 07:45 시작. P6 이벤트(07:30, 8GB)와 따로 돕니다. 기다리는 규칙은 P6와 같습니다. kr-prepare 완료 마커(`prepared/kr/score_date=*/prep_id=<D>/completion.json`, score_date는 아무거나)를 30초마다 파일로만 확인하고 `SHADOW_WAIT_UNTIL`(기본 09:20)까지 기다립니다. t가 쓸 만한지는 `shadow_prepare`가 입력(`daily_ohlcv` 행 수)으로 직접 봅니다 |
+| 피할 시간 | 22:50에서 24:00 사이 상태 변경 금지, OpenDART 운영 잡 22:10·23:30·04:00대 |
+| 락 | 자기 락 `locks/kr-next-p6prime-shadow.lock`만 잡습니다. `kr-prepare.lock`과 P6 락은 기다리거나 잡지 않습니다. 이미 돌고 있으면 "locked"를 남기고 0으로 끝납니다 |
+| 종료 코드 | P6 wrapper와 같습니다. 0 정상(또는 락 중·휴장), 2 사용법, 3 15:00 뒤에 써서 `valid=false`로 남김, 10 설정·release 검증 실패(`SHADOW_ROOT`에 `p6prime`이 없을 때 포함), 12 달력 밖, 30 마커 없음, 31 패널·manifest 없음 또는 prepare 실패, 33 t의 가격 행이 덜 찬 날(`skips/D=<D>.json`만 남기고 기록 없음, 빠진 날은 확정) |
+| 마감 | 쓰기 마감은 D 15:00 KST. 그 전에 쓴 기록만 유효합니다. 같은 날 재실행은 `D=<D>/attempt-<n>/`에 따로 쌓입니다 |
+
+환경변수는 P6 wrapper와 같습니다(`SHADOW_RELEASE` 필수, `SHADOW_ROOT`, `SERVING_ROOT`, `SHADOW_WAIT_UNTIL`, `SHADOW_POLL_SECONDS`, `SHADOW_PREPARE_CMD`, `SHADOW_RAW_LAKE`, `SHADOW_RAW_SOURCE`, `SHADOW_PREPARE_MEMORY_LIMIT`, `SHADOW_PREPARE_THREADS`, `BOOTSTRAP_PYTHON`). `SHADOW_PREPARE_CMD`가 없으면 `shadow_prepare run`을 부릅니다. 이 명령은 D날 raw 스냅샷에서 P6 뷰(`views_p6/D-<D>/`)와 P6′ 뷰 폴더(`views/D-<D>/`)를 차례로 만들고, t의 서빙 패널과 `p6prime_panel.json`을 씁니다. 완성된 뷰 폴더는 해시가 맞으면 다시 쓰고, manifest 없는 폴더는 죽은 빌드로 보고 다시 만듭니다.
+
+### 맥 리허설과 디스크
+
+- prepare는 212초, 최대 RSS는 5.41GB였습니다(P6는 162.7초, 3.7GB).
+- 뷰는 하루 약 0.74GB입니다(P6 뷰와 P6′ 뷰의 합). 보관은 P6 계획을 따라 최근 20세션과 격자일만 남깁니다.
+
+### 아직 없는 것
+
+- 서버 시간·메모리 실측, release 반영, Cronicle 이벤트 생성, 첫 실행 점검은 사용자와 서버가 필요합니다.
+- **휴일 CSV를 2027년 12월 중순 전에 늘려야 합니다.** P6′의 뷰 세션 달력은 앵커(스냅샷의 마지막 가격일) 뒤 10세션을 휴일 CSV 안에서 찾아야 합니다(`inputs.py`의 `CALENDAR_SESSIONS_AFTER_ANCHOR = 10`). 묶인 CSV는 2027-12-31까지라서, 그 전에 2028년 휴일을 넣지 않으면 달력을 못 만들어 prepare가 멈춥니다. P6는 1세션만 필요해 더 늦게 걸립니다.
