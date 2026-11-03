@@ -154,6 +154,19 @@ def test_hgb_real_fit_runs(grant):
     assert out["y_hat"].notna().all() and len(out) == 40
 
 
+def test_hgb_all_nan_train_column_dropped(grant):
+    """C1: a feature with no value in the training rows is left out of that fit only."""
+    ds = make_ds(40)
+    last = ds["decision_date"] == DATES[-1]
+    ds.loc[~last, "capex_ttm"] = np.nan  # all-NaN in training, observed on the eval date
+    out = train.fit_predict_date(ds=ds, eval_date=DATES[-1], spec=SPEC_HGB, **kw(grant))
+    assert out["y_hat"].notna().all() and len(out) == 40
+    ds2 = ds.copy()
+    ds2.loc[last, "capex_ttm"] = 1e9  # eval values of a dropped column cannot move predictions
+    out2 = train.fit_predict_date(ds=ds2, eval_date=DATES[-1], spec=SPEC_HGB, **kw(grant))
+    assert np.allclose(out["y_hat"], out2["y_hat"])
+
+
 def test_ridge_matrix_flags_and_fill():
     ds = make_ds(6, dates=DATES[:1])
     ds.loc[ds.index[0], "oi_q1"] = np.nan

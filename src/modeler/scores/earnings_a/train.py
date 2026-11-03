@@ -128,9 +128,13 @@ def _predict_ridge(tr: pd.DataFrame, ev: pd.DataFrame, params: dict[str, Any]) -
 
 
 def _predict_hgb(tr: pd.DataFrame, ev: pd.DataFrame, params: dict[str, Any]) -> np.ndarray:
-    x_tr = tr[list(FEATURES)].astype(float)
+    # Correction C1 (2026-11-03, after the freeze tag, before any result): a feature with no
+    # observed value in the training rows carries no split, but sklearn 1.9 refuses to bin an
+    # all-NaN column. Drop such columns for this fit (capex_ttm / div_ttm before 2020-09).
+    cols = [f for f in FEATURES if tr[f].notna().any()]
+    x_tr = tr[cols].astype(float)
     y_tr = tr["y_clip"].to_numpy(dtype=float)
-    x_ev = ev[list(FEATURES)].astype(float)
+    x_ev = ev[cols].astype(float)
     preds = []
     for seed in SEEDS:
         model = HistGradientBoostingRegressor(**params, random_state=seed)
