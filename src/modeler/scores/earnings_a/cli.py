@@ -1,5 +1,8 @@
 """Command line: ``python -m modeler.scores.earnings_a.cli {f3,f4,dev,sealed} [--out DIR] [--rehearsal | --dry-run-dev]``.
 
+Stage 2: ``stage2-check``, ``stage2-repro`` (DEV grant only), ``stage2-past`` (opens STAGE2_PAST once),
+``stage2-forward --decision-date D`` (opens FORWARD for D), ``stage2-score --meta FILE...``.
+
 stdout carries only the output directory and the manifest path. Errors go to stderr.
 F4 refuses a dirty ``earnings_a`` tree unless ``--rehearsal`` (then the manifest kind says so).
 """
@@ -111,6 +114,45 @@ def run_sealed_cmd(paths: P.DataPaths, out: str | None, dry_run_dev: bool) -> tu
     )
 
 
+def run_stage2_cmd(paths: P.DataPaths, args: argparse.Namespace) -> tuple[Path, Path]:
+    from datetime import date
+
+    from modeler.scores.earnings_a import stage2_run as S2
+
+    if args.cmd == "stage2-check":
+        return S2.run_check(paths, args.out)
+    if args.cmd == "stage2-past":
+        return S2.run_past(paths, args.out, allow_reopen=args.allow_reopen)
+    if args.cmd == "stage2-forward":
+        return S2.run_forward(
+            paths,
+            date.fromisoformat(args.decision_date),
+            args.out,
+            allow_reopen=args.allow_reopen,
+        )
+    past = Path(args.past_summary) if args.past_summary else None
+    return S2.run_score(paths, [Path(m) for m in args.meta], args.out, past)
+
+
+def run_stage2_repro(paths: P.DataPaths) -> str:
+    """Reproduction check under the DEV grant: prints the max abs MAE differences only."""
+    import json as _json
+
+    from modeler.scores.earnings_a import stage2_run as S2
+    from modeler.scores.earnings_a.sealed_run import CHOSEN_REL, CHOSEN_SHA256, _load_chosen
+
+    P.verify_input_hashes(paths)
+    chosen = _load_chosen(paths.out_root / CHOSEN_REL, CHOSEN_SHA256)
+    con = S2.connect_stage2(paths)
+    try:
+        res = S2.reproduce_dev(
+            paths, con, chosen, paths.out_root / "dev_20261103T031237Z" / "per_date.tsv"
+        )
+    finally:
+        con.close()
+    return _json.dumps(res, sort_keys=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.WARNING)
     ap = argparse.ArgumentParser(prog="modeler.scores.earnings_a.cli")
@@ -125,8 +167,27 @@ def main(argv: list[str] | None = None) -> int:
     ps = sub.add_parser("sealed")
     ps.add_argument("--out")
     ps.add_argument("--dry-run-dev", action="store_true")
+    sub.add_parser("stage2-check").add_argument("--out")
+    sub.add_parser("stage2-repro")
+    for name in ("stage2-past", "stage2-forward"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--out")
+        sp.add_argument("--allow-reopen", action="store_true")
+        if name == "stage2-forward":
+            sp.add_argument("--decision-date", required=True)
+    sc = sub.add_parser("stage2-score")
+    sc.add_argument("--out")
+    sc.add_argument("--meta", nargs="+", required=True)
+    sc.add_argument("--past-summary")
     args = ap.parse_args(argv)
     paths = P.DataPaths.resolve()
+    if args.cmd == "stage2-repro":
+        sys.stdout.write(run_stage2_repro(paths) + "\n")
+        return 0
+    if args.cmd.startswith("stage2-"):
+        out_dir, mpath = run_stage2_cmd(paths, args)
+        sys.stdout.write(f"{out_dir}\n{mpath}\n")
+        return 0
     if args.cmd == "f3":
         out_dir, mpath = run_f3(paths, args.out)
     elif args.cmd == "sealed":

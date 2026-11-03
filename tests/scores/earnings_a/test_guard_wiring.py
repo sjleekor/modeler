@@ -370,6 +370,43 @@ def test_open_seal_grant_without_tag_raises_and_writes_nothing(tmp_path):
     assert not ledger.exists() and not ledger.parent.exists()
 
 
+@pytest.mark.parametrize("phase", [seal.Phase.STAGE2_PAST, seal.Phase.FORWARD])
+def test_stage2_grants_without_tag_raise_and_write_nothing(tmp_path, phase):
+    ledger = tmp_path / "sub" / "seal_ledger.jsonl"
+
+    def runner(args):
+        return 0, ""  # no tag
+
+    with pytest.raises(SealViolation):
+        if phase is seal.Phase.STAGE2_PAST:
+            seal.open_seal_grant(phase, repo_dir=tmp_path, ledger_path=ledger, git_runner=runner)
+        else:
+            seal.open_forward_grant(
+                date(2026, 9, 30),
+                repo_dir=tmp_path,
+                ledger_path=ledger,
+                today=date(2026, 11, 3),
+                git_runner=runner,
+            )
+    assert not ledger.exists() and not ledger.parent.exists()
+
+
+def test_stage2_grants_cannot_read_confirm_dates_by_default(tmp_path):
+    g = seal.open_forward_grant(
+        date(2026, 9, 30),
+        repo_dir=tmp_path,
+        ledger_path=tmp_path / "l.jsonl",
+        today=date(2026, 11, 3),
+        git_runner=lambda a: (
+            0,
+            {"tag": "earnings-a2-frozen\n", "cat-file": "tag\n"}.get(a[0], "x\n"),
+        ),
+    )
+    with pytest.raises(SealViolation, match="2025-09-30"):
+        seal.check_decision_dates([date(2025, 9, 30)], seal.Phase.STAGE2_PAST)
+    assert not set(seal.CONFIRM_DATES) & set(g.allowed_dates)
+
+
 def test_dev_label_ending_after_cutoff_raises():
     g = seal.grant_dev()
     t = date(2021, 9, 30)

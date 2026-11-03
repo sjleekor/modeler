@@ -12,8 +12,14 @@ Decision dates are calendar quarter-ends. Windows (inclusive):
 * CONFIRM  2025-09-30 .. 2026-06-30  (4 dates)
 
 Phases: ``DEV`` allows DEV only. ``SEALED_RUN`` retrains walk-forward, so it allows
-DEV + GAP + SEALED. ``CONFIRM_RUN`` allows DEV + GAP + SEALED + CONFIRM. ``FORWARD``
-(dates after the freeze) is not implemented yet.
+DEV + GAP + SEALED. ``CONFIRM_RUN`` allows DEV + GAP + SEALED + CONFIRM.
+
+Stage 2 (``my/milestones/kr/modeling/plan/20261103_earnings_a_stage2/01_preregistration_draft.md``):
+``STAGE2_PAST`` evaluates the 25 quarter-ends 2019-06-30..2025-06-30 once (tag
+``earnings-a2-frozen``, one ledger record); its training and allowed rows are DEV + GAP +
+SEALED. ``FORWARD`` evaluates one quarter-end at a time (>= 2026-09-30 and <= the latest quarter
+end on or before today); one grant and one ledger record per decision date. A CONFIRM date is a
+training row only when the ledger holds a ``CONFIRM_RUN`` record whose ``scored_dates`` lists it.
 
 Boundaries come from the preregistration draft
 ``my/milestones/common/scores/20261102_earnings_forecast_a/01_preregistration_draft.md``
@@ -43,6 +49,7 @@ import numpy as np
 import pandas as pd
 
 SEAL_TAG = "earnings-a-frozen"
+STAGE2_TAG = "earnings-a2-frozen"
 DEV_LABEL_END_MAX = date(2023, 6, 30)  # DEV labels must not reach 2023Q3
 _QUARTER_END_MD = {(3, 31), (6, 30), (9, 30), (12, 31)}
 
@@ -56,6 +63,7 @@ class Phase(Enum):
     SEALED_RUN = "SEALED_RUN"
     CONFIRM_RUN = "CONFIRM_RUN"
     FORWARD = "FORWARD"
+    STAGE2_PAST = "STAGE2_PAST"
 
 
 def _quarter_ends(start: date, end: date) -> tuple[date, ...]:
@@ -73,16 +81,40 @@ GAP_DATES = _quarter_ends(date(2022, 9, 30), date(2023, 3, 31))
 SEALED_DATES = _quarter_ends(date(2023, 6, 30), date(2025, 6, 30))
 CONFIRM_DATES = _quarter_ends(date(2025, 9, 30), date(2026, 6, 30))
 
+# Stage 2. Evaluation dates of the one-shot past run (25 quarter-ends).
+STAGE2_PAST_DATES = _quarter_ends(date(2019, 6, 30), date(2025, 6, 30))
+FORWARD_START = date(2026, 9, 30)
 
-def allowed_decision_dates(phase: Phase) -> tuple[date, ...]:
+
+def forward_eval_dates(today: date) -> tuple[date, ...]:
+    """Quarter-ends >= 2026-09-30 and <= ``today`` (the latest one on or before today)."""
+    return _quarter_ends(FORWARD_START, today) if today >= FORWARD_START else ()
+
+
+def allowed_decision_dates(
+    phase: Phase,
+    *,
+    today: date | None = None,
+    confirm_dates: Iterable[date] = (),
+) -> tuple[date, ...]:
+    """Rows a phase may read. ``FORWARD`` needs ``today`` (forward quarter-ends are added) and
+    adds the ``confirm_dates`` the ledger covers (see :func:`covered_confirm_dates`)."""
     if phase is Phase.DEV:
         return DEV_DATES
-    if phase is Phase.SEALED_RUN:
+    if phase in (Phase.SEALED_RUN, Phase.STAGE2_PAST):
         return DEV_DATES + GAP_DATES + SEALED_DATES
     if phase is Phase.CONFIRM_RUN:
         return DEV_DATES + GAP_DATES + SEALED_DATES + CONFIRM_DATES
-    # TODO: FORWARD dates depend on the freeze date, which is not fixed yet.
-    raise NotImplementedError("FORWARD phase: allowed dates depend on the freeze date (TODO)")
+    if today is None:
+        raise SealViolation("FORWARD phase: allowed dates need the 'today' date")
+    keep = {d for d in confirm_dates if d in set(CONFIRM_DATES)}
+    return (
+        DEV_DATES
+        + GAP_DATES
+        + SEALED_DATES
+        + tuple(d for d in CONFIRM_DATES if d in keep)
+        + forward_eval_dates(today)
+    )
 
 
 def _to_date(v: Any) -> date:
@@ -165,6 +197,36 @@ def _read_ledger(path: Path) -> list[dict[str, Any]]:
     return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
 
+def _check_tag(run: GitRunner, repo: Path, tag: str) -> tuple[str, str]:
+    """Return (tag commit, HEAD commit) of an existing annotated ``tag``; else raise."""
+    rc, out = run(["tag", "-l", tag])
+    if rc != 0 or out.strip() != tag:
+        raise SealViolation(f"git tag {tag!r} not found in {repo}; seal stays closed")
+    rc, kind = run(["cat-file", "-t", f"refs/tags/{tag}"])
+    if rc != 0 or kind.strip() != "tag":
+        raise SealViolation(f"git tag {tag!r} is not an annotated tag")
+    rc, tag_commit = run(["rev-list", "-n", "1", tag])
+    if rc != 0 or not tag_commit.strip():
+        raise SealViolation(f"cannot resolve commit of tag {tag!r}")
+    rc, head = run(["rev-parse", "HEAD"])
+    if rc != 0 or not head.strip():
+        raise SealViolation("cannot resolve HEAD commit")
+    return tag_commit.strip(), head.strip()
+
+
+def _append_ledger(ledger: Path, record: dict[str, Any]) -> None:
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with ledger.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+_OPEN_TAGS = {
+    Phase.SEALED_RUN: SEAL_TAG,
+    Phase.CONFIRM_RUN: SEAL_TAG,
+    Phase.STAGE2_PAST: STAGE2_TAG,
+}
+
+
 def open_seal(
     phase: Phase,
     *,
@@ -173,24 +235,19 @@ def open_seal(
     allow_reopen: bool = False,
     git_runner: GitRunner | None = None,
 ) -> dict[str, Any]:
-    """Verify the freeze tag, check the ledger, append and return an open record."""
-    if phase not in (Phase.SEALED_RUN, Phase.CONFIRM_RUN):
-        raise SealViolation(f"open_seal applies to SEALED_RUN/CONFIRM_RUN, not {phase.value}")
+    """Verify the freeze tag, check the ledger, append and return an open record.
+
+    ``SEALED_RUN``/``CONFIRM_RUN`` need tag ``earnings-a-frozen``; ``STAGE2_PAST`` needs
+    ``earnings-a2-frozen``. Each phase opens once unless ``allow_reopen`` (recorded).
+    """
+    if phase not in _OPEN_TAGS:
+        raise SealViolation(
+            f"open_seal applies to SEALED_RUN/CONFIRM_RUN/STAGE2_PAST, not {phase.value}"
+        )
+    tag = _OPEN_TAGS[phase]
     repo = Path(repo_dir)
     run = git_runner or _subprocess_runner(repo)
-
-    rc, out = run(["tag", "-l", SEAL_TAG])
-    if rc != 0 or out.strip() != SEAL_TAG:
-        raise SealViolation(f"git tag {SEAL_TAG!r} not found in {repo}; seal stays closed")
-    rc, kind = run(["cat-file", "-t", f"refs/tags/{SEAL_TAG}"])
-    if rc != 0 or kind.strip() != "tag":
-        raise SealViolation(f"git tag {SEAL_TAG!r} is not an annotated tag")
-    rc, tag_commit = run(["rev-list", "-n", "1", SEAL_TAG])
-    if rc != 0 or not tag_commit.strip():
-        raise SealViolation(f"cannot resolve commit of tag {SEAL_TAG!r}")
-    rc, head = run(["rev-parse", "HEAD"])
-    if rc != 0 or not head.strip():
-        raise SealViolation("cannot resolve HEAD commit")
+    tag_commit, head = _check_tag(run, repo, tag)
 
     ledger = Path(ledger_path)
     prior = [r for r in _read_ledger(ledger) if r.get("phase") == phase.value]
@@ -200,14 +257,81 @@ def open_seal(
     record = {
         "phase": phase.value,
         "opened_at": datetime.now(UTC).isoformat(),
-        "tag": SEAL_TAG,
-        "tag_commit": tag_commit.strip(),
-        "head_commit": head.strip(),
+        "tag": tag,
+        "tag_commit": tag_commit,
+        "head_commit": head,
         "reopen": bool(prior),
     }
-    ledger.parent.mkdir(parents=True, exist_ok=True)
-    with ledger.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, sort_keys=True) + "\n")
+    _append_ledger(ledger, record)
+    return record
+
+
+def covered_confirm_dates(ledger_path: str | Path) -> tuple[date, ...]:
+    """CONFIRM dates a ``CONFIRM_RUN`` ledger record lists in ``scored_dates`` (none today)."""
+    out: set[date] = set()
+    for r in _read_ledger(Path(ledger_path)):
+        if r.get("phase") == Phase.CONFIRM_RUN.value:
+            out.update(date.fromisoformat(str(d)[:10]) for d in r.get("scored_dates", []))
+    return tuple(d for d in CONFIRM_DATES if d in out)
+
+
+def forward_train_dates(
+    decision_date: date, *, today: date, ledger_path: str | Path
+) -> tuple[date, ...]:
+    """Dates a FORWARD grant for ``decision_date`` may read as training rows: DEV + GAP + SEALED,
+    covered CONFIRM dates and earlier forward quarter-ends (not the decision date itself)."""
+    d = _to_date(decision_date)
+    allowed = allowed_decision_dates(
+        Phase.FORWARD, today=today, confirm_dates=covered_confirm_dates(ledger_path)
+    )
+    return tuple(x for x in allowed if x < d)
+
+
+def open_forward(
+    decision_date: date,
+    *,
+    repo_dir: str | Path,
+    ledger_path: str | Path,
+    today: date | None = None,
+    allow_reopen: bool = False,
+    git_runner: GitRunner | None = None,
+) -> dict[str, Any]:
+    """One FORWARD grant record per decision date; needs tag ``earnings-a2-frozen``."""
+    today = today or datetime.now(UTC).date()
+    d = _to_date(decision_date)
+    if d not in set(forward_eval_dates(today)):
+        raise SealViolation(
+            f"{d.isoformat()} is not a FORWARD decision date as of {today.isoformat()}"
+        )
+    repo = Path(repo_dir)
+    run = git_runner or _subprocess_runner(repo)
+    tag_commit, head = _check_tag(run, repo, STAGE2_TAG)
+    ledger = Path(ledger_path)
+    rows = _read_ledger(ledger)
+    prior = [
+        r
+        for r in rows
+        if r.get("phase") == Phase.FORWARD.value and r.get("decision_date") == d.isoformat()
+    ]
+    if prior and not allow_reopen:
+        raise SealViolation(f"FORWARD {d.isoformat()} already granted once")
+    confirm = covered_confirm_dates(ledger)
+    allowed = allowed_decision_dates(Phase.FORWARD, today=today, confirm_dates=confirm)
+    # earlier forward quarter-ends stay readable as training rows (rule A20 decides by
+    # label_pub_date <= d whether one is actually used); later ones do not
+    allowed = tuple(x for x in allowed if x <= d)
+    record = {
+        "phase": Phase.FORWARD.value,
+        "decision_date": d.isoformat(),
+        "opened_at": datetime.now(UTC).isoformat(),
+        "tag": STAGE2_TAG,
+        "tag_commit": tag_commit,
+        "head_commit": head,
+        "reopen": bool(prior),
+        "confirm_dates": [x.isoformat() for x in confirm],
+        "allowed_dates": [x.isoformat() for x in allowed],
+    }
+    _append_ledger(ledger, record)
     return record
 
 
@@ -240,6 +364,8 @@ class SealGrant:
 
     @property
     def allowed_dates(self) -> tuple[date, ...]:
+        if self.phase is Phase.FORWARD:
+            return tuple(date.fromisoformat(x) for x in (self.record or {})["allowed_dates"])
         return allowed_decision_dates(self.phase)
 
 
@@ -274,6 +400,26 @@ def _is_genuine(grant: Any) -> bool:
 
 def grant_dev() -> SealGrant:
     return _mint(SealGrant, Phase.DEV, None)
+
+
+def open_forward_grant(
+    decision_date: date,
+    *,
+    repo_dir: str | Path,
+    ledger_path: str | Path,
+    today: date | None = None,
+    allow_reopen: bool = False,
+    git_runner: GitRunner | None = None,
+) -> SealGrant:
+    record = open_forward(
+        decision_date,
+        repo_dir=repo_dir,
+        ledger_path=ledger_path,
+        today=today,
+        allow_reopen=allow_reopen,
+        git_runner=git_runner,
+    )
+    return _mint(SealGrant, Phase.FORWARD, record)
 
 
 def open_seal_grant(

@@ -24,8 +24,11 @@ def test_allowed_sets():
     assert len(seal.allowed_decision_dates(Phase.DEV)) == 26
     assert len(seal.allowed_decision_dates(Phase.SEALED_RUN)) == 38
     assert len(seal.allowed_decision_dates(Phase.CONFIRM_RUN)) == 42
-    with pytest.raises(NotImplementedError):
+    assert len(seal.allowed_decision_dates(Phase.STAGE2_PAST)) == 38
+    # FORWARD needs today; with no CONFIRM record it is DEV + GAP + SEALED + forward dates
+    with pytest.raises(SealViolation):
         seal.allowed_decision_dates(Phase.FORWARD)
+    assert len(seal.allowed_decision_dates(Phase.FORWARD, today=date(2026, 11, 3))) == 39
 
 
 def test_phase_accept_reject():
