@@ -1,4 +1,4 @@
-"""Command line: ``python -m modeler.scores.earnings_a.cli {f3,f4,dev} [--out DIR] [--rehearsal]``.
+"""Command line: ``python -m modeler.scores.earnings_a.cli {f3,f4,dev,sealed} [--out DIR] [--rehearsal | --dry-run-dev]``.
 
 stdout carries only the output directory and the manifest path. Errors go to stderr.
 F4 refuses a dirty ``earnings_a`` tree unless ``--rehearsal`` (then the manifest kind says so).
@@ -12,7 +12,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-from modeler.scores.earnings_a import dev_select, digest, manifest
+from modeler.scores.earnings_a import dev_select, digest, manifest, sealed_run
 from modeler.scores.earnings_a import paths as P
 
 
@@ -103,6 +103,14 @@ def run_dev_cmd(paths: P.DataPaths, out: str | None, rehearsal: bool) -> tuple[P
     return out_dir, manifest.write_once(out_dir / "manifest_dev.json", m)
 
 
+def run_sealed_cmd(paths: P.DataPaths, out: str | None, dry_run_dev: bool) -> tuple[Path, Path]:
+    """One-shot sealed verdict (or its DEV dry run); all checks and the single open are inside."""
+    mode = sealed_run.make_mode(dry_run_dev)
+    return sealed_run.run_sealed(
+        paths, sealed_run.make_out_dir(paths, mode, out), dry_run_dev=dry_run_dev
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.WARNING)
     ap = argparse.ArgumentParser(prog="modeler.scores.earnings_a.cli")
@@ -114,10 +122,15 @@ def main(argv: list[str] | None = None) -> int:
     pd_ = sub.add_parser("dev")
     pd_.add_argument("--out")
     pd_.add_argument("--rehearsal", action="store_true")
+    ps = sub.add_parser("sealed")
+    ps.add_argument("--out")
+    ps.add_argument("--dry-run-dev", action="store_true")
     args = ap.parse_args(argv)
     paths = P.DataPaths.resolve()
     if args.cmd == "f3":
         out_dir, mpath = run_f3(paths, args.out)
+    elif args.cmd == "sealed":
+        out_dir, mpath = run_sealed_cmd(paths, args.out, args.dry_run_dev)
     elif args.cmd == "dev":
         out_dir, mpath = run_dev_cmd(paths, args.out, args.rehearsal)
     else:
