@@ -266,15 +266,25 @@ class TestContent(Base):
         self.assertIn("순위용 점수 — 확률 아님", t)
 
     def test_ranking_status_line(self):
-        want = "이 순위는 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B · 미국 A 0)"
-        self.assertEqual(bm.RANKING_STATUS, want)
-        for name in ("kr-stocks.md", "us-stocks.md"):
+        # 문구는 상수와 동어반복이 되지 않게 시험에 직접 박습니다. 줄 끝 마침표는 없습니다.
+        us = "이 순위는 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B · 미국 A 0)"
+        kr = (
+            "이 순위는 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B). "
+            "모델02 연구는 2026-10-10에 중단했고, 지금 순위는 성능 평가를 받은 적 없는 서빙 점수입니다"
+        )
+        self.assertEqual(bm.RANKING_STATUS_US, us)
+        self.assertEqual(bm.RANKING_STATUS_KR, kr)
+        self.assertFalse(hasattr(bm, "RANKING_STATUS"))
+        for name, want, other in (("kr-stocks.md", kr, us), ("us-stocks.md", us, kr)):
             t = text(REPO, UNITS["normal"], name)
             self.assertEqual(t.count(want), 1, name)
             self.assertIn("> " + want + "\n", t)
             self.assertLess(t.index(want), t.index("| 순위 |"))
+            # KR 문구는 US 문구를 접두로 품지 않으므로(괄호 뒤가 다름) 단순 포함으로 갈린다
+            self.assertNotIn(other, t, name)
         # 순위가 없는 단위(실패)에는 넣지 않습니다
-        self.assertNotIn(want, text(REPO, UNITS["kr_unavail"], "kr-stocks.md"))
+        for want in (kr, us):
+            self.assertNotIn(want, text(REPO, UNITS["kr_unavail"], "kr-stocks.md"))
 
     def test_table_escape(self):
         t = text(REPO, UNITS["normal"], "kr-stocks.md")

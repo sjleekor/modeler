@@ -525,6 +525,7 @@ def test_publisher_input_carries_the_roots_only_when_configured() -> None:
         "release_manifest": "/s/releases/r1/release.json",
         "model_cards_path": "/s/releases/r1/model-cards.json",
         "reports_checkout": "/s/reports-checkout",
+        "explain_enabled": False,
     }
     render = {"report_sha256": "a" * 64, "invocation_id": "inv"}
     args = (dt.date(2026, 10, 7), render, Path("/s/runs/2026-10-07"))

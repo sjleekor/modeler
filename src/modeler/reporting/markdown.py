@@ -2,6 +2,7 @@
 
 내부 report(`runs/D/report-D.json`)를 단위 폴더(README.md와 섹션 파일 넷)로 렌더하고,
 저장소 인덱스(자동 구간)를 다시 만들고, 저장소 트리를 검증합니다. 표준 라이브러리만 씁니다.
+근거 입력(`explain-D.json`)이 있으면 순위 표에 근거 칸을 더하고 `assets/*.svg`(svg.py)를 만듭니다.
 템플릿과 문구는 전부 이 파일의 문자열입니다. release가 `.py` 말고는 복사하지 않기 때문입니다.
 
 원격에 접속하는 일은 여기 없습니다. 접속은 `deploy/reports/publish_reports.py`가 합니다.
@@ -29,6 +30,7 @@ import math
 import os
 import posixpath
 import re
+import shutil
 import sys
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
@@ -63,6 +65,7 @@ KR_QUALITY_REASON_TEXT = {
     "K_share_change_or_unknown": "K 기준 상장주식수 변화 또는 확인 불가",
     "K_price_rule_unknown": "K 기준 가격 점검 규칙 적용 불가",
     "K_price_quality_unavailable": "K 기준 가격 품질 정보 없음",
+    "W20_halt_in_window": "최근 20거래일 안 거래정지 — 가격 피쳐 왜곡 가능",
 }
 # 내부 report 상태 -> front matter status (01 문서 §6, 지시서의 매핑)
 STATUS_MAP = {
@@ -269,7 +272,11 @@ REPLAY_NOTICE = (
 )
 SYNTHETIC_NOTICE = "합성 fixture 예시 전용 — 실제 시장 데이터가 아닙니다."
 DISCLAIMER = "연구용 탐색 결과입니다. 투자 권유가 아니며 실현 수익률은 표시하지 않습니다."
-RANKING_STATUS = "이 순위는 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B · 미국 A 0)"
+RANKING_STATUS_US = "이 순위는 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B · 미국 A 0)"
+RANKING_STATUS_KR = (
+    "이 순위는 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B). "
+    "모델02 연구는 2026-10-10에 중단했고, 지금 순위는 성능 평가를 받은 적 없는 서빙 점수입니다"
+)
 
 FORBIDDEN_PATTERNS = (
     ("서버 절대경로 /home/", re.compile(r"/home/")),
@@ -1270,6 +1277,591 @@ def last_normal_link(repo: Path, unit: str, section_file: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 근거·그래프 (explain-D.json v1 — 20261026 계획 §5.2.1·§5.3·§5.4)
+#
+# 계산은 serving의 explain 단계가 하고, 여기서는 읽어서 표시만 합니다. 근거 입력이 없으면
+# (`None`: 근거 표시를 껐거나 파일이 없음) 어떤 출력도 바뀌지 않습니다 — 근거 기능이 없던 때와
+# 바이트까지 같습니다. 입력이 있으면 report SHA-256·invocation id가 맞을 때만 씁니다.
+# ---------------------------------------------------------------------------
+EXPLAIN_SCHEMA = "briefing-explain.v1"
+EXPLAIN_STATES = ("ok", "partial", "failed", "skipped")
+EXPLAIN_SESSIONS = 60  # 가격 경로가 없을 때 열 이름에 쓰는 기간(계획 X2)
+EXPLAIN_HORIZONS = ("5", "20", "60")
+EXPLAIN_DETAIL_ROWS = 20
+EXPLAIN_MAX_FEATURES = 5
+EXPLAIN_MISMATCH = "입력 불일치"
+EXPLAIN_FORMAT = "근거 파일 형식 오류"
+EXPLAIN_REASON_KO = {
+    "input_mismatch": EXPLAIN_MISMATCH,
+    "timeout": "시간 초과",
+    "score_mismatch": "점수 재현 실패",
+    "score_reproduction_failed": "점수 재현 실패",
+    "price_unavailable": "가격 입력 없음",
+    "model_failed": "순위 계산 실패",
+    "short_history": "이력 부족",
+}
+GAP_KIND_KO = {"halt": "거래정지", "missing": "값 없음", "ca_suspect": "가격 의심일"}
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+SPARK_WIDTH = 10
+SPARK_GAP = "·"
+BLANK = "—"
+# 상위 20 그래프 파일 이름. 모델 id마다 하나입니다. 모르는 모델은 id에서 만듭니다.
+ASSET_NAMES = {
+    KR_MODEL: "kr-top20.svg",
+    "us_exploratory_20260929_r1_lightgbm": "us-lightgbm-top20.svg",
+    "us_exploratory_20260929_r1_ridge": "us-ridge-top20.svg",
+}
+ASSET_NAME_RE = re.compile(r"^assets/[A-Za-z0-9._\-]+\.svg$")
+GROUP_ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+
+def is_asset_name(name: str) -> bool:
+    """단위 파일 이름이 그림(`assets/*.svg`)인지 봅니다."""
+    return ASSET_NAME_RE.match(name) is not None
+
+
+def as_bytes(value: object) -> bytes:
+    return value.encode("utf-8") if isinstance(value, str) else bytes(value)
+
+
+def asset_name(model_id: str) -> str:
+    known = ASSET_NAMES.get(model_id)
+    if known:
+        return known
+    slug = re.sub(r"[^a-z0-9]+", "-", model_id.lower()).strip("-") or "model"
+    return f"{slug}-top20.svg"
+
+
+def explain_reason_text(raw: object) -> str:
+    """serving이 적은 사유를 표시 문구로 바꿉니다. 모르는 사유는 이스케이프해서 그대로 씁니다."""
+    text = _safe_str(raw).strip()
+    if not text:
+        return "사유 기록 없음"
+    return EXPLAIN_REASON_KO.get(text) or c(text[:120])
+
+
+def _explain_date_list(raw: object) -> list | None:
+    if not isinstance(raw, list) or len(raw) < 2:
+        return None
+    out: list = []
+    for value in raw:
+        day = good_date(value)
+        if day is None or (out and day <= out[-1]):
+            return None
+        out.append(day)
+    return out
+
+
+def _explain_path(raw: object, length: int) -> list | None:
+    """지수화 경로(시작일=100). 길이가 날짜 수와 같고, 값은 양수이거나 끊는 날(None)입니다."""
+    if not isinstance(raw, list) or len(raw) != length:
+        return None
+    out: list = []
+    for value in raw:
+        if value is None:
+            out.append(None)
+        elif is_num(value) and value > 0:
+            out.append(float(value))
+        else:
+            return None
+    return out
+
+
+def _explain_features(raw: object) -> list:
+    """극단 피쳐 목록. 형식이 맞지 않는 항목은 건너뜁니다."""
+    out = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        label, scope, pct_value = item.get("label"), item.get("scope"), item.get("pct")
+        if not (isinstance(label, str) and label.strip() and isinstance(scope, str)):
+            continue
+        if not is_num(pct_value) or not 0 <= pct_value <= 1:
+            continue
+        side = item.get("side") if item.get("side") in ("high", "low") else None
+        if side is None:
+            side = "high" if pct_value >= 0.5 else "low"
+        # pct가 백분위(0.98)든 꼬리 비율(0.02)이든 같은 꼬리로 읽습니다. 방향은 side가 정합니다.
+        tail = pct_value if pct_value <= 0.5 else 1.0 - pct_value
+        out.append({"label": label.strip(), "scope": scope.strip(), "side": side, "tail": tail})
+    return out[:EXPLAIN_MAX_FEATURES]
+
+
+def _explain_row(raw: dict, groups: list, length: int) -> dict:
+    """종목 한 줄의 표시 값. 근거(`delta`)와 가격(`path`)은 따로 성공·실패합니다."""
+    view = {
+        "explain": "failed",
+        "explain_reason": EXPLAIN_FORMAT,
+        "delta": {},
+        "features": [],
+        "price": "failed",
+        "price_reason": EXPLAIN_FORMAT,
+        "path": None,
+        "bench": None,
+        "ret": {},
+        "ret_note": {},
+        "gaps": [],
+        "n_obs": None,
+    }
+    status = raw.get("explain_status")
+    if status == "ok":
+        delta = raw.get("delta")
+        ids = [g for g, _ in groups]
+        if (
+            isinstance(delta, dict)
+            and all(delta.get(g) is None or is_num(delta.get(g)) for g in ids)
+            and any(is_num(delta.get(g)) for g in ids)
+        ):
+            view["delta"] = {g: float(delta[g]) if is_num(delta.get(g)) else None for g in ids}
+            view["explain"], view["explain_reason"] = "ok", None
+            view["features"] = _explain_features(raw.get("top_features"))
+    elif status == "failed":
+        view["explain_reason"] = explain_reason_text(raw.get("explain_reason"))
+    status = raw.get("price_status")
+    if status in ("ok", "partial") and length >= 2:
+        path = _explain_path(raw.get("path"), length)
+        bench = _explain_path(raw.get("bench_path"), length)
+        ret, notes = raw.get("ret"), raw.get("ret_note")
+        if path is not None and bench is not None and isinstance(ret, dict):
+            notes = notes if isinstance(notes, dict) else {}
+            view["path"], view["bench"] = path, bench
+            view["ret"] = {
+                h: float(ret[h]) if is_num(ret.get(h)) else None for h in EXPLAIN_HORIZONS
+            }
+            view["ret_note"] = {
+                h: notes[h].strip()
+                for h in EXPLAIN_HORIZONS
+                if isinstance(notes.get(h), str) and notes[h].strip()
+            }
+            gaps = raw.get("gaps") if isinstance(raw.get("gaps"), list) else []
+            view["gaps"] = [
+                (g["date"], g.get("kind") if g.get("kind") in GAP_KIND_KO else "missing")
+                for g in gaps
+                if isinstance(g, dict) and good_date(g.get("date"))
+            ]
+            n_obs = raw.get("n_obs")
+            view["n_obs"] = (
+                int(n_obs)
+                if is_num(n_obs) and int(n_obs) == n_obs and 0 <= n_obs <= length
+                else sum(1 for v in path if v is not None)
+            )
+            view["price"], view["price_reason"] = status, None
+            note = raw.get("price_reason")
+            if status == "partial" and isinstance(note, str) and note.strip():
+                view["price_note"] = c(note.strip()[:120])  # 예: 거래정지·누락 15일
+    elif status == "failed":
+        view["price_reason"] = explain_reason_text(raw.get("price_reason"))
+    return view
+
+
+def _missing_row() -> dict:
+    view = _explain_row({}, [], 0)
+    view["explain_reason"] = view["price_reason"] = "근거 행 없음"
+    return view
+
+
+def _explain_model(raw: object, m: dict) -> dict:
+    """모델 하나의 표시 값. 순위 report와 맞지 않으면 모델 전체를 failed로 둡니다."""
+
+    def failed(reason: str) -> dict:
+        return {"status": "failed", "reason": reason}
+
+    if not isinstance(raw, dict) or raw.get("status") not in EXPLAIN_STATES:
+        return failed(EXPLAIN_FORMAT)
+    if raw["status"] == "failed":
+        return failed(explain_reason_text(raw.get("reason")))
+    if raw["status"] == "skipped":
+        return failed("근거를 계산하지 않았습니다")
+    asof = good_date(m["asof"])
+    if raw.get("market") != m["market"] or asof is None or good_date(raw.get("asof")) != asof:
+        return failed(EXPLAIN_MISMATCH + "(기준일)")
+    # 가격 계산이 실패하면 serving은 dates를 []로 둡니다. 근거(Δ)는 그대로 쓸 수 있습니다.
+    dates = [] if raw.get("dates") == [] else _explain_date_list(raw.get("dates"))
+    if dates is None:
+        return failed(EXPLAIN_FORMAT)
+    if dates and dates[-1] > asof:
+        return failed(EXPLAIN_MISMATCH + "(그래프 날짜가 기준일 뒤)")
+    groups = []
+    for item in raw.get("groups") if isinstance(raw.get("groups"), list) else []:
+        if not isinstance(item, dict):
+            return failed(EXPLAIN_FORMAT)
+        gid, label = item.get("id"), item.get("label")
+        if not (isinstance(gid, str) and GROUP_ID_RE.match(gid) and isinstance(label, str)):
+            return failed(EXPLAIN_FORMAT)
+        groups.append((gid, label.strip() or gid))
+    if not groups or len({g for g, _ in groups}) != len(groups):
+        return failed(EXPLAIN_FORMAT)
+    mean_raw = raw.get("top100_mean_delta")
+    mean_raw = mean_raw if isinstance(mean_raw, dict) else {}
+    mean = {g: float(mean_raw[g]) if is_num(mean_raw.get(g)) else None for g, _ in groups}
+    by_rank: dict = {}
+    for item in raw.get("rows") if isinstance(raw.get("rows"), list) else []:
+        if isinstance(item, dict) and isinstance(item.get("rank"), int):
+            by_rank.setdefault(item["rank"], item)
+    rows = {}
+    for row in m["rows"]:
+        item = by_rank.get(row["rank"])
+        if item is None:
+            rows[row["rank"]] = _missing_row()
+        elif item.get("symbol") != row["symbol"]:
+            return failed(EXPLAIN_MISMATCH + "(순위)")
+        else:
+            rows[row["rank"]] = _explain_row(item, groups, len(dates))
+    gaps = any(v["explain"] != "ok" or v["price"] == "failed" for v in rows.values())
+    status = "partial" if raw["status"] == "partial" or gaps else "ok"
+    return {
+        "status": status,
+        "reason": explain_reason_text(raw.get("reason")) if raw.get("reason") else None,
+        "asof": asof,
+        "dates": dates,
+        "groups": groups,
+        "mean": mean,
+        "rows": rows,
+    }
+
+
+def load_explain(
+    raw: bytes | None, unit: str, report_sha: str, invocation_id: object, sections: tuple
+) -> dict | None:
+    """근거 입력을 읽어 `ctx["explain"]`을 만듭니다. 입력이 없으면 None(출력 변화 없음)."""
+    if raw is None:
+        return None
+    digest = sha256_bytes(raw)
+
+    def failed(reason: str, accepted: bool = False) -> dict:
+        return {"state": "failed", "reason": reason, "sha": digest, "accepted": accepted}
+
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return failed(EXPLAIN_FORMAT)
+    if not isinstance(doc, dict) or doc.get("schema") != EXPLAIN_SCHEMA:
+        return failed(EXPLAIN_FORMAT)
+    if (
+        doc.get("unit") != unit
+        or doc.get("report_sha256") != report_sha
+        or not isinstance(invocation_id, str)
+        or not invocation_id
+        or doc.get("invocation_id") != invocation_id
+    ):
+        return failed(EXPLAIN_MISMATCH)
+    if doc.get("status") not in EXPLAIN_STATES or not isinstance(doc.get("models"), dict):
+        return failed(EXPLAIN_FORMAT, accepted=True)
+    if doc["status"] == "failed":
+        return failed(explain_reason_text(doc.get("reason")), accepted=True)
+    if doc["status"] == "skipped":
+        return None  # 추론 실패 report라 근거를 계산하지 않은 날입니다. 근거 없는 단위와 같습니다
+    models = {}
+    for sec in sections:
+        for m in sec["models"]:
+            if m["status"] == "failed" or m["suppressed"] or not m["rows"]:
+                continue
+            if m["model_id"] in doc["models"]:
+                models[m["model_id"]] = _explain_model(doc["models"][m["model_id"]], m)
+            else:
+                models[m["model_id"]] = {"status": "failed", "reason": "이 모델의 근거가 없습니다"}
+    states = {x["status"] for x in models.values()}
+    state = "ok" if states <= {"ok"} else ("failed" if states == {"failed"} else "partial")
+    return {"state": state, "reason": None, "sha": digest, "accepted": True, "models": models}
+
+
+def explain_model(ctx: dict, m: dict) -> dict | None:
+    """표시할 순위가 있는 모델의 근거 표시 값. 근거 입력이 없으면 None입니다."""
+    ex = ctx.get("explain")
+    if ex is None or m["status"] == "failed" or m["suppressed"] or not m["rows"]:
+        return None
+    if "models" not in ex:
+        return {"status": "failed", "reason": ex["reason"]}
+    return ex["models"].get(m["model_id"]) or {
+        "status": "failed",
+        "reason": "이 모델의 근거가 없습니다",
+    }
+
+
+def sparkline(path: list | None) -> str:
+    """60세션 흐름 글자 그림. 구간을 SPARK_WIDTH개로 나눠 평균하고, 종목마다 세로축을 맞춥니다.
+
+    값이 하나도 없는 구간은 `·`입니다. 높이로 종목끼리 비교할 수 없습니다.
+    """
+    if not path:
+        return BLANK
+    width = min(SPARK_WIDTH, len(path))
+    base, extra = divmod(len(path), width)
+    values, start = [], 0
+    for i in range(width):
+        size = base + (1 if i < extra else 0)
+        chunk = [v for v in path[start : start + size] if v is not None]
+        values.append(math.fsum(chunk) / len(chunk) if chunk else None)
+        start += size
+    finite = [v for v in values if v is not None]
+    if not finite:
+        return BLANK
+    lo, hi = min(finite), max(finite)
+    chars = []
+    for v in values:
+        if v is None:
+            chars.append(SPARK_GAP)
+        elif hi - lo < 1e-9:
+            chars.append(SPARK_CHARS[3])
+        else:
+            chars.append(SPARK_CHARS[min(7, int((v - lo) / (hi - lo) * 8))])
+    return "`" + "".join(chars) + "`"
+
+
+def fmt_ret(value: float | None) -> str:
+    if value is None:
+        return BLANK
+    shown = round(value * 100.0, 1)
+    return "0.0%" if shown == 0 else f"{value * 100.0:+.1f}%"
+
+
+def fmt_delta(value: float | None) -> str:
+    """점수 변화. 소수 4자리이고, 반올림해 0이면 부호 없이 0.0000입니다."""
+    if value is None:
+        return BLANK
+    return "0.0000" if round(value, 4) == 0 else f"{value:+.4f}"
+
+
+def ret_cell(view: dict, horizon: str) -> str:
+    text = fmt_ret(view["ret"].get(horizon))
+    return text + " ※" if view["ret_note"].get(horizon) else text
+
+
+def up_groups(view: dict, groups: list) -> str:
+    """점수를 올린 요인: Δ가 양수인 묶음 가운데 큰 순서로 둘. 반올림해 0이면 넣지 않습니다."""
+    picked = []
+    for order, (gid, label) in enumerate(groups):
+        value = view["delta"].get(gid)
+        if value is not None and round(value, 4) > 0:
+            picked.append((-value, order, label))
+    picked.sort()
+    return " · ".join(c(label) for _, _, label in picked[:2]) or "없음"
+
+
+def explain_cells(xm: dict, rank: int) -> list:
+    """표 한 행에 더할 칸: 60세션 흐름 · 5세션 · 20세션 · 60세션 · 점수를 올린 요인."""
+    view = xm["rows"].get(rank) or _missing_row()
+    if view["price"] == "failed":
+        cells = [BLANK] * 4
+    else:
+        cells = [sparkline(view["path"])] + [ret_cell(view, h) for h in EXPLAIN_HORIZONS]
+    cells.append(up_groups(view, xm["groups"]) if view["explain"] == "ok" else BLANK)
+    return cells
+
+
+def explain_sessions(xm: dict) -> int:
+    """그래프 기간(세션 수). 가격 경로가 없으면 계획의 60세션을 씁니다."""
+    return len(xm["dates"]) - 1 if xm["dates"] else EXPLAIN_SESSIONS
+
+
+def explain_status_line(xm: dict) -> str:
+    if xm["status"] == "failed":
+        return f"- 근거·그래프: 실패 — {xm['reason']}. 표는 근거 없이 냈습니다."
+    if xm["dates"]:
+        span = f"그래프 {xm['dates'][0]}부터 {xm['dates'][-1]}까지 {explain_sessions(xm)}세션"
+    else:
+        span = "가격 경로 없음"
+    if xm["status"] == "partial":
+        return f"- 근거·그래프: 일부만 계산 ({span}). 못 낸 종목은 표 아래에 사유를 적었습니다."
+    return f"- 근거·그래프: 정상 ({span})"
+
+
+def explain_intro_lines(xm: dict, market: str) -> list:
+    """표 위에 두는 읽는 법."""
+    peers = "같은 시장" if market == "KR" else "US 적격 종목"
+    sessions = explain_sessions(xm)
+    if market == "KR":
+        price = "수정주가 기준 가격 수익률입니다. 기준일 K 뒤 가격은 쓰지 않았습니다."
+    else:
+        price = (
+            "분할만 조정한 가격 수익률이며 배당은 넣지 않았습니다. "
+            "기준 세션 A 뒤 가격은 쓰지 않았습니다."
+        )
+    return [
+        f"> 점수를 올린 요인: 그 묶음의 입력을 그날 {peers}의 평범한 수준(연속 값은 평균, "
+        "0/1 값은 최빈값)으로 바꾸면 점수가 내려가는 묶음을, 많이 내려가는 순서로 둘까지 "
+        "적었습니다. 순위가 왜 이 자리인지를 직접 설명하는 값이 아닙니다.",
+        f"> {sessions}세션 흐름은 시작일=100으로 맞춘 지수를 종목마다 세로축을 따로 맞춰 그린 "
+        "것이라 높이로 종목끼리 상승폭을 비교할 수 없습니다. `·`는 값이 없는 구간입니다.",
+        "> 5·20·60세션은 " + price + " `※`는 아래에 사유를 적은 칸입니다.",
+        "",
+    ]
+
+
+def explain_header(base: list, xm: dict) -> list:
+    sessions = explain_sessions(xm)
+    return base + [f"{sessions}세션 흐름", "5세션", "20세션", "60세션", "점수를 올린 요인"]
+
+
+def explain_note_lines(m: dict, xm: dict) -> list:
+    """표 아래: 근거·가격을 못 낸 종목과 수익률 칸의 사유."""
+    failed, notes = [], []
+    for row in m["rows"]:
+        view = xm["rows"].get(row["rank"]) or _missing_row()
+        who = f"{row['rank']}위 {code(row['symbol'])}"
+        if view["explain"] != "ok":
+            failed.append(f"- {who} 근거: {view['explain_reason']}")
+        if view["price"] == "failed":
+            failed.append(f"- {who} 가격: {view['price_reason']}")
+            continue
+        for h in EXPLAIN_HORIZONS:
+            note = view["ret_note"].get(h)
+            if view["ret"].get(h) is None:
+                notes.append(f"- {who} {h}세션: 비움 — {c(note) if note else '사유 기록 없음'}")
+            elif note:
+                notes.append(f"- {who} {h}세션: {c(note)}")
+    lines = []
+    if failed:
+        lines += ["근거·가격을 내지 못한 칸:", ""] + failed + [""]
+    if notes:
+        lines += ["수익률 칸의 사유:", ""] + notes + [""]
+    return lines
+
+
+def _last_value(path: list | None) -> float | None:
+    for v in reversed(path or []):
+        if v is not None:
+            return v
+    return None
+
+
+def explain_svg(ctx: dict, m: dict, xm: dict) -> bytes | None:
+    """상위 20 그래프 SVG. 그릴 가격 경로가 하나도 없으면 None입니다."""
+    rows = m["rows"][:EXPLAIN_DETAIL_ROWS]
+    views = [xm["rows"].get(r["rank"]) or _missing_row() for r in rows]
+    if not any(v["price"] != "failed" for v in views):
+        return None
+    index = {d: i for i, d in enumerate(xm["dates"])}
+    panels = []
+    for row, view in zip(rows, views):
+        label = row["symbol"] if m["market"] == "US" else row.get("name") or row["symbol"]
+        # 오른쪽 위 글자와 겹치지 않게 이름은 8자까지만 씁니다(P1 시제품과 같은 규칙).
+        label = scrub(str(label)).replace("\n", " ")[:8]
+        last, bench_last = _last_value(view["path"]), _last_value(view["bench"])
+        sub = "종목 {} / 평균 {}".format(
+            BLANK if last is None else f"{last:.1f}",
+            BLANK if bench_last is None else f"{bench_last:.1f}",
+        )
+        panels.append(
+            {
+                "label": f"#{row['rank']} {label}",
+                "sub": sub if view["price"] != "failed" else "",
+                "stock": view["path"] or [],
+                "bench": view["bench"] or [],
+                "breaks": [
+                    index[d] for d, kind in view["gaps"] if kind == "ca_suspect" and d in index
+                ],
+            }
+        )
+    sessions = explain_sessions(xm)
+    if m["market"] == "KR":
+        title = f"KR 상위 {len(rows)} · 최근 {sessions}세션 지수"
+        sub = (
+            f"기준일 K {xm['asof']} · 시작일=100 · 굵은 선 종목 · "
+            "옅은 선 비교 대상 평균(같은 시장 동일가중)"
+        )
+    else:
+        short = US_SHORT.get(m["model_id"], m["model_id"])
+        title = f"US {short} 상위 {len(rows)} · 최근 {sessions}세션 지수"
+        sub = (
+            f"기준 세션 A {xm['asof']} · 시작일=100 · 굵은 선 종목(분할 조정 종가) · "
+            "옅은 선 비교 대상 평균(US 적격 종목 동일가중, 배당 제외 가격 수익률)"
+        )
+    # 그림 모듈은 근거 입력이 있을 때만 읽습니다. 근거가 없는 렌더는 이 파일만으로 돕니다.
+    from modeler.reporting import svg as reporting_svg
+
+    return reporting_svg.small_multiples(scrub(title), sub, panels)
+
+
+def explain_assets(ctx: dict) -> dict:
+    """단위 폴더에 더할 그림 {"assets/이름.svg": 바이트}. 근거 입력이 없으면 빈 dict입니다."""
+    out = {}
+    if ctx.get("explain") is None:
+        return out
+    for sec in (ctx["kr"], ctx["us"]):
+        for m in sec["models"]:
+            xm = explain_model(ctx, m)
+            if xm is None or xm["status"] == "failed":
+                continue
+            data = explain_svg(ctx, m, xm)
+            if data is not None:
+                out["assets/" + asset_name(m["model_id"])] = data
+    return out
+
+
+def explain_detail_lines(ctx: dict, m: dict, xm: dict, show_name: bool) -> list:
+    """상위 20 상세(접기): 그래프, 묶음별 Δ와 상위 100 평균, 극단 피쳐 백분위."""
+    rows = m["rows"][:EXPLAIN_DETAIL_ROWS]
+    lines = [
+        "<details>",
+        f"<summary>상위 {len(rows)} 상세 — 그래프와 묶음별 점수 변화</summary>",
+        "",
+    ]
+    sessions = explain_sessions(xm)
+    if explain_svg(ctx, m, xm) is not None:
+        who = "KR" if m["market"] == "KR" else "US " + US_SHORT.get(m["model_id"], m["model_id"])
+        alt = f"{who} 상위 {len(rows)} 최근 {sessions}세션 지수"
+        lines += [f"![{c(alt)}](assets/{asset_name(m['model_id'])})", ""]
+    else:
+        lines += ["그릴 가격 경로가 없어 그래프를 만들지 않았습니다.", ""]
+    lines += [
+        "묶음별 Δ는 그 묶음의 입력만 그날 평범한 종목 수준으로 바꿨을 때 점수가 얼마나 "
+        "내려가는지(양수)나 올라가는지(음수)입니다. 이 모델의 점수 단위라 다른 모델과 크기를 "
+        "비교하지 않습니다. 비선형 모델에서는 묶음 Δ를 더해도 점수 차이와 같지 않습니다. "
+        "오른쪽 열은 상위 100 평균이며, 가리기 효과를 나란히 보는 것일 뿐 순위 차이를 "
+        "설명하는 값이 아닙니다.",
+        "",
+    ]
+    for row in rows:
+        view = xm["rows"].get(row["rank"]) or _missing_row()
+        name = f" {c(row['name'])}" if show_name else ""
+        lines += [
+            f"#### {row['rank']}위 {code(row['symbol'])}{name} — 점수 {row['score']:.4f}",
+            "",
+        ]
+        if view["explain"] == "ok":
+            body = [
+                [c(label), fmt_delta(view["delta"].get(gid)), fmt_delta(xm["mean"].get(gid))]
+                for gid, label in xm["groups"]
+                if view["delta"].get(gid) is not None
+            ]
+            lines += md_table(["묶음", "점수 변화 Δ", "상위 100 평균 Δ"], body, right=(1, 2))
+            lines.append("")
+            if view["features"]:
+                lines += ["백분위가 극단인 피쳐 (점수 기여와는 다른 칸입니다):", ""]
+                for f in view["features"]:
+                    scope = re.sub(r"\s*안$", "", f["scope"])
+                    where = (c(scope) + " 안 ") if scope else ""
+                    tail = max(1, int(round(f["tail"] * 100)))
+                    side = "상위" if f["side"] == "high" else "하위"
+                    lines.append(f"- {c(f['label'])}: {where}{side} {tail}%")
+                lines.append("")
+        else:
+            lines += [f"근거를 내지 못했습니다: {view['explain_reason']}", ""]
+        caution = []
+        counts = Counter(kind for _, kind in view["gaps"])
+        if view.get("price_note"):
+            caution.append(view["price_note"])  # serving이 적은 문장을 그대로 씁니다
+        else:
+            for kind in GAP_KIND_KO:
+                if counts.get(kind):
+                    caution.append(f"{GAP_KIND_KO[kind]} {counts[kind]}일")
+        if view["price"] == "failed":
+            caution.append(f"가격 경로 없음({view['price_reason']})")
+        elif view["n_obs"] is not None and view["n_obs"] < len(xm["dates"]):
+            caution.append(f"관측 {view['n_obs']}/{len(xm['dates'])}세션")
+        if caution:
+            lines += ["표시 주의: " + " · ".join(caution) + " (값이 없는 날은 선을 끊었습니다)", ""]
+    lines += ["</details>", ""]
+    return lines
+
+
+def explain_table_lines(ctx: dict, m: dict, xm: dict, show_name: bool) -> list:
+    """표 아래에 붙는 사유 목록과 상위 20 상세."""
+    return explain_note_lines(m, xm) + explain_detail_lines(ctx, m, xm, show_name)
+
+
+# ---------------------------------------------------------------------------
 # 본문 렌더링
 # ---------------------------------------------------------------------------
 def title_for(ctx: dict, base: str) -> str:
@@ -1356,6 +1948,11 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
         "- 추론 시작: {}".format(kst_text((m["report"] or {}).get("inference_started_at")))
     )
     lines.append("- 모델: " + model_link(ctx, m["model_id"]))
+    xm = explain_model(ctx, m)
+    if xm is not None:
+        lines.append(explain_status_line(xm))
+        if xm["status"] == "failed":
+            xm = None  # 표는 지금 모양 그대로 냅니다
     lines.append("")
     banner = stale_banner_kr(m)
     if banner:
@@ -1380,7 +1977,7 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
         if not rows:
             lines += ["이번 판에 순위가 없습니다 (전체 0개).", ""]
         else:
-            lines += ["> " + RANKING_STATUS, ""]
+            lines += ["> " + RANKING_STATUS_KR, ""]
             show_kind = sec.get("show_kind", False)
             held, reasons, body = 0, Counter(), []
             for row, kind in zip(rows, kinds_of(m)):
@@ -1404,7 +2001,9 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
                 body.append(
                     [str(row["rank"]), c(row["symbol"]), c(row["name"])]
                     + ([c(kind)] if show_kind else [])
-                    + ["{:.4f}".format(row["score"]), quality]
+                    + ["{:.4f}".format(row["score"])]
+                    + (explain_cells(xm, row["rank"]) if xm is not None else [])
+                    + [quality]
                 )
             lines.append(
                 f"전체 {m['total']}개 중 상위 {len(rows)}개입니다. 그 밖의 순위는 올리지 않습니다."
@@ -1430,13 +2029,26 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
                 lines += [kind_count_line(kinds_of(m)) + " " + KIND_NOTE, ""]
             else:
                 lines += [KIND_OMITTED, ""]
-            headers = (
-                ["순위", "코드", "이름"]
-                + (["종류"] if show_kind else [])
-                + ["점수 (순위용 점수 — 확률 아님)", "품질"]
-            )
-            lines += md_table(headers, body, right=(0, len(headers) - 2))
-            lines.append("")
+            if xm is None:
+                headers = (
+                    ["순위", "코드", "이름"]
+                    + (["종류"] if show_kind else [])
+                    + ["점수 (순위용 점수 — 확률 아님)", "품질"]
+                )
+                lines += md_table(headers, body, right=(0, len(headers) - 2))
+                lines.append("")
+            else:
+                headers = explain_header(
+                    ["순위", "코드", "이름"]
+                    + (["종류"] if show_kind else [])
+                    + ["점수 (순위용 점수 — 확률 아님)"],
+                    xm,
+                ) + ["품질"]
+                at = 4 if show_kind else 3
+                lines += explain_intro_lines(xm, "KR")
+                lines += md_table(headers, body, right=(0, at, at + 2, at + 3, at + 4))
+                lines.append("")
+                lines += explain_table_lines(ctx, m, xm, show_name=True)
     lines += [DISCLAIMER, ""]
     meta_extra = {
         "data_asof": {"kr_features": sec["asof"]} if sec["asof"] else {},
@@ -1466,6 +2078,11 @@ def render_us_model(ctx: dict, m: dict, show_name: bool, show_kind: bool = False
         else:
             lines.append("- 지연 세션 수: 확인되지 않음")
     lines.append("- 모델: " + model_link(ctx, m["model_id"]))
+    xm = explain_model(ctx, m)
+    if xm is not None:
+        lines.append(explain_status_line(xm))
+        if xm["status"] == "failed":
+            xm = None  # 표는 지금 모양 그대로 냅니다
     lines.append("")
     if (
         m["status"] != "failed"
@@ -1505,6 +2122,11 @@ def render_us_model(ctx: dict, m: dict, show_name: bool, show_kind: bool = False
         + ["점수 (순위용 점수 — 확률 아님)"]
     )
     right = (0, len(headers) - 1)
+    if xm is not None:
+        at = len(headers) - 1
+        headers = explain_header(headers, xm)
+        right = (0, at, at + 2, at + 3, at + 4)
+        lines += explain_intro_lines(xm, "US")
     body = []
     for row, kind in zip(rows, kinds_of(m)):
         cells = [str(row["rank"]), c(row["symbol"])]
@@ -1513,9 +2135,13 @@ def render_us_model(ctx: dict, m: dict, show_name: bool, show_kind: bool = False
         if show_kind:
             cells.append(c(kind))
         cells.append("{:.4f}".format(row["score"]))
+        if xm is not None:
+            cells += explain_cells(xm, row["rank"])
         body.append(cells)
     lines += md_table(headers, body, right=right)
     lines.append("")
+    if xm is not None:
+        lines += explain_table_lines(ctx, m, xm, show_name=show_name)
     return lines
 
 
@@ -1558,7 +2184,7 @@ def render_us(ctx: dict) -> tuple[list, dict]:
             "",
         ]
     if shown_rows:
-        lines += ["> " + RANKING_STATUS, ""]
+        lines += ["> " + RANKING_STATUS_US, ""]
         if not sec.get("show_kind"):
             lines += [KIND_OMITTED, ""]
         else:
@@ -1805,6 +2431,7 @@ QUALITY_SCALARS = (
     "management_state",
     "halted_rows_at_K",
     "price_jump_review",
+    "halt_window_review",
     "top100_quality_review_rows",
     "D_management_and_halt_state",
     "eligible_rows_scored",
@@ -2310,6 +2937,15 @@ def render_summary(ctx: dict) -> tuple[list, dict]:
         warnings.append("KR은 현재 관리종목·거래정지 상태를 확인하지 못해 부분 완료로 표시합니다.")
     if ctx["corrections"]:
         warnings.append("이 단위는 정정판입니다. 위 정정 줄을 확인하십시오.")
+    for m in kr["models"] + us["models"]:
+        xm = explain_model(ctx, m)
+        if xm is None or xm["status"] == "ok":
+            continue
+        who = "KR" if m["market"] == "KR" else "US " + US_SHORT.get(m["model_id"], m["model_id"])
+        if xm["status"] == "failed":
+            warnings.append(f"{who} 근거·그래프를 계산하지 못했습니다: {xm['reason']}.")
+        else:
+            warnings.append(f"{who} 근거·그래프는 일부 종목만 계산했습니다.")
     if warnings:
         lines += ["- " + w for w in warnings]
     else:
@@ -2335,16 +2971,26 @@ def render_summary(ctx: dict) -> tuple[list, dict]:
     else:
         lines += ["대표지수 상태를 내지 못했습니다.", ""]
     lines += ["## KR 상위 10", ""]
-    lines += top10_lines(kr_m, with_name=True, show_kind=kr.get("show_kind", False))
+    lines += top10_lines(
+        kr_m, with_name=True, show_kind=kr.get("show_kind", False), xm=explain_model(ctx, kr_m)
+    )
     lines += ["## US 상위 10", ""]
     for m in us["models"]:
         lines += ["### " + c(US_SHORT.get(m["model_id"], m["model_id"])), ""]
-        lines += top10_lines(m, with_name=False, show_kind=us.get("show_kind", False))
+        lines += top10_lines(
+            m, with_name=False, show_kind=us.get("show_kind", False), xm=explain_model(ctx, m)
+        )
     lines += [
         f"상위 10개만 적었습니다. 상위 {ctx['top_n']}개와 점수(순위용 점수 — 확률 아님)는 "
         "각 섹션 파일에 있습니다.",
         "",
     ]
+    shown = [explain_model(ctx, m) for m in kr["models"] + us["models"]]
+    if any(x is not None and x["status"] != "failed" for x in shown):
+        lines += [
+            "흐름과 점수를 올린 요인을 읽는 법, 상위 20 그래프는 각 섹션 파일에 있습니다.",
+            "",
+        ]
     if kr.get("show_kind") or us.get("show_kind"):
         if not (us.get("show_kind") and us.get("kind_master")):
             lines += [KIND_NOTE, ""]
@@ -2364,7 +3010,8 @@ def render_summary(ctx: dict) -> tuple[list, dict]:
     return lines, meta_extra
 
 
-def top10_lines(m: dict, with_name: bool, show_kind: bool = False) -> list:
+def top10_lines(m: dict, with_name: bool, show_kind: bool = False, xm: dict | None = None) -> list:
+    """요약의 상위 10 표. `xm`(근거 표시 값)이 있으면 흐름과 점수를 올린 요인 칸을 더합니다."""
     if m["status"] == "failed":
         return ["순위를 내지 못했습니다.", ""]
     if m["suppressed"]:
@@ -2382,6 +3029,13 @@ def top10_lines(m: dict, with_name: bool, show_kind: bool = False) -> list:
         for r, k in zip(rows, kinds)
     ]
     head = [kind_count_line(kinds), ""] if show_kind else []
+    if xm is not None and xm["status"] == "failed":
+        head = [f"근거·그래프: 실패 — {xm['reason']}.", ""] + head
+    elif xm is not None:
+        headers += [f"{explain_sessions(xm)}세션 흐름", "점수를 올린 요인"]
+        for cells, r in zip(body, rows):
+            extra = explain_cells(xm, r["rank"])
+            cells += [extra[0], extra[4]]
     return head + md_table(headers, body, right=(0,)) + [""]
 
 
@@ -2402,8 +3056,12 @@ SECTION_MARKETS = {
 
 
 def render_unit(ctx: dict) -> dict:
-    """단위 폴더의 파일 5개를 {파일 이름: 텍스트}로 만듭니다."""
-    files = {}
+    """단위 폴더의 파일을 {파일 이름: 내용}으로 만듭니다.
+
+    markdown 5개는 텍스트(str)입니다. 근거 입력이 있으면 상위 20 그래프 `assets/*.svg`가
+    바이트(bytes)로 더해집니다. 근거 입력이 없으면 markdown 5개뿐이고 내용도 전과 같습니다.
+    """
+    files: dict = {}
     for section, base, renderer in SECTION_RENDERERS:
         lines, extra = renderer(ctx)
         status = (
@@ -2428,12 +3086,16 @@ def render_unit(ctx: dict) -> dict:
             "revision": ctx["revision"],
             "source": {"release": ctx["release"], "report_sha256": ctx["sha"]},
         }
+        explain = ctx.get("explain")
+        if explain is not None and explain["accepted"]:
+            meta["source"]["explain_sha256"] = explain["sha"]
         if ctx["replay"]:
             meta["historical_replay"] = True
         if ctx["synthetic"]:
             meta["synthetic_fixture"] = True
         body = escape_tilde("\n".join(lines).rstrip("\n") + "\n")
         files[SECTION_FILES[section]] = front_matter(meta) + "\n" + body
+    files.update(explain_assets(ctx))
     return files
 
 
@@ -2453,14 +3115,40 @@ def normalize(text: str) -> str:
     return raw + "\n---\n" + body
 
 
+INVALID_ASSET = b"\0invalid-asset"
+
+
+def read_asset_dir(udir: Path) -> dict:
+    """단위 폴더의 `assets/`를 {"assets/이름": 바이트}로 읽습니다.
+
+    symlink·디렉터리·이름 규칙 밖의 항목은 내용을 읽지 않고 `INVALID_ASSET`으로 둡니다.
+    그래야 같은 내용 비교가 실패하고, 정정이나 검증에서 드러납니다.
+    """
+    assets = udir / "assets"
+    if assets.is_symlink():
+        return {"assets": INVALID_ASSET}
+    if not assets.is_dir():
+        return {}
+    found = {}
+    for path in sorted(assets.iterdir()):
+        name = "assets/" + path.name
+        if path.is_symlink() or not path.is_file() or not is_asset_name(name):
+            found[name] = INVALID_ASSET
+        else:
+            found[name] = path.read_bytes()
+    return found
+
+
 def read_existing(udir: Path) -> dict | None:
+    """기존 단위의 파일 집합: markdown 5개(텍스트)와 `assets/*.svg`(바이트)."""
     if not udir.is_dir():
         return None
-    texts = {}
+    texts: dict = {}
     for name in SECTION_FILES.values():
         path = udir / name
         if path.is_file():
             texts[name] = path.read_text(encoding="utf-8")
+    texts.update(read_asset_dir(udir))
     return texts or None
 
 
@@ -2471,8 +3159,8 @@ def existing_corrections(readme_text: str) -> list:
     return match.group(1).split("\n") if match else []
 
 
-def write_if_changed(path: Path, text: str) -> bool:
-    data = text.encode("utf-8")
+def write_if_changed(path: Path, text: str | bytes) -> bool:
+    data = as_bytes(text)
     if path.is_file() and path.read_bytes() == data:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2519,6 +3207,8 @@ def build_context(
     security_names: bytes | None = None,
     names_notes: dict | None = None,
     operator_memo: bytes | None = None,
+    explain: bytes | None = None,
+    invocation_id: str | None = None,
 ) -> dict:
     """envelope(JSON 바이트)와 시장·섹터 입력으로 렌더 입력(ctx)을 만듭니다. 파일은 쓰지 않습니다.
 
@@ -2529,6 +3219,10 @@ def build_context(
     `증권 종류` 절에 사유로 적습니다(publisher가 레이크에서 이름을 만들지 못했을 때).
     `operator_memo`는 `operator-memo.v1` JSON 바이트입니다. 실패·stale 섹션에 "운영자 메모" 줄로
     붙고, 없으면 출력은 메모 기능이 없던 때와 바이트까지 같습니다.
+    `explain`은 `briefing-explain.v1` JSON 바이트(그날 `explain-D.json`)입니다. 파일 안의
+    `report_sha256`이 `env_bytes`의 sha256과, `invocation_id`가 이 인자(없으면 envelope의
+    값)와 같을 때만 근거·그래프를 그립니다. 다르면 "근거·그래프: 실패 — 입력 불일치"를 적고
+    표는 지금 모양으로 냅니다. `None`이면 출력은 근거 기능이 없던 때와 바이트까지 같습니다.
     """
     env = load_json_bytes(env_bytes, "envelope")
     unit, decision = parse_envelope(env)
@@ -2605,6 +3299,9 @@ def build_context(
         "env_status": env.get("status") if isinstance(env.get("status"), str) else "failed",
     }
     ctx["status"] = unit_status([kr["status"], us["status"], ms_sec["status"]])
+    if explain is not None:
+        expected = invocation_id if invocation_id is not None else env.get("invocation_id")
+        ctx["explain"] = load_explain(explain, unit, ctx["sha"], expected, (kr, us))
     return ctx
 
 
@@ -2618,10 +3315,21 @@ def unit_sha256(files: dict) -> str:
 
 
 def same_unit_content(existing: dict, files: dict) -> bool:
-    """generated_at·revision·정정 줄을 빼고 두 단위의 내용이 같은지 봅니다."""
-    return set(existing) == set(files) and all(
-        normalize(files[name]) == normalize(existing[name]) for name in files
-    )
+    """generated_at·revision·정정 줄을 빼고 두 단위의 내용이 같은지 봅니다.
+
+    markdown은 front matter를 정규화해 비교하고, 그림(`assets/*.svg`)은 바이트 그대로 비교합니다.
+    """
+    if set(existing) != set(files):
+        return False
+    for name in files:
+        if name.endswith(".md"):
+            if not (isinstance(files[name], str) and isinstance(existing[name], str)):
+                return False
+            if normalize(files[name]) != normalize(existing[name]):
+                return False
+        elif as_bytes(files[name]) != as_bytes(existing[name]):
+            return False
+    return True
 
 
 def existing_revision(existing: dict) -> int:
@@ -2661,6 +3369,8 @@ def generate(
     log,
     names_path: Path | None = None,
     memo_path: Path | None = None,
+    explain_path: Path | None = None,
+    invocation_id: str | None = None,
 ) -> str:
     """단위 하나를 저장소 트리에 쓰고 인덱스를 다시 만듭니다. 수동·시험용입니다.
 
@@ -2672,6 +3382,7 @@ def generate(
     ms_bytes = read_bytes(ms_path, "시장·섹터 입력") if ms_path else None
     names_bytes = read_bytes(names_path, "증권 이름 입력") if names_path else None
     memo_bytes = read_bytes(memo_path, "운영자 메모") if memo_path else None
+    explain_bytes = read_bytes(explain_path, "근거 입력") if explain_path else None
     ctx = build_context(
         repo,
         env_bytes,
@@ -2682,6 +3393,8 @@ def generate(
         log,
         security_names=names_bytes,
         operator_memo=memo_bytes,
+        explain=explain_bytes,
+        invocation_id=invocation_id,
     )
     unit = ctx["unit"]
     udir = unit_dir(repo, unit)
@@ -2708,6 +3421,7 @@ def generate(
                 "(revision을 올립니다), 같은 revision으로 덮으려면 --overwrite를 쓰십시오."
             )
     changed = [name for name, text in files.items() if write_if_changed(udir / name, text)]
+    changed += remove_stale_assets(udir, files)
     log(f"{unit}: {action} ({len(changed)}개 파일 쓰기)")
     reindex(repo, log)
     return action
@@ -2716,6 +3430,32 @@ def generate(
 # ---------------------------------------------------------------------------
 # 인덱스 재생성 (자동 구간만 다시 씁니다)
 # ---------------------------------------------------------------------------
+def remove_stale_assets(udir: Path, files: dict) -> list:
+    """새 파일 집합에 없는 `assets/` 항목을 지우고, 비면 `assets/`도 지웁니다. symlink는 따라가지 않습니다.
+
+    같은 단위를 정정하거나 덮을 때 옛 그림이 남지 않게 합니다. 지운 이름 목록을 돌려줍니다.
+    """
+    assets = udir / "assets"
+    removed = []
+    if assets.is_symlink():
+        assets.unlink()
+        return ["assets"]
+    if not assets.is_dir():
+        return removed
+    for path in sorted(assets.iterdir()):
+        name = "assets/" + path.name
+        if name in files and not path.is_symlink() and path.is_file():
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        removed.append(name)
+    if not any(assets.iterdir()):
+        assets.rmdir()
+    return removed
+
+
 def replace_auto(text: str, block_lines: list) -> str:
     block = AUTO_BEGIN + "\n" + "\n".join(block_lines).strip("\n") + "\n" + AUTO_END
     begin, end = text.find(AUTO_BEGIN), text.find(AUTO_END)
@@ -2814,7 +3554,8 @@ ROOT_DEFAULT = (
     "**이 저장소는 본인 전용입니다** (`audience: owner_only`). private이고 본인만 봅니다.\n"
     "협업자를 추가하거나 공개로 바꾸면 여기 올린 내용의 권리 판단이 무효가 됩니다. 그때는 올린 "
     "내용을 먼저 다시 검토하십시오.\n"
-    "전체 순위, 원시 피쳐, raw 수치, 서버 경로, 비밀값은 올리지 않습니다.\n"
+    "전체 순위, 피쳐 원값, raw 수치, 서버 경로, 비밀값은 올리지 않습니다. 피쳐는 비교 범위를 "
+    "붙인 백분위로만 올립니다.\n"
     "\n"
     "계층, 이름, front matter, 정정 규칙은 [CONVENTIONS.md](CONVENTIONS.md)에 있습니다.\n"
     "용어와 모델 설명은 [reference/](reference/README.md)에 있습니다.\n"
@@ -2970,7 +3711,8 @@ CONVENTIONS_TEXT = (
     "\n"
     "이 저장소는 private이고 본인만 봅니다(`audience: owner_only`). 협업자를 추가하거나 공개로 "
     "바꾸면 여기 올린 내용의 권리 판단이 무효가 됩니다. 그때는 올린 내용을 먼저 다시 "
-    "검토하십시오. 전체 순위, 원시 피쳐, raw 수치, 서버 경로, 비밀값은 올리지 않습니다.\n"
+    "검토하십시오. 전체 순위, 피쳐 원값, raw 수치, 서버 경로, 비밀값은 올리지 않습니다. "
+    "피쳐는 비교 범위를 붙인 백분위로만 올립니다(예: `같은 시장(코스닥) 안 하위 2%`).\n"
     "\n"
     "## 구조\n"
     "\n"
@@ -3005,9 +3747,14 @@ CONVENTIONS_TEXT = (
     "\n"
     "## 넣는 것과 넣지 않는 것\n"
     "\n"
-    "- markdown 표와 글만 넣습니다. parquet, CSV, JSON 같은 데이터 파일은 넣지 않습니다.\n"
-    "- 그림은 필요해질 때까지 쓰지 않습니다. 쓰게 되면 단위 폴더 안 `assets/`에 SVG만, 개당 "
-    "200KB 이하로 둡니다.\n"
+    "- markdown 표와 글, 단위 폴더 `assets/`의 SVG 그림만 넣습니다. parquet, CSV, JSON 같은 "
+    "데이터 파일은 넣지 않습니다.\n"
+    "- 그림은 단위 폴더 안 `assets/`에 SVG만, 개당 200KB 이하로 둡니다. 지금은 일일 브리핑의 "
+    "상위 20 그래프(모델마다 한 장: `kr-top20.svg`, `us-lightgbm-top20.svg`, "
+    "`us-ridge-top20.svg`)에만 씁니다. 같은 단위의 markdown에서 `![설명](assets/<이름>.svg)`로만 "
+    "가리킵니다.\n"
+    "- 그림에는 시작일=100으로 맞춘 지수만 그리고 가격 수준(원·달러)은 그리지 않습니다. "
+    "스크립트, 이벤트 속성(`on…=`), 외부 참조(`href`)를 넣지 않습니다. 검증기가 막습니다.\n"
     "- 링크는 상대 경로만 씁니다.\n"
     "- 서버 절대경로, 호스트명, 비밀값은 넣지 않습니다. 검증기가 막습니다.\n"
     "- 범위나 근사값의 물결표는 `\\~`로 씁니다(예: `50KB\\~5MB`). 렌더러에 따라 물결표 두 "
@@ -3015,7 +3762,8 @@ CONVENTIONS_TEXT = (
     "\n"
     "## front matter\n"
     "\n"
-    "단위 폴더의 모든 파일은 YAML front matter로 시작합니다. 아래 필드를 모두 적습니다.\n"
+    "단위 폴더의 모든 markdown 파일은 YAML front matter로 시작합니다. 아래 필드를 모두 "
+    "적습니다. 그림(`assets/*.svg`)에는 front matter가 없습니다.\n"
     "\n"
     "```yaml\n"
     "{fm}\n"
@@ -3033,7 +3781,8 @@ CONVENTIONS_TEXT = (
     "| `data_asof` | 입력별 기준일 |\n"
     "| `models` | 쓴 `model_id` 목록 |\n"
     "| `revision` | 같은 단위를 고쳐 다시 낸 횟수. 처음은 1 |\n"
-    "| `source` | 만든 release와 정본 내부 report의 sha256 |\n"
+    "| `source` | 만든 release와 정본 내부 report의 sha256. 근거·그래프를 그린 단위는 근거 "
+    "입력의 sha256(`explain_sha256`)도 적습니다 |\n"
     "| `historical_replay` | 지난 날짜를 나중에 다시 계산한 리포트일 때만 `true`로 적습니다. "
     "모든 파일에 같이 적고, 제목 끝에 `(재현)`을 붙입니다 |\n"
     "\n"
@@ -3072,12 +3821,14 @@ CONVENTIONS_TEXT = (
     "\n"
     "## 정정과 재실행\n"
     "\n"
-    "- 같은 단위를 다시 만들었는데 내용이 같으면 커밋하지 않습니다.\n"
+    "- 같은 단위를 다시 만들었는데 내용이 같으면 커밋하지 않습니다. 그림은 바이트로 "
+    "비교합니다.\n"
     "- 내용이 다르면 `revision`을 올리고, 요약 맨 위에 정정 줄(이유와 이전 판 커밋)을 "
     "넣습니다. 커밋 메시지는 `<family> <unit> r<revision>: <사유>` 형식입니다.\n"
     "- 일일 실행은 오늘 단위보다 이전 단위를 건드리지 않습니다. 이전 단위를 고칠 때는 수동으로 "
     "`--correct <unit> --reason`을 씁니다.\n"
-    "- 단위를 지우지 않습니다.\n"
+    "- 단위를 지우지 않습니다. 예외는 하나입니다. 정정판에 없는 옛 그림(`assets/*.svg`)은 "
+    "그 정정 커밋에서 지웁니다.\n"
     "\n"
     "## 쓰는 쪽의 경계\n"
     "\n"
@@ -3226,6 +3977,27 @@ def ensure_model_cards(repo: Path, cards: dict, log) -> list:
     return created
 
 
+# 새 모델 카드에 넣는 "근거 읽는 법". 이미 있는 카드는 고치지 않습니다(사람이 고칩니다).
+EXPLAIN_CARD_LINES = [
+    "## 근거 읽는 법",
+    "",
+    "근거 칸이 붙은 단위에서는 순위 표에 아래 칸이 더 있습니다. 순위를 계산한 뒤 따로 계산한 "
+    "표시이고, 모델·점수·순위는 바꾸지 않습니다.",
+    "",
+    "- 60세션 흐름: 기준일에서 60세션 전을 100으로 맞춘 지수를 글자 그림으로 그린 것입니다. "
+    "종목마다 세로축을 따로 맞춰서 높이로 종목끼리 비교할 수 없습니다.",
+    "- 5·20·60세션: 기준일까지의 가격 수익률입니다. 기준일 뒤 가격은 쓰지 않습니다.",
+    "- 점수를 올린 요인: 한 묶음의 입력만 그날 비교 대상의 평범한 수준(연속 값은 평균, 0/1 값은 "
+    "최빈값)으로 바꿨을 때 점수가 내려가는 묶음을, 많이 내려가는 순서로 둘까지 적습니다.",
+    "- 상위 20 상세: 그래프, 묶음별 점수 변화(Δ)와 상위 100 평균, 백분위가 극단인 피쳐입니다.",
+    "",
+    "Δ는 이 모델의 점수 단위라 다른 모델과 크기를 비교하지 않습니다. Δ는 순위가 왜 이 자리인지나 "
+    "오를 이유를 설명하는 값이 아닙니다. 백분위가 극단인 피쳐와 점수에 크게 기여한 피쳐는 "
+    "다릅니다.",
+    "",
+]
+
+
 def model_card_text(model_id: str, card: dict) -> str:
     meta = {
         "schema": SCHEMA,
@@ -3247,6 +4019,9 @@ def model_card_text(model_id: str, card: dict) -> str:
         "",
         "리포트의 점수는 순위용 점수 — 확률 아님입니다.",
         "",
+    ]
+    lines += EXPLAIN_CARD_LINES
+    lines += [
         "출처: 운영 모델 카드(`model-cards.json`)를 옮겼습니다.",
         "",
     ]
@@ -3324,7 +4099,32 @@ ASSET_PATH_RE = re.compile(
 FAMILY_FM_FIELDS = ("schema", "family", "cadence", "owner", "unit_id_format")
 ALLOWED_FAMILIES = (FAMILY,)  # 새 종류를 더할 때 여기에 이름 한 줄을 더합니다(01 문서 §10).
 SVG_MAX_BYTES = 200 * 1024
-SVG_FORBIDDEN = re.compile(r"<script|javascript:|\son\w+\s*=", re.IGNORECASE)
+SVG_FORBIDDEN = re.compile(
+    r"<script|javascript:|\son\w+\s*=|<foreignObject|<!DOCTYPE|<!ENTITY|<iframe|<embed|<object"
+    r"|<image\b|<use\b|\bhref\s*=|@import|url\(\s*['\"]?(?!#)",
+    re.IGNORECASE,
+)
+SVG_START = re.compile(r"^\s*(?:<\?xml[^>]*\?>\s*)?<svg[\s>]")
+IMAGE_RE = re.compile(r"(?<!\\)!\[[^\]]*\]\(([^)\s]*)(?:\s+\"[^\"]*\")?\)")
+
+
+def svg_violations(rel: str, raw: bytes) -> list:
+    """그림 파일 하나를 검사합니다: 크기, UTF-8, `<svg`로 시작, 스크립트·이벤트·외부 참조 없음."""
+    if len(raw) > SVG_MAX_BYTES:
+        return [f"{rel}: SVG가 200KB를 넘습니다"]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return [f"{rel}: SVG가 UTF-8이 아닙니다"]
+    out = []
+    if not SVG_START.match(text):
+        out.append(f"{rel}: SVG 파일이 아닙니다 (<svg로 시작하지 않음)")
+    if SVG_FORBIDDEN.search(text):
+        out.append(f"{rel}: SVG에 스크립트나 이벤트 속성, 외부 참조가 있습니다")
+    for label, pattern in FORBIDDEN_PATTERNS:
+        if pattern.search(text):
+            out.append(f"{rel}: 금지 문자열이 있습니다 ({label})")
+    return out
 
 
 def strip_code(text: str) -> str:
@@ -3413,9 +4213,35 @@ def iter_repo_files(repo: Path) -> list:
     return sorted(found)
 
 
+def image_violations(rel: str, text: str, exists) -> list:
+    """그림 링크 `![..](..)`를 검사합니다. 대상이 있어야 하고, 외부·절대 경로는 받지 않습니다.
+
+    단위 파일의 그림은 같은 단위의 `assets/*.svg`만 가리킬 수 있습니다.
+    """
+    out = []
+    unit_match = UNIT_PATH_RE.match(rel)
+    for target in IMAGE_RE.findall(strip_code(text)):
+        if not target or re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*:", target):
+            out.append(f"{rel}: 그림은 저장소 안 상대 경로만 씁니다: {target}")
+            continue
+        path_part = target.split("#", 1)[0].split("?", 1)[0]
+        if path_part.startswith("/"):
+            out.append(f"{rel}: 절대 경로 그림 링크입니다: {target}")
+            continue
+        resolved = posixpath.normpath(posixpath.join(posixpath.dirname(rel), path_part))
+        if unit_match:
+            asset = ASSET_PATH_RE.match(resolved)
+            if asset is None or asset.group(3) != unit_match.group(3):
+                out.append(f"{rel}: 그림은 같은 단위의 assets/ 아래 SVG만 씁니다: {target}")
+                continue
+        if resolved.startswith("..") or not exists(resolved):
+            out.append(f"{rel}: 그림 대상이 없습니다: {target}")
+    return out
+
+
 def link_violations(rel: str, text: str, exists) -> list:
     """상대 링크를 검사합니다. `exists(resolved)`가 가리키는 파일이 있는지 알려줍니다."""
-    out = []
+    out = image_violations(rel, text, exists)
     for target in LINK_RE.findall(strip_code(text)):
         if target.startswith("#"):
             continue
@@ -3516,11 +4342,13 @@ def validate(repo: Path | str, paths=None, *, allow_synthetic: bool = False) -> 
         asset = ASSET_PATH_RE.match(rel)
         if asset:
             touched_units.add(asset.group(3))
-            raw = path.read_bytes()
-            if len(raw) > SVG_MAX_BYTES:
-                violations.append(f"{rel}: SVG가 200KB를 넘습니다")
-            elif SVG_FORBIDDEN.search(raw.decode("utf-8", "replace")):
-                violations.append(f"{rel}: SVG에 스크립트나 이벤트 속성이 있습니다")
+            if any(
+                (repo / parent).is_symlink()
+                for parent in (posixpath.dirname(rel), posixpath.dirname(posixpath.dirname(rel)))
+            ):
+                violations.append(f"{rel}: symlink 경로 아래의 파일은 허용하지 않습니다")
+                continue
+            violations += svg_violations(rel, path.read_bytes())
             continue
         if not rel.endswith(".md"):
             violations.append(f"{rel}: .md만 올릴 수 있습니다")
@@ -3551,7 +4379,9 @@ def validate(repo: Path | str, paths=None, *, allow_synthetic: bool = False) -> 
 def validate_unit_files(unit: str, files: dict, *, allow_synthetic: bool = False) -> list:
     """단위 하나를 저장소 없이 검사합니다(로컬 단계 L3). 단위 밖으로 나가는 링크는 모양만 봅니다.
 
-    front matter, 파일 크기, 단위 안 상대 링크, 서버 경로·비밀값을 봅니다. 단위 밖 링크의 대상은
+    front matter, 파일 크기, 단위 안 상대 링크와 그림 링크, 서버 경로·비밀값을 봅니다.
+    그림(`assets/*.svg`)은 markdown 규칙 대신 그림 규칙(크기·금지 내용)으로 봅니다.
+    단위 밖 링크의 대상은
     저장소 트리가 있어야 알 수 있으므로 동기화 단계의 트리 검증이 맡습니다.
     """
     prefix = unit_rel(unit)
@@ -3567,6 +4397,19 @@ def validate_unit_files(unit: str, files: dict, *, allow_synthetic: bool = False
     for name in sorted(files):
         rel = f"{prefix}/{name}"
         text = files[name]
+        if not name.endswith(".md"):
+            if not is_asset_name(name):
+                violations.append(
+                    f"{rel}: 단위에 둘 수 없는 파일입니다 (markdown 5개와 assets/*.svg만)"
+                )
+            elif not isinstance(text, (bytes, str)):
+                violations.append(f"{rel}: 그림 내용이 바이트가 아닙니다")
+            else:
+                violations += svg_violations(rel, as_bytes(text))
+            continue
+        if not isinstance(text, str):
+            violations.append(f"{rel}: markdown 내용이 텍스트가 아닙니다")
+            continue
         if len(text.encode("utf-8")) > MAX_FILE_BYTES:
             violations.append(f"{rel}: 파일이 1MB를 넘습니다")
             continue
@@ -3598,6 +4441,14 @@ def main(argv: list | None = None) -> int:
         "--operator-memo",
         type=Path,
         help="operator-memo.v1 JSON (실패·stale 섹션에 붙일 운영자 메모)",
+    )
+    parser.add_argument(
+        "--explain",
+        type=Path,
+        help="briefing-explain.v1 JSON (그날 explain-D.json. 없으면 근거·그래프 없이 렌더)",
+    )
+    parser.add_argument(
+        "--invocation-id", help="근거 입력과 맞춰 볼 invocation id (없으면 envelope 값)"
     )
     parser.add_argument("--release", help="서빙 release id")
     parser.add_argument("--generated-at", help="ISO 시각(시간대 포함). 없으면 지금")
@@ -3655,6 +4506,8 @@ def main(argv: list | None = None) -> int:
                     log,
                     names_path=args.security_names,
                     memo_path=args.operator_memo,
+                    explain_path=args.explain,
+                    invocation_id=args.invocation_id,
                 )
             elif not (args.init or args.reindex):
                 raise InputError("--envelope, --init, --reindex, --validate 중 하나가 필요합니다.")

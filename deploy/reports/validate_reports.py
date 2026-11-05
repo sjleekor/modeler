@@ -8,6 +8,8 @@
 | 3 | 파일 크기 1MB | modeler.reporting.markdown.validate |
 | 4 | 상대 링크 | modeler.reporting.markdown.validate |
 | 5 | 과거 단위 보호: 단위의 변경·삭제 거부(--correct한 단위만 예외) | check_change_set |
+
+검사 5의 예외: --correct한 단위는 정정판에 없는 옛 그림(`assets/*.svg`)을 지울 수 있습니다.
 | 6 | 서버 경로·호스트명·키 모양 문자열 | modeler.reporting.markdown.validate |
 
 publisher는 동기화 단계에서 이 모듈의 `validate_working_tree`를 부릅니다. 수동으로는
@@ -132,6 +134,9 @@ def check_change_set(
             problems.append(f"{path}: symlink는 허용하지 않습니다")
             continue
         if code == "D":
+            asset = md.ASSET_PATH_RE.match(path)
+            if asset and asset.group(3) in corrected:
+                continue  # 정정판에서 빠진 옛 그림입니다. 정정을 허가한 단위만 지울 수 있습니다
             problems.append(f"{path}: 삭제는 허용하지 않습니다 (단위와 문서는 지우지 않습니다)")
             continue
         if code not in ("A", "M"):
@@ -186,7 +191,9 @@ def _only_auto_zone_changed(
 def own_models_of(unit_files: dict) -> set[str]:
     """단위 파일의 front matter `models`에 적힌 모델 id입니다."""
     found: set[str] = set()
-    for text in unit_files.values():
+    for name, text in unit_files.items():
+        if not name.endswith(".md") or not isinstance(text, str):
+            continue  # 그림(assets/*.svg)에는 front matter가 없습니다
         try:
             meta, _ = md.parse_front_matter(text)
         except ValueError:

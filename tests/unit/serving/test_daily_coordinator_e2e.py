@@ -30,7 +30,8 @@ MODULES = (
     "modeler/serving/opening_prepare.py",
     "modeler/serving/runtime_contract.py", "modeler/reporting/__init__.py",
     "modeler/reporting/site.py", "modeler/reporting/markdown.py",
-    "modeler/reporting/security_names.py",
+    "modeler/reporting/security_names.py", "modeler/reporting/svg.py",
+    "modeler/serving/explain.py",
 )
 ADAPTER = '''from modeler.serving.schema import report_template
 
@@ -157,7 +158,7 @@ def _setup(tmp_path: Path) -> tuple[Path, Path]:
         "model_cards_path": str(cards), "model_cards_sha256": _sha(cards),
         "kr_calendar": str(kr_calendar), "us_calendar": str(us_calendar),
         "us_expected_source": str(expected), "opening_artifact": None,
-        "publisher_enabled": False, "external_verification_enabled": False,
+        "publisher_enabled": False, "external_verification_enabled": False, "explain_enabled": False,
         "reports_publisher": None, "reports_publisher_sha256": None, "reports_checkout": None,
         "reports_remote_url": None, "reports_repository": None, "reports_audience": None,
         "reports_branch": None, "reports_top_n": 100})

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .daily_coordinator import (
     SEOUL, _absolute, _config, _day_dir, _lock, _read,
-    ensure_selection, infer_stage, market_sector_stage, monitor_stage, publish_stage, render_stage,
+    ensure_selection, explain_stage, infer_stage, market_sector_stage, monitor_stage, publish_stage, render_stage,
     select_stage,
 )
 from .daily_opening import prepare_opening
@@ -82,6 +82,14 @@ def main(argv: list[str] | None = None) -> int:
                         ms_status = "market_sector_failed"
                     if ms_status != "disabled":  # a release without the section reports as before
                         states["market_sector"] = ms_status
+                    # Explain (why a stock ranks where it does, its price path) is read-only and
+                    # time-limited: whatever happens, the run goes on with the unit as before.
+                    try:
+                        explain_status = explain_stage(config, day, now)["status"]
+                    except Exception:
+                        explain_status = "failed"
+                    if explain_status != "disabled":  # off means the unit and this output stay as before
+                        states["explain"] = explain_status
                     states["render"] = render_stage(config, day)["status"]
                     states["publication"] = publish_stage(config, day)["status"]
                     failed = failed or states["publication"] == "publisher_failed"

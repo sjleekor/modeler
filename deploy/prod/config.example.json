@@ -26,6 +26,8 @@
   "security_names_kr_root": null,
   "publisher_enabled": false,
   "external_verification_enabled": false,
+  "explain_enabled": false,
+  "explain_timeout_seconds": 120,
   "reports_repository": "sjleekor/stock_reports",
   "reports_audience": "owner_only",
   "reports_branch": "main",

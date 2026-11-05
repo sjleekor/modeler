@@ -76,6 +76,7 @@ Pages 공개 경로는 없앴습니다. `publish` 단계는 private 저장소 `s
 | 구성 요소 | 위치 | 하는 일 |
 |---|---|---|
 | 렌더러 | `src/modeler/reporting/markdown.py` (release 안) | report를 단위 폴더(`README.md`·`market-sector.md`·`kr-stocks.md`·`us-stocks.md`·`data-status.md`)로 렌더하고, 인덱스 자동 구간을 다시 쓰고, 트리를 검증합니다. 표준 라이브러리만 쓰고, 템플릿은 `.py` 문자열이라 release `DATA_FILES`를 늘리지 않습니다. **release 검토 목록(`SOURCE_MANIFEST`)에 이 파일을 넣어야 release 빌드가 통과합니다.** |
+| 그림 | `src/modeler/reporting/svg.py` (release 안) | 근거 입력(`explain-D.json`)이 있을 때 상위 20 그래프 `assets/*.svg`를 만듭니다(표준 라이브러리만, 같은 입력이면 같은 바이트, 스크립트·이벤트 속성·외부 참조 없음). 렌더러가 근거 입력이 있을 때만 import합니다. **release 검토 목록(`SOURCE_MANIFEST`)에 넣어야 합니다.** |
 | 증권 이름 | `src/modeler/reporting/security_names.py` (release 안) | 순위 종목의 이름 입력(`security-names.v1`)을 레이크에서 만듭니다. publisher 로컬 단계가 부릅니다(`publish_reports.py`가 import하므로 **release 검토 목록과 import 따라가기 진입 모듈에 넣어야 합니다**). polars는 함수 안에서 불러(serving venv에 있습니다) 패키지를 가볍게 둡니다. 수동으로는 `python -m modeler.reporting.security_names --envelope … --us-root … --kr-root … --out …` |
 | publisher | `deploy/reports/publish_reports.py` (release 밖, `serving/publisher/`로 복사, sha256 고정) | 로컬 단계와 동기화 단계 |
 | 검증기 | `deploy/reports/validate_reports.py` (같은 곳) | 경로 allowlist, front matter, 크기, 상대 링크, 과거 단위 보호, 서버 경로·비밀값, symlink |
@@ -129,6 +130,10 @@ python publish_reports.py sync --config runs/2026-10-07/reports-publisher-config
 
 결과는 stdout에 JSON 한 줄로 나옵니다. coordinator는 종료 코드 0이면 `coordinator-publication.json`의 `status`를 `published`로, 아니면 `publisher_failed`로 적고 `publisher_status`·`publisher_exit_code`·`local_done`을 같이 남깁니다. 성공하면 `reports_commit`(원격 `main`의 커밋)도 적습니다.
 
+### explain 단계
+
+`daily_wrapper run`이 `market_sector` 다음에 `explain_stage`를 부릅니다(단독 실행은 `daily_coordinator explain`). 별도 프로세스 그룹에서 `python -m modeler.serving.explain run`을 돌리고, 이 단계가 어떻게 끝나도 `render`·`publish`는 그대로 이어집니다. 모델·점수·순위·`report-D.json` 바이트는 건드리지 않습니다. 결과는 `run/explain-<D>.json`(`briefing-explain.v1`, 형식은 계획 §5.2.1)이고 `coordinator-explain.json`에 상태(`ok`·`partial`·`failed`·`disabled`·`skipped`)를 적습니다. 파일 안의 `invocation_id`·`report_sha256`이 그날 report와 다르면 표시 쪽이 버립니다. 가격은 시장·섹터 root(`market_sector_*_root`, 없으면 `security_names_*_root`)에서 읽습니다. **release의 검토 목록(`SOURCE_MANIFEST`)에 `modeler/src/modeler/serving/explain.py`가 있어야 release 빌드가 통과합니다.**
+
 ### ops 설정 키
 
 Pages용 `base_path`·`projection_root`·`previous_projection_dir`·`publisher_script(_sha256)`·`publisher_config`·`site_checkout`·`actions_repository`·`actions_workflow`·`public_manifest_url`은 없앴습니다. `publisher_enabled`가 `true`일 때 아래 키를 모두 검증합니다. `false`이면 검증하지 않고 `publish`는 `publication_withheld`로 끝납니다.
@@ -137,6 +142,8 @@ Pages용 `base_path`·`projection_root`·`previous_projection_dir`·`publisher_s
 |---|---|
 | `publisher_enabled` | 게시를 켤지. 명시해야 합니다 |
 | `external_verification_enabled` | monitor가 `git ls-remote`로 원격을 볼지 |
+| `explain_enabled` | 순위 근거·가격 흐름(`explain-D.json`)을 계산할지. 명시해야 합니다. `false`이면 파일을 만들지 않고 단위는 전과 바이트까지 같습니다. 이미 있던 같은 날 파일은 `explain-D.superseded-<sha>.json`으로 옮깁니다(지우지 않음) |
+| `explain_timeout_seconds` | explain 하위 프로세스 제한 시간(초, 10\~1800, 기본 120). 넘으면 프로세스 그룹을 끝내고 `failed` 문서를 남깁니다. 실행은 계속됩니다 |
 | `reports_repository` | `sjleekor/stock_reports`(다르면 멈춤) |
 | `reports_audience` | `owner_only`(다르면 멈춤) |
 | `reports_branch` | `main` |
@@ -336,6 +343,7 @@ python3 $B/source/modeler/deploy/prod/provision_serving.py \
 - **runner timeout·예외**: infer가 이번 실행의 report를 받지 못하면(timeout, 비정상 종료, selection 실패, report 없음) coordinator가 실패 report를 만들어 render·publish로 넘깁니다. 모든 모델 섹션이 `failed`이고 `failure`에 단계·원인 클래스·timeout 여부가 있습니다. 이번 실행의 `run-state.json`도 같이 씁니다. 같은 D에 이전 실행의 report가 있으면 `report-D.superseded-<sha12>.json`으로 옮겨 두고 쓰지 않습니다. 이 경우 publisher는 내용이 달라 정정을 요구합니다(종료 30).
 - **select 사유(E6 · 2026-10-06)**: envelope에 `selection_summary`가 들어갑니다. 09:30 select가 `selection-state.json`의 `markets`에 시장별로 적은 값 중 `status`, `reason`, `feature_asof_date`, `lag_sessions`, `freshness_reason`만 옮긴 것입니다(경로·해시·자유 문장은 옮기지 않습니다). 10-06 US 섹션은 원인 클래스 `MissingInference`만 보였는데, 이제 같은 섹션에 "select 사유: 상태 `unavailable`(고른 입력 없음), 사유 `producer_completion_missing`(D 09:30 전에 끝난 prepare 입력(native)이 없습니다)."가 나옵니다. 실패한 모델과 `stale` 섹션에만 이 줄이 나오고(`kr-stocks.md`·`us-stocks.md`, `data-status.md`의 섹션 표 사유 칸, `README.md` 경고), 정상 섹션은 그대로입니다. 필드가 없는 envelope는 렌더 결과가 전과 바이트까지 같습니다. runner는 `infer --selection-state <selection-state.json> --selection-state-sha256 <sha>`로 이 파일을 받고(coordinator가 줍니다), 이번 실행이 실패 report를 직접 만드는 경로도 selection이 있으면 같은 필드를 넣습니다. selection 단계 자체가 실패한 날은 필드가 없습니다.
 - **운영자 메모**: `runs/D/operator-memo-D.json`(`{"schema": "operator-memo.v1", "report_date": "D", "memos": {"US": "한 줄 설명"}}`)이 있으면 publisher 로컬 단계가 읽어 실패·stale 섹션에 "운영자 메모: …" 줄로 붙입니다(키는 `KR`·`US`·`MS`=시장·섹터). 정상·partial 섹션과 순위 표를 내지 않은 stale 모델에는 붙이지 않고 log에만 남깁니다. 메모는 200자 이하 한 줄이고 서버 경로(`/home/` 등)·호스트명·키 모양 문자열·`password=` 모양이 있으면 단위 전체를 `rejected`로 거절합니다. 파일이 없으면 렌더·manifest·journal이 전과 바이트까지 같습니다. 이미 올린 단위에 메모를 더하면 내용이 달라져 `correction_required`(종료 30)가 되고, `publish_reports.py sync --correct D --reason "운영자 메모 추가"`로만 revision이 오릅니다. 파일은 사람이 직접 씁니다(coordinator·render는 만들지 않습니다). 수동 렌더는 `python -m modeler.reporting.markdown --operator-memo <파일>`입니다.
+- **근거·그래프**: `runs/D/explain-D.json`(`briefing-explain.v1`, serving의 explain 단계가 씀)이 있으면 publisher 로컬 단계가 읽어 렌더러에 넘깁니다. 파일 안의 `report_sha256`·`invocation_id`가 이번 실행과 같을 때만 순위 표에 60세션 흐름·5·20·60세션 수익률·점수를 올린 요인 칸과 상위 20 상세(`<details>`, 그림 `assets/*.svg`)를 더합니다. 다르거나 읽지 못하면 "근거·그래프: 실패 — 사유" 한 줄을 적고 표는 지금 모양으로 냅니다(단위를 막지 않습니다). publisher 날짜별 설정 `explain_enabled: false`이거나 파일이 없으면 읽지 않고, 렌더·manifest·journal이 전과 바이트까지 같습니다. 경로·sha256·상태는 manifest·journal(`explain_path`·`explain_sha256`·`explain_state`)에 남고, 정정·재시도는 같은 파일인지 확인하고 다시 읽습니다. 단위 파일 집합은 markdown 5개와 `assets/*.svg`이며, 정정판에 없는 옛 그림은 그 정정 커밋에서 지웁니다(검증기는 `--correct`한 단위의 그림 삭제만 받습니다). 수동 렌더는 `python -m modeler.reporting.markdown --explain <파일> --invocation-id <id>`입니다.
 - report `quality`의 새 키: `selection_mode`, `selected_at`, `producer_completed_at`, `lag_sessions`, `status_before_stale`, `rankings_withheld`. KR은 `reference_verdict`, `reference_k`, `reference_date`, `reference_lag_sessions`, `k_ticker_count`, `k_ticker_ratio`, `k_previous_session`, `export_gate_verdict`, `dart_chain_ended_at`도 있고 `provenance.reference_selection`에 증거 전체가 있습니다.
 
 ### US universe revision 불일치

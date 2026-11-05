@@ -40,6 +40,7 @@ KR_QUALITY_REASON_TEXT = {
     "K_share_change_or_unknown": "K 기준 상장주식수 변화 또는 확인 불가",
     "K_price_rule_unknown": "K 기준 가격 점검 규칙 적용 불가",
     "K_price_quality_unavailable": "K 기준 가격 품질 정보 없음",
+    "W20_halt_in_window": "최근 20거래일 안 거래정지 — 가격 피쳐 왜곡 가능",
 }
 
 
