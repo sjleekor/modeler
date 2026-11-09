@@ -37,6 +37,8 @@ RUNNER_TIMEOUT_SECONDS = 1800
 MARKET_SECTOR_TIMEOUT_SECONDS = 900
 EXPLAIN_ENTRYPOINT = "modeler.serving.explain"
 EXPLAIN_TIMEOUT_SECONDS = 120
+MACRO_CONTEXT_ENTRYPOINT = "modeler.serving.macro_context_run"
+MACRO_CONTEXT_TIMEOUT_SECONDS = 300
 MARKET_SECTOR_ROOT_KEYS = ("market_sector_kr_root", "market_sector_us_root")
 # 증권 이름 입력을 만들 레이크 root. 전용 키가 없으면 같은 레이크를 가리키는 시장·섹터 root를 씁니다.
 SECURITY_NAMES_ROOT_KEYS = (
@@ -190,6 +192,14 @@ def _config(path: Path) -> dict[str, Any]:
     explain_timeout = config.get("explain_timeout_seconds", EXPLAIN_TIMEOUT_SECONDS)
     if isinstance(explain_timeout, bool) or not isinstance(explain_timeout, int) or not 10 <= explain_timeout <= 1800:
         raise ValueError("explain_timeout_seconds must be 10..1800")
+    # Display-only section: a missing key means off (an old ops.json keeps working); a value that
+    # is there must be a bool.
+    if not isinstance(config.get("macro_context_enabled", False), bool):
+        raise ValueError("macro_context_enabled must be true or false")
+    macro_timeout = config.get("macro_context_timeout_seconds", MACRO_CONTEXT_TIMEOUT_SECONDS)
+    if (isinstance(macro_timeout, bool) or not isinstance(macro_timeout, int)
+            or not 10 <= macro_timeout <= 1800):
+        raise ValueError("macro_context_timeout_seconds must be 10..1800")
     if config["publisher_enabled"]:
         _reports_publisher_config(config)
     return config
@@ -655,6 +665,141 @@ def explain_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str,
     return state
 
 
+def _clear_macro_temps(run_root: Path, day: date) -> None:
+    """Remove this D's ``.macro-<D>.*`` temporaries (scratch output, a killed child's temp file)."""
+    for path in run_root.glob(f".macro-{day.isoformat()}.*"):
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+
+
+def macro_context_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, Any]:
+    """The macro_context stage; clears this D's temporaries before and after (see below)."""
+    run_root = _day_dir(config, day)
+    run_root.mkdir(parents=True, exist_ok=True)
+    _clear_macro_temps(run_root, day)
+    try:
+        return _macro_context_stage(config, day, now)
+    finally:
+        _clear_macro_temps(run_root, day)
+
+
+def _macro_context_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, Any]:
+    """Compute the display-only ``macro-D.json`` (거시 흐름) in a child process under a time limit.
+
+    Runs after market-sector and explain, before render.  It needs the D selection only, not a
+    model report: a failure report still gets the section.  The calculation reads the
+    market-sector selection document (``market-sector-selection.v1``, ``ms-selection.json``) that
+    09:30 select pinned, by path and SHA-256 from ``selection-state.json``'s ``market_sector``
+    block; without a usable block the section fails with the market-sector stage's reason codes.
+    It never reads or changes ``report-D.json``, ``market-sector-D.json`` or ``explain-D.json``.
+    A failure, a timeout or a crash ends in a ``failed`` document
+    (``modeler.scores.macro_context.failure_document``) that carries this invocation's id; the
+    stage never raises into the run.
+    ``macro_context_enabled`` false or absent writes no document and the unit renders exactly as
+    before.
+    A document of an earlier invocation is set aside (renamed), never reused.
+    """
+    run_root = _day_dir(config, day)
+    run_root.mkdir(parents=True, exist_ok=True)
+    state_path = run_root / "coordinator-macro-context.json"
+    document = run_root / f"macro-{day.isoformat()}.json"
+    _retire_explain_document(document)
+    if config.get("macro_context_enabled", False) is not True:
+        state = {"report_date": day.isoformat(), "status": "disabled"}
+        _atomic(state_path, state)
+        return state
+    infer_path = run_root / "coordinator-inference.json"
+    infer_state = _read(infer_path) if infer_path.is_file() else {}
+    invocation_id = infer_state.get("invocation_id")
+    if not isinstance(invocation_id, str) or not invocation_id:
+        # The publisher only takes this run's invocation: without one there is nothing to bind to.
+        state = {"report_date": day.isoformat(), "status": "skipped", "reason": "no_invocation"}
+        _atomic(state_path, state)
+        return state
+    release_name = Path(config["release_manifest"]).parent.name
+    selection_sha: str | None = None
+
+    def failed(reason: str, *, timed_out: bool = False,
+               exit_code: int | None = None) -> dict[str, Any]:
+        state = {"report_date": day.isoformat(), "status": "failed", "reason": reason,
+                 "timed_out": timed_out, "exit_code": exit_code, "invocation_id": invocation_id}
+        try:
+            from modeler.scores.macro_context import document_bytes, failure_document
+
+            body = failure_document(unit=day.isoformat(), invocation_id=invocation_id,
+                                    release=release_name, selection_sha256=selection_sha,
+                                    reason=reason)
+            state["document_sha256"] = _install_ms_document(document, document_bytes(body))
+        except Exception as exc:  # no module to write it with: the unit renders without the page
+            state["document_error_class"] = type(exc).__name__
+        _atomic(state_path, state)
+        return state
+
+    try:
+        selected = ensure_selection(config, day, now)
+    except Exception:
+        return failed("selection_unavailable")
+    if selected.get("status") == "holiday":
+        state = {"report_date": day.isoformat(), "status": "holiday"}
+        _atomic(state_path, state)
+        return state
+    block = selected.get("market_sector")
+    if not isinstance(block, dict):
+        return failed("not_in_selection")
+    if block.get("status") not in {"selected", "partial"}:
+        return failed(str(block.get("reason") or "inputs_unavailable"))
+    try:
+        selection_path = Path(block["selection"])
+        selection_sha = block["selection_sha256"]
+        if not isinstance(selection_sha, str) or _hash(selection_path) != selection_sha:
+            return failed("selection_changed")
+        release = _read(_absolute(config, "release_manifest"))
+        release_root = Path(release["release_root"]).resolve(strict=True)
+    except Exception as exc:
+        return failed(f"setup:{type(exc).__name__}")
+    scratch = run_root / f".macro-{day.isoformat()}.new"
+    scratch.unlink(missing_ok=True)
+    argv = [str(_absolute(config, "python")), "-m", MACRO_CONTEXT_ENTRYPOINT, "run",
+            "--report-date", day.isoformat(), "--selection", str(selection_path),
+            "--selection-sha256", selection_sha, "--invocation-id", invocation_id,
+            "--release", release_name, "--output", str(scratch)]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(release_root / "src")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    timeout = config.get("macro_context_timeout_seconds", MACRO_CONTEXT_TIMEOUT_SECONDS)
+    try:
+        done = run_group(argv, cwd=release_root, env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        scratch.unlink(missing_ok=True)
+        return failed("timeout", timed_out=True, exit_code=124)
+    except OSError as exc:
+        return failed(f"spawn:{type(exc).__name__}", exit_code=127)
+    if done.returncode != 0 or not scratch.is_file():
+        scratch.unlink(missing_ok=True)
+        return failed("exit_nonzero" if done.returncode else "output_missing",
+                      exit_code=done.returncode)
+    raw = scratch.read_bytes()
+    try:
+        from modeler.scores.macro_context import SCHEMA as MACRO_SCHEMA
+
+        body = json.loads(raw)
+        if (not isinstance(body, dict) or body.get("schema") != MACRO_SCHEMA
+                or body.get("invocation_id") != invocation_id
+                or body.get("unit") != day.isoformat()
+                or not isinstance(body.get("state"), str) or not body["state"]):
+            raise ValueError("macro document identity")
+    except (ImportError, ValueError):
+        scratch.unlink(missing_ok=True)
+        return failed("output_invalid", exit_code=done.returncode)
+    os.replace(scratch, document)  # the child wrote scratch whole; the rename publishes it
+    state = {"report_date": day.isoformat(), "status": body["state"],
+             "invocation_id": invocation_id, "document_sha256": hashlib.sha256(raw).hexdigest(),
+             "selection_sha256": selection_sha}
+    _atomic(state_path, state)
+    return state
+
+
 def _previous_private(config: dict[str, Any], day: date,
                       synthetic: bool) -> tuple[Path | None, dict[str, bytes] | None]:
     """Newest strictly earlier private view with the same fixture mode; never a public projection."""
@@ -770,6 +915,9 @@ def _reports_publisher_input(config: dict[str, Any], day: date, render: dict[str
         "top_n": config.get("reports_top_n", 100),
         "explain_enabled": config["explain_enabled"],  # off: the publisher reads no explain file
         **_security_names_roots(config),
+        # Only when on: an off switch adds no key, so a publisher older than the section accepts
+        # the input (its check_config refuses unknown keys) and the publisher reads no macro file.
+        **({"macro_context_enabled": True} if config.get("macro_context_enabled") is True else {}),
     }
 
 
@@ -965,8 +1113,8 @@ def monitor_stage(config: dict[str, Any], day: date, *, attempt: int) -> dict[st
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="modeler-daily-coordinator")
-    parser.add_argument("stage", choices=("select", "infer", "market-sector", "explain", "render",
-                                          "publish", "monitor"))
+    parser.add_argument("stage", choices=("select", "infer", "market-sector", "explain",
+                                          "macro-context", "render", "publish", "monitor"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--report-date", type=date.fromisoformat, required=True)
     parser.add_argument("--attempt", type=int, default=0)
@@ -987,6 +1135,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = market_sector_stage(config, args.report_date, now)
             elif args.stage == "explain":
                 result = explain_stage(config, args.report_date, now)
+            elif args.stage == "macro-context":
+                result = macro_context_stage(config, args.report_date, now)
             elif args.stage == "render":
                 result = render_stage(config, args.report_date)
             elif args.stage == "publish":

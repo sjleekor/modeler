@@ -31,7 +31,12 @@ MODULES = (
     "modeler/serving/runtime_contract.py", "modeler/reporting/__init__.py",
     "modeler/reporting/site.py", "modeler/reporting/markdown.py",
     "modeler/reporting/security_names.py", "modeler/reporting/svg.py",
-    "modeler/serving/explain.py",
+    "modeler/serving/explain.py", "modeler/serving/macro_context_run.py",
+    "modeler/scores/__init__.py", "modeler/scores/macro_context/__init__.py",
+    "modeler/scores/macro_context/spec.py", "modeler/scores/macro_context/document.py",
+    "modeler/scores/macro_context/calc.py", "modeler/scores/macro_context/summary.py",
+    "modeler/scores/macro_context/figures.py", "modeler/scores/macro_context/load.py",
+    "modeler/scores/macro_context/build.py", "modeler/reporting/macro.py",
 )
 ADAPTER = '''from modeler.serving.schema import report_template
 
@@ -107,13 +112,17 @@ def _runtime_manifest(target: Path) -> None:
     target.write_text(json.dumps(body, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _setup(tmp_path: Path) -> tuple[Path, Path]:
+def _setup(tmp_path: Path, extra_sources: dict[str, str] | None = None) -> tuple[Path, Path]:
     release = tmp_path / "frozen-release"
     source = release / "src"
     for relative in MODULES:
         target = source / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(PROJECT / "src" / relative, target)
+    for relative, text in (extra_sources or {}).items():  # stand-ins for modules on other branches
+        target = source / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
     adapter = source / "modeler" / "serving" / "adapters.py"
     adapter.write_text(ADAPTER)
     shutil.copy2(PROJECT / "uv.lock", release / "uv.lock")
@@ -159,6 +168,7 @@ def _setup(tmp_path: Path) -> tuple[Path, Path]:
         "kr_calendar": str(kr_calendar), "us_calendar": str(us_calendar),
         "us_expected_source": str(expected), "opening_artifact": None,
         "publisher_enabled": False, "external_verification_enabled": False, "explain_enabled": False,
+        "macro_context_enabled": False,
         "reports_publisher": None, "reports_publisher_sha256": None, "reports_checkout": None,
         "reports_remote_url": None, "reports_repository": None, "reports_audience": None,
         "reports_branch": None, "reports_top_n": 100})

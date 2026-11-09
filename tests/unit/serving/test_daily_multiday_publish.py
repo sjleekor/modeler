@@ -13,7 +13,10 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import pytest
 import test_daily_coordinator_e2e as e2e
+
+from modeler.reporting import markdown as md
 
 sys.path.insert(0, str(Path(e2e.PROJECT) / "tests" / "unit" / "reporting"))
 from reports_world import REPORTS_DIR, World, git  # noqa: E402
@@ -120,6 +123,7 @@ def _enable_publisher(
         {
             "publisher_enabled": True,
             "external_verification_enabled": external_verification, "explain_enabled": False,
+            "macro_context_enabled": False,
             "reports_publisher": str(script),
             "reports_publisher_sha256": e2e._sha(script),
             "reports_checkout": str(world.checkout),
@@ -432,3 +436,127 @@ def test_wrapper_run_with_explain_off_writes_no_explain_state_or_file(tmp_path: 
     assert not any(name.startswith("assets/") for name in local)
     assert not any("explain_sha256" in data.decode() for data in local.values())
     assert set(local) == _pushed_files(world, D1)
+
+
+def test_publisher_input_carries_the_macro_switch(tmp_path: Path) -> None:
+    from modeler.serving import daily_coordinator as dc
+
+    _release, config_path = e2e._setup(tmp_path)
+    _enable_publisher(tmp_path, config_path)
+    base = json.loads(config_path.read_text())
+    render = {"report_sha256": "a" * 64, "invocation_id": "i"}
+    built = dc._reports_publisher_input(
+        {**base, "macro_context_enabled": True}, D1, render, tmp_path / "run")
+    assert built["macro_context_enabled"] is True
+    for off in ({**base, "macro_context_enabled": False},
+                {k: v for k, v in base.items() if k != "macro_context_enabled"}):
+        assert "macro_context_enabled" not in dc._reports_publisher_input(
+            off, D1, render, tmp_path / "run")
+
+
+def _old_publisher(tmp_path: Path):
+    """publish_reports.py as of b0262b0 (before the macro section), loaded from git."""
+    import importlib.util
+
+    done = subprocess.run(["git", "-C", str(e2e.PROJECT), "show",
+                           "b0262b0:deploy/reports/publish_reports.py"],
+                          capture_output=True, text=True, check=False)
+    if done.returncode:
+        pytest.skip("b0262b0 is not in this checkout")
+    path = tmp_path / "publish_reports_b0262b0.py"
+    path.write_text(done.stdout, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("publish_reports_b0262b0", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_an_old_publisher_accepts_the_input_while_the_section_is_off(tmp_path: Path) -> None:
+    from modeler.serving import daily_coordinator as dc
+
+    old = _old_publisher(tmp_path)
+    _release, config_path = e2e._setup(tmp_path)
+    _enable_publisher(tmp_path, config_path)
+    base = json.loads(config_path.read_text())
+    render = {"report_sha256": "a" * 64, "invocation_id": "inv"}
+    for off in ({**base, "macro_context_enabled": False},
+                {k: v for k, v in base.items() if k != "macro_context_enabled"}):
+        built = dc._reports_publisher_input(off, D1, render, tmp_path / "run")
+        old.check_config(built, need_local=True, strict_remote=False)  # does not raise
+    on = dc._reports_publisher_input({**base, "macro_context_enabled": True}, D1, render,
+                                     tmp_path / "run")
+    with pytest.raises(old.PublishError, match="unknown config keys"):
+        old.check_config(on, need_local=True, strict_remote=False)  # needs the new publisher
+
+
+def test_wrapper_run_without_the_switch_key_is_the_unit_without_the_section(
+        tmp_path: Path) -> None:
+    """ops.json without macro_context_enabled (as before the section): select/run go on, the
+    publisher gets no key and the unit has no trace of the section (the renderer's byte identity
+    with the golden hashes is in test_macro_section_render)."""
+    import macro_fakes as mk
+
+    release, config = e2e._setup(tmp_path, extra_sources=mk.RELEASE_SOURCES)
+    world = _enable_publisher(tmp_path, config)
+    body = json.loads(config.read_text())
+    del body["macro_context_enabled"]
+    e2e._write(config, body)
+    stages = _wrapper_run(release, config, D1, "2026-09-29T10:00:00+09:00")
+    assert "macro_context" not in stages and stages["publication"] == "published"
+    run = tmp_path / "runs" / D1.isoformat()
+    assert not (run / f"macro-{D1}.json").exists()
+    assert json.loads((run / "coordinator-macro-context.json").read_text())["status"] == "disabled"
+    assert "macro_context_enabled" not in json.loads(
+        (run / "reports-publisher-config.json").read_text())
+    unit = _unit_files(world, D1)
+    assert set(unit) == set(md.SECTION_FILES.values()) == _pushed_files(world, D1)
+    assert all(b"macro" not in data for data in unit.values())
+    manifest = json.loads((run / "markdown" / "manifest.json").read_text())
+    assert not any(key.startswith("macro_") for key in manifest)
+
+
+def test_wrapper_run_with_macro_on_but_no_market_sector_selection_publishes_a_notice(
+    tmp_path: Path,
+) -> None:
+    """This release has no market-sector section, so 09:30 select pins no selection document for
+    the macro calculation: the section fails with ``not_in_selection`` and the unit still goes out
+    with the failure notice (the ok path with a pinned document is in test_macro_context_stage)."""
+    import macro_fakes as mk
+
+    release, config = e2e._setup(tmp_path, extra_sources=mk.RELEASE_SOURCES)
+    world = _enable_publisher(tmp_path, config)
+    body = json.loads(config.read_text())
+    body["macro_context_enabled"] = True
+    e2e._write(config, body)
+    stages = _wrapper_run(release, config, D1, "2026-09-29T10:00:00+09:00")
+    assert stages["macro_context"] == "failed" and stages["publication"] == "published"
+    run = tmp_path / "runs" / D1.isoformat()
+    document = json.loads((run / f"macro-{D1}.json").read_text())
+    inference = json.loads((run / "coordinator-inference.json").read_text())
+    assert document["invocation_id"] == inference["invocation_id"]
+    assert document["state"] == "failed" and document["reason"] == "not_in_selection"
+    daily = json.loads((run / "reports-publisher-config.json").read_text())
+    assert daily["macro_context_enabled"] is True
+    pushed = _pushed_files(world, D1)
+    assert "macro.md" in pushed and not any(name.startswith("assets/") for name in pushed)
+    local = _unit_files(world, D1)
+    assert "거시 흐름을 내지 못했습니다: not_in_selection." in local["macro.md"].decode()
+    assert "| [거시 흐름](macro.md) | 실패 |" in local["README.md"].decode()
+    manifest = json.loads((run / "markdown" / "manifest.json").read_text())
+    assert manifest["macro_state"] == "failed"
+    assert manifest["macro_path"] == str(run / f"macro-{D1}.json")
+
+
+def test_wrapper_run_with_macro_off_writes_no_macro_state_or_file(tmp_path: Path) -> None:
+    release, config = e2e._setup(tmp_path)
+    world = _enable_publisher(tmp_path, config)  # macro_context_enabled False
+    stages = _wrapper_run(release, config, D1, "2026-09-29T10:00:00+09:00")
+    assert "macro_context" not in stages and stages["publication"] == "published"
+    run = tmp_path / "runs" / D1.isoformat()
+    assert not (run / f"macro-{D1}.json").exists()
+    daily = json.loads((run / "reports-publisher-config.json").read_text())
+    assert "macro_context_enabled" not in daily  # off adds no key (old publishers refuse it)
+    pushed = _pushed_files(world, D1)
+    assert "macro.md" not in pushed and not any(name.startswith("assets/") for name in pushed)
+    manifest = json.loads((run / "markdown" / "manifest.json").read_text())
+    assert not any(key.startswith("macro_") for key in manifest)

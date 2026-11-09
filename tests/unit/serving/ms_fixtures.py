@@ -97,8 +97,13 @@ def fake_ms_bundle(directory: Path) -> Path:
     return directory
 
 
-def build_release_world(tmp_path: Path, monkeypatch, *, kr_snapshot_done: str | None = None):
-    """(release, config_path, world) for D=2026-10-07 with a real synthetic market-sector bundle."""
+def build_release_world(tmp_path: Path, monkeypatch, *, kr_snapshot_done: str | None = None,
+                        extra_sources: dict[str, str] | None = None):
+    """(release, config_path, world) for D=2026-10-07 with a real synthetic market-sector bundle.
+
+    ``extra_sources`` ({"modeler/...py": source}) adds modules to the release ``src`` before its
+    code inventory is taken (stand-ins for modules that live on other branches).
+    """
     from tests.scores import ms_world as W
 
     monkeypatch.setattr(e2e, "ADAPTER", ADAPTER_R3)
@@ -111,6 +116,10 @@ def build_release_world(tmp_path: Path, monkeypatch, *, kr_snapshot_done: str | 
         target = release / "src" / path.relative_to(SRC)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
+    for rel, source in (extra_sources or {}).items():
+        target = release / "src" / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source, encoding="utf-8")
     adapter = release / "src" / "modeler" / "serving" / "adapters.py"
     adapter.write_text(ADAPTER_R3)
     shutil.copy2(e2e.PROJECT / "uv.lock", release / "uv.lock")
@@ -167,6 +176,7 @@ def build_release_world(tmp_path: Path, monkeypatch, *, kr_snapshot_done: str | 
         "us_expected_source": str(expected), "opening_artifact": None,
         "market_sector_kr_root": str(world.kr_root), "market_sector_us_root": str(world.us_root),
         "publisher_enabled": False, "external_verification_enabled": False, "explain_enabled": False,
+        "macro_context_enabled": False,
         "reports_publisher": None, "reports_publisher_sha256": None, "reports_checkout": None,
         "reports_remote_url": None, "reports_repository": None, "reports_audience": None,
         "reports_branch": None, "reports_top_n": 100}

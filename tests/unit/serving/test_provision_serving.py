@@ -162,6 +162,7 @@ def test_ops_json_fields(world):
     assert ops["schema_version"] == "daily-briefing-ops.v1"
     assert ops["publisher_enabled"] is False and ops["external_verification_enabled"] is False
     assert ops["explain_enabled"] is False
+    assert ops["macro_context_enabled"] is False
     assert all(ops[key] is None for key in ("opening_artifact", "opening_snapshot_root", "opening_output_root",
                                             "opening_max_age_seconds"))
     assert ops["private_projection_root"] == str(root / "private-projection")
