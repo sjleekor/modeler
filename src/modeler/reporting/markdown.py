@@ -33,6 +33,7 @@ import os
 import posixpath
 import re
 import shutil
+import statistics
 import sys
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
@@ -1988,8 +1989,10 @@ def load_macro(raw: bytes | None, unit: str, invocation_id: object, release: str
     text, assets = rendered
     header = doc.get("header") if accepted else None
     asof = good_date(header.get("daily_asof_max")) if isinstance(header, dict) else None
+    asof_min = good_date(header.get("daily_asof_min")) if isinstance(header, dict) else None
     return {
         "asof": asof,  # README 섹션 표의 기준일 칸: 일간 지표의 마지막 기준일
+        "asof_min": asof_min,  # 첫 화면 v2의 기준일 줄에만 씁니다
         "state": state if isinstance(state, str) and state else "failed",
         "reason": reason,
         "sha": digest,
@@ -2124,6 +2127,7 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
             lines += ["이번 판에 순위가 없습니다 (전체 0개).", ""]
         else:
             lines += ["> " + RANKING_STATUS_KR, ""]
+            lines += same_session_lines(ctx, "KR")
             show_kind = sec.get("show_kind", False)
             held, reasons, body = 0, Counter(), []
             for row, kind in zip(rows, kinds_of(m)):
@@ -2155,6 +2159,7 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
                 f"전체 {m['total']}개 중 상위 {len(rows)}개입니다. 그 밖의 순위는 올리지 않습니다."
             )
             lines.append("")
+            lines += list_summary_lines(ctx, m)
             lines.append("## 품질 보류 요약")
             lines.append("")
             lines.append(
@@ -2259,6 +2264,7 @@ def render_us_model(ctx: dict, m: dict, show_name: bool, show_kind: bool = False
         f"전체 {m['total']}개 중 상위 {len(rows)}개입니다. 그 밖의 순위는 올리지 않습니다."
     )
     lines.append("")
+    lines += list_summary_lines(ctx, m)
     if show_kind:
         lines += [kind_count_line(kinds_of(m)), ""]
     headers = (
@@ -2331,6 +2337,7 @@ def render_us(ctx: dict) -> tuple[list, dict]:
         ]
     if shown_rows:
         lines += ["> " + RANKING_STATUS_US, ""]
+        lines += same_session_lines(ctx, "US")
         if not sec.get("show_kind"):
             lines += [KIND_OMITTED, ""]
         else:
@@ -3029,16 +3036,9 @@ def all_data_asof(ctx: dict) -> dict:
     return merged
 
 
-def render_summary(ctx: dict) -> tuple[list, dict]:
-    title = title_for(ctx, "일일 브리핑")
-    lines = head_lines(ctx, title, summary=True)
+def summary_status_rows(ctx: dict) -> list:
+    """요약의 섹션 상태 표 행(v1·v2 같음)."""
     kr, us, ms = ctx["kr"], ctx["us"], ctx["ms"]
-    lines.append(
-        "단위 상태: {}. 판단 시각은 {}입니다.".format(
-            STATUS_KO[ctx["status"]], kst_minute(ctx["decision_at"])
-        )
-    )
-    lines += ["", "## 섹션 상태", ""]
     asof_ms = asof_text(ms["data_asof"])
     kr_m = kr["models"][0]
     rows = [
@@ -3062,13 +3062,22 @@ def render_summary(ctx: dict) -> tuple[list, dict]:
     if macro_status(ctx) is not None:  # 거시 흐름 입력이 없으면 표는 전과 같습니다
         asof = ctx["macro"].get("asof") or "—"
         rows.insert(1, ["[거시 흐름](macro.md)", STATUS_KO[macro_status(ctx)], asof])
-    lines += md_table(["섹션", "상태", "기준일"], rows)
-    lines += ["", "## 경고", ""]
+    return rows
+
+
+WARN_TODAY = "today"  # 그날 생긴 것: 실패·지연·정정·근거 계산 실패
+WARN_STANDING = "standing"  # 늘 같은 한계: KR 관리종목·거래정지 미확인(서빙이 partial로 고정)
+
+
+def summary_warnings(ctx: dict) -> list:
+    """요약 경고 목록 [(출처, 문장)]. v1은 문장만 순서대로 싣고, v2는 출처로 나눠 싣습니다."""
+    kr, us, ms = ctx["kr"], ctx["us"], ctx["ms"]
+    kr_m = kr["models"][0]
     warnings = []
     if ms["status"] == "failed":
-        warnings.append("시장·섹터를 내지 못했습니다: " + " ".join(ms["reason"]))
+        warnings.append((WARN_TODAY, "시장·섹터를 내지 못했습니다: " + " ".join(ms["reason"])))
     elif ms["status"] != "ok" and ms["reason"]:
-        warnings.append("시장·섹터 일부 값이 비어 있습니다.")
+        warnings.append((WARN_TODAY, "시장·섹터 일부 값이 비어 있습니다."))
     for sec, label in ((kr, "KR"), (us, "US")):
         groups: dict = {}
         for m in sec["models"]:
@@ -3086,22 +3095,48 @@ def render_summary(ctx: dict) -> tuple[list, dict]:
         for text, models in groups.items():
             if sec is us:
                 names = "·".join(US_SHORT.get(m["model_id"], m["model_id"]) for m in models)
-                warnings.append(f"US {names}: {text}")
+                warnings.append((WARN_TODAY, f"US {names}: {text}"))
             else:
-                warnings.append("KR: " + text)
+                warnings.append((WARN_TODAY, "KR: " + text))
     if kr_m["status"] == "partial" and kr_m["quality"].get("management_filter_available") is False:
-        warnings.append("KR은 현재 관리종목·거래정지 상태를 확인하지 못해 부분 완료로 표시합니다.")
+        warnings.append(
+            (
+                WARN_STANDING,
+                "KR은 현재 관리종목·거래정지 상태를 확인하지 못해 부분 완료로 표시합니다.",
+            )
+        )
     if ctx["corrections"]:
-        warnings.append("이 단위는 정정판입니다. 위 정정 줄을 확인하십시오.")
+        warnings.append((WARN_TODAY, "이 단위는 정정판입니다. 위 정정 줄을 확인하십시오."))
     for m in kr["models"] + us["models"]:
         xm = explain_model(ctx, m)
         if xm is None or xm["status"] == "ok":
             continue
         who = "KR" if m["market"] == "KR" else "US " + US_SHORT.get(m["model_id"], m["model_id"])
         if xm["status"] == "failed":
-            warnings.append(f"{who} 근거·그래프를 계산하지 못했습니다: {xm['reason']}.")
+            warnings.append(
+                (WARN_TODAY, f"{who} 근거·그래프를 계산하지 못했습니다: {xm['reason']}.")
+            )
         else:
-            warnings.append(f"{who} 근거·그래프는 일부 종목만 계산했습니다.")
+            warnings.append((WARN_TODAY, f"{who} 근거·그래프는 일부 종목만 계산했습니다."))
+    return warnings
+
+
+def render_summary(ctx: dict) -> tuple[list, dict]:
+    if ctx.get("summary_v2"):
+        return render_summary_v2(ctx)
+    title = title_for(ctx, "일일 브리핑")
+    lines = head_lines(ctx, title, summary=True)
+    kr, us, ms = ctx["kr"], ctx["us"], ctx["ms"]
+    lines.append(
+        "단위 상태: {}. 판단 시각은 {}입니다.".format(
+            STATUS_KO[ctx["status"]], kst_minute(ctx["decision_at"])
+        )
+    )
+    lines += ["", "## 섹션 상태", ""]
+    kr_m = kr["models"][0]
+    lines += md_table(["섹션", "상태", "기준일"], summary_status_rows(ctx))
+    lines += ["", "## 경고", ""]
+    warnings = [text for _, text in summary_warnings(ctx)]
     if warnings:
         lines += ["- " + w for w in warnings]
     else:
@@ -3193,6 +3228,649 @@ def top10_lines(m: dict, with_name: bool, show_kind: bool = False, xm: dict | No
             extra = explain_cells(xm, r["rank"])
             cells += [extra[0], extra[4]]
     return head + md_table(headers, body, right=(0,)) + [""]
+
+
+# ---------------------------------------------------------------------------
+# 첫 화면 v2와 순위 섹션 목록 요약 (20261110 쓸모 개선 계획 1단계, 설정 `summary_v2_enabled`)
+#
+# `ctx["summary_v2"]`가 True일 때만 씁니다. 꺼져 있으면 어떤 출력도 바뀌지 않습니다. 새 계산 단계와
+# 새 입력은 없습니다. report 행, 근거 입력(explain-D.json), 시장·섹터 입력, 거시 흐름 렌더 결과,
+# 저장소에 있는 직전 단위의 README front matter만 읽습니다. 값은 모두 각 기준일(K·A·지수 기준일)까지의
+# 값이고, 기준일 뒤 가격·실현 성과는 쓰지 않습니다. 순위 표·`- 모델:` 줄·front matter·파일 집합은
+# 그대로입니다. 새 표의 머리는 `항목 | 값` 또는 `모델`로 시작합니다(피드백 F2가 `순위 | 코드` 표를
+# 읽습니다).
+# ---------------------------------------------------------------------------
+NARROW_RANGE = 0.015  # 최근 20세션 (최고 − 최저) ÷ 마지막 값이 이 값 미만이면 "가격 범위 좁음"
+NARROW_WINDOW = 20
+BENCH_HORIZONS = ("1", "5", "20", "60")
+LIST_HORIZONS = ("5", "20", "60")
+HALT_QUALITY_CODES = ("K_halt_or_unknown", "W20_halt_in_window")
+KR_BOARDS = (("KOSPI", "코스피"), ("KOSDAQ", "코스닥"))
+UNVERIFIED = "확인되지 않음"
+RANKING_STATUS_ALL = (
+    "세 순위 모두 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B · 미국 A 0). "
+    "성과 평가 일정은 모델 설명에 있습니다."
+)
+FIRST_FACTOR_NOTE = (
+    "첫째 요인은 종목마다 묶음별 Δ가 가장 큰 묶음을 센 것입니다. "
+    "순위가 왜 이 자리인지를 직접 설명하는 값이 아닙니다."
+)
+NARROW_NOTE = (
+    "가격 범위 좁음: 최근 20세션 가격 범위가 1.5% 미만인 종목입니다. 인수·합병이 진행 중이라 "
+    "가격이 묶인 종목에서 흔한 모양입니다. 순위와 점수는 그대로입니다."
+)
+MACRO_NOT_SIGNAL = "점수·순위에 쓰지 않습니다. 매매 신호가 아닙니다."
+
+
+def previous_unit_asof(repo: Path, unit: str) -> dict | None:
+    """저장소에서 `unit` 바로 앞 단위의 날짜와 README front matter `data_asof`.
+
+    바로 앞 단위의 README를 못 읽으면 None입니다(더 앞 단위로 건너가지 않습니다).
+    """
+    base = repo / "reports" / FAMILY
+    if not base.is_dir():
+        return None
+    found = []
+    for udir in base.glob("[0-9][0-9][0-9][0-9]/[0-9][0-9]/*"):
+        name = udir.name
+        if (
+            udir.is_dir()
+            and good_date(name)
+            and name < unit
+            and udir.parent.name == name[5:7]
+            and udir.parent.parent.name == name[:4]
+        ):
+            found.append(udir)
+    if not found:
+        return None
+    prev = max(found, key=lambda p: p.name)
+    try:
+        meta = read_fm(prev / "README.md")
+    except (OSError, ValueError):
+        meta = None
+    asof = meta.get("data_asof") if isinstance(meta, dict) else None
+    if not isinstance(asof, dict):
+        return None
+    return {"unit": prev.name, "data_asof": {k: v for k, v in asof.items() if good_date(v)}}
+
+
+def same_session_unit(ctx: dict, key: str) -> str | None:
+    """직전 단위의 `data_asof[key]`가 이번과 같으면 그 단위 날짜, 아니면 None."""
+    prev = ctx.get("prev_unit")
+    current = all_data_asof(ctx).get(key)
+    if not prev or not current:
+        return None
+    return prev["unit"] if prev["data_asof"].get(key) == current else None
+
+
+def same_session_lines(ctx: dict, market: str) -> list:
+    """순위 섹션 머리의 같은 기준 세션 문장. v2가 꺼져 있거나 다르면 빈 목록입니다."""
+    if not ctx.get("summary_v2"):
+        return []
+    if market == "US":
+        prev = same_session_unit(ctx, "us_features")
+        if prev is None:
+            return []
+        return [
+            f"기준 세션 A({ctx['us']['asof']})가 전 단위({prev})와 같습니다. "
+            "새 US 자료가 없어 같은 입력에서 나온 순위입니다.",
+            "",
+        ]
+    prev = same_session_unit(ctx, "kr_features")
+    if prev is None:
+        return []
+    return [
+        f"기준일({ctx['kr']['asof']})이 전 단위({prev})와 같습니다. "
+        "새 KR 자료가 없어 같은 입력에서 나온 순위입니다.",
+        "",
+    ]
+
+
+def _same_path(a: list, b: list) -> bool:
+    return len(a) == len(b) and all(abs(x - y) <= 1e-9 * max(1.0, abs(x)) for x, y in zip(a, b))
+
+
+def _bench_returns(xm: dict, rows: list, market: str) -> dict:
+    """비교 대상 동일가중 평균(`bench_path`)의 1·5·20·60세션 수익률 {시장 키: {기간: 값}}.
+
+    기간 전체를 관측한 행(값 빠짐·정지·의심일 없음)만 씁니다. 같은 시장 키 안에서 행마다 경로가
+    다르면(시장 단위 평균이 아니면) 그 키는 내지 않습니다.
+    """
+    dates = xm["dates"]
+    n = len(dates)
+    if n <= max(int(h) for h in BENCH_HORIZONS):
+        return {}
+    paths: dict = {}
+    mixed = set()
+    for row in rows:
+        view = xm["rows"].get(row["rank"])
+        if not view or view["price"] == "failed" or view["path"] is None or view["bench"] is None:
+            continue
+        if view["n_obs"] != n or view["gaps"] or any(x is None for x in view["path"]):
+            continue
+        if any(x is None for x in view["bench"]):
+            continue
+        key = row.get("market") if market == "KR" else "US"
+        if market == "KR" and key not in dict(KR_BOARDS):
+            continue
+        if key in paths and not _same_path(paths[key], view["bench"]):
+            mixed.add(key)
+        paths.setdefault(key, view["bench"])
+    out = {}
+    for key, bench in paths.items():
+        if key in mixed:
+            continue
+        values = {}
+        for h in BENCH_HORIZONS:
+            end, start = bench[-1], bench[-1 - int(h)]
+            values[h] = end / start - 1.0 if start else None
+        out[key] = values
+    return out
+
+
+def _narrow_rows(xm: dict, rows: list, market: str) -> list:
+    """가격 범위 좁음 [(순위, 코드)]. 창 안에 값 빠짐·정지·의심일이 있는 행은 뺍니다."""
+    dates = xm["dates"]
+    if len(dates) < NARROW_WINDOW:
+        return []
+    window = set(dates[-NARROW_WINDOW:])
+    out = []
+    for row in rows:
+        view = xm["rows"].get(row["rank"])
+        if not view or view["price"] == "failed" or view["path"] is None:
+            continue
+        values = view["path"][-NARROW_WINDOW:]
+        if any(x is None for x in values) or any(d in window for d, _ in view["gaps"]):
+            continue
+        reasons = row.get("quality_reasons")
+        if market == "KR" and isinstance(reasons, list):
+            if any(x in HALT_QUALITY_CODES for x in reasons):
+                continue
+        last = values[-1]
+        if last > 0 and (max(values) - min(values)) / last < NARROW_RANGE:
+            out.append((row["rank"], row["symbol"]))
+    return out
+
+
+def _first_factors(xm: dict, rows: list) -> tuple[list, int]:
+    """[(묶음 이름, 종목 수)]를 많은 순서(같으면 묶음 순서)로, 그리고 센 종목 수."""
+    groups = xm["groups"]
+    counts: Counter = Counter()
+    counted = 0
+    for row in rows:
+        view = xm["rows"].get(row["rank"])
+        if not view or view["explain"] != "ok":
+            continue
+        values = [
+            (view["delta"][gid], i)
+            for i, (gid, _) in enumerate(groups)
+            if view["delta"].get(gid) is not None
+        ]
+        if not values:
+            continue
+        best = max(values, key=lambda t: (t[0], -t[1]))[1]
+        counts[best] += 1
+        counted += 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [(groups[i][1], n) for i, n in ranked], counted
+
+
+def _kind_mark(m: dict) -> str:
+    counts = Counter(kinds_of(m))
+    others = [k for k in counts if k not in KIND_ORDER + (KIND_COMMON, KIND_UNKNOWN)]
+    parts = [f"{k} {counts[k]}" for k in list(KIND_ORDER) + sorted(others) if counts.get(k)]
+    total = sum(counts[k] for k in counts if k not in (KIND_COMMON, KIND_UNKNOWN))
+    text = f"보통주가 아닌 종목 {total}" + (f" ({' · '.join(parts)})" if parts else "")
+    if counts.get(KIND_UNKNOWN):
+        text += f" · 종류 확인 안 됨 {counts[KIND_UNKNOWN]}"
+    return text
+
+
+def list_summary(ctx: dict, m: dict) -> dict | None:
+    """모델 하나의 목록 요약 값. 표시할 순위가 없으면 None입니다.
+
+    근거 입력이 없거나 실패면 근거에서 나오는 값(첫째 요인·수익률·비교 대상·가격 범위)은 None입니다.
+    """
+    if m["status"] == "failed" or m["suppressed"] or not m["rows"]:
+        return None
+    rows = m["rows"]
+    kr = m["market"] == "KR"
+    sec = ctx["kr"] if kr else ctx["us"]
+    xm = explain_model(ctx, m)
+    if xm is not None and xm["status"] == "failed":
+        xm = None
+    out = {
+        "kr": kr,
+        "label": "K" if kr else "A",
+        "asof": good_date(m["asof"]),
+        "total": m["total"],
+        "shown": len(rows),
+        "mix": None,
+        "held": None,
+        "kind": _kind_mark(m) if sec.get("show_kind") else None,
+        "factors": None,
+        "factor_rows": 0,
+        "median": None,
+        "bench": None,
+        "last": None,
+        "narrow": None,
+    }
+    if kr:
+        boards = Counter(row.get("market") for row in rows)
+        mix = [f"{label} {boards.get(key, 0)}" for key, label in KR_BOARDS]
+        rest = sum(n for key, n in boards.items() if key not in dict(KR_BOARDS))
+        out["mix"] = " · ".join(mix + ([f"기타 {rest}"] if rest else []))
+        out["held"] = sum(
+            1
+            for row in rows
+            if row.get("quality_review") is True
+            or (isinstance(row.get("quality_reasons"), list) and row["quality_reasons"])
+        )
+    if xm is None:
+        return out
+    out["factors"], out["factor_rows"] = _first_factors(xm, rows)
+    median = {}
+    for h in LIST_HORIZONS:
+        values = [
+            xm["rows"][row["rank"]]["ret"].get(h) for row in rows if row["rank"] in xm["rows"]
+        ]
+        values = [x for x in values if x is not None]
+        median[h] = statistics.median(values) if values else None
+    out["median"] = median
+    out["bench"] = _bench_returns(xm, rows, m["market"])
+    out["last"] = xm["dates"][-1] if xm["dates"] else None
+    out["narrow"] = _narrow_rows(xm, rows, m["market"]) if xm["dates"] else None
+    return out
+
+
+def _factor_text(s: dict, top: int | None = None) -> str:
+    if s["factors"] is None:
+        return UNVERIFIED
+    if not s["factors"]:
+        return "-"
+    items = s["factors"][:top] if top else s["factors"]
+    text = " · ".join(f"{c(label)} {n}" for label, n in items)
+    if s["factor_rows"] < s["shown"]:
+        text += f" (근거가 있는 {s['factor_rows']}개)"
+    return text
+
+
+def _bench_text(s: dict, horizons: tuple) -> str:
+    bench = s["bench"]
+    if not bench:
+        return UNVERIFIED
+    if s["kr"]:
+        parts = [
+            f"{label} " + " · ".join(pct(bench[key][h], 1) for h in horizons)
+            for key, label in KR_BOARDS
+            if key in bench
+        ]
+        return (" / " if len(horizons) > 1 else " · ").join(parts)
+    return " · ".join(pct(bench["US"][h], 1) for h in horizons) if "US" in bench else UNVERIFIED
+
+
+def _median_text(s: dict, horizons: tuple) -> str:
+    if s["median"] is None:
+        return UNVERIFIED
+    return " · ".join(pct(s["median"][h], 1) for h in horizons)
+
+
+def _marks_text(s: dict, with_list: bool) -> str:
+    marks = []
+    if s["kr"]:
+        marks.append(f"품질 보류 {s['held']}")
+    if s["kind"] is not None:
+        marks.append(s["kind"])
+    narrow = s["narrow"]
+    if narrow is None:
+        marks.append(f"가격 범위 좁음 {UNVERIFIED}")
+    else:
+        text = f"가격 범위 좁음 {len(narrow)}"
+        if with_list and narrow:
+            text += " — " + " · ".join(f"{rank}위 {c(sym)}" for rank, sym in narrow)
+        marks.append(text)
+    return " · ".join(marks)
+
+
+def list_summary_lines(ctx: dict, m: dict) -> list:
+    """순위 표 위의 `### 목록 요약` 블록. v2가 꺼져 있거나 표시할 순위가 없으면 빈 목록입니다."""
+    if not ctx.get("summary_v2"):
+        return []
+    s = list_summary(ctx, m)
+    if s is None:
+        return []
+    rows = []
+    if s["kr"]:
+        rows.append(["시장 구성", s["mix"]])
+    rows.append(["첫째 요인", _factor_text(s)])
+    rows.append(["수익률 중앙값 (5 · 20 · 60세션)", _median_text(s, LIST_HORIZONS)])
+    rows.append(["비교 대상 평균 (5 · 20 · 60세션)", _bench_text(s, LIST_HORIZONS)])
+    rows.append(["표시", _marks_text(s, with_list=True)])
+    label = s["label"]
+    basis = s["last"] or s["asof"] or UNVERIFIED
+    return (
+        ["### 목록 요약", ""]
+        + md_table(["항목", "값"], rows)
+        + [
+            "",
+            FIRST_FACTOR_NOTE + f" 수익률과 비교 대상 평균은 기준일 {label}({basis})까지의 값이고 "
+            f"{label} 뒤 가격은 쓰지 않았습니다.",
+            "",
+            NARROW_NOTE,
+            "",
+        ]
+    )
+
+
+def _section_of(text: str, title: str) -> list | None:
+    """`## title` 절의 줄(다음 `## ` 전까지). 없으면 None."""
+    lines = text.split("\n")
+    try:
+        start = lines.index("## " + title)
+    except ValueError:
+        return None
+    out = []
+    for line in lines[start + 1 :]:
+        if line.startswith("## "):
+            break
+        out.append(line)
+    return out
+
+
+def _macro_items(section: list, title: str) -> list:
+    """지난 보고서 대비 절의 `**title**` 아래 목록 줄. `- 없음`은 빈 목록입니다."""
+    try:
+        start = section.index(f"**{title}**")
+    except ValueError:
+        return []
+    items = []
+    for line in section[start + 1 :]:
+        if line.startswith("**") or (line and not line.startswith("- ")):
+            break
+        if line.startswith("- "):
+            items.append(line[2:])
+    return [] if items == ["없음"] else items
+
+
+def macro_overview_lines(ctx: dict) -> list:
+    """첫 화면의 거시 변화 절. 거시 흐름 렌더 결과(`macro.md` 본문)의 표와 문장을 그대로 옮깁니다.
+
+    입력이 없거나(꺼짐) 요약 표가 없으면(실패 문서) 빈 목록입니다.
+    """
+    macro = ctx.get("macro")
+    if macro is None or not isinstance(macro.get("text"), str):
+        return []
+    text = macro["text"]
+    summary = _section_of(text, "이번에 눈여겨볼 변화")
+    table = [line for line in summary or [] if line.startswith("|")]
+    if not table:
+        return []
+    lines = ["## 거시 — 눈여겨볼 변화", ""]
+    body = text.split("\n")
+    if MACRO_NOT_SIGNAL in body:
+        lines.append(MACRO_NOT_SIGNAL)
+    daily = next((line for line in body if line.startswith("일간 지표 기준일 ")), None)
+    if daily:
+        lines.append(daily)
+    if len(lines) > 2:
+        lines.append("")
+    lines += table + [""]
+    vs = _section_of(text, "지난 보고서 대비")
+    tail = "상세는 [거시 흐름](macro.md)에 있습니다."
+    found = re.search(r"이전 보고서 날짜는 (\d{4}-\d{2}-\d{2})", "\n".join(vs or []))
+    if vs is not None and found:
+
+        def count(title: str) -> str:
+            items = _macro_items(vs, title)
+            return f"{title} {len(items)}" + (f" ({', '.join(items)})" if items else "")
+
+        tail = (
+            f"지난 보고서({found.group(1)}) 대비: "
+            + " · ".join(count(t) for t in ("새로 나타남", "방향 차이 새로 생김", "해제"))
+            + ". "
+            + tail
+        )
+    return lines + [tail, ""]
+
+
+def _index_rows(ms: dict) -> list:
+    rows = []
+    for a in ms["assets"]:
+        if a.get("group") not in ("market", "style"):
+            continue
+        rows.append(
+            [
+                c(a.get("name") or a.get("asset_id")),
+                c(a.get("asof_date")),
+                pct(a.get("ret_1")),
+                pct(a.get("ret_5")),
+                pct(a.get("ret_20")),
+                pct(a.get("ret_60")),
+                pct(a.get("rvol_20"), signed=False),
+                pct(a.get("dd_252")),
+            ]
+        )
+    return rows
+
+
+def _sector_text(ms: dict, market: str) -> str | None:
+    sectors = [
+        a
+        for a in ms["assets"]
+        if a["market"] == market and a.get("group") == "sector" and is_num(a.get("ret_20"))
+    ]
+    if not sectors:
+        return None
+    hi = max(sectors, key=lambda a: a["ret_20"])
+    lo = min(sectors, key=lambda a: a["ret_20"])
+    return (
+        f"{market}: 가장 높음 {c(hi.get('name') or hi.get('asset_id'))} {pct(hi['ret_20'])}, "
+        f"가장 낮음 {c(lo.get('name') or lo.get('asset_id'))} {pct(lo['ret_20'])}"
+    )
+
+
+def market_overview_lines(ctx: dict, summaries: dict) -> list:
+    """첫 화면의 시장 절: 지수 표, 20세션 섹터 한 줄, 적격 종목 동일가중 평균 한 줄."""
+    ms = ctx["ms"]
+    lines = ["## 시장", ""]
+    rows = _index_rows(ms) if ms["status"] != "failed" else []
+    if rows:
+        lines += md_table(
+            [
+                "지수",
+                "기준 종가일",
+                "1세션",
+                "5세션",
+                "20세션",
+                "60세션",
+                "20세션 변동성",
+                "252세션 낙폭",
+            ],
+            rows,
+            right=tuple(range(2, 8)),
+        )
+    else:
+        lines.append("대표지수 상태를 내지 못했습니다.")
+    lines.append("")
+    sectors = (
+        [t for t in (_sector_text(ms, "US"), _sector_text(ms, "KR")) if t]
+        if ms["status"] != "failed"
+        else []
+    )
+    if sectors:
+        lines.append("- 20세션 섹터 — " + " · ".join(sectors))
+    parts = []
+    kr_s = summaries.get(KR_MODEL)
+    if kr_s and kr_s["bench"]:
+        for key, label in KR_BOARDS:
+            if key in kr_s["bench"]:
+                values = " · ".join(pct(kr_s["bench"][key][h], 1) for h in BENCH_HORIZONS)
+                parts.append(f"{label} {values} ({kr_s['last']})")
+    us_s = next(
+        (
+            summaries[m["model_id"]]
+            for m in ctx["us"]["models"]
+            if summaries.get(m["model_id"])
+            and summaries[m["model_id"]]["bench"]
+            and "US" in summaries[m["model_id"]]["bench"]
+        ),
+        None,
+    )
+    if us_s:
+        values = " · ".join(pct(us_s["bench"]["US"][h], 1) for h in BENCH_HORIZONS)
+        parts.append(f"US {values} ({us_s['last']})")
+    if parts:
+        lines.append(
+            "- 적격 종목 동일가중 평균 1 · 5 · 20 · 60세션 — "
+            + " / ".join(parts)
+            + ". 지수가 아닙니다."
+        )
+    lines += [
+        "- 지수 종가 수준은 올리지 않습니다. 섹터 값은 [시장·섹터](market-sector.md)에 있습니다.",
+        "",
+    ]
+    return lines
+
+
+def _model_label(m: dict) -> str:
+    return "KR" if m["market"] == "KR" else "US " + c(US_SHORT.get(m["model_id"], m["model_id"]))
+
+
+def ranking_overview_lines(ctx: dict, summaries: dict) -> list:
+    """첫 화면의 순위 절: 판정 상태 줄, 모델별 요약 표, 모델별 상위 10 한 줄, 겹침 줄."""
+    models = ctx["kr"]["models"] + ctx["us"]["models"]
+    same = {
+        "KR": same_session_unit(ctx, "kr_features"),
+        "US": same_session_unit(ctx, "us_features"),
+    }
+    top = ctx["top_n"]
+    lines = ["## 종목 순위 — 어떤 목록인가", "", "> " + RANKING_STATUS_ALL, ""]
+    body = []
+    for m in models:
+        s = summaries.get(m["model_id"])
+        if s is None:
+            if m["status"] == "failed":
+                state = "순위를 내지 못했습니다"
+            elif m["suppressed"]:
+                state = f"입력이 {m['lag']}세션 늦어 순위 표를 내지 않았습니다"
+            else:
+                state = "이번 판에 순위가 없습니다"
+            asof = good_date(m["asof"]) or "-"
+            body.append([_model_label(m), asof, state, "-", "-", "-"])
+            continue
+        asof = (s["asof"] or "-") + (" (전 단위와 같음)" if same[m["market"]] and s["asof"] else "")
+        total = f"{s['total']:,} → {s['shown']}" + (f" ({s['mix']})" if s["kr"] else "")
+        if s["median"] is None:
+            ret60 = UNVERIFIED
+        else:
+            ret60 = f"{pct(s['median']['60'], 1)} / {_bench_text(s, ('60',))}"
+        body.append(
+            [
+                _model_label(m),
+                asof,
+                total,
+                _factor_text(s, top=3),
+                ret60,
+                _marks_text(s, with_list=False),
+            ]
+        )
+    lines += md_table(
+        [
+            "모델",
+            "기준일",
+            "전체 → 표시",
+            f"첫째 요인 (상위 {top})",
+            f"60세션 수익률 중앙값: 상위 {top} / 비교 대상 평균",
+            "표시",
+        ],
+        body,
+    )
+    lines.append("")
+    for m in models:
+        file = "kr-stocks.md" if m["market"] == "KR" else "us-stocks.md"
+        head = f"- {_model_label(m)} 상위 10: "
+        if m["status"] == "failed":
+            lines.append(head + "순위를 내지 못했습니다.")
+        elif m["suppressed"]:
+            lines.append(head + f"입력이 {m['lag']}세션 늦어(5세션 초과) 순위를 내지 않았습니다.")
+        elif not m["rows"]:
+            lines.append(head + "이번 판에 순위가 없습니다.")
+        else:
+            names = " · ".join(
+                c(r["name"]) if m["market"] == "KR" else c(r["symbol"]) for r in m["rows"][:10]
+            )
+            lines.append(head + f"{names} → [상위 {len(m['rows'])}]({file})")
+    overlap = us_overlap(ctx["us"], top)
+    tail = "점수는 순위용이며 확률이 아닙니다. 수익률은 기준일까지의 값입니다."
+    if overlap is not None:
+        tail = f"두 US 모델 상위 {top}의 겹침: {overlap}개. " + tail
+    return lines + ["- " + tail, ""]
+
+
+def _warning_lines(label: str, items: list) -> list:
+    if not items:
+        return [f"- {label}: 없습니다."]
+    if len(items) == 1:
+        return [f"- {label}: {items[0]}"]
+    return [f"- {label}:"] + ["  - " + text for text in items]
+
+
+def render_summary_v2(ctx: dict) -> tuple[list, dict]:
+    """첫 화면 v2: 머리(상태·기준일) → 시장 → 거시 변화 → 순위 요약 → 상태 → 면책."""
+    title = title_for(ctx, "일일 브리핑")
+    lines = head_lines(ctx, title, summary=True)
+    kr, us = ctx["kr"], ctx["us"]
+    warnings = summary_warnings(ctx)
+    today = [t for kind, t in warnings if kind == WARN_TODAY]
+    standing = [t for kind, t in warnings if kind == WARN_STANDING]
+    lines.append(
+        "단위 상태: {} (오늘의 경고 {}건 · 상시 한계 {}건). 판단 시각은 {}입니다.".format(
+            STATUS_KO[ctx["status"]], len(today), len(standing), kst_minute(ctx["decision_at"])
+        )
+    )
+    asof = all_data_asof(ctx)
+    marks = {}
+    for key in ("kr_features", "us_features"):
+        prev = same_session_unit(ctx, key)
+        marks[key] = f" (**전 단위 {prev}와 같은 기준 세션**)" if prev else ""
+    parts = []
+    for key, label in (
+        ("kr_features", "KR 종목"),
+        ("kr_index", "KR 지수"),
+        ("us_features", "US 종목"),
+    ):
+        if asof.get(key):
+            parts.append(f"{label} {asof[key]}" + marks.get(key, ""))
+    macro = ctx.get("macro")
+    if macro is not None and macro.get("asof"):
+        low = macro.get("asof_min")
+        parts.append(
+            "거시 " + (f"{low}~{macro['asof']}" if low and low != macro["asof"] else macro["asof"])
+        )
+    if parts:
+        lines += ["", "기준일: " + " · ".join(parts)]
+    lines.append("")
+    summaries = {m["model_id"]: list_summary(ctx, m) for m in kr["models"] + us["models"]}
+    lines += market_overview_lines(ctx, summaries)
+    lines += macro_overview_lines(ctx)
+    lines += ranking_overview_lines(ctx, summaries)
+    lines += ["## 상태", ""]
+    lines += md_table(["섹션", "상태", "기준일"], summary_status_rows(ctx))
+    lines.append("")
+    lines += _warning_lines("오늘의 경고", today)
+    lines += _warning_lines("상시 한계", standing)
+    lines += ["", DISCLAIMER, ""]
+    meta_extra = {
+        "data_asof": all_data_asof(ctx),
+        "models": list(
+            dict.fromkeys(
+                [m["model_id"] for m in kr["models"]]
+                + [m["model_id"] for m in us["models"]]
+                + [MS_MODEL]
+            )
+        ),
+    }
+    return lines, meta_extra
 
 
 SECTION_RENDERERS = (
@@ -3398,6 +4076,7 @@ def build_context(
     explain: bytes | None = None,
     invocation_id: str | None = None,
     macro: bytes | None = None,
+    summary_v2: bool = False,
 ) -> dict:
     """envelope(JSON 바이트)와 시장·섹터 입력으로 렌더 입력(ctx)을 만듭니다. 파일은 쓰지 않습니다.
 
@@ -3415,6 +4094,10 @@ def build_context(
     `macro`는 `briefing-macro.v1` JSON 바이트(그날 `macro-D.json`)입니다. 있으면 단위에 `macro.md`와
     `assets/macro-*.svg`를 더하고 README·시장·섹터에 링크를 답니다(`load_macro`). `None`이면 출력은
     거시 흐름 기능이 없던 때와 바이트까지 같습니다.
+    `summary_v2`가 True이면 첫 화면을 v2(시장 → 거시 변화 → 순위 요약 → 상태)로 그리고 순위 섹션에
+    목록 요약과 같은 기준 세션 문장을 더합니다(설정 `summary_v2_enabled`). 이때만 `repo`에서 직전
+    단위의 README front matter를 읽습니다. False(기본)이면 출력은 이 기능이 없던 때와 바이트까지
+    같습니다. 순위 표·`- 모델:` 줄·front matter·파일 집합은 켜도 그대로입니다.
     """
     env = load_json_bytes(env_bytes, "envelope")
     unit, decision = parse_envelope(env)
@@ -3491,6 +4174,9 @@ def build_context(
         "env_status": env.get("status") if isinstance(env.get("status"), str) else "failed",
     }
     ctx["status"] = unit_status([kr["status"], us["status"], ms_sec["status"]])
+    if summary_v2 is True:
+        ctx["summary_v2"] = True
+        ctx["prev_unit"] = previous_unit_asof(repo, unit)
     if explain is not None:
         expected = invocation_id if invocation_id is not None else env.get("invocation_id")
         ctx["explain"] = load_explain(explain, unit, ctx["sha"], expected, (kr, us))
@@ -3567,6 +4253,7 @@ def generate(
     explain_path: Path | None = None,
     invocation_id: str | None = None,
     macro_path: Path | None = None,
+    summary_v2: bool = False,
 ) -> str:
     """단위 하나를 저장소 트리에 쓰고 인덱스를 다시 만듭니다. 수동·시험용입니다.
 
@@ -3593,6 +4280,7 @@ def generate(
         explain=explain_bytes,
         invocation_id=invocation_id,
         macro=macro_bytes,
+        **({"summary_v2": True} if summary_v2 else {}),
     )
     unit = ctx["unit"]
     udir = unit_dir(repo, unit)
@@ -4703,6 +5391,11 @@ def main(argv: list | None = None) -> int:
     parser.add_argument(
         "--invocation-id", help="근거 입력과 맞춰 볼 invocation id (없으면 envelope 값)"
     )
+    parser.add_argument(
+        "--summary-v2",
+        action="store_true",
+        help="첫 화면 v2와 순위 섹션 목록 요약으로 렌더합니다(서버 설정 summary_v2_enabled)",
+    )
     parser.add_argument("--release", help="서빙 release id")
     parser.add_argument("--generated-at", help="ISO 시각(시간대 포함). 없으면 지금")
     parser.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
@@ -4762,6 +5455,7 @@ def main(argv: list | None = None) -> int:
                     explain_path=args.explain,
                     invocation_id=args.invocation_id,
                     macro_path=args.macro,
+                    summary_v2=args.summary_v2,
                 )
             elif not (args.init or args.reindex):
                 raise InputError("--envelope, --init, --reindex, --validate 중 하나가 필요합니다.")
