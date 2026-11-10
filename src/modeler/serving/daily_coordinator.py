@@ -196,6 +196,10 @@ def _config(path: Path) -> dict[str, Any]:
     # is there must be a bool.
     if not isinstance(config.get("macro_context_enabled", False), bool):
         raise ValueError("macro_context_enabled must be true or false")
+    # Display-only front page v2 (README order market -> macro -> ranking summary -> status, and a
+    # list summary above each rank table): the same shape as macro_context_enabled.
+    if not isinstance(config.get("summary_v2_enabled", False), bool):
+        raise ValueError("summary_v2_enabled must be true or false")
     macro_timeout = config.get("macro_context_timeout_seconds", MACRO_CONTEXT_TIMEOUT_SECONDS)
     if (isinstance(macro_timeout, bool) or not isinstance(macro_timeout, int)
             or not 10 <= macro_timeout <= 1800):
@@ -918,6 +922,8 @@ def _reports_publisher_input(config: dict[str, Any], day: date, render: dict[str
         # Only when on: an off switch adds no key, so a publisher older than the section accepts
         # the input (its check_config refuses unknown keys) and the publisher reads no macro file.
         **({"macro_context_enabled": True} if config.get("macro_context_enabled") is True else {}),
+        # Same rule for the display-only front page v2: no key when off.
+        **({"summary_v2_enabled": True} if config.get("summary_v2_enabled") is True else {}),
     }
 
 

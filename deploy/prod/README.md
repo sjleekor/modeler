@@ -154,6 +154,7 @@ Pages용 `base_path`·`projection_root`·`previous_projection_dir`·`publisher_s
 | `explain_timeout_seconds` | explain 하위 프로세스 제한 시간(초, 10\~1800, 기본 120). 넘으면 프로세스 그룹을 끝내고 `failed` 문서를 남깁니다. 실행은 계속됩니다 |
 | `macro_context_enabled` | 거시 흐름(`macro-D.json`, `macro.md`)을 계산·게시할지. **키가 없으면 꺼짐**이고, 있으면 `true`·`false`여야 합니다(다른 값이면 멈춤). 꺼져 있으면 문서를 만들지 않고 단위는 전과 바이트까지 같습니다. 이미 있던 같은 날 문서는 `macro-D.superseded-<sha>.json`으로 옮깁니다(지우지 않음). publisher 날짜별 설정에는 **`true`일 때만** 키를 넣습니다. 그래서 꺼져 있으면 이 섹션 전의 publisher도 설정을 받습니다. publisher도 키가 없으면 꺼짐으로 읽습니다. 켜려면 새 publisher 사본이 먼저 있어야 합니다(옛 publisher는 모르는 키를 거부) |
 | `macro_context_timeout_seconds` | 거시 흐름 하위 프로세스 제한 시간(초, 10\~1800, 기본 300). 넘으면 프로세스 그룹을 끝내고 `failed` 문서를 남깁니다. 실행은 계속됩니다 |
+| `summary_v2_enabled` | 첫 화면 v2를 쓸지. 켜면 요약(`README.md`)을 시장 → 거시 변화 → 순위 요약 → 상태 순서로 그리고, `kr-stocks.md`·`us-stocks.md`의 모델마다 순위 표 위에 `### 목록 요약` 블록과 같은 기준 세션 문장을 더합니다. 표시 전용이고 새 입력이 없습니다(report·explain·시장·섹터·거시 흐름과 저장소의 직전 단위 front matter만 읽음). 순위 표·`- 모델:` 줄·front matter·파일 집합·`report-D.json`은 그대로입니다. **키가 없으면 꺼짐**이고, 있으면 `true`·`false`여야 합니다(다른 값이면 멈춤). 꺼져 있으면 단위는 전과 바이트까지 같습니다. publisher 날짜별 설정에는 **`true`일 때만** 키를 넣고, 켠 단위는 manifest·journal에 `summary_v2_enabled: true`를 남깁니다. 켜려면 새 publisher 사본과 `reports_publisher_sha256`이 먼저 있어야 합니다(옛 publisher는 모르는 키를 거부). 끄면 다음 단위부터 지금 화면입니다 |
 | `reports_repository` | `sjleekor/stock_reports`(다르면 멈춤) |
 | `reports_audience` | `owner_only`(다르면 멈춤) |
 | `reports_branch` | `main` |

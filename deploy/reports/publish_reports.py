@@ -36,6 +36,11 @@
 `true`일 때만 읽습니다. 키가 없거나 `false`이거나 파일이 없으면 읽지 않고, 단위는 거시 흐름 기능이
 없던 때와 바이트까지 같습니다.
 
+첫 화면 v2: 설정 `summary_v2_enabled`가 `true`일 때만 요약(README)을 시장 → 거시 변화 → 순위 요약 →
+상태 순서로 그리고, 순위 섹션 표 위에 목록 요약을 더합니다(표시 전용, 새 입력 없음). 켠 단위는
+manifest·journal에 `summary_v2_enabled: true`를 남기고, 정정·재시도는 그 값으로 다시 렌더합니다. 키가
+없거나 `false`이면 단위와 manifest·journal은 이 기능이 없던 때와 바이트까지 같습니다.
+
 release의 `modeler` 패키지가 `PYTHONPATH`에 있어야 합니다(coordinator가 맞춰 줍니다).
 이 스크립트와 `validate_reports.py`는 release 밖에 두고 sha256을 고정합니다.
 """
@@ -88,6 +93,7 @@ OPTIONAL_KEYS = {
     "report_date",
     "explain_enabled",
     "macro_context_enabled",
+    "summary_v2_enabled",
 }
 ALLOWED_KEYS = REQUIRED_KEYS | LOCAL_KEYS | OPTIONAL_KEYS
 # 증권 이름 입력(security-names.v1)을 레이크에서 만드는 데 쓰는 root. 시장별로 따로 받습니다.
@@ -325,6 +331,8 @@ def check_config(config: dict, *, need_local: bool, strict_remote: bool = True) 
         raise PublishError("explain_enabled must be true or false")
     if "macro_context_enabled" in config and not isinstance(config["macro_context_enabled"], bool):
         raise PublishError("macro_context_enabled must be true or false")
+    if "summary_v2_enabled" in config and not isinstance(config["summary_v2_enabled"], bool):
+        raise PublishError("summary_v2_enabled must be true or false")
 
 
 def _absolute(value: object, label: str) -> Path:
@@ -715,6 +723,8 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         macro_bytes = _read_macro(macro_file)
     else:
         macro_file = None
+    # 첫 화면 v2. 켰을 때만 렌더러에 넘깁니다(키가 없으면 꺼짐, 표시 전용).
+    summary_v2 = config.get("summary_v2_enabled", False) is True
 
     # L2. 렌더합니다. 같은 입력을 다시 돌려 내용이 같으면 파일을 그대로 둡니다(generated_at 고정).
     md.reset_scrub_hits()
@@ -733,6 +743,7 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
             explain=explain_bytes,
             invocation_id=config["invocation_id"],
             macro=macro_bytes,
+            **({"summary_v2": True} if summary_v2 else {}),
         )
         files = md.render_unit(ctx)
     except md.InputError as exc:
@@ -795,6 +806,8 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
                 "macro_state": macro.get("state"),
             }
         )
+    if summary_v2:  # 꺼져 있으면 manifest·journal은 전과 같습니다
+        extra_fields["summary_v2_enabled"] = True
     manifest.update(extra_fields)
     _write_atomic(
         markdown_dir / "manifest.json",
@@ -994,8 +1007,8 @@ def _read_macro(path: Path) -> bytes:
 
 
 def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: str) -> dict:
-    """journal 항목에 적힌 입력(report, 시장·섹터, 이름, 메모, 근거, 거시 흐름)으로 렌더 입력을
-    만듭니다."""
+    """journal 항목에 적힌 입력(report, 시장·섹터, 이름, 메모, 근거, 거시 흐름)과 첫 화면 v2 여부로
+    렌더 입력을 만듭니다."""
     run_dir = Path(entry["run_dir"])
     report_path = _regular_file(run_dir / f"report-{unit}.json", "report")
     report_bytes = report_path.read_bytes()
@@ -1049,6 +1062,8 @@ def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: 
             explain=explain_bytes,
             invocation_id=entry["invocation_id"],
             macro=macro_bytes,
+            # 로컬 단계에서 켠 단위만 v2로 다시 렌더합니다(그날 설정이 아니라 journal 값을 따릅니다).
+            **({"summary_v2": True} if entry.get("summary_v2_enabled") is True else {}),
         )
     except md.InputError as exc:
         raise PublishError(f"cannot render from the journaled inputs: {exc}") from None
