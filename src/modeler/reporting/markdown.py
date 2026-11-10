@@ -3247,6 +3247,11 @@ LIST_HORIZONS = ("5", "20", "60")
 HALT_QUALITY_CODES = ("K_halt_or_unknown", "W20_halt_in_window")
 KR_BOARDS = (("KOSPI", "코스피"), ("KOSDAQ", "코스닥"))
 UNVERIFIED = "확인되지 않음"
+NO_EVIDENCE = "근거 없음"  # 모델의 근거(explain)를 쓰지 못한 경우. 값이 있는데 일부만 빠진 경우는 UNVERIFIED
+NO_EVIDENCE_NOTE = (
+    "이 모델은 근거(explain)를 쓰지 못해 첫째 요인·수익률 중앙값·비교 대상 평균·가격 범위 좁음을 "
+    "계산하지 않았습니다. 순위와 점수는 그대로입니다."
+)
 RANKING_STATUS_ALL = (
     "세 순위 모두 holdout 판정을 통과하지 못한 탐색 모델의 결과입니다(한국 갈래 B · 미국 A 0). "
     "성과 평가 일정은 모델 설명에 있습니다."
@@ -3454,6 +3459,7 @@ def list_summary(ctx: dict, m: dict) -> dict | None:
         "bench": None,
         "last": None,
         "narrow": None,
+        "evidence": xm is not None,
     }
     if kr:
         boards = Counter(row.get("market") for row in rows)
@@ -3484,6 +3490,8 @@ def list_summary(ctx: dict, m: dict) -> dict | None:
 
 
 def _factor_text(s: dict, top: int | None = None) -> str:
+    if not s["evidence"]:
+        return NO_EVIDENCE
     if s["factors"] is None:
         return UNVERIFIED
     if not s["factors"]:
@@ -3496,6 +3504,8 @@ def _factor_text(s: dict, top: int | None = None) -> str:
 
 
 def _bench_text(s: dict, horizons: tuple) -> str:
+    if not s["evidence"]:
+        return NO_EVIDENCE
     bench = s["bench"]
     if not bench:
         return UNVERIFIED
@@ -3510,6 +3520,8 @@ def _bench_text(s: dict, horizons: tuple) -> str:
 
 
 def _median_text(s: dict, horizons: tuple) -> str:
+    if not s["evidence"]:
+        return NO_EVIDENCE
     if s["median"] is None:
         return UNVERIFIED
     return " · ".join(pct(s["median"][h], 1) for h in horizons)
@@ -3522,14 +3534,16 @@ def _marks_text(s: dict, with_list: bool) -> str:
     if s["kind"] is not None:
         marks.append(s["kind"])
     narrow = s["narrow"]
-    if narrow is None:
+    if not s["evidence"]:
+        pass  # 근거가 없으면 가격 범위 좁음 표시를 빼고, 아래 NO_EVIDENCE_NOTE가 이유를 적습니다
+    elif narrow is None:
         marks.append(f"가격 범위 좁음 {UNVERIFIED}")
     else:
         text = f"가격 범위 좁음 {len(narrow)}"
         if with_list and narrow:
             text += " — " + " · ".join(f"{rank}위 {c(sym)}" for rank, sym in narrow)
         marks.append(text)
-    return " · ".join(marks)
+    return " · ".join(marks) or "-"
 
 
 def list_summary_lines(ctx: dict, m: dict) -> list:
@@ -3546,6 +3560,8 @@ def list_summary_lines(ctx: dict, m: dict) -> list:
     rows.append(["수익률 중앙값 (5 · 20 · 60세션)", _median_text(s, LIST_HORIZONS)])
     rows.append(["비교 대상 평균 (5 · 20 · 60세션)", _bench_text(s, LIST_HORIZONS)])
     rows.append(["표시", _marks_text(s, with_list=True)])
+    if not s["evidence"]:
+        return ["### 목록 요약", ""] + md_table(["항목", "값"], rows) + ["", NO_EVIDENCE_NOTE, ""]
     label = s["label"]
     basis = s["last"] or s["asof"] or UNVERIFIED
     return (
@@ -3760,7 +3776,9 @@ def ranking_overview_lines(ctx: dict, summaries: dict) -> list:
             continue
         asof = (s["asof"] or "-") + (" (전 단위와 같음)" if same[m["market"]] and s["asof"] else "")
         total = f"{s['total']:,} → {s['shown']}" + (f" ({s['mix']})" if s["kr"] else "")
-        if s["median"] is None:
+        if not s["evidence"]:
+            ret60 = NO_EVIDENCE
+        elif s["median"] is None:
             ret60 = UNVERIFIED
         else:
             ret60 = f"{pct(s['median']['60'], 1)} / {_bench_text(s, ('60',))}"

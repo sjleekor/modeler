@@ -488,21 +488,31 @@ def test_explain_missing_or_failed_degrades(tmp_path: Path, inputs: dict, case: 
     kr, us, readme = files["kr-stocks.md"], files["us-stocks.md"], files["README.md"]
     assert md.validate_unit_files(ctx["unit"], files) == []
     ridge = us[us.index("## Ridge") :]
-    assert "| 첫째 요인 | 확인되지 않음 |" in ridge
-    assert "| 비교 대상 평균 (5 · 20 · 60세션) | 확인되지 않음 |" in ridge
-    assert "가격 범위 좁음 확인되지 않음" in ridge
+    assert "| 첫째 요인 | 근거 없음 |" in ridge
+    assert "| 수익률 중앙값 (5 · 20 · 60세션) | 근거 없음 |" in ridge
+    assert "| 비교 대상 평균 (5 · 20 · 60세션) | 근거 없음 |" in ridge
+    ridge_summary = ridge.split("### 목록 요약", 1)[1].split("| 순위 | 코드", 1)[0]
+    # 근거가 없으면 가격 범위 좁음 표시와 값이 있는 것처럼 읽히는 주석 두 문단을 빼고 이유 한 줄을 적습니다.
+    assert "가격 범위 좁음" not in ridge_summary.replace(md.NO_EVIDENCE_NOTE, "")
+    assert md.NO_EVIDENCE_NOTE in ridge_summary
+    assert md.FIRST_FACTOR_NOTE not in ridge_summary and md.NARROW_NOTE not in ridge_summary
+    assert "확인되지 않음" not in ridge_summary
     row = next(x for x in readme.split("\n") if x.startswith("| US Ridge |"))
-    assert "확인되지 않음" in row
+    assert "근거 없음" in row and "확인되지 않음" not in row and "가격 범위 좁음" not in row
     if case == "model_failed":
-        assert "| 첫째 요인 | 확인되지 않음 |" not in kr
+        assert "| 첫째 요인 | 근거 없음 |" not in kr
+        assert md.NO_EVIDENCE_NOTE not in kr
         assert "- 오늘의 경고: US Ridge 근거·그래프를 계산하지 못했습니다" in readme
         assert "(오늘의 경고 1건 · 상시 한계 1건)" in readme
     else:
         assert "적격 종목 동일가중 평균" not in readme
-        assert "| 첫째 요인 | 확인되지 않음 |" in kr
+        assert "| 첫째 요인 | 근거 없음 |" in kr
     if case == "mismatch":
         assert "(오늘의 경고 3건 · 상시 한계 1건)" in readme
         assert "- 오늘의 경고:\n  - KR 근거·그래프를 계산하지 못했습니다" in readme
+        # 첫 화면 줄 예산(P1 ⑥, P3 뒤 11-11 결정): 경고 하위 목록 줄은 빼고 65줄 이하
+        lines = body_lines(readme)
+        assert len([x for x in lines if not x.startswith("  - ")]) <= 65
 
 
 def test_bench_line_needs_one_path_per_market(tmp_path: Path, inputs: dict) -> None:
