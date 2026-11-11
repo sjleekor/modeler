@@ -39,6 +39,8 @@ EXPLAIN_ENTRYPOINT = "modeler.serving.explain"
 EXPLAIN_TIMEOUT_SECONDS = 120
 MACRO_CONTEXT_ENTRYPOINT = "modeler.serving.macro_context_run"
 MACRO_CONTEXT_TIMEOUT_SECONDS = 300
+SCREEN_ENTRYPOINT = "modeler.serving.screen"
+SCREEN_TIMEOUT_SECONDS = 600
 MARKET_SECTOR_ROOT_KEYS = ("market_sector_kr_root", "market_sector_us_root")
 # 증권 이름 입력을 만들 레이크 root. 전용 키가 없으면 같은 레이크를 가리키는 시장·섹터 root를 씁니다.
 SECURITY_NAMES_ROOT_KEYS = (
@@ -200,6 +202,9 @@ def _config(path: Path) -> dict[str, Any]:
     # list summary above each rank table): the same shape as macro_context_enabled.
     if not isinstance(config.get("summary_v2_enabled", False), bool):
         raise ValueError("summary_v2_enabled must be true or false")
+    # Rank screening (screen-v1, screen-D.json, "선별 상위 30"): the same shape again.
+    if not isinstance(config.get("rank_screen_enabled", False), bool):
+        raise ValueError("rank_screen_enabled must be true or false")
     macro_timeout = config.get("macro_context_timeout_seconds", MACRO_CONTEXT_TIMEOUT_SECONDS)
     if (isinstance(macro_timeout, bool) or not isinstance(macro_timeout, int)
             or not 10 <= macro_timeout <= 1800):
@@ -636,6 +641,9 @@ def explain_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str,
         argv += ["--kr-root", str(kr_root)]
     if us_root is not None:
         argv += ["--us-root", str(us_root)]
+    screen = _screen_for_explain(config, day, run_root, invocation_id, report_sha)
+    if screen is not None:  # only when on: explain also covers the screened top 30 (05 §6 C5)
+        argv += ["--screen", str(screen[0]), "--screen-sha256", screen[1]]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(release_root / "src")
     env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -664,6 +672,120 @@ def explain_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str,
     os.replace(scratch, document)  # the child wrote scratch whole; the rename is the only publication
     state = {"report_date": day.isoformat(), "status": body["status"], "invocation_id": invocation_id,
              "document_sha256": hashlib.sha256(raw).hexdigest(),
+             "models": {k: v.get("status") for k, v in body["models"].items()}}
+    _atomic(state_path, state)
+    return state
+
+
+def _screen_for_explain(config: dict[str, Any], day: date, run_root: Path, invocation_id: str,
+                        report_sha: str) -> tuple[Path, str] | None:
+    """This invocation's usable ``screen-D.json`` (path, sha256) when screening is on, else None."""
+    if config.get("rank_screen_enabled", False) is not True:
+        return None
+    state_path = run_root / "coordinator-screen.json"
+    document = run_root / f"screen-{day.isoformat()}.json"
+    try:
+        state = _read(state_path)
+        if (state.get("status") not in {"ok", "partial"} or state.get("invocation_id") != invocation_id
+                or state.get("report_sha256") != report_sha or not document.is_file()
+                or _hash(document) != state.get("document_sha256")):
+            return None
+    except (OSError, ValueError):
+        return None
+    return document, state["document_sha256"]
+
+
+def screen_stage(config: dict[str, Any], day: date, now: datetime) -> dict[str, Any]:
+    """Compute ``screen-D.json`` (rule screen-v1) in a child process under a time limit.
+
+    Runs after market-sector and before explain (05 §6 C5).  It reads the report and the pinned raw
+    inputs only: no model, score, rank or ``report-D.json`` byte changes.  A failure, a timeout or a
+    crash ends in a ``failed`` document carrying this invocation's id and the report's hash; the stage
+    never raises into the run.  ``rank_screen_enabled`` false or absent touches nothing at all (no
+    document, no state file, nothing set aside), so the run directory and the unit stay as before.
+    """
+    if config.get("rank_screen_enabled", False) is not True:
+        return {"report_date": day.isoformat(), "status": "disabled"}
+    run_root = _day_dir(config, day)
+    run_root.mkdir(parents=True, exist_ok=True)
+    state_path = run_root / "coordinator-screen.json"
+    document = run_root / f"screen-{day.isoformat()}.json"
+    _retire_explain_document(document)
+    infer_state = _read(run_root / "coordinator-inference.json")
+    if infer_state.get("report_ready", infer_state.get("this_invocation_completed")) is not True or \
+            infer_state.get("failure_report") is True:
+        state = {"report_date": day.isoformat(), "status": "skipped", "reason": "no_model_report",
+                 "invocation_id": infer_state.get("invocation_id")}
+        _atomic(state_path, state)
+        return state
+    from . import screen as sc  # only an enabled stage needs the module
+
+    invocation_id = infer_state["invocation_id"]
+    report_sha = infer_state["report_sha256"]
+    release_name = Path(config["release_manifest"]).parent.name
+
+    def failed(reason: str, *, timed_out: bool = False, exit_code: int | None = None) -> dict[str, Any]:
+        body = sc.failure_document(unit=day.isoformat(), invocation_id=invocation_id,
+                                   report_sha256=report_sha, release=release_name, reason=reason)
+        sha = _install_ms_document(document, sc.document_bytes(body))
+        state = {"report_date": day.isoformat(), "status": "failed", "reason": reason, "timed_out": timed_out,
+                 "exit_code": exit_code, "invocation_id": invocation_id, "report_sha256": report_sha,
+                 "document_sha256": sha}
+        _atomic(state_path, state)
+        return state
+
+    try:
+        report_path = Path(infer_state["report_path"])
+        if _hash(report_path) != report_sha:
+            return failed("report_changed")
+        selected = _selected(config, day)
+        jobs_config, jobs_sha = selected["jobs_config"], selected["jobs_config_sha256"]
+        release = _read(_absolute(config, "release_manifest"))
+        release_root = Path(release["release_root"]).resolve(strict=True)
+        kr_root, us_root = _explain_roots(config)
+    except Exception as exc:
+        return failed(f"setup:{type(exc).__name__}")
+    scratch = run_root / f".screen-{day.isoformat()}.new"
+    scratch.unlink(missing_ok=True)
+    top_n = config.get("reports_top_n", 100)
+    argv = [str(_absolute(config, "python")), "-m", SCREEN_ENTRYPOINT, "run",
+            "--report-date", day.isoformat(), "--report", str(report_path), "--report-sha256", report_sha,
+            "--invocation-id", invocation_id, "--release", release_name,
+            "--jobs-config", jobs_config, "--jobs-config-sha256", jobs_sha,
+            "--prepared-root", str(_absolute(config, "prepared_root")),
+            "--top-n", str(top_n if isinstance(top_n, int) and not isinstance(top_n, bool) else 100),
+            "--output", str(scratch)]
+    if kr_root is not None:
+        argv += ["--kr-root", str(kr_root)]
+    if us_root is not None:
+        argv += ["--us-root", str(us_root)]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(release_root / "src")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        done = run_group(argv, cwd=release_root, env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, timeout=SCREEN_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        scratch.unlink(missing_ok=True)
+        return failed("timeout", timed_out=True, exit_code=124)
+    except OSError as exc:
+        return failed(f"spawn:{type(exc).__name__}", exit_code=127)
+    if done.returncode != 0 or not scratch.is_file():
+        scratch.unlink(missing_ok=True)
+        return failed("exit_nonzero" if done.returncode else "output_missing", exit_code=done.returncode)
+    raw = scratch.read_bytes()
+    try:
+        body = json.loads(raw)
+        if (body.get("schema") != sc.SCHEMA or body.get("rule_version") != sc.RULE_VERSION
+                or body.get("invocation_id") != invocation_id or body.get("report_sha256") != report_sha
+                or body.get("unit") != day.isoformat() or body.get("status") not in {"ok", "partial", "failed"}):
+            raise ValueError("screen document identity")
+    except ValueError:
+        scratch.unlink(missing_ok=True)
+        return failed("output_invalid", exit_code=done.returncode)
+    os.replace(scratch, document)  # the child wrote scratch whole; the rename is the only publication
+    state = {"report_date": day.isoformat(), "status": body["status"], "invocation_id": invocation_id,
+             "report_sha256": report_sha, "document_sha256": hashlib.sha256(raw).hexdigest(),
              "models": {k: v.get("status") for k, v in body["models"].items()}}
     _atomic(state_path, state)
     return state
@@ -924,6 +1046,8 @@ def _reports_publisher_input(config: dict[str, Any], day: date, render: dict[str
         **({"macro_context_enabled": True} if config.get("macro_context_enabled") is True else {}),
         # Same rule for the display-only front page v2: no key when off.
         **({"summary_v2_enabled": True} if config.get("summary_v2_enabled") is True else {}),
+        # Same rule for rank screening: no key when off, so the publisher reads no screen file.
+        **({"rank_screen_enabled": True} if config.get("rank_screen_enabled") is True else {}),
     }
 
 
@@ -1119,7 +1243,7 @@ def monitor_stage(config: dict[str, Any], day: date, *, attempt: int) -> dict[st
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="modeler-daily-coordinator")
-    parser.add_argument("stage", choices=("select", "infer", "market-sector", "explain",
+    parser.add_argument("stage", choices=("select", "infer", "market-sector", "screen", "explain",
                                           "macro-context", "render", "publish", "monitor"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--report-date", type=date.fromisoformat, required=True)
@@ -1139,6 +1263,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = infer_stage(config, args.report_date, now)
             elif args.stage == "market-sector":
                 result = market_sector_stage(config, args.report_date, now)
+            elif args.stage == "screen":
+                result = screen_stage(config, args.report_date, now)
             elif args.stage == "explain":
                 result = explain_stage(config, args.report_date, now)
             elif args.stage == "macro-context":

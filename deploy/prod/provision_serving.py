@@ -405,6 +405,9 @@ def provision(plan: Plan) -> dict[str, Any]:
            # Display-only front page v2 and rank-section list summary: off until the owner turns it
            # on (a missing key also means off).
            "summary_v2_enabled": False,
+           # Rank screening (screen-v1, screen-D.json, "선별 상위 30"): off until the owner turns it
+           # on (a missing key also means off).
+           "rank_screen_enabled": False,
            # Market-sector section: the KR data root and the US lake link, read only.  Both null
            # (no --ms-bundle) leaves the section off and the unit says its input is missing.
            "market_sector_kr_root": str(plan.ms_kr_root) if plan.ms_bundle else None,

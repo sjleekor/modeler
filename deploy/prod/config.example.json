@@ -31,6 +31,7 @@
   "macro_context_enabled": false,
   "macro_context_timeout_seconds": 300,
   "summary_v2_enabled": false,
+  "rank_screen_enabled": false,
   "reports_repository": "sjleekor/stock_reports",
   "reports_audience": "owner_only",
   "reports_branch": "main",

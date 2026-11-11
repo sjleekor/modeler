@@ -11,7 +11,7 @@ from pathlib import Path
 from .daily_coordinator import (
     SEOUL, _absolute, _config, _day_dir, _lock, _read,
     ensure_selection, explain_stage, infer_stage, macro_context_stage, market_sector_stage,
-    monitor_stage, publish_stage, render_stage, select_stage,
+    monitor_stage, publish_stage, render_stage, screen_stage, select_stage,
 )
 from .daily_opening import prepare_opening
 
@@ -82,6 +82,14 @@ def main(argv: list[str] | None = None) -> int:
                         ms_status = "market_sector_failed"
                     if ms_status != "disabled":  # a release without the section reports as before
                         states["market_sector"] = ms_status
+                    # Rank screening (screen-v1) runs before explain so explain can cover the
+                    # screened top 30. Off: nothing is written and this output stays as before.
+                    try:
+                        screen_status = screen_stage(config, day, now)["status"]
+                    except Exception:
+                        screen_status = "failed"
+                    if screen_status != "disabled":
+                        states["screen"] = screen_status
                     # Explain (why a stock ranks where it does, its price path) is read-only and
                     # time-limited: whatever happens, the run goes on with the unit as before.
                     try:

@@ -31,7 +31,7 @@ MODULES = (
     "modeler/serving/runtime_contract.py", "modeler/reporting/__init__.py",
     "modeler/reporting/site.py", "modeler/reporting/markdown.py",
     "modeler/reporting/security_names.py", "modeler/reporting/svg.py",
-    "modeler/serving/explain.py", "modeler/serving/macro_context_run.py",
+    "modeler/serving/explain.py", "modeler/serving/macro_context_run.py", "modeler/serving/screen.py",
     "modeler/scores/__init__.py", "modeler/scores/macro_context/__init__.py",
     "modeler/scores/macro_context/spec.py", "modeler/scores/macro_context/document.py",
     "modeler/scores/macro_context/calc.py", "modeler/scores/macro_context/summary.py",

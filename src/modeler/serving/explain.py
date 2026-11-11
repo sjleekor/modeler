@@ -342,12 +342,14 @@ class CrossSection:
 def explain_cross_section(*, predict: Callable[[Any], Any], X, design, features, feature_group: dict[str, str],
                           keys: list[Any], symbols: list[str], comparison, report_keys: list[Any],
                           report_scores: list[float], names: dict[str, str], scope_for: Callable[[Any], str],
-                          flag_features: frozenset[str] = frozenset(), top_n: int = TOP_N) -> CrossSection:
+                          flag_features: frozenset[str] = frozenset(), top_n: int = TOP_N,
+                          target_keys: list[Any] | None = None) -> CrossSection:
     """Reproduce the report's scores, then occlude the top ``top_n``. Raises ``ExplainError`` on mismatch.
 
     ``keys[i]`` identifies matrix row ``i`` (KR ``(ticker, market)``, US ``symbol``); ``report_keys`` and
     ``report_scores`` are the report's ranking in order. ``comparison[i]`` is the comparison set of the row
-    (KR market, US one set): the baseline and tie shares are taken inside it.
+    (KR market, US one set): the baseline and tie shares are taken inside it.  ``target_keys`` (rank
+    screening on) replaces the top ``top_n`` as the rows to occlude; None keeps the top ``top_n``.
     """
     import numpy as np
 
@@ -365,7 +367,8 @@ def explain_cross_section(*, predict: Callable[[Any], Any], X, design, features,
     if [keys[i] for i in order] != list(report_keys):
         raise ExplainError("rank_order_mismatch")
     position = {key: i for i, key in enumerate(keys)}
-    top_index = [position[key] for key in report_keys[:top_n]]
+    targets = report_keys[:top_n] if target_keys is None else target_keys
+    top_index = [position[key] for key in targets]
 
     comparison = np.asarray(comparison)
     base_by = {label: baseline(X[comparison == label], design, {c for c in design if c in flag_features})
@@ -663,8 +666,13 @@ def _scope_for_kr(label: Any) -> str:
 
 def _assemble(*, model_id: str, market: str, asof: str, inputs: dict[str, str], group_ids: list[str],
               top: list[dict[str, Any]], section: CrossSection | None, explain_error: str | None,
-              prices: dict[str, Any] | None, price_error: str | None) -> dict[str, Any]:
-    """Model block of the document. Explain and price fail separately; rows carry both."""
+              prices: dict[str, Any] | None, price_error: str | None,
+              n_mean: int | None = None) -> dict[str, Any]:
+    """Model block of the document. Explain and price fail separately; rows carry both.
+
+    Rows after the first ``n_mean`` are screened-top rows outside the top N (rank screening on): they
+    carry ``screen_target: true`` and stay out of ``top100_mean_delta``.
+    """
     import numpy as np
 
     rows = []
@@ -680,11 +688,14 @@ def _assemble(*, model_id: str, market: str, asof: str, inputs: dict[str, str], 
         else:
             row.update(price_status="failed", price_reason=price_error, path=[], bench_path=[],
                        ret={str(h): None for h in RETURN_HORIZONS}, ret_note={}, gaps=[], n_obs=0)
+        if n_mean is not None and k >= n_mean:
+            row["screen_target"] = True
         rows.append(row)
     mean_delta = {}
     if section is not None:
+        cut = len(top) if n_mean is None else n_mean
         for g in group_ids:
-            mean_delta[g] = float(np.mean(section.delta[:, GID.index(g)]))
+            mean_delta[g] = float(np.mean(section.delta[:cut, GID.index(g)]))
     reasons = []
     if explain_error:
         reasons.append(f"explain:{explain_error}")
@@ -708,14 +719,21 @@ def failed_model(market: str, reason: str, asof: str | None = None) -> dict[str,
                        "benchmark": ""}, "groups": [], "dates": [], "top100_mean_delta": {}, "rows": []}
 
 
-def _top_of_report(report_model: dict[str, Any], top_n: int) -> list[dict[str, Any]]:
+def _top_of_report(report_model: dict[str, Any], top_n: int,
+                   extra_ranks: list[int] | None = None) -> list[dict[str, Any]]:
+    """The top ``top_n`` rows, then (rank screening on) the screened rows ranked below them, in rank order."""
+    rows = report_model["rankings"][:top_n]
+    if extra_ranks:
+        by_rank = {int(r["rank"]): r for r in report_model["rankings"]}
+        rows = rows + [by_rank[k] for k in sorted(set(extra_ranks)) if k > top_n and k in by_rank]
     return [{"rank": int(r["rank"]), "symbol": r["symbol"], "market": r.get("market"), "score": float(r["score"])}
-            for r in report_model["rankings"][:top_n]]
+            for r in rows]
 
 
 # --------------------------------------------------------------------------- KR
 def explain_kr(pin: JobPin, report_model: dict[str, Any], *, kr_root: Path | None,
-               price_dir: Path | None = None, top_n: int = TOP_N) -> dict[str, Any]:
+               price_dir: Path | None = None, top_n: int = TOP_N,
+               extra_ranks: list[int] | None = None) -> dict[str, Any]:
     """KR model block. ``price_dir`` overrides the lake path (tests, copied inputs)."""
     import numpy as np
     import polars as pl
@@ -725,7 +743,8 @@ def explain_kr(pin: JobPin, report_model: dict[str, Any], *, kr_root: Path | Non
 
     asof = str(report_model["feature_asof_date"])
     asof_date = date.fromisoformat(asof)
-    top = _top_of_report(report_model, top_n)
+    top = _top_of_report(report_model, top_n, extra_ranks)
+    n_mean = min(top_n, len(report_model["rankings"])) if len(top) > top_n else None
     inputs = {"prepared_sha256": pin.input_sha256, "bundle_sha256": pin.bundle_sha256, "price_source": "",
               "price_sha256": "", "benchmark": "same-market equal-weight mean of adjacent-session simple "
                                                "returns (price only), chained, start=100"}
@@ -752,7 +771,8 @@ def explain_kr(pin: JobPin, report_model: dict[str, Any], *, kr_root: Path | Non
             predict=lambda M: bundle.model.predict_proba(M)[:, 1], X=X, design=design, features=features,
             feature_group=KR_FEATURE_GROUP, keys=list(zip(tickers, markets, strict=True)), symbols=tickers,
             comparison=np.array(markets), report_keys=keys_all, report_scores=report_scores,
-            names=KR_NAMES, scope_for=_scope_for_kr, flag_features=KR_FLAG_FEATURES, top_n=top_n)
+            names=KR_NAMES, scope_for=_scope_for_kr, flag_features=KR_FLAG_FEATURES, top_n=top_n,
+            target_keys=None if n_mean is None else [(r["symbol"], r["market"]) for r in top])
         group_ids = [g for g, cols in group_columns(design, features, KR_FEATURE_GROUP).items() if len(cols)]
     except Exception as exc:  # explain fails alone; the price part below still runs
         section, explain_error = None, _reason(exc)
@@ -789,7 +809,7 @@ def explain_kr(pin: JobPin, report_model: dict[str, Any], *, kr_root: Path | Non
         prices, price_error = None, _reason(exc)
     return _assemble(model_id=pin.model_id, market="KR", asof=asof, inputs=inputs, group_ids=group_ids,
                      top=top, section=section if explain_error is None else None, explain_error=explain_error,
-                     prices=prices, price_error=price_error)
+                     prices=prices, price_error=price_error, n_mean=n_mean)
 
 
 def _kr_price_dir(kr_root: Path, native: dict[str, Any]) -> Path:
@@ -938,13 +958,15 @@ def _load_us_estimator(pin: JobPin):
     return bundle["model"]
 
 
-def explain_us(pin: JobPin, report_model: dict[str, Any], shared: UsShared, *, top_n: int = TOP_N) -> dict[str, Any]:
+def explain_us(pin: JobPin, report_model: dict[str, Any], shared: UsShared, *, top_n: int = TOP_N,
+               extra_ranks: list[int] | None = None) -> dict[str, Any]:
     import numpy as np
 
     from modeler.serving import us_daily
 
     asof = str(report_model["feature_asof_date"])
-    top = _top_of_report(report_model, top_n)
+    top = _top_of_report(report_model, top_n, extra_ranks)
+    n_mean = min(top_n, len(report_model["rankings"])) if len(top) > top_n else None
     inputs = {"prepared_sha256": pin.input_sha256, "bundle_sha256": pin.bundle_sha256,
               "price_source": shared.price_inputs.get("price_source", ""),
               "price_sha256": shared.price_inputs.get("price_sha256", ""),
@@ -966,7 +988,8 @@ def explain_us(pin: JobPin, report_model: dict[str, Any], shared: UsShared, *, t
             feature_group=US_FEATURE_GROUP, keys=keys, symbols=keys, comparison=np.zeros(len(keys), dtype=int),
             report_keys=[r["symbol"] for r in report_model["rankings"]],
             report_scores=[float(r["score"]) for r in report_model["rankings"]], names=US_NAMES,
-            scope_for=lambda _label: US_SCOPE, flag_features=frozenset(), top_n=top_n)
+            scope_for=lambda _label: US_SCOPE, flag_features=frozenset(), top_n=top_n,
+            target_keys=None if n_mean is None else [r["symbol"] for r in top])
         del estimator
     except Exception as exc:
         section, explain_error = None, _reason(exc)
@@ -984,7 +1007,8 @@ def explain_us(pin: JobPin, report_model: dict[str, Any], shared: UsShared, *, t
     except Exception as exc:
         prices, price_error = None, _reason(exc)
     return _assemble(model_id=pin.model_id, market="US", asof=asof, inputs=inputs, group_ids=group_ids, top=top,
-                     section=section, explain_error=explain_error, prices=prices, price_error=price_error)
+                     section=section, explain_error=explain_error, prices=prices, price_error=price_error,
+                     n_mean=n_mean)
 
 
 def _reason(exc: BaseException) -> str:
@@ -1024,23 +1048,37 @@ def failure_document(*, unit: str, invocation_id: str, report_sha256: str, relea
 def explain_report(*, unit: str, invocation_id: str, report_bytes: bytes, release: str,
                    pins: dict[str, JobPin], kr_root: Path | None, us_root: Path | None,
                    top_n: int = TOP_N, kr_price_dir: Path | None = None,
-                   us_price_files: tuple[Path, Path] | None = None) -> dict[str, Any]:
+                   us_price_files: tuple[Path, Path] | None = None,
+                   screen_bytes: bytes | None = None) -> dict[str, Any]:
     """Whole document for one day. One model never stops another.
 
     ``kr_price_dir`` / ``us_price_files`` replace the lake paths (copied inputs, tests).
+    ``screen_bytes`` (rank screening on, ``screen-D.json``) adds each model's screened top 30 to the
+    rows explained (05 §6 C5); None explains the top ``top_n`` only and the document is as before.
     """
     report = json.loads(report_bytes)
     report_sha = hashlib.sha256(report_bytes).hexdigest()
     models: dict[str, dict[str, Any]] = {}
     shared_us: dict[str, UsShared] = {}
+    screen_doc = None
+    if screen_bytes is not None:
+        from modeler.serving import screen as sc
+
+        screen_doc = json.loads(screen_bytes)
+        if screen_doc.get("report_sha256") != report_sha:
+            screen_doc = None
     for model_id, market in MODEL_MARKET.items():
+        extra = None
+        if screen_doc is not None:
+            extra = [t["rank"] for t in sc.screened_targets(screen_doc, model_id)] or None
         try:
             pin = pins.get(model_id)
             if pin is None:
                 raise ExplainError("model_not_pinned")
             report_model = _report_model(report, market, model_id)
             if market == "KR":
-                models[model_id] = explain_kr(pin, report_model, kr_root=kr_root, price_dir=kr_price_dir, top_n=top_n)
+                models[model_id] = explain_kr(pin, report_model, kr_root=kr_root, price_dir=kr_price_dir, top_n=top_n,
+                                              extra_ranks=extra)
             else:
                 key = pin.input_sha256
                 if key not in shared_us:
@@ -1048,12 +1086,15 @@ def explain_report(*, unit: str, invocation_id: str, report_bytes: bytes, releas
                     gc.collect()
                     shared_us[key] = load_us_shared(pin, date.fromisoformat(str(report_model["feature_asof_date"])),
                                                     us_root=us_root, price_files=us_price_files)
-                models[model_id] = explain_us(pin, report_model, shared_us[key], top_n=top_n)
+                models[model_id] = explain_us(pin, report_model, shared_us[key], top_n=top_n, extra_ranks=extra)
         except Exception as exc:
             models[model_id] = failed_model(market, _reason(exc))
         gc.collect()
-    return _clean(build_document(unit=unit, invocation_id=invocation_id, report_sha256=report_sha,
-                                 release=release, models=models))
+    doc = build_document(unit=unit, invocation_id=invocation_id, report_sha256=report_sha, release=release,
+                         models=models)
+    if screen_bytes is not None:  # off: no key, the document is as before
+        doc["screen_sha256"] = hashlib.sha256(screen_bytes).hexdigest()
+    return _clean(doc)
 
 
 # --------------------------------------------------------------------------- CLI (child process)
@@ -1066,10 +1107,16 @@ def _run(args: argparse.Namespace) -> int:
         print(json.dumps({"status": "failed", "reason": "jobs_config_changed"}))
         return 2
     pins = read_job_pins(Path(args.jobs_config), Path(args.prepared_root))
+    screen_bytes = None
+    if args.screen is not None:
+        screen_bytes = Path(args.screen).read_bytes()
+        if hashlib.sha256(screen_bytes).hexdigest() != args.screen_sha256:
+            print(json.dumps({"status": "failed", "reason": "screen_changed"}))
+            return 2
     document = explain_report(
         unit=args.report_date, invocation_id=args.invocation_id, report_bytes=report_bytes,
         release=args.release, pins=pins, kr_root=Path(args.kr_root) if args.kr_root else None,
-        us_root=Path(args.us_root) if args.us_root else None, top_n=args.top_n)
+        us_root=Path(args.us_root) if args.us_root else None, top_n=args.top_n, screen_bytes=screen_bytes)
     atomic_write_json(Path(args.output), document)
     print(json.dumps({"status": document["status"],
                       "models": {k: v["status"] for k, v in document["models"].items()}}, sort_keys=True))
@@ -1091,8 +1138,12 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--kr-root", type=Path)
     run.add_argument("--us-root", type=Path)
     run.add_argument("--top-n", type=int, default=TOP_N)
+    run.add_argument("--screen", type=Path, help="screen-D.json (rank screening on): also explain the screened top 30")
+    run.add_argument("--screen-sha256")
     run.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
+    if (args.screen is None) != (args.screen_sha256 is None):
+        return 2
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.report_date):
         return 2
     try:
