@@ -1515,6 +1515,12 @@ def _explain_model(raw: object, m: dict) -> dict:
             rows[row["rank"]] = _explain_row(item, groups, len(dates))
     gaps = any(v["explain"] != "ok" or v["price"] == "failed" for v in rows.values())
     status = "partial" if raw["status"] == "partial" or gaps else "ok"
+    # 거르기를 켠 날 serving이 더한 선별 행(원순위 상위 N 밖). 선별 표에만 쓰고 순위 표·목록 요약에는 쓰지 않습니다.
+    screen_rows = {
+        rank: _explain_row(item, groups, len(dates))
+        for rank, item in by_rank.items()
+        if item.get("screen_target") is True and rank not in rows
+    }
     return {
         "status": status,
         "reason": explain_reason_text(raw.get("reason")) if raw.get("reason") else None,
@@ -1523,6 +1529,7 @@ def _explain_model(raw: object, m: dict) -> dict:
         "groups": groups,
         "mean": mean,
         "rows": rows,
+        "screen_rows": screen_rows,
     }
 
 
@@ -2128,6 +2135,7 @@ def render_kr(ctx: dict) -> tuple[list, dict]:
         else:
             lines += ["> " + RANKING_STATUS_KR, ""]
             lines += same_session_lines(ctx, "KR")
+            lines += screen_block_lines(ctx, m, xm, show_name=True)
             show_kind = sec.get("show_kind", False)
             held, reasons, body = 0, Counter(), []
             for row, kind in zip(rows, kinds_of(m)):
@@ -2260,6 +2268,7 @@ def render_us_model(ctx: dict, m: dict, show_name: bool, show_kind: bool = False
     rows = m["rows"]
     if not rows:
         return lines + ["이번 판에 순위가 없습니다 (전체 0개).", ""]
+    lines += screen_block_lines(ctx, m, xm, show_name=show_name)
     lines.append(
         f"전체 {m['total']}개 중 상위 {len(rows)}개입니다. 그 밖의 순위는 올리지 않습니다."
     )
@@ -3813,6 +3822,17 @@ def ranking_overview_lines(ctx: dict, summaries: dict) -> list:
             lines.append(head + f"입력이 {m['lag']}세션 늦어(5세션 초과) 순위를 내지 않았습니다.")
         elif not m["rows"]:
             lines.append(head + "이번 판에 순위가 없습니다.")
+        elif screen_model(ctx, m) is not None and screen_model(ctx, m)["status"] == "ok":
+            # 거르기를 켠 날은 선별 상위 10입니다(04 Z2). 원순위 상위 100 표는 섹션 파일에 그대로 있습니다.
+            sm = screen_model(ctx, m)
+            names = " · ".join(
+                c(r["name"]) if m["market"] == "KR" else c(r["symbol"]) for r in sm["rows"][:10]
+            )
+            head = f"- {_model_label(m)} 선별 상위 10: "
+            lines.append(
+                head + (f"{names} → [선별 상위 {len(sm['rows'])}]({file})" if names
+                        else "조건을 통과한 종목이 없습니다.")
+            )
         else:
             names = " · ".join(
                 c(r["name"]) if m["market"] == "KR" else c(r["symbol"]) for r in m["rows"][:10]
@@ -3905,6 +3925,206 @@ SECTION_MARKETS = {
     "us-stocks": ["US"],
     "data-status": ["KR", "US"],
 }
+
+
+# ---------------------------------------------------------------------------
+# 선별 순위 (screen-D.json, 규칙 screen-v1 — 20261110_briefing_usefulness 03 §3.4 · 06)
+#
+# 계산은 serving의 screen 단계가 하고, 여기서는 읽어서 표시만 합니다. 입력이 없으면(설정이 꺼져 있으면)
+# 어떤 출력도 바뀌지 않습니다. 선별 표의 머리는 "선별 | 원순위 | 코드"로 시작합니다. 피드백 파서는
+# "순위 | 코드"로 시작하는 표만 순위 표로 읽으므로, 게시 행 집합은 원순위 표 그대로입니다.
+
+SCREEN_SCHEMA = "briefing-screen.v1"
+SCREEN_RULE = "screen-v1"
+SCREEN_FORMAT = "입력 형식 오류"
+SCREEN_MISMATCH = "입력 불일치"
+SCREEN_REASON_KO = {
+    "kind": "종류",
+    "delisting_filing": "퇴출 절차 공시",
+    "long_halt": "장기 정지",
+    "close_below_1000": "1,000원 미만",
+    "mcap_below_20b": "시총 200억 미만",
+    "acquisition_target": "인수 진행",
+    "narrow_range": "가격 범위 좁음",
+    "listing_deficiency": "상장 요건 미달 통지",
+    "trading_gap": "거래 공백",
+}
+SCREEN_KR_ORDER = ("kind", "delisting_filing", "long_halt", "close_below_1000", "mcap_below_20b",
+                   "short_history")
+SCREEN_US_ORDER = ("acquisition_target", "narrow_range", "listing_deficiency", "trading_gap",
+                   "short_history")
+SCREEN_SIZE = {"KR": "size_liquidity", "US": "liquidity"}
+SCREEN_CONDITION = {
+    "KR": "보통주 · 퇴출 위험 없음(퇴출 절차 공시 3년 · 252세션 안 거래 없는 날 20일 이상 · 종가 1,000원 "
+    "미만 · 시총 200억 원 미만 · 상장 252세션 미만) · 시총 순위 500 안이면서 20일 평균 거래대금 순위 500 안",
+    "US": "지금 유니버스 · 인수 진행(대상 쪽) · 가격 범위 좁음 · 상장 요건 미달 통지 · 거래 공백 · 이력 부족 "
+    "제외 · 20세션 평균 거래대금 순위 1,500 안",
+}
+
+
+def load_screen(
+    raw: bytes, unit: str, report_sha: str, invocation_id: object, sections: tuple
+) -> dict:
+    """거르기 입력을 읽어 `ctx["screen"]`을 만듭니다. 선별 행은 report의 원순위·코드와 맞아야 합니다."""
+    digest = sha256_bytes(raw)
+
+    def failed(reason: str) -> dict:
+        return {"state": "failed", "reason": reason, "sha": digest, "models": {}}
+
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return failed(SCREEN_FORMAT)
+    if (
+        not isinstance(doc, dict)
+        or doc.get("schema") != SCREEN_SCHEMA
+        or doc.get("rule_version") != SCREEN_RULE
+        or not isinstance(doc.get("models"), dict)
+    ):
+        return failed(SCREEN_FORMAT)
+    if (
+        doc.get("unit") != unit
+        or doc.get("report_sha256") != report_sha
+        or not isinstance(invocation_id, str)
+        or doc.get("invocation_id") != invocation_id
+    ):
+        return failed(SCREEN_MISMATCH)
+    models = {}
+    for sec in sections:
+        for m in sec["models"]:
+            if m["status"] == "failed" or m["suppressed"] or not m["rows"]:
+                continue
+            models[m["model_id"]] = _screen_model(doc["models"].get(m["model_id"]), m)
+    states = {x["status"] for x in models.values()}
+    state = "ok" if states <= {"ok"} else ("failed" if states == {"failed"} else "partial")
+    return {"state": state, "reason": None, "sha": digest, "models": models}
+
+
+def _screen_model(raw: object, m: dict) -> dict:
+    def failed(reason: str) -> dict:
+        return {"status": "failed", "reason": reason}
+
+    if not isinstance(raw, dict) or raw.get("status") not in ("ok", "failed"):
+        return failed(SCREEN_FORMAT if raw is not None else "이 모델의 선별 결과가 없습니다")
+    if raw["status"] == "failed":
+        return failed(explain_reason_text(raw.get("reason")))
+    if raw.get("market") != m["market"] or good_date(raw.get("asof")) != good_date(m["asof"]):
+        return failed(SCREEN_MISMATCH + "(기준일)")
+    by_rank = {int(r["rank"]): r for r in m["report"]["rankings"]}
+    rows = []
+    for item in raw.get("screened") if isinstance(raw.get("screened"), list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("rank"), int):
+            return failed(SCREEN_FORMAT)
+        row = by_rank.get(item["rank"])
+        if row is None or row["symbol"] != item.get("symbol") or item.get("screen_rank") != len(rows) + 1:
+            return failed(SCREEN_MISMATCH + "(순위)")
+        rows.append(row)
+    if any(a["rank"] >= b["rank"] for a, b in zip(rows, rows[1:])):
+        return failed(SCREEN_MISMATCH + "(순서)")
+    summary = raw.get("summary") if isinstance(raw.get("summary"), dict) else {}
+    dates = raw.get("dates") if isinstance(raw.get("dates"), dict) else {}
+    if not is_num(summary.get("total")) or not is_num(summary.get("passed")):
+        return failed(SCREEN_FORMAT)
+    # 사유별 수: 겹침 포함. 규모·유동성은 앞 조건(종류·위험)을 모두 통과한 종목 가운데 수입니다(03 §3.4).
+    size_key = SCREEN_SIZE[m["market"]]
+    counts: Counter = Counter()
+    size_only = 0
+    for r in raw.get("rows") if isinstance(raw.get("rows"), list) else []:
+        reasons = r.get("reasons") if isinstance(r, dict) and isinstance(r.get("reasons"), list) else []
+        keys = {"kind" if str(x).startswith("kind_") else str(x) for x in reasons}
+        counts.update(keys - {size_key})
+        if keys == {size_key}:
+            size_only += 1
+    return {
+        "status": "ok",
+        "rows": rows,
+        "total": int(summary["total"]),
+        "passed": int(summary["passed"]),
+        "kept": summary.get("top_n_kept") if is_num(summary.get("top_n_kept")) else None,
+        "unchecked": summary.get("filings_unchecked") if is_num(summary.get("filings_unchecked")) else 0,
+        "counts": counts,
+        "size_only": size_only,
+        "dates": {k: v for k, v in dates.items() if isinstance(v, str) and good_date(v)},
+    }
+
+
+def screen_model(ctx: dict, m: dict) -> dict | None:
+    """선별 표시 값. 거르기 입력이 없으면(꺼짐) None입니다."""
+    sc = ctx.get("screen")
+    if sc is None or m["status"] == "failed" or m["suppressed"] or not m["rows"]:
+        return None
+    if sc["state"] == "failed" and not sc["models"]:
+        return {"status": "failed", "reason": sc["reason"]}
+    return sc["models"].get(m["model_id"]) or {
+        "status": "failed",
+        "reason": "이 모델의 선별 결과가 없습니다",
+    }
+
+
+def _screen_counts_text(sm: dict, market: str) -> str:
+    order = SCREEN_KR_ORDER if market == "KR" else SCREEN_US_ORDER
+    labels = dict(SCREEN_REASON_KO)
+    labels["short_history"] = "상장 1년 미만" if market == "KR" else "이력 부족"
+    parts = [f"{labels[k]} {sm['counts'].get(k, 0):,}" for k in order]
+    parts.append(("규모·유동성 " if market == "KR" else "거래대금 ") + f"{sm['size_only']:,}")
+    return " · ".join(parts)
+
+
+def screen_block_lines(ctx: dict, m: dict, xm: dict | None, show_name: bool) -> list:
+    """원순위 표 위의 선별 블록. 거르기가 꺼져 있으면 빈 목록입니다."""
+    sm = screen_model(ctx, m)
+    if sm is None:
+        return []
+    heading = ("## " if m["market"] == "KR" else "### ") + "선별 상위 30 — 살 만한 종목 안에서의 순위"
+    lines = [heading, ""]
+    if sm["status"] != "ok":
+        return lines + [f"선별 목록: 실패 — {sm['reason']}. 아래 원순위 표는 그대로입니다.", ""]
+    d = sm["dates"]
+    basis = [f"공시 기준일 {d.get('filing_basis_date', '확인되지 않음')}"]
+    if m["market"] == "KR":
+        basis.append(f"시총 기준일 {d.get('risk_market_cap_date', '확인되지 않음')}")
+        basis.append(
+            f"규모·유동성 판정 {d.get('judgement_session', '확인되지 않음')} "
+            f"(시총 표 {d.get('size_market_cap_date', '확인되지 않음')} 값)"
+        )
+    else:
+        basis.append(f"거래대금 판정 {d.get('judgement_session', '확인되지 않음')}")
+    excluded = sm["total"] - sm["passed"]
+    unchecked = f" · 공시 확인 못 함 {sm['unchecked']:,}" if m["market"] == "US" and sm["unchecked"] else ""
+    lines += [
+        f"- 조건(`{SCREEN_RULE}`): {SCREEN_CONDITION[m['market']]}",
+        "- 기준: " + " · ".join(basis),
+        f"- 걸러진 종목: {excluded:,} / {sm['total']:,} ({_screen_counts_text(sm, m['market'])}{unchecked})",
+        f"- 원순위 상위 {ctx['top_n']} 가운데 남은 종목: "
+        + (f"{int(sm['kept'])}" if sm["kept"] is not None else "확인되지 않음"),
+        "",
+        "사유별 수는 겹침을 넣은 값이고, 규모·유동성(거래대금)은 앞 조건을 통과한 종목 가운데 수입니다. "
+        "선별 순위는 원순위에서 조건에 맞지 않는 종목을 건너뛴 순서이며 점수를 다시 매기지 않았습니다. "
+        "판정을 통과하지 못한 탐색 모델의 결과이고, 지켜보는 목록입니다.",
+        "",
+    ]
+    if not sm["rows"]:
+        return lines + ["조건을 통과한 종목이 없습니다.", ""]
+    headers = ["선별", "원순위", "코드"] + (["이름"] if show_name else [])
+    headers += (["시장"] if m["market"] == "KR" else []) + ["점수 (순위용 점수 — 확률 아님)"]
+    right = (0, 1, len(headers) - 1)
+    if xm is not None:
+        headers.append(f"{explain_sessions(xm)}세션 흐름")
+    body = []
+    for k, row in enumerate(sm["rows"], start=1):
+        cells = [str(k), str(row["rank"]), c(row["symbol"])]
+        if show_name:
+            cells.append(c(row.get("name")))
+        if m["market"] == "KR":
+            cells.append(c(row.get("market")))
+        cells.append("{:.4f}".format(row["score"]))
+        if xm is not None:
+            view = xm["rows"].get(row["rank"]) or xm.get("screen_rows", {}).get(row["rank"])
+            cells.append(
+                sparkline(view["path"]) if view is not None and view["price"] != "failed" else BLANK
+            )
+        body.append(cells)
+    return lines + md_table(headers, body, right=right) + [""]
 
 
 def render_unit(ctx: dict) -> dict:
@@ -4095,6 +4315,7 @@ def build_context(
     invocation_id: str | None = None,
     macro: bytes | None = None,
     summary_v2: bool = False,
+    screen: bytes | None = None,
 ) -> dict:
     """envelope(JSON 바이트)와 시장·섹터 입력으로 렌더 입력(ctx)을 만듭니다. 파일은 쓰지 않습니다.
 
@@ -4116,6 +4337,9 @@ def build_context(
     목록 요약과 같은 기준 세션 문장을 더합니다(설정 `summary_v2_enabled`). 이때만 `repo`에서 직전
     단위의 README front matter를 읽습니다. False(기본)이면 출력은 이 기능이 없던 때와 바이트까지
     같습니다. 순위 표·`- 모델:` 줄·front matter·파일 집합은 켜도 그대로입니다.
+    `screen`은 `briefing-screen.v1` JSON 바이트(그날 `screen-D.json`, 설정 `rank_screen_enabled`)입니다.
+    있으면 순위 섹션의 모델마다 원순위 표 위에 "선별 상위 30" 표를 더하고, v2 첫 화면의 상위 10 줄을
+    선별 상위 10으로 바꿉니다. `None`(기본)이면 출력은 거르기 기능이 없던 때와 바이트까지 같습니다.
     """
     env = load_json_bytes(env_bytes, "envelope")
     unit, decision = parse_envelope(env)
@@ -4201,6 +4425,9 @@ def build_context(
     if macro is not None:
         expected = invocation_id if invocation_id is not None else env.get("invocation_id")
         ctx["macro"] = load_macro(macro, unit, expected, release)
+    if screen is not None:
+        expected = invocation_id if invocation_id is not None else env.get("invocation_id")
+        ctx["screen"] = load_screen(screen, unit, ctx["sha"], expected, (kr, us))
     return ctx
 
 

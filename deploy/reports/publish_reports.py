@@ -41,6 +41,13 @@
 manifest·journal에 `summary_v2_enabled: true`를 남기고, 정정·재시도는 그 값으로 다시 렌더합니다. 키가
 없거나 `false`이면 단위와 manifest·journal은 이 기능이 없던 때와 바이트까지 같습니다.
 
+거르기(선별 순위): 설정 `rank_screen_enabled`가 `true`일 때만 run 디렉터리의 `screen-D.json`
+(`briefing-screen.v1`, 규칙 `screen-v1`)을 읽어 KR·US 순위 섹션의 모델마다 "선별 상위 30" 표를 원순위 표
+위에 더합니다. 원순위 표·`- 모델:` 줄·front matter·파일 집합은 그대로입니다. 켠 단위는 manifest·journal에
+`rank_screen_enabled: true`와 `screen_*`(경로·sha256·상태)를 남기고, 정정·재시도는 그 값과 같은 파일로 다시
+렌더합니다. 키가 없거나 `false`이면 읽지 않고, 단위와 manifest·journal은 이 기능이 없던 때와 바이트까지
+같습니다.
+
 release의 `modeler` 패키지가 `PYTHONPATH`에 있어야 합니다(coordinator가 맞춰 줍니다).
 이 스크립트와 `validate_reports.py`는 release 밖에 두고 sha256을 고정합니다.
 """
@@ -79,6 +86,7 @@ GIT_TIMEOUT = 120
 LOCAL_LOCK_WAIT_SECONDS = 60.0
 EXPLAIN_MAX_BYTES = 64 * 1024 * 1024
 MACRO_MAX_BYTES = 16 * 1024 * 1024
+SCREEN_MAX_BYTES = 64 * 1024 * 1024
 KST = timezone(timedelta(hours=9))
 
 REQUIRED_KEYS = {"audience", "checkout_dir", "remote_name", "expected_remote_url", "branch"}
@@ -94,6 +102,7 @@ OPTIONAL_KEYS = {
     "explain_enabled",
     "macro_context_enabled",
     "summary_v2_enabled",
+    "rank_screen_enabled",
 }
 ALLOWED_KEYS = REQUIRED_KEYS | LOCAL_KEYS | OPTIONAL_KEYS
 # 증권 이름 입력(security-names.v1)을 레이크에서 만드는 데 쓰는 root. 시장별로 따로 받습니다.
@@ -333,6 +342,8 @@ def check_config(config: dict, *, need_local: bool, strict_remote: bool = True) 
         raise PublishError("macro_context_enabled must be true or false")
     if "summary_v2_enabled" in config and not isinstance(config["summary_v2_enabled"], bool):
         raise PublishError("summary_v2_enabled must be true or false")
+    if "rank_screen_enabled" in config and not isinstance(config["rank_screen_enabled"], bool):
+        raise PublishError("rank_screen_enabled must be true or false")
 
 
 def _absolute(value: object, label: str) -> Path:
@@ -725,6 +736,10 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         macro_file = None
     # 첫 화면 v2. 켰을 때만 렌더러에 넘깁니다(키가 없으면 꺼짐, 표시 전용).
     summary_v2 = config.get("summary_v2_enabled", False) is True
+    # 거르기(선별 상위 30). 켰을 때만 읽습니다(키가 없으면 꺼짐). 파일이 없으면 렌더러가 실패 안내를 씁니다.
+    screen_on = config.get("rank_screen_enabled", False) is True
+    screen_file = run_dir / f"screen-{unit}.json" if screen_on else None
+    screen_bytes = _read_screen(screen_file) if screen_file is not None else None
 
     # L2. 렌더합니다. 같은 입력을 다시 돌려 내용이 같으면 파일을 그대로 둡니다(generated_at 고정).
     md.reset_scrub_hits()
@@ -744,6 +759,7 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
             invocation_id=config["invocation_id"],
             macro=macro_bytes,
             **({"summary_v2": True} if summary_v2 else {}),
+            **({"screen": screen_bytes} if screen_on else {}),
         )
         files = md.render_unit(ctx)
     except md.InputError as exc:
@@ -808,6 +824,15 @@ def _local_locked(config: dict, checkout: Path, *, allow_synthetic: bool) -> dic
         )
     if summary_v2:  # 꺼져 있으면 manifest·journal은 전과 같습니다
         extra_fields["summary_v2_enabled"] = True
+    if screen_on:  # 꺼져 있으면 manifest·journal은 전과 같습니다
+        extra_fields.update(
+            {
+                "rank_screen_enabled": True,
+                "screen_path": str(screen_file),
+                "screen_sha256": hashlib.sha256(screen_bytes).hexdigest(),
+                "screen_state": (ctx.get("screen") or {}).get("state"),
+            }
+        )
     manifest.update(extra_fields)
     _write_atomic(
         markdown_dir / "manifest.json",
@@ -1006,6 +1031,16 @@ def _read_macro(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def _read_screen(path: Path) -> bytes:
+    """거르기 입력을 읽습니다. 없거나 일반 파일이 아니거나 너무 크면 빈 바이트를 돌려줍니다.
+
+    빈 바이트는 렌더러가 "선별 목록: 실패 — 입력 형식 오류"로 그립니다. 거르기 문제로 단위를 막지 않습니다.
+    """
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > SCREEN_MAX_BYTES:
+        return b""
+    return path.read_bytes()
+
+
 def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: str) -> dict:
     """journal 항목에 적힌 입력(report, 시장·섹터, 이름, 메모, 근거, 거시 흐름)과 첫 화면 v2 여부로
     렌더 입력을 만듭니다."""
@@ -1047,6 +1082,14 @@ def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: 
         macro_bytes = _read_macro(macro_path)
         if hashlib.sha256(macro_bytes).hexdigest() != entry.get("macro_sha256"):
             raise PublishError("macro input changed since the local step")
+    screen_bytes = None
+    if entry.get("rank_screen_enabled") is True:
+        screen_path = Path(entry.get("screen_path") or "")
+        if screen_path.parent != run_dir:
+            raise PublishError("screen input is outside the run directory")
+        screen_bytes = _read_screen(screen_path)
+        if hashlib.sha256(screen_bytes).hexdigest() != entry.get("screen_sha256"):
+            raise PublishError("screen input changed since the local step")
     try:
         return md.build_context(
             checkout,
@@ -1064,6 +1107,7 @@ def _entry_context(config: dict, entry: dict, unit: str, checkout: Path, stamp: 
             macro=macro_bytes,
             # 로컬 단계에서 켠 단위만 v2로 다시 렌더합니다(그날 설정이 아니라 journal 값을 따릅니다).
             **({"summary_v2": True} if entry.get("summary_v2_enabled") is True else {}),
+            **({"screen": screen_bytes} if screen_bytes is not None else {}),
         )
     except md.InputError as exc:
         raise PublishError(f"cannot render from the journaled inputs: {exc}") from None
